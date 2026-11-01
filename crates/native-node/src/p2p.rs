@@ -1,6 +1,7 @@
 //! Bounded native protocol over an externally authenticated hybrid channel.
 //! No production authenticator or classical/plaintext fallback is supplied.
 //! The identity, combiner and record-layer implementation require separate review.
+use crate::identity::{Descriptor, PeerPin};
 use crate::state::Config;
 use crate::wire::{Block, Hash, MAX_BLOCK_BYTES, MAX_ENVELOPE_BYTES, SUITE_ID};
 use std::io::{self, Read, Write};
@@ -60,6 +61,8 @@ struct BudgetInner {
 }
 /// Shared logical ownership budget. Every listener, outbound connection and
 /// retained packet for one node must receive clones of the same instance.
+/// Handshake reservations consume this same maximum, in addition to their
+/// category-specific count and byte caps.
 /// This does not replace a process-level charged-memory guard.
 #[derive(Clone, Debug)]
 pub struct Budget(Arc<BudgetInner>);
@@ -91,15 +94,23 @@ impl Budget {
     }
     fn handshake(&self) -> Result<HandshakeReservation, Error> {
         let mut usage = self.0.usage.lock().map_err(|_| Error::Unavailable)?;
-        let next = usage
+        let next_bytes = usage
+            .bytes
+            .checked_add(HANDSHAKE_BYTES)
+            .ok_or(Error::ResourceExhausted)?;
+        let next_handshake_bytes = usage
             .handshake_bytes
             .checked_add(HANDSHAKE_BYTES)
             .ok_or(Error::ResourceExhausted)?;
-        if usage.handshakes >= MAX_HANDSHAKES || next > HANDSHAKE_TOTAL_BYTES {
+        if next_bytes > self.0.maximum
+            || usage.handshakes >= MAX_HANDSHAKES
+            || next_handshake_bytes > HANDSHAKE_TOTAL_BYTES
+        {
             return Err(Error::ResourceExhausted);
         }
+        usage.bytes = next_bytes;
         usage.handshakes += 1;
-        usage.handshake_bytes = next;
+        usage.handshake_bytes = next_handshake_bytes;
         Ok(HandshakeReservation(self.0.clone()))
     }
 }
@@ -133,6 +144,7 @@ impl Drop for HandshakeReservation {
             .usage
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        usage.bytes = usage.bytes.saturating_sub(HANDSHAKE_BYTES);
         usage.handshakes = usage.handshakes.saturating_sub(1);
         usage.handshake_bytes = usage.handshake_bytes.saturating_sub(HANDSHAKE_BYTES);
     }
@@ -142,6 +154,7 @@ impl Drop for HandshakeReservation {
 pub(crate) struct Deadline {
     started: Instant,
     limit: Duration,
+    cancellation: Cancellation,
     #[cfg(test)]
     elapsed: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
@@ -150,11 +163,18 @@ impl Deadline {
         Self {
             started: Instant::now(),
             limit,
+            cancellation: Cancellation::default(),
             #[cfg(test)]
             elapsed: None,
         }
     }
     fn check(&self) -> io::Result<()> {
+        if self.cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "native admission cancelled",
+            ));
+        }
         #[cfg(test)]
         let elapsed = self.elapsed.as_ref().map_or_else(
             || self.started.elapsed(),
@@ -167,6 +187,135 @@ impl Deadline {
                 io::ErrorKind::TimedOut,
                 "native operation deadline",
             ));
+        }
+        Ok(())
+    }
+}
+
+/// A handshake role, independent of a peer's mining or validation role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionRole {
+    Initiator,
+    Responder,
+}
+
+/// Cooperative admission cancellation. A provider must additionally interrupt
+/// blocked I/O; observing this flag only before and after a read is insufficient.
+#[derive(Clone, Debug, Default)]
+pub struct Cancellation(Arc<std::sync::atomic::AtomicBool>);
+impl Cancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Full public identity and its independently authenticated pin. Receiving a
+/// self-signed descriptor on the connection is not independent authentication.
+#[derive(Clone, Debug)]
+pub struct ExpectedPeer {
+    binding: Binding,
+    descriptor: Descriptor,
+    pin: PeerPin,
+}
+impl ExpectedPeer {
+    pub fn from_pinned_descriptor(
+        binding: Binding,
+        descriptor: Descriptor,
+        pin: PeerPin,
+    ) -> Result<Self, Error> {
+        if descriptor.binding() != binding {
+            return Err(Error::InvalidProtocol);
+        }
+        pin.verify(&descriptor)
+            .map_err(|_| Error::InvalidProtocol)?;
+        Ok(Self {
+            binding,
+            descriptor,
+            pin,
+        })
+    }
+    pub fn descriptor(&self) -> &Descriptor {
+        &self.descriptor
+    }
+    pub fn fingerprint(&self) -> Hash {
+        self.pin.fingerprint()
+    }
+}
+
+/// Immutable expected identity, connection role and one provider-to-Hello
+/// admission budget. The caller obtains the peer configuration before dialing
+/// or accepting; the provider cannot replace it with a received descriptor.
+#[derive(Clone)]
+pub struct AdmissionContext {
+    expected: ExpectedPeer,
+    role: ConnectionRole,
+    deadline: Deadline,
+}
+impl AdmissionContext {
+    pub fn new(expected: ExpectedPeer, role: ConnectionRole, cancellation: Cancellation) -> Self {
+        let mut deadline = Deadline::new(HELLO_TIMEOUT);
+        deadline.cancellation = cancellation;
+        Self {
+            expected,
+            role,
+            deadline,
+        }
+    }
+    pub fn binding(&self) -> Binding {
+        self.expected.binding
+    }
+    pub fn role(&self) -> ConnectionRole {
+        self.role
+    }
+    pub fn expected_peer(&self) -> &ExpectedPeer {
+        &self.expected
+    }
+    pub fn deadline(&self) -> Instant {
+        self.deadline.started + self.deadline.limit
+    }
+    pub fn cancellation(&self) -> &Cancellation {
+        &self.deadline.cancellation
+    }
+    pub fn check(&self) -> Result<(), Error> {
+        self.deadline.check().map_err(io_error)
+    }
+    fn same_attempt(&self, other: &Self) -> bool {
+        self.binding() == other.binding()
+            && self.role == other.role
+            && self.expected.fingerprint() == other.expected.fingerprint()
+            && self.deadline.started == other.deadline.started
+            && self.deadline.limit == other.deadline.limit
+            && Arc::ptr_eq(
+                &self.deadline.cancellation.0,
+                &other.deadline.cancellation.0,
+            )
+    }
+}
+
+/// Parameters reported by a reviewed provider from its completed TLS state.
+/// Validating these values is only an interface guard, not evidence that TLS,
+/// either identity signature or the exporter binding was actually verified.
+pub struct NegotiatedParameters<'a> {
+    pub tls_version: u16,
+    pub group: u16,
+    pub cipher_suite: u16,
+    pub alpn: &'a [u8],
+    pub resumed: bool,
+    pub early_data: bool,
+}
+impl NegotiatedParameters<'_> {
+    fn validate(&self) -> Result<(), Error> {
+        if self.tls_version != 0x0304
+            || self.group != 0x11ec
+            || self.cipher_suite != 0x1303
+            || self.alpn != b"/siworld/native-hybrid/1"
+            || self.resumed
+            || self.early_data
+        {
+            return Err(Error::InvalidProtocol);
         }
         Ok(())
     }
@@ -272,32 +421,47 @@ impl Hello {
 /// sequence numbers, nonce limits, secret cleanup and rekeying.
 pub struct Authenticated<S> {
     channel: S,
-    binding: Binding,
-    descriptor: Hash,
+    admission: AdmissionContext,
 }
 impl<S> Authenticated<S> {
     // Reserved for a separately reviewed in-crate hybrid provider. Keeping the
     // constructor crate-private prevents external callers minting capabilities.
     #[allow(dead_code)]
-    pub(crate) fn from_verified_provider(channel: S, binding: Binding, descriptor: Hash) -> Self {
-        Self {
-            channel,
-            binding,
-            descriptor,
+    pub(crate) fn from_verified_provider(
+        channel: S,
+        admission: &AdmissionContext,
+        observed_role: ConnectionRole,
+        observed_peer: &Descriptor,
+        parameters: NegotiatedParameters<'_>,
+    ) -> Result<Self, Error> {
+        admission.check()?;
+        parameters.validate()?;
+        if observed_role != admission.role || observed_peer.binding() != admission.binding() {
+            return Err(Error::InvalidProtocol);
         }
+        admission
+            .expected
+            .pin
+            .verify(observed_peer)
+            .map_err(|_| Error::InvalidProtocol)?;
+        admission.check()?;
+        Ok(Self {
+            channel,
+            admission: admission.clone(),
+        })
     }
 }
 pub trait HybridAuthenticator {
     type Channel: Read + Write;
     /// Must complete X25519+ML-KEM and Ed25519+ML-DSA authentication by the
-    /// supplied absolute deadline, with no classical fallback. Provider state
-    /// must fit HANDSHAKE_BYTES and every channel I/O must return within five
-    /// seconds or support cancellation; a wrapper cannot preempt blocked I/O.
+    /// context's role, independently pinned full descriptor and original
+    /// absolute deadline, with no classical fallback. Provider state must fit
+    /// HANDSHAKE_BYTES. It must interrupt blocked I/O on deadline/cancellation;
+    /// a cooperative flag or a wrapper cannot preempt blocked I/O by itself.
     fn authenticate(
         &mut self,
         socket: TcpStream,
-        binding: &Binding,
-        deadline: Instant,
+        admission: &AdmissionContext,
     ) -> Result<Authenticated<Self::Channel>, Error>;
 }
 /// No default authenticator or unauthenticated production constructor exists.
@@ -326,27 +490,29 @@ pub enum Packet {
 impl<S: Read + Write> Session<S> {
     pub fn establish(
         auth: Authenticated<S>,
-        binding: Binding,
+        admission: &AdmissionContext,
         role: Role,
         budget: Budget,
     ) -> Result<Self, Error> {
         let permit = budget.handshake()?;
-        Self::establish_reserved(auth, binding, role, budget, permit)
+        Self::establish_reserved(auth, admission, role, budget, permit)
     }
     fn establish_reserved(
         auth: Authenticated<S>,
-        binding: Binding,
+        admission: &AdmissionContext,
         role: Role,
         budget: Budget,
         _permit: HandshakeReservation,
     ) -> Result<Self, Error> {
-        if auth.binding != binding || auth.descriptor == [0; 32] {
+        if !auth.admission.same_attempt(admission) {
             return Err(Error::InvalidProtocol);
         }
+        admission.check()?;
+        let binding = admission.binding();
         let mut channel = auth.channel;
         let mut timed = Timed {
             channel: &mut channel,
-            deadline: Deadline::new(HELLO_TIMEOUT),
+            deadline: admission.deadline.clone(),
         };
         timed
             .write_all(&Hello { binding, role }.encode())
@@ -358,7 +524,7 @@ impl<S: Read + Write> Session<S> {
         Ok(Self {
             channel,
             binding,
-            peer: auth.descriptor,
+            peer: admission.expected.fingerprint(),
             role: hello.role,
             budget,
         })
@@ -553,36 +719,49 @@ fn timeout(socket: &TcpStream) -> Result<(), Error> {
 pub fn accept_once<A: HybridAuthenticator>(
     listener: &TcpListener,
     auth: &mut A,
-    binding: Binding,
+    expected: &ExpectedPeer,
     role: Role,
     budget: Budget,
+    cancellation: Cancellation,
 ) -> Result<Session<A::Channel>, Error> {
     let (socket, _) = listener.accept().map_err(io_error)?;
     let permit = budget.handshake()?;
+    let admission =
+        AdmissionContext::new(expected.clone(), ConnectionRole::Responder, cancellation);
+    admission.check()?;
     timeout(&socket)?;
-    let deadline = Instant::now() + HELLO_TIMEOUT;
-    let channel = auth.authenticate(socket, &binding, deadline)?;
-    if Instant::now() >= deadline {
-        return Err(Error::Unavailable);
-    }
-    Session::establish_reserved(channel, binding, role, budget, permit)
+    let channel = auth.authenticate(socket, &admission)?;
+    admission.check()?;
+    Session::establish_reserved(channel, &admission, role, budget, permit)
 }
 pub fn connect<A: HybridAuthenticator>(
     endpoint: SocketAddr,
     auth: &mut A,
-    binding: Binding,
+    expected: &ExpectedPeer,
     role: Role,
     budget: Budget,
+    cancellation: Cancellation,
 ) -> Result<Session<A::Channel>, Error> {
     let permit = budget.handshake()?;
-    let socket = TcpStream::connect_timeout(&endpoint, Duration::from_secs(5)).map_err(io_error)?;
-    timeout(&socket)?;
-    let deadline = Instant::now() + HELLO_TIMEOUT;
-    let channel = auth.authenticate(socket, &binding, deadline)?;
-    if Instant::now() >= deadline {
+    let admission =
+        AdmissionContext::new(expected.clone(), ConnectionRole::Initiator, cancellation);
+    admission.check()?;
+    let remaining = admission
+        .deadline()
+        .saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
         return Err(Error::Unavailable);
     }
-    Session::establish_reserved(channel, binding, role, budget, permit)
+    let socket = TcpStream::connect_timeout(&endpoint, remaining).map_err(io_error)?;
+    admission.check()?;
+    timeout(&socket)?;
+    let channel = auth.authenticate(socket, &admission)?;
+    admission.check()?;
+    Session::establish_reserved(channel, &admission, role, budget, permit)
 }
+#[cfg(test)]
+mod admission_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

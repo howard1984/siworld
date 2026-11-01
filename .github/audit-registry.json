@@ -30,7 +30,7 @@
       "id": "hash-and-consensus",
       "area": "consensus",
       "status": "planned",
-      "scope": "SIWORLD Poseidon2 instances, BLAKE3 consensus hashes, ASERT, proof-of-work and cumulative-work fork choice. Shared native issuance and rounding, Voyager/Holder allocation, Holder pool deposits/claims, cumulative burn and supply conservation, per-credit 1,461-day fund vesting, authenticated expenditures and atomic economic reorganization rollback.",
+      "scope": "SIWORLD Poseidon2 instances, BLAKE3 consensus hashes, ASERT, proof-of-work and cumulative-work fork choice. Shared native issuance and rounding, Voyager/Holder allocation, Holder pool deposits/claims, cumulative burn and supply conservation, per-credit 1,461-day fund vesting, authenticated expenditures and atomic economic reorganization rollback. Economic rule version 3 claims the pre-block Holder pool before current-block credits; 24-wallet disposable engineering genesis and immutable per-wallet main-network allocation boundaries.",
       "excluded": [
         "unmodified upstream BLAKE3",
         "unmodified upstream Poseidon2 reference code"
@@ -51,7 +51,7 @@
       "id": "post-quantum-integration",
       "area": "cryptography",
       "status": "planned",
-      "scope": "SIWORLD integration of ML-KEM-768, ML-DSA-65, sender output self-checks, selective payment receipts, genuine padding encryption, key lifecycle, encoding, authorization and downgrade boundaries. Note lock ciphertext recovery, denomination-only source renaming with preserved address/serialization domains, and off-chain threshold backup/custody boundaries; V1 does not implement consensus multisignature.",
+      "scope": "SIWORLD integration of ML-KEM-768, ML-DSA-65, sender output self-checks, selective payment receipts, genuine padding encryption, key lifecycle, encoding, authorization and downgrade boundaries. Note lock ciphertext recovery, denomination-only source renaming with preserved address/serialization domains, and off-chain threshold backup/custody boundaries; V1 does not implement consensus multisignature. Offline fund-key seed custody, bounded Argon2id/XChaCha20 vaults, public-only key submissions and verified encrypted backups; native mnemonic entropy semantics, exclusive wallet ownership, encrypted reservations and retained payment openings, restart/reorganization reconciliation and external threshold-backup procedures.",
       "excluded": [
         "unmodified upstream ML-KEM",
         "unmodified upstream ML-DSA"
@@ -62,7 +62,13 @@
         "docs/protocol.md",
         "crates/bench-d8/src/encryption.rs",
         "crates/bench-multi-asset/src/encryption.rs",
-        "crates/bench-multi-asset/src/issuance.rs"
+        "crates/bench-multi-asset/src/issuance.rs",
+        "crates/fund-keytool",
+        "crates/native-node/src/wallet_vault.rs",
+        "crates/native-node/src/wallet_vault",
+        "crates/native-node/src/wallet_cli.rs",
+        "docs/v1-offline-fund-keys.md",
+        "docs/v1-wallet-storage.md"
       ],
       "report": null,
       "accepted_commit": null,
@@ -72,7 +78,7 @@
       "id": "transport-and-worker-boundary",
       "area": "network",
       "status": "planned",
-      "scope": "Legacy miner/worker authentication and retry/resource boundaries, distinct from planned native V1 transcript-bound hybrid peer identities, X25519 plus ML-KEM transport and Dandelion++ source relay. No external review engagement or completed report is represented.",
+      "scope": "Legacy miner/worker authentication and retry/resource boundaries, distinct from planned native V1 transcript-bound hybrid peer identities, X25519 plus ML-KEM transport and Dandelion++ source relay. No external review engagement or completed report is represented. Native dual-signed Ed25519/ML-DSA-65 descriptors and immutable trusted pins, no-follow service-credential persistence, explicit connection roles, continuous admission deadlines, proposed maintained TLS hybrid profile, exporter-bound dual authentication and no-fallback/no-keylogging requirements. Production provider activation and independent-host tests remain separate pending gates.",
       "excluded": [
         "unmodified libp2p transport implementation"
       ],
@@ -82,7 +88,12 @@
         "docs/legacy/worker-control.md",
         "crates/node/src/worker_transport.rs",
         "crates/node/tests/worker_listener.rs",
-        "docs/v1-network-design.md"
+        "docs/v1-network-design.md",
+        "crates/native-node/src/identity.rs",
+        "crates/native-node/src/identity",
+        "crates/native-node/src/p2p.rs",
+        "docs/v1-native-identity.md",
+        "docs/v1-hybrid-handshake.md"
       ],
       "report": null,
       "accepted_commit": null,

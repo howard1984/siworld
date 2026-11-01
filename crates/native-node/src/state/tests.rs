@@ -425,7 +425,7 @@ fn mode_reward_count_pool_burn_and_trusted_plan_are_bound() {
     h.apply(&holder, &TestVerifier).unwrap();
     assert_eq!(v.economics.totals().holder_pool, 692_483_000);
     assert_eq!(v.economics.totals().burned, 147_661_816);
-    assert_eq!(h.economics.totals().holder_pool, 101_810_479);
+    assert_eq!(h.economics.totals().holder_pool, 101_835_735);
     assert_eq!(h.economics.totals().burned, 0);
     assert_eq!(h.tree.count, v.tree.count + 4);
     assert_eq!(

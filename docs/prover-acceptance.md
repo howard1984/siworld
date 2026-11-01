@@ -189,7 +189,8 @@ four-worker trials on minimum-qualified hardware. The economic b7/q41/g20
 transaction trials range from 1.429902190 to 1.531155438 seconds, with a
 1.462877730-second median. Their maximum charged process-tree peak is
 525,234,176 bytes. Transaction proof bodies must fit 655,360 bytes;
-settlement and issuance bodies retain separate 524,288-byte caps. The 640-KiB
+settlement bodies use a 655,360-byte cap and issuance retains a separate
+524,288-byte cap. The 640-KiB
 transaction cap gives more than 10% margin over the 588,832-byte selected
 maximum across one- and four-worker measurements;
 it is not a deterministic size theorem. Measure independent transaction and
@@ -218,10 +219,10 @@ Height equality or a cached busy response is insufficient.
 
 At the 43-Mbps uplink floor, the capped multi-asset three-copy transaction
 and settlement payload requires 30.345178 Mbps. The
-[complete economic wire model](v1-network-budget.md) requires 36.51651984 Mbps
+[complete economic wire model](v1-network-budget.md) requires 36.52910683 Mbps
 after control, transport, reciprocal ACK, bounded issuance, all five reward
 records, eight signed fund claim slots, retransmission and recovery costs.
-The floor leaves 15.077861% capacity unused; recommend 100 Mbps.
+The floor leaves 15.048589% capacity unused; recommend 100 Mbps.
 Reconcile every assumption against packet/application counters and qualify
 both bandwidth profiles using the actual hybrid listener, concurrent ingress,
 losses, missing bodies and handshake churn. Report overload without silently
@@ -319,9 +320,10 @@ The following scope is required; this list does not claim tests have passed.
 - Recompute every atom of Voyager and Holder subsidy allocation, the one/five
   reward-note count, reserved SIP asset IDs, indices, unlock heights and
   note-zero fee sum. Reject any unrecognized mode or reward mutation.
-- Cover empty pool, current-block deposit before Holder draw, Voyager no-draw,
-  sub-4,032 balances, exact division and retained remainders. Track burn
-  independently and enforce the supply invariant at every accepted height.
+- Cover empty pool, Holder draw before current-block injection, Voyager no-draw,
+  sub-4,032 balances, exact division and retained remainders. Reject a reward
+  that draws from the current block's credit. Track burn independently and
+  enforce the supply invariant at every accepted height.
 - In the real transaction AIR, reject a spend one block before its input
   unlock; accept at the trusted snapshot height. Reject forged lock heights,
   substituted snapshot heights and a newer tip with an old snapshot.

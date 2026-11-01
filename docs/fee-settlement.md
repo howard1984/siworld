@@ -5,7 +5,7 @@ proof parameters for the [revised monetary relation](v1-economics.md).
 Scheme B is native and non-recursive; no network activation is implied.
 The [transaction profile](../crates/bench-multi-asset/artifacts/v1-transaction-profile.json)
 is b7/q41/g20 with a 655,360-byte cap. The separate fixed-576 settlement uses
-b8/q36/g20 and a 524,288-byte cap. The
+b8/q36/g20 and a 655,360-byte cap. The
 [source-bound manifest](../crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json)
 binds the revised public preprocessing identities and actual-AIR reports.
 Settlement binds the public mode, trusted consensus reward plan and one/five
@@ -258,7 +258,7 @@ fixed-size fee-opening sidecar separately from the implemented 2,027-byte public
 transaction body, totaling 2,075 bytes with the fee commitment. The permanent
 snapshot selector adds 40 bytes, for a 2,115-byte per-position record. Use the
 transaction body admission cap of 655,360 bytes (640 KiB); the independent
-settlement and issuance body caps remain 524,288 bytes each. The prior
+settlement body cap is 655,360 bytes and issuance remains 524,288 bytes. The prior
 `bench-d8` decoder is unchanged; the multi-asset envelope and node decoder
 must enforce the new transaction limit before activation. Mempool byte caps,
 concurrent-verification limits and complete relay capacity require the
@@ -425,7 +425,7 @@ groups. Fixed-576 settlement b8/q36/g20 generates in 5.523829281 seconds median
 (maximum 5.616304295), with bodies no larger than 520,203 bytes and a maximum
 charged process-tree peak of 3,161,432,064 bytes. Its one-worker verification
 median is 19.914259 ms; quantum-halved Johnson challenge union is
-81.983705354 bits. The separate 524,288-byte settlement cap and complete
+81.983705354 bits. The separate 655,360-byte settlement cap and complete
 mode-selected one/five-note SIP reward relation remain fixed. The
 [multi-asset evaluation](v1-multi-asset-evaluation.md) records actual dimensions,
 all transaction scan trials, security terms and separate settlement evidence.

@@ -101,8 +101,11 @@ power-loss behavior, synchronous commits, write amplification and compaction.
 The conditional planning minimum uplink is **43 Mbps**, with **100 Mbps sustained uplink**
 recommended. Keep all 576 positions. The engineering-frozen transaction proof
 cap is 655,360 bytes (640 KiB), with more than 10% margin above the selected
-588,832-byte observed maximum. Settlement and issuance caps remain
-524,288 bytes.
+588,832-byte observed maximum. Settlement uses a 655,360-byte cap and
+issuance retains a separate 524,288-byte cap. The source-bound measurement
+profiles retain the historical 524,288-byte settlement admission value; the
+current decoder cap does not change their hashes or establish full-capacity
+maximum-fee/claim qualification.
 The [complete conditional wire budget](v1-network-budget.md) charges three
 application copies, settlement and bounded issuance, control, authenticated
 framing, IPv6/TCP/link serialization, reciprocal ACKs, handshakes, 2%
@@ -113,13 +116,16 @@ issuance proof caps are independent. Reproduce the economic format with
 `python3 scripts/v1-network-budget.py --native-protocol --economic-rewards`.
 It includes a 61,235-byte compact fixed record (five reward notes and eight
 signed fund payouts), the settlement proof once in the compact body and all
-remaining allowances. Its full wire model uses 36.51651984 Mbps;
-43 Mbps leaves 6.483 Mbps (15.077861%) spare, while 100 Mbps leaves 63.483 Mbps.
+remaining allowances. Its full wire model uses 36.52910683 Mbps;
+43 Mbps leaves 6.471 Mbps (15.048589%) spare, while 100 Mbps leaves 63.471 Mbps.
 The integrated four-issuance envelope needs 44 Mbps for the same reserve;
 one issuance remains within 43 Mbps. Pin the actual admission setting and
 repeat the model before activation.
-The unflagged and native-only script modes preserve earlier evidence; their
-single-reward or generic framing totals do not size the revised format.
+The unflagged and native-only modes use their generic or single-reward layouts
+with current independent cap defaults. They do not reproduce earlier numeric
+evidence unchanged or size the revised format. Historical native single-reward
+numbers require an explicit 524,288-byte settlement cap; `--legacy-baseline`
+restores all three 524,288-byte caps and the earlier link/reserve settings.
 Measure packet counters and queue growth
 before accepting maximum-load operation, and schedule bulk backup/checkpoint
 transfers separately.
@@ -156,28 +162,28 @@ the explicit planning model with
 `python3 scripts/v1-storage-budget.py --economic-rewards`.
 The three-output codec has 2,115 permanent bytes/position. At the 640-KiB
 transaction cap, ordinary transaction proofs, settlement proofs and sidecars
-require 335.714 GB at the nominal 888-block window; an additional capped
-issuance proof/block brings the rolling budget to 336.180 GB. Include 64 KiB
+require 335.831 GB at the nominal 888-block window; an additional capped
+issuance proof/block brings the rolling budget to 336.296 GB. Include 64 KiB
 permanent block records and 16 KiB permanent issuance records/block, 25% of all permanent bytes for indexes/state, 16 GB database
 working space, a one-time 64-KiB fund genesis registry, 20 GB system/recovery
 files, and 20% device free:
 
 | Workload | Device year 1 | Device year 3 | Device year 5 |
 | --- | ---: | ---: | ---: |
-| Maximum 576 positions/block | 678.776 GB | 1,105.879 GB | 1,532.981 GB |
-| 10,000/day, minimum 64-position blocks | 128.415 GB | 199.791 GB | 271.168 GB |
-| 50,000/day, adaptive grouping | 246.246 GB | 393.778 GB | 541.310 GB |
-| 50,000/day, uniform 176 positions | 248.806 GB | 397.998 GB | 547.189 GB |
+| Maximum 576 positions/block | 678.922 GB | 1,106.024 GB | 1,533.127 GB |
+| 10,000/day, minimum 64-position blocks | 128.560 GB | 199.937 GB | 271.313 GB |
+| 50,000/day, adaptive grouping | 246.391 GB | 393.923 GB | 541.455 GB |
+| 50,000/day, uniform 176 positions | 248.952 GB | 398.143 GB | 547.335 GB |
 
 **500 GB usable SSD is the installation minimum; 1 TB is recommended** for
 both miners and validators. That minimum does not qualify continuous maximum
-load: year-one used bytes are 543.021 GB before the 20% free reserve. A 1-TB
+load: year-one used bytes are 543.137 GB before the 20% free reserve. A 1-TB
 device reaches the modeled free-space threshold after approximately **2.50 full
-load years**; year three needs 1,105.879 GB, rather than fitting 1 TB.
+load years**; year three needs 1,106.024 GB, rather than fitting 1 TB.
 
 At 10,000/day, 500 GB has modeled headroom beyond five years: the year-five
-device requirement is 271.168 GB. At 50,000/day, adaptive packing needs
-541.310 GB in year five and uniform 176-position blocks need 547.189 GB;
+device requirement is 271.313 GB. At 50,000/day, adaptive packing needs
+541.455 GB in year five and uniform 176-position blocks need 547.335 GB;
 both exceed 500 GB including the free reserve. Do not promise five years on
 500 GB for every early workload. These conditional horizons depend on the
 final measured overheads, packing and workload. Publish actual growth and expand storage before reserves are
@@ -192,8 +198,9 @@ allowance. Actual shares and keys are required before activation; V1 has no
 key/share replacement mechanism. Per-wallet credits accrue in the ledger
 without emitting an output each block; up to eight signed claims can be
 included in one block. Each claim spends only its own wallet's released
-unspent balance. The unflagged storage script preserves the earlier 8-KiB
-block-record scenario rather than silently replacing historical evidence.
+unspent balance. The unflagged storage script uses the 8-KiB block-record
+layout with current cap defaults; historical numeric evidence requires
+explicit original caps or `--legacy-baseline`.
 
 The block/issuance ceilings and database allowance remain proposed engineering
 budgets: final encoding must bound headers/PoW, settlement declarations,

@@ -23,7 +23,9 @@ pub const MAX_POW_ITERATIONS: u64 = 1_000_000;
 const FUND_CONFIG_OFFSET: usize = 146;
 const FUND_WALLET_BYTES: usize = 2 + crate::fund_spend::VERIFYING_KEY_BYTES;
 const ISSUANCE_CONFIG_OFFSET: usize = FUND_CONFIG_OFFSET + 2 + MAX_FUND_WALLETS * FUND_WALLET_BYTES;
-pub const CONFIG_RULE_BYTES: usize = ISSUANCE_CONFIG_OFFSET + 52;
+const CONFIG_REVISION_OFFSET: usize = ISSUANCE_CONFIG_OFFSET + 52;
+const CONFIG_REVISION: u32 = 5;
+pub const CONFIG_RULE_BYTES: usize = CONFIG_REVISION_OFFSET + 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -115,6 +117,27 @@ impl Config {
         self.validate()?;
         Ok(self)
     }
+    /// Publicly reproducible keys for a disposable engineering genesis only.
+    /// These keys have no custody security and must never fund a live network.
+    pub fn with_test_fund_registry(self) -> Result<Self, String> {
+        let mut shares = vec![400; 24];
+        shares[23] = 800;
+        let keys = (0u32..24)
+            .map(|index| {
+                let seed = blake3::derive_key(
+                    "siworld disposable twenty-four-wallet fund fixture v1",
+                    &index.to_le_bytes(),
+                );
+                *libcrux_ml_dsa::ml_dsa_65::generate_key_pair(seed)
+                    .verification_key
+                    .as_ref()
+            })
+            .collect();
+        self.with_fund_wallets(
+            FundAllocation::new_bps(shares, 23).map_err(|e| e.to_string())?,
+            keys,
+        )
+    }
     pub fn validate(&self) -> Result<(), String> {
         self.economics.validate().map_err(|e| e.to_string())?;
         if let Some(policy) = &self.issuance {
@@ -196,10 +219,20 @@ impl Config {
                 .copy_from_slice(&policy.max_metadata_bytes.to_le_bytes());
             bytes[offset + 51] = policy.max_per_block;
         }
+        bytes[CONFIG_REVISION_OFFSET..CONFIG_REVISION_OFFSET + 4]
+            .copy_from_slice(&CONFIG_REVISION.to_le_bytes());
+        bytes[CONFIG_REVISION_OFFSET + 4..]
+            .copy_from_slice(&u32::from(economics::ECONOMICS_RULE_VERSION).to_le_bytes());
         bytes
     }
     pub fn decode_rules(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != CONFIG_RULE_BYTES || bytes[33] > 1 {
+        if bytes.len() != CONFIG_RULE_BYTES
+            || bytes[33] > 1
+            || bytes[CONFIG_REVISION_OFFSET..CONFIG_REVISION_OFFSET + 4]
+                != CONFIG_REVISION.to_le_bytes()
+            || bytes[CONFIG_REVISION_OFFSET + 4..]
+                != u32::from(economics::ECONOMICS_RULE_VERSION).to_le_bytes()
+        {
             return Err("invalid engineering rule encoding".into());
         }
         let count = usize::from(bytes[FUND_CONFIG_OFFSET]);
@@ -212,7 +245,9 @@ impl Config {
                 .any(|value| *value != 0)
             || bytes[policy_offset] > 1
             || (bytes[policy_offset] == 0
-                && bytes[policy_offset + 1..].iter().any(|value| *value != 0))
+                && bytes[policy_offset + 1..CONFIG_REVISION_OFFSET]
+                    .iter()
+                    .any(|value| *value != 0))
         {
             return Err("noncanonical fund registry or issuance configuration".into());
         }
@@ -866,5 +901,45 @@ mod proof_profile_tests {
         let mut changed = profile;
         changed[0] ^= 1;
         assert_ne!(genesis, config.genesis_id_for_profile(&changed));
+    }
+
+    #[test]
+    fn encoded_rules_require_the_current_economic_order() {
+        let config = Config::development([95; 32], 0).unwrap();
+        let mut encoded = config.encode_rules();
+        assert_eq!(Config::decode_rules(&encoded).unwrap(), config);
+        assert!(Config::decode_rules(&encoded[..encoded.len() - 8]).is_err());
+        let offset = encoded.len() - 4;
+        encoded[offset..].copy_from_slice(&2u32.to_le_bytes());
+        assert!(Config::decode_rules(&encoded).is_err());
+        encoded = config.encode_rules();
+        let offset = encoded.len() - 8;
+        encoded[offset..offset + 4].copy_from_slice(&4u32.to_le_bytes());
+        assert!(Config::decode_rules(&encoded).is_err());
+    }
+
+    #[test]
+    fn disposable_asert_genesis_can_use_twenty_four_test_wallets() {
+        let config = Config::asert_development([96; 32], 1, [0xff; 32], 1)
+            .unwrap()
+            .with_test_fund_registry()
+            .unwrap();
+        let allocation = config.fund_allocation.as_ref().unwrap();
+        assert_eq!(allocation.basis_points().len(), 24);
+        assert_eq!(
+            allocation
+                .basis_points()
+                .iter()
+                .map(|x| u32::from(*x))
+                .sum::<u32>(),
+            10_000
+        );
+        assert_eq!(allocation.team_index(), 23);
+        assert_eq!(config.fund_verifying_keys.len(), 24);
+        assert_eq!(
+            Config::decode_rules(&config.encode_rules()).unwrap(),
+            config
+        );
+        State::new(config).unwrap();
     }
 }

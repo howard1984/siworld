@@ -44,8 +44,8 @@ fn exact_initial_mode_allocations_and_note_unlocks() {
     )
     .unwrap();
     assert_eq!(holder.fund_credit, [169_726_225, 169_726_226]);
-    assert_eq!(holder.pool_payout, 25_256);
-    assert_eq!(holder.pool_after, 101_810_479);
+    assert_eq!(holder.pool_payout, 0);
+    assert_eq!(holder.pool_after, 101_835_735);
     assert_eq!(holder.mode_pool_credit, 0);
     assert_eq!(holder.burn, 0);
     assert_eq!(
@@ -55,7 +55,7 @@ fn exact_initial_mode_allocations_and_note_unlocks() {
             .map(|n| n.amount)
             .collect::<Vec<_>>(),
         vec![
-            1_771_967_057,
+            1_771_941_801,
             295_323_632,
             295_323_632,
             295_323_632,
@@ -126,16 +126,62 @@ fn pool_empty_claim_credit_order_and_remainder() {
     let remainder =
         allocate_reward(&params, &allocation(), 1, RewardMode::Holder, 0, 4_033).unwrap();
     assert_eq!((remainder.pool_payout, remainder.pool_after), (1, 4_032));
-    let credit_first =
+    let claim_first =
         allocate_reward(&params, &allocation(), 1, RewardMode::Holder, 134_400, 0).unwrap();
-    assert_eq!(credit_first.protocol_pool_credit, 4_032);
+    assert_eq!(claim_first.protocol_pool_credit, 4_032);
     assert_eq!(
-        (credit_first.pool_payout, credit_first.pool_after),
-        (1, 4_031)
+        (claim_first.pool_payout, claim_first.pool_after),
+        (0, 4_032)
     );
+    let sub_divisor = allocate_reward(
+        &params,
+        &allocation(),
+        1,
+        RewardMode::Holder,
+        134_400,
+        4_031,
+    )
+    .unwrap();
+    assert_eq!(
+        (sub_divisor.pool_payout, sub_divisor.pool_after),
+        (0, 8_063)
+    );
+    let funded = allocate_reward(
+        &params,
+        &allocation(),
+        1,
+        RewardMode::Holder,
+        134_400,
+        4_033,
+    )
+    .unwrap();
+    assert_eq!((funded.pool_payout, funded.pool_after), (1, 8_064));
+    for allocation in [&empty, &remainder, &claim_first, &sub_divisor, &funded] {
+        allocation.check_conservation().unwrap();
+    }
     let voyager =
         allocate_reward(&params, &allocation(), 1, RewardMode::Voyager, 0, 4_033).unwrap();
     assert_eq!((voyager.pool_payout, voyager.pool_after), (0, 4_033));
+}
+
+#[test]
+fn reward_notes_that_claim_this_blocks_pool_credit_are_rejected() {
+    let correct = allocate_reward(
+        &EconomicsParams::production(),
+        &allocation(),
+        1,
+        RewardMode::Holder,
+        INITIAL_REWARD,
+        0,
+    )
+    .unwrap();
+    let mut credit_before_claim = correct.reward_notes.clone();
+    credit_before_claim[0].amount += correct.protocol_pool_credit / POOL_PAYOUT_DIVISOR as u64;
+    assert_eq!(
+        correct.verify_reward_notes(&credit_before_claim),
+        Err(EconomicsError::RewardMismatch)
+    );
+    correct.verify_reward_notes(&correct.reward_notes).unwrap();
 }
 
 #[test]
@@ -408,6 +454,9 @@ fn seeded_twenty_year_modes_preserve_supply_and_curve() {
     let height = 20 * BLOCKS_PER_YEAR;
     let mut reference = vec![FundBalance::default(); bps.len()];
     let mut reference_subsidy = INITIAL_REWARD;
+    let mut reference_pool = 0u128;
+    let mut reference_burn = 0u128;
+    let mut reference_miner_credit = 0u128;
     for h in 1..=height {
         if h > 1 && (h - 1).is_multiple_of(EPOCH_BLOCKS) {
             reference_subsidy = ((u128::from(reference_subsidy)
@@ -436,16 +485,42 @@ fn seeded_twenty_year_modes_preserve_supply_and_curve() {
         seed ^= seed << 13;
         seed ^= seed >> 7;
         seed ^= seed << 17;
-        ledger
-            .advance(
-                h,
-                if seed & 1 == 0 {
-                    RewardMode::Voyager
-                } else {
-                    RewardMode::Holder
-                },
-            )
-            .unwrap();
+        let mode = if seed & 1 == 0 {
+            RewardMode::Voyager
+        } else {
+            RewardMode::Holder
+        };
+        // Independent atom arithmetic claims only the pre-block balance.
+        // Same-block protocol and Voyager credits enter after the claim.
+        let protocol_credit = u128::from(reference_subsidy) * 3 / 100;
+        let miner_base = u128::from(reference_subsidy - fund_total) - protocol_credit;
+        let claim = if mode == RewardMode::Holder {
+            reference_pool / 4_032
+        } else {
+            0
+        };
+        let burn = if mode == RewardMode::Voyager {
+            miner_base * 5 / 100
+        } else {
+            0
+        };
+        let mode_credit = if mode == RewardMode::Voyager {
+            miner_base * 20 / 100
+        } else {
+            0
+        };
+        reference_pool = reference_pool - claim + protocol_credit + mode_credit;
+        reference_burn += burn;
+        reference_miner_credit += miner_base + claim - burn - mode_credit;
+        let actual = ledger.advance(h, mode).unwrap();
+        assert_eq!(u128::from(actual.pool_payout), claim);
+        assert_eq!(actual.pool_after, reference_pool);
+        assert_eq!(ledger.totals().holder_pool, reference_pool);
+        assert_eq!(ledger.totals().burned, reference_burn);
+        assert_eq!(
+            ledger.totals().miner_subsidy_credited,
+            reference_miner_credit
+        );
         ledger.assert_supply_invariant().unwrap();
         if h.is_multiple_of(50_000) {
             let account = FundAccount::new((seed as usize) % bps.len()).unwrap();
@@ -495,7 +570,7 @@ fn seeded_twenty_year_modes_preserve_supply_and_curve() {
     }).collect();
     let wallets_json = wallet_records.join(",");
     println!(
-        "V1_ECONOMICS_SIMULATION={{\"height\":{height},\"issued\":{},\"miner_subsidy_credited\":{},\"holder_pool\":{},\"burned\":{},\"locked_subsidy\":{},\"synthetic_wallet_basis_points\":{:?},\"team_remainder_index\":23,\"wallet_count\":24,\"fund_entitlement\":{entitlement},\"fund_unlocked\":{unlocked},\"fund_spent\":{spent},\"fund_wallets\":[{wallets_json}]}}",
+        "V1_ECONOMICS_SIMULATION={{\"economics_rule_version\":{ECONOMICS_RULE_VERSION},\"holder_claim_before_injection\":1,\"height\":{height},\"issued\":{},\"miner_subsidy_credited\":{},\"holder_pool\":{},\"burned\":{},\"locked_subsidy\":{},\"synthetic_wallet_basis_points\":{:?},\"team_remainder_index\":23,\"wallet_count\":24,\"fund_entitlement\":{entitlement},\"fund_unlocked\":{unlocked},\"fund_spent\":{spent},\"fund_wallets\":[{wallets_json}]}}",
         ledger.totals().issued,
         ledger.totals().miner_subsidy_credited,
         ledger.totals().holder_pool,
@@ -515,6 +590,7 @@ fn canonical_state_encoding_covers_counters_and_future_schedules() {
         bytes
     };
     let original = encode(&ledger);
+    assert_eq!(original[..2], ECONOMICS_RULE_VERSION.to_le_bytes());
     assert_eq!(original, encode(&ledger.clone()));
     let mut changed = ledger.clone();
     changed.current_subsidy += 1;

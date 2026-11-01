@@ -22,10 +22,12 @@ const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("canonical-bloc
 const DETACHED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("detached-blocks-v1");
 const HEAD_BYTES: usize = 72;
 const FINGERPRINT_BYTES: usize = 32;
+mod receipts;
 
 pub struct Store {
     database: Database,
     state: State,
+    receipt_owner: receipts::Owner,
 }
 
 impl Store {
@@ -58,6 +60,7 @@ impl Store {
     ) -> Result<Self, String> {
         config.validate()?;
         let (file, created) = open_regular_file(path, create_allowed)?;
+        let receipt_owner = receipts::Owner::bind(path, &file)?;
         let mut builder = Database::builder();
         builder.set_cache_size(32 * 1024 * 1024);
         // An allocator or checksum repair may discard evidence. Recovery of an
@@ -71,11 +74,23 @@ impl Store {
             sync_parent(path)?;
         }
         let state = replay(&database, config, verifier)?;
-        Ok(Self { database, state })
+        Ok(Self {
+            database,
+            state,
+            receipt_owner,
+        })
     }
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    pub(crate) fn save_reward_receipt(
+        &self,
+        id: &crate::wire::Hash,
+        secret: &[u8],
+    ) -> Result<(), String> {
+        self.receipt_owner.save(id, secret)
     }
 
     /// Returns the complete canonical block, including proofs, for local receipt

@@ -154,6 +154,37 @@ fn reward_block(
 }
 
 #[test]
+fn first_voyager_reward_uses_the_reward_receipt_namespace() {
+    let network = [18; 32];
+    let config = Config::development(network, 0).unwrap();
+    let state = State::new(config.clone()).unwrap();
+    let original = wallet(network, 19);
+    let block = reward_block(
+        &state,
+        &original,
+        crate::state::RewardMode::Voyager,
+        120_000,
+    );
+    let expected = block.rewards[0].commitment;
+    let mut restored = wallet(network, 19);
+    restored.reconcile(config, &[block], &TestVerifier).unwrap();
+    assert_eq!(restored.receipts().len(), 1);
+    assert!(
+        restored
+            .receipts()
+            .iter()
+            .all(|receipt| receipt.output_index != 0)
+    );
+    let reward = restored
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.height == 1 && receipt.output_index == 3)
+        .expect("the first miner reward uses the first reward receipt position");
+    assert_eq!(reward.commitment, expected);
+    assert_eq!(reward.note().unlock_height, 25);
+}
+
+#[test]
 fn reward_scanning_recovers_five_holder_batches_and_unique_nullifiers_from_seed() {
     let network = [8; 32];
     let config = Config::development(network, 0).unwrap();
@@ -691,16 +722,33 @@ fn transfer_witness_balances_sip_fees_and_token_change_with_two_or_one_inputs() 
     let mut sender = wallet(network, 16);
     let receiver = wallet(network, 17);
     let asset = AssetId([18; 32]);
-    let (record, _, _) = encrypted_record(&state, &sender, asset, 500_000, 1000);
+    let (token_record, token_notes, _) = encrypted_record(&state, &sender, asset, 500_000, 1000);
+    let token_id = token_record.statement_id(&network);
+    let token_commitment = encode_digest(&Hasher::new().note_cm(&token_notes[0]));
     let mut block = candidate(&state, 100_000);
-    insert_record(&mut block, record);
     // A second owned SIP payment funds either canonical-snapshot fee tier.
     let sip_funding = base_fee(block.height) * 4 + 100_000;
-    let (record, _, _) = encrypted_record(&state, &sender, SIP_ASSET_ID, sip_funding, 2000);
-    block.transactions[1].record = record;
+    let (sip_record, sip_notes, _) =
+        encrypted_record(&state, &sender, SIP_ASSET_ID, sip_funding, 2000);
+    let sip_id = sip_record.statement_id(&network);
+    let sip_commitment = encode_digest(&Hasher::new().note_cm(&sip_notes[0]));
+    // Populate both positions before sorting: the first record's random
+    // ciphertext can otherwise move it into the second replacement position.
+    block.transactions[0].record = token_record;
+    block.transactions[1].record = sip_record;
     block
         .transactions
         .sort_by_key(|tx| tx.record.statement_id(&network));
+    for (id, commitment) in [(token_id, token_commitment), (sip_id, sip_commitment)] {
+        let inserted = block
+            .transactions
+            .iter()
+            .filter(|transaction| transaction.record.statement_id(&network) == id)
+            .collect::<Vec<_>>();
+        assert_eq!(inserted.len(), 1);
+        let public = PublicTransaction::decode(&inserted[0].record.body).unwrap();
+        assert_eq!(encode_digest(&public.cm[0]), commitment);
+    }
     state.apply(&block, &TestVerifier).unwrap();
     sender.reconcile(config, &[block], &TestVerifier).unwrap();
     let token = sender
@@ -709,12 +757,14 @@ fn transfer_witness_balances_sip_fees_and_token_change_with_two_or_one_inputs() 
         .find(|r| r.note.asset_id == asset && r.note.value > 0)
         .unwrap()
         .commitment;
+    assert_eq!(token, token_commitment);
     let sip = sender
         .receipts()
         .iter()
         .find(|r| r.note.asset_id == SIP_ASSET_ID && r.note.value == sip_funding)
         .unwrap()
         .commitment;
+    assert_eq!(sip, sip_commitment);
     for tier in [FeeTier::Standard, FeeTier::Priority] {
         let prepared = sender
             .prepare_transfer(

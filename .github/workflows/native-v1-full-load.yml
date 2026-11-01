@@ -1,0 +1,170 @@
+name: Native V1 settlement full-load measurements
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/bench-multi-asset/**'
+      - 'crates/bench-d8/**'
+      - 'crates/native-node/src/proofs.rs'
+      - 'crates/native-node/src/wire.rs'
+      - 'crates/native-node/src/fund_spend.rs'
+      - 'crates/native-node/tests/max_fund_claim_envelope.rs'
+      - 'scripts/measure-native-cgroup.py'
+      - 'scripts/measure-settlement-full-load.py'
+      - 'scripts/settlement-full-load.rs'
+      - 'scripts/tests/test_native_v1_full_load.py'
+      - '.github/workflows/native-v1-full-load.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-v1-full-load-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  settlement-full-load:
+    name: Fixed 576-slot settlement, three independent scopes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.local/native-v1-full-load-target
+      RAYON_NUM_THREADS: 4
+      SIWORLD_COMPOSITION_HIDING_WORKERS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Check collector contracts and cgroup availability
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_native_v1_full_load.py -v
+          python3 -m unittest discover -s scripts/tests -p test_native_cgroup_measurement.py -v
+          test -e /sys/fs/cgroup/cgroup.controllers
+          sudo --non-interactive systemctl --version
+      - name: Install the repository toolchain
+        run: rustup toolchain install
+      - name: Check the CPU before building the fixed profile
+        run: |
+          rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/native-v1-cpu-check
+          /tmp/native-v1-cpu-check --check-cpu
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/bench-multi-asset -> ../../.local/native-v1-full-load-target
+          cache-on-failure: true
+      - name: Prepare an isolated application over the unchanged fixed library
+        run: |
+          mkdir -p .local/native-v1-full-load/private .local/native-v1-full-load/public
+          python3 scripts/measure-settlement-full-load.py --prepare .local/native-v1-full-load/application
+      - name: Build only the unchanged fixed settlement profile
+        run: |
+          python3 - <<'PY_CONFIG'
+          import importlib.util
+          import os
+          spec = importlib.util.spec_from_file_location('controlled', 'scripts/build-composition-intra.py')
+          controlled = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(controlled)
+          controlled.controlled_configuration(os.environ)
+          PY_CONFIG
+          rustfmt --edition 2024 --check scripts/settlement-full-load.rs
+          cargo clippy --release --locked --manifest-path .local/native-v1-full-load/application/Cargo.toml --features security-report --bin settlement-full-load -- -D warnings
+          cargo test --release --locked --manifest-path .local/native-v1-full-load/application/Cargo.toml --features security-report --bin settlement-full-load
+          cargo build --release --locked --manifest-path .local/native-v1-full-load/application/Cargo.toml --features security-report --bin settlement-full-load
+      - name: Measure three fresh 5-GiB zero-swap process trees
+        run: python3 scripts/measure-settlement-full-load.py
+      - name: Preserve explicit workflow outcome
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'PY_STATUS'
+          import json
+          import os
+          from pathlib import Path
+          output = Path('.local/native-v1-full-load/public')
+          output.mkdir(parents=True, exist_ok=True)
+          (output / 'workflow-status.json').write_text(json.dumps(dict(
+              job_status_before_upload=os.environ['JOB_STATUS'], source_commit=os.environ['SOURCE_COMMIT'],
+              summary_present=(output / 'summary.json').is_file(), acceptance=False,
+              cryptographic_approval=False, network_activation=False), indent=2) + '\n')
+          PY_STATUS
+      - name: Upload allowlisted measurements and kernel evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-v1-full-load-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/native-v1-full-load/public/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  signed-claim-envelope:
+    name: Eight native ML-DSA-65 claims and maximum codec envelope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.local/native-v1-envelope-target
+      RAYON_NUM_THREADS: 4
+      SIWORLD_COMPOSITION_HIDING_WORKERS: 2
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: rustup toolchain install
+      - name: Check the CPU before building the native codec
+        run: |
+          rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/native-v1-envelope-cpu-check
+          /tmp/native-v1-envelope-cpu-check --check-cpu
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/native-node -> ../../.local/native-v1-envelope-target
+          cache-on-failure: true
+      - name: Build the actual native claim and envelope test
+        run: |
+          python3 - <<'PY_CONFIG'
+          import importlib.util
+          import os
+          spec = importlib.util.spec_from_file_location('controlled', 'scripts/build-composition-intra.py')
+          controlled = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(controlled)
+          controlled.controlled_configuration(os.environ)
+          PY_CONFIG
+          rustfmt --edition 2024 --check crates/native-node/tests/max_fund_claim_envelope.rs
+          cargo clippy --release --locked --manifest-path crates/native-node/Cargo.toml --test max_fund_claim_envelope -- -D warnings
+          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --test max_fund_claim_envelope
+      - name: Check maximum opaque proof envelopes with real claim signatures
+        run: |
+          mkdir -p .local/native-v1-full-load/public
+          SIWORLD_CLAIM_ENVELOPE_REPORT="$GITHUB_WORKSPACE/.local/native-v1-full-load/public/claim-envelope.json" \
+            cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --test max_fund_claim_envelope maximum_opaque_proof_envelope_with_eight_signed_claims_preserves_native_budgets -- --ignored --exact
+      - name: Preserve explicit claim diagnostic outcome
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'PY_STATUS'
+          import json
+          import os
+          from pathlib import Path
+          output = Path('.local/native-v1-full-load/public')
+          output.mkdir(parents=True, exist_ok=True)
+          (output / 'claim-workflow-status.json').write_text(json.dumps(dict(
+              job_status_before_upload=os.environ['JOB_STATUS'], source_commit=os.environ['SOURCE_COMMIT'],
+              claim_report_present=(output / 'claim-envelope.json').is_file(),
+              proof_fills_are_codec_only=True, acceptance=False,
+              cryptographic_approval=False, network_activation=False), indent=2) + '\n')
+          PY_STATUS
+      - name: Upload allowlisted native claim diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-v1-claim-envelope-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/native-v1-full-load/public/claim-*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

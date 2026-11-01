@@ -14,7 +14,7 @@ node/network activation and integrated resource acceptance.
 | Relation | Fixed shape | FRI profile | Proof-body admission requirement |
 | --- | --- | --- | ---: |
 | Transaction | Two inputs, three outputs; per-asset balance, SIP-only fees and snapshot-height input locks | Blowup 7, 41 queries | 655,360 bytes |
-| Fee settlement | 576 ordered positions; SIP reward asset and one/five mode-dependent reward notes | Blowup 8, 36 queries | 524,288 bytes |
+| Fee settlement | 576 ordered positions; SIP reward asset and one/five mode-dependent reward notes | Blowup 8, 36 queries | 655,360 bytes |
 | Asset issuance | Three initial unlocked notes; fixed public supply | Blowup 8, 36 queries | 524,288 bytes |
 
 All use KoalaBear D8, Poseidon2 W24, twelve-element digests, query and opening-
@@ -23,6 +23,17 @@ polynomial log length zero. The issuance shape does not adopt a protocol limit
 of three notes: metadata, note-count and per-block issuance policy still require
 explicit decisions before integration. Other settlement capacities require their
 own preprocessing identities; this manifest freezes the maximum-capacity shape.
+
+Runtime envelope policy version 1 is checked independently by
+[`check-native-envelope-policy.py`](../scripts/check-native-envelope-policy.py).
+The source-bound measurement profiles retain their historical 524,288-byte
+settlement admission value and their original hashes. The active native wire
+and bounded decoder accept settlement proof bodies up to 655,360 bytes; this
+admission change does not change the measured AIR, preprocessing keys or
+8/36/20 FRI configuration. Full-capacity qualification must separately measure
+three fresh proofs with maximum fees and fund claims, with every observed body
+at most 589,824 bytes, before claiming ten-percent headroom. The policy check
+does not establish that measurement gate or resource acceptance.
 
 The [relation manifest](../crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json)
 records deterministic public preprocessing keys, actual-AIR security reports,
@@ -96,6 +107,14 @@ must also match the current frozen transaction key. Public preprocessing is
 performed serially to avoid unnecessary concurrent memory pressure.
 
 ## Generate and verify synthetic proofs
+
+The original `.github/workflows/v1-economics.yml` is an immutable input to the
+historical source-bound measurement and is disabled in this repository.
+`.github/workflows/v1-economic-regressions.yml` retains the economic tests,
+actual-AIR screening and public-key reproduction. Its full parameter grid is
+disabled by default and requires explicit manual dispatch with
+`measure_wallet_grid` enabled. Routine PR validation must not start a new grid
+or rewrite the frozen profile.
 
 The isolated `native-scan` executable generates a fresh synthetic proof, verifies
 it locally, and writes a technical result file. It does not export a reusable

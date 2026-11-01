@@ -8,6 +8,14 @@ must reproduce the installed public keys and exercise the native adapters.
 Independent security review, node/network integration and activation remain
 separate gates; no audit approval or active-network change is implied.
 
+The current integration candidate changes economic ordering and the native
+custody/identity dependency graph. Native application qualification remains
+separate from the unchanged AIR profiles. Preserve the measured proof sources,
+dependency revisions, benchmark configuration and source guards; do not update
+frozen hash records merely to accept unmeasured changes. Economic rule version
+3 changes no AIR relation or selected FRI parameter. Its source-bound accounting
+reference and strict per-wallet checks are separate from proof measurements.
+
 ## Network and proof architecture
 
 Preserve the existing seven-node N=2 legacy recursive classical engineering
@@ -54,8 +62,11 @@ basis points totaling exactly 10,000; canonical parameters include each
 ML-DSA-65 public key and an explicit development-team wallet index. First
 compute `T = floor(subsidy / 10)`, then `floor(T * share[i] / 10000)` for each
 wallet; credit the residue to the team wallet. No V1 key or share replacement
-mechanism exists. Unconfigured production fails closed; launch recipients and
-shares remain explicit activation inputs, not synthetic test defaults.
+mechanism exists. Main-network activation requires an approved real registry;
+its importer and activation validation remain unimplemented. A distinct
+resettable ASERT engineering genesis uses 24 reproducible test keys, 23 shares
+of 400 basis points and a team share of 800 basis points, without waiting for
+main-network keys. Test keys and shares never select a main-network allocation.
 
 Each wallet accumulates entitlement without a per-block output. Up to eight
 signed claims may enter one block, with independent wallet counters and
@@ -72,8 +83,12 @@ The public block mode is explicitly selected without a miner default:
   52,560 / 105,120 / 157,680 / 210,240 blocks. The residual, confidential fees
   and pool payment form the fifth note, which matures after 24 blocks.
 
-Credit the block's 3% pool allocation before computing a Holder payment as
-floor(pool balance / 4,032). Voyager never draws from the pool. Fees are
+Compute a Holder payment as floor(pre-block pool balance / 4,032), subtract it,
+and only then inject the block's 3% allocation. Same-block credits cannot fund
+the current claim. Voyager never draws from the pool; its 3% protocol credit
+and additional mode allocation are retained in the post-block pool. Economic
+rule version 3 binds this order into the native genesis and state identity.
+Fees are
 transfers and all enter reward note zero; fees do not participate in subsidy
 splits. Template creation snapshots the selected mode, so preference changes
 cannot modify an already prepared candidate. Reward note nonces bind height
@@ -158,7 +173,8 @@ Settlement uses blowup 8, 36 queries and the same grinding/folding settings.
 Its four-worker generation median is 5.523829281 seconds and maximum charged
 peak is 3,161,432,064 bytes. Three-note issuance uses those same FRI settings;
 its four-worker generation median is 0.639979907 seconds and charged peak is
-211,423,232 bytes. Settlement and issuance retain separate 524,288-byte caps.
+211,423,232 bytes. Settlement uses a 655,360-byte cap and issuance retains a
+separate 524,288-byte issuance cap.
 The 5-GiB cgroup boundary is a measurement condition, not a miner RAM
 requirement. All scopes use zero swap and preserve the kernel memory-event
 record. The 39 distinct scopes consist of 24 grid trials, three selected
@@ -179,9 +195,9 @@ economic-record model:
 `python3 scripts/v1-network-budget.py --native-protocol --economic-rewards`.
 Its maximum compact fixed record is 61,235 bytes for five reward notes and
 eight native signed fund claims; settlement appears once inside the
-compact body. The model charges 1,369,369,494 bytes per target interval, or
-36.51651984 Mbps. Require at least 43 Mbps sustained uplink, computed as
-`ceil(wire_mbps / 0.85)`; 15.077861% remains unused at that floor. Deployment
+compact body. The model charges 1,369,841,506 bytes per target interval, or
+36.52910683 Mbps. Require at least 43 Mbps sustained uplink, computed as
+`ceil(wire_mbps / 0.85)`; 15.048589% remains unused at that floor. Deployment
 recommends 100 Mbps. The [full wire budget](v1-network-budget.md) remains
 conditional planning, not measured throughput. Earlier unflagged/native-only
 reports remain historical evidence. Recompute if the revised scan changes
@@ -304,7 +320,7 @@ does not change runtime proof decoders or consensus limits, replace maximal
 fee/full-block acceptance, or establish sustained node resource acceptance.
 
 At the target block rate, proofs and sidecars including the nominal depth-24
-finality tail require 336,179,807,232 rolling bytes at the separate caps.
+finality tail require 336,296,199,168 rolling bytes at the separate caps.
 The 2,115-byte position codec adds 128,061,388,800 permanent bytes/year at
 full load. The [finite storage model](v1-storage-and-sync.md) also reserves
 64 KiB/block for economic permanent block records, 16 KiB/block for issuance records,
@@ -439,7 +455,7 @@ preserves the two-second four-worker transaction criterion, 655,360-byte cap
 with at least 10% observed-body margin, 80-bit quantum-halved Johnson target
 and 576 positions. Required CI re-creates all three public keys and checks
 native proof round trips and rejection behavior. Keep the independent
-524,288-byte settlement and issuance limits. Any subsequent source or parameter
+655,360-byte settlement and 524,288-byte issuance limits. Any subsequent source or parameter
 change requires a new source-bound profile and reviewed measurements.
 
 Independent verifier qualification, valid-block timing, configured testnet
@@ -459,7 +475,8 @@ The runtime must use the revised source-bound keys; retained earlier service
 observations do not qualify the new economic relation.
 
 Continuous production uses a new independent ASERT engineering directory with
-configuration format v4, fresh network identity and genesis, immutable
+configuration revision 5 with economic-rule version 3 bound in canonical rules,
+fresh network identity and genesis, immutable
 initially calibrated work rules and a 300-second target interval. Producer and
 validator share the integer-only timestamp, ASERT target and sequential BLAKE3
 work checks. A resident prover and bounded private pre-generation queue supply

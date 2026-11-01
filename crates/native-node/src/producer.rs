@@ -33,6 +33,29 @@ pub struct ProducedBlock {
     pub reward_secret: Zeroizing<Vec<u8>>,
 }
 
+/// Synthetic proof fixture with real reward encryption and receipt binding.
+#[cfg(all(test, unix))]
+pub(crate) fn production_fixture(state: &State, seed: u32) -> ProducedBlock {
+    let keys =
+        crate::wallet::WalletKeys::from_seed(state.config.network, Zeroizing::new([42; 32]), 0)
+            .expect("synthetic production wallet");
+    let rewards = prepare_rewards(
+        state,
+        0,
+        &MiningSettings {
+            mode: RewardMode::Voyager,
+            recipient: keys.address(),
+        },
+    )
+    .expect("synthetic production rewards");
+    let mut block = crate::fixtures::candidate(state, seed);
+    block.rewards = rewards.records;
+    ProducedBlock {
+        block,
+        reward_secret: rewards.secret,
+    }
+}
+
 struct PreparedTransaction {
     witness: AccWitness,
     public: PublicTransaction,

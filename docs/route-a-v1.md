@@ -377,7 +377,8 @@ body across all six four-/one-worker measurements is 588,832 bytes, leaving
 11.2983% margin. The cap rounds up the required 10% margin to 64 KiB; it is
 an admission policy, not a deterministic proof-length theorem. Reject an
 oversized encoding; never weaken security or truncate data. Settlement and
-issuance retain separate 524,288-byte caps. The old two-output decoder's
+settlement uses a 655,360-byte cap and issuance retains a separate 524,288-byte
+cap. The old two-output decoder's
 512-KiB limit is unchanged and cannot admit the revised shape. Native decoder,
 wallet and standalone-verifier resource qualification precede activation.
 

@@ -10,7 +10,7 @@ evidence; public-key reproduction, complete CI, final admission policy and
 actual hybrid transport overhead retain separate release/activation gates.
 
 The engineering-frozen transaction proof cap is **655,360 bytes (640 KiB)**, independent
-of the **524,288-byte** settlement and issuance caps. Keep **576 positions per
+of the **655,360-byte** settlement cap and the **524,288-byte** issuance cap. Keep **576 positions per
 300-second target block**. Under the assumptions below, **43 Mbps** is the
 smallest integer uplink leaving 15% capacity unused; **100 Mbps sustained
 uplink** remains the deployment recommendation. These are conditional resource
@@ -30,14 +30,27 @@ python3 scripts/v1-network-budget.py --native-protocol --economic-rewards --link
 requiring different limits needs the complete model rerun. The economic mode
 requires `--native-protocol`; it is incompatible with `--legacy-baseline`.
 
-The unflagged script retains its earlier generic framing report unchanged.
-`--native-protocol` without `--economic-rewards` reproduces the pre-revision
-single-reward codec model. `--legacy-baseline` reproduces the earlier
-524,288-byte transaction cap and 30-Mbps link without the later reserve.
-These modes preserve historical evidence; they do not describe the revised
-reward format or set its activation requirements.
+The unflagged script uses generic framing, and `--native-protocol` without
+`--economic-rewards` uses the single-reward codec layout. Both use the current
+independent cap defaults unless explicit cap arguments are supplied; they do
+not reproduce earlier numeric evidence unchanged. Reproduce the historical
+native single-reward result with the command below; its transaction cap is
+655,360 bytes and its issuance cap is 524,288 bytes:
 
-The economic b7/q41/g20 actual-AIR scan retains the 640-KiB transaction cap.
+```sh
+python3 scripts/v1-network-budget.py --native-protocol --settlement-proof-cap-bytes 524288
+```
+
+`--legacy-baseline` explicitly restores all three
+524,288-byte caps, a 30-Mbps link and no capacity reserve. These historical
+layouts do not size the revised economic reward format or set its activation
+requirements.
+
+The source-bound b7/q41/g20 actual-AIR scan retains the 640-KiB transaction cap.
+Its frozen settlement profile records the historical 524,288-byte admission
+value. The current 655,360-byte settlement admission cap is a separate decoder
+policy; it does not amend the measured profile or demonstrate maximum-fee,
+maximum-claim qualification. The following budgets use current admission caps.
 The selected four-worker generation samples range from 1.429902190 to
 1.531155438 seconds, with a 1.462877730-second median. The largest body across
 selected one- and four-worker trials is 588,832 bytes. The
@@ -60,12 +73,12 @@ the mode/count fields. At 576 positions and the separate settlement cap, the
 compact payload is:
 
 ```text
-61,235 + 576 * 64 + 524,288 = 622,387 bytes
+61,235 + 576 * 64 + 655,360 = 753,459 bytes
 ```
 
 Settlement is already carried in this compact body. Do not charge or send an
 additional standalone copy in the selected relay schedule. Three transaction
-copies and three compact bodies total **1,138,244,889 payload bytes** per
+copies and three compact bodies total **1,138,638,105 payload bytes** per
 interval, before the remaining wire costs. An independent 8-KiB future block
 record allowance is also charged per compact copy. It is additional planning
 space, not an extracted database measurement.
@@ -131,20 +144,22 @@ Multiplying load by 1.15 would leave less than 15% unused. The script uses
 integer byte/rate arithmetic to select the link and checks that one lower
 integer-Mbps link fails the reserve requirement.
 
-The economic model uses **1,369,369,494 wire bytes per 300 seconds**, or
-**36.51651984 Mbps**. Its minimum is **43 Mbps**; 42 Mbps fails the reserve.
+The economic model uses **1,369,841,506 wire bytes per 300 seconds**, or
+**36.52910683 Mbps**. Its minimum is **43 Mbps**; 42 Mbps fails the reserve.
 
 | Link | Serialization at modeled load | Remaining rate | Remaining fraction |
 | --- | ---: | ---: | ---: |
-| 43 Mbps conditional minimum | 254.77 seconds | 6.483 Mbps | 15.077861% |
-| 100 Mbps recommended | 109.55 seconds | 63.483 Mbps | 63.483480% |
+| 43 Mbps conditional minimum | 254.85 seconds | 6.471 Mbps | 15.048589% |
+| 100 Mbps recommended | 109.59 seconds | 63.471 Mbps | 63.470893% |
 
 For sensitivity, `--native-protocol --economic-rewards --duplicate-settlement`
-adds a standalone settlement copy: **1,371,258,310 bytes**, **36.56688827 Mbps**
-and a **44-Mbps** minimum. It is not the selected relay schedule. The historical
-native single-reward calculation was 1,369,154,385 bytes / 36.51078360 Mbps;
-the additional economic records therefore add 215,109 modeled wire bytes per
-interval under the selected schedule.
+adds a standalone settlement copy: **1,372,202,332 bytes**, **36.59206219 Mbps**
+and a **44-Mbps** minimum. It is not the selected relay schedule. At the same
+current admission caps, the native single-reward model uses 1,369,626,397 bytes /
+36.52337059 Mbps. The economic records add 215,109 modeled wire bytes per
+interval to that same-cap comparison. The historical 524,288-byte settlement
+cap instead produced 1,369,154,385 bytes / 36.51078360 Mbps; do not attribute its
+cap difference to economic records.
 
 These are interval-average serialization figures, not propagation-latency
 bounds. Measure actual application/packet counters, handshakes, reconstruction,
@@ -174,12 +189,12 @@ python3 scripts/v1-network-budget.py --native-protocol --economic-rewards --inte
 
 | Configured maximum issuance records | Complete modeled rate | Minimum link with 15% unused |
 | --- | ---: | ---: |
-| 1 | 36.51587963 Mbps | 43 Mbps |
-| 4 | 36.66976011 Mbps | 44 Mbps |
+| 1 | 36.52846661 Mbps | 43 Mbps |
+| 4 | 36.68234707 Mbps | 44 Mbps |
 
 The existing 43-Mbps planning floor covers one issuance per block. Four
 maximum records need 44 Mbps under the same assumptions; at 43 Mbps the spare
-fraction is 14.721488%, below the selected reserve. Preserve the 100-Mbps
+fraction is 14.692216%, below the selected reserve. Preserve the 100-Mbps
 deployment recommendation. Pin the actual admission setting and rerun the
 model before activation; transport overhead and sustained relay still require
 measurement with the reviewed provider.

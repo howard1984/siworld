@@ -39,7 +39,6 @@ F[i] = floor(T * basis_points[i] / 10000)
 F[team] += T - sum(i) F[i]
 C = floor(3 * S / 100)
 M = S - T - C
-P1 = P + C
 ```
 
 The development-fund registry contains 1–32 wallets. Every share is a positive
@@ -50,9 +49,14 @@ keys, an invalid team index, a count/key mismatch or invalid share sum are
 rejected. The team wallet receives the distribution residue after all
 per-wallet floors. No V1 mechanism replaces keys, recipients or shares.
 
-The actual launch recipients, wallet count and shares remain unconfigured.
-New-network production fails closed until a complete configuration exists.
-Synthetic test registries do not select a launch allocation. The native
+The actual main-network recipients, wallet count and shares remain unconfigured.
+Main-network activation requires an approved real registry; its authenticated
+configuration importer and activation validation remain unimplemented. The
+native ledger refuses to advance without a configured allocation, but that
+check does not distinguish a synthetic test registry from an approved one.
+A distinct resettable engineering genesis may use test keys and the synthetic
+24-wallet allocation without waiting for real recipient keys. Synthetic test
+registries never select a main-network allocation. The native
 configuration and ledger have new versioned encodings; old engineering stores
 are rejected without migration. Retained legacy chain parameters and their
 `DevFundKeys` structure remain separate compatibility interfaces.
@@ -69,12 +73,20 @@ templates. An in-flight template retains the mode bound at its creation.
 | Mode | Immediate subsidy note | Locked subsidy notes | Burn | Additional pool credit |
 | --- | --- | --- | --- | --- |
 | Voyager | `M - floor(5*M/100) - floor(20*M/100)` | None | `floor(5*M/100)` | `floor(20*M/100)` |
-| Holder | `M - 4*floor(M/10) + floor(P1/4032)` | Four notes of `floor(M/10)` each | Zero | Zero |
+| Holder | `M - 4*floor(M/10) + floor(P/4032)` | Four notes of `floor(M/10)` each | Zero | Zero |
 
-For Voyager, the post-block pool is `P1 + floor(20*M/100)` and no claim occurs.
-For Holder, first include this block's 3% pool credit, then pay
-`floor(P1/4032)` and retain the remainder. Empty pools and sub-4,032-atom
-balances require no special rounding exception. The pool has no private key.
+For Voyager, the post-block pool is `P + C + floor(20*M/100)` and no claim occurs.
+For Holder, first pay `Q = floor(P/4032)` from the pre-block balance; only then
+inject `C`. The post-block pool is `P - Q + C`. Same-block protocol credit is
+unavailable to the current Holder claim. Thus a zero opening balance yields a
+zero claim even when `C >= 4032`; a sub-4,032-atom opening balance also yields
+zero. Integer remainders remain in the pool. The pool has no private key.
+
+Economic rule version 3 authenticates this calculation order in the native
+genesis preimage and ledger encoding. Existing credit-before-claim engineering
+stores must not be interpreted under this rule; a fresh isolated genesis is
+required. This rule change leaves note formats, AIR constraints and proof
+parameters unchanged.
 
 Settlement adds the entire private transaction-fee sum to note zero. Voyager
 has one reward note; Holder has note zero plus four locked notes. Note zero,
@@ -190,37 +202,43 @@ about 0.493103% of the gross amount at tail entry; that ratio then decreases as
 gross issuance grows. Burn, pool holdings and mode-dependent lock schedules
 change the distribution, not the gross schedule.
 
-## Executed accounting simulation
+## Accounting simulation qualification
 
-The remote release-mode deterministic test advanced 2,102,400 consecutive production
-heights with mixed Voyager and Holder modes. It checked supply conservation at
-every height, cross-checked gross issuance against the epoch projection, and
-checked the remaining reward-lock schedule. The
-[numeric evidence](../crates/core/artifacts/v1-economics-simulation.json)
-records the source identity and exact reproduction command.
+The release-mode deterministic test covers 2,102,400 consecutive production
+heights with mixed Voyager and Holder modes. It checks supply conservation at
+every height, gross issuance against the epoch projection, the reward-lock
+schedule, and an independent pre-block-pool oracle. Economic rule version 3
+has an [executed source-bound accounting reference](../crates/core/artifacts/v1-economics-simulation.json)
+from an isolated macOS/aarch64 release-mode run. The reference identifies the
+exact source hashes, command and numeric result; it does not represent remote
+CI, proof-performance acceptance or network qualification. Measurements of a
+different claim order do not qualify this rule.
 
-| State after 20 protocol years | Atoms |
+| Counter after 2,102,400 blocks | Atoms |
 | --- | ---: |
-| Cumulative gross subsidy | 2,112,093,162,237,312 |
-| Cumulative miner subsidy credits | 1,854,911,800,239,910 |
-| Holder pool balance | 125,271,865,958 |
+| Gross issuance | 2,112,093,162,237,312 |
+| Miner subsidy credited, including pool claims | 1,854,911,796,266,400 |
+| Holder pool remaining | 125,275,839,468 |
 | Cumulative burn | 45,846,774,833,460 |
-| Scheduled locked subsidy | 3,396,010,239,013 |
-| Cumulative fund entitlements | 211,209,315,297,984 |
-| Unlocked fund entitlements | 209,476,713,447,456 |
-| Spent fund entitlements | 93,912,546,485,906 |
+| Development-fund entitlement | 211,209,315,297,984 |
+| Locked miner subsidy, a subset of miner credits | 3,396,010,239,179 |
 
-The test uses 24 synthetic wallets: 23 shares of 400 basis points and a
-team wallet with 800 basis points at index 23. Every height checks supply
-conservation; the final entitlement and unlocked components of every wallet
-also match an independent per-deposit oracle. Randomized mode choices and
-wallet claims exercise separate balances and counters. The evidence lists
-every wallet; it selects no launch recipient or share.
+The allocation counters satisfy
+`issuance = miner credits + pool + burn + fund entitlement` exactly. The
+reference also reports every synthetic fund wallet's entitlement, released
+components, spending and available allowance. The simulation's fixed random
+sequence is a deterministic test case, not a forecast of mode participation.
 
-Scheduled locked subsidy is a subset of miner credits; unlocked and spent
-fund amounts are subsets of fund entitlements. These subsets must not be
-added again in the supply sum. This is an executed accounting simulation,
-not a long-running network or proof-resource qualification.
+The test uses 24 synthetic wallets: 23 shares of 400 basis points and a team
+wallet with 800 basis points at index 23. The final entitlement and unlocked
+components of every wallet must match an independent per-deposit oracle.
+Randomized mode choices and wallet claims exercise separate balances and
+counters. These fixtures select no main-network recipient or share.
+
+Scheduled locked subsidy is a subset of miner credits; unlocked and spent fund
+amounts are subsets of fund entitlements. These subsets must not be added again
+in the supply sum. Accounting simulation does not establish a long-running
+network or proof-resource qualification.
 
 ## Engineering timing and acceptance
 
@@ -254,7 +272,8 @@ Fixed-576 revised settlement generates in 5.523829281 seconds median with four
 workers, maximum body 520,203 bytes and charged peak 3,161,432,064 bytes.
 Three-note issuance generates in 0.639979907 seconds median, maximum
 four-worker body 280,401 bytes and charged peak 211,423,232 bytes. Both retain
-independent 524,288-byte caps and pass their own 80-bit quantum screens.
+independent settlement (655,360-byte) and issuance (524,288-byte) caps and pass
+their own 80-bit quantum screens.
 The current source-bound reports replace earlier baseline qualification;
 required CI and deterministic public-key reproduction remain release checks.
 
@@ -266,5 +285,8 @@ caps preserve the complete conditional 43-Mbps uplink and rolling-storage
 budgets; do not lower them solely from smaller sampled bodies. Independent
 review includes snapshot-height locks, mode-dependent settlement, Holder
 pool/burn, fund vesting/spending, recursion-free composition and hiding.
-Launch recipients and shares remain unconfigured; the native registry supports
-up to 32 wallets and fails closed without a complete genesis allocation.
+The native registry supports up to 32 wallets and rejects an unconfigured
+allocation. Main-network recipients and shares remain unconfigured; authenticating
+and importing the approved real registry and enforcing main-network activation
+remain separate unimplemented gates. Resettable engineering networks use a
+separately bound synthetic test allocation.

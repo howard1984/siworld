@@ -291,7 +291,7 @@ body across both worker groups, rounded up to 64 KiB. It is an admission limit,
 not a theorem that every randomized valid proof fits. Independently qualify
 malformed decoding, verifier resources and wallet/node integration. The earlier
 `bench-d8` decoder retains its 512-KiB limit. Settlement and issuance use
-separate 524,288-byte caps and b8/q36/g20 profiles; the fresh scan measures each
+separate 655,360-byte settlement and 524,288-byte issuance caps and b8/q36/g20 profiles; the fresh scan measures each
 with three four-worker and three one-worker processes.
 
 Keep the maximum at 576 positions. The economic-record complete network model

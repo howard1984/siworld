@@ -18,15 +18,15 @@ class NetworkBudgetTests(unittest.TestCase):
     def test_original_512_kib_scenario_is_reproducible(self):
         result = budget.report(link_mbps=30, transaction_proof_cap=524_288,
                                capacity_headroom_percent=0)
-        self.assertEqual(result['transaction_settlement_payload_bytes'], 911_451_741)
-        self.assertEqual(result['wire_bytes_per_interval'], 1_096_933_002)
+        self.assertEqual(result['transaction_settlement_payload_bytes'], 911_844_957)
+        self.assertEqual(result['wire_bytes_per_interval'], 1_097_405_014)
         self.assertGreater(result['remaining_bytes_per_interval'], 0)
         self.assertLess(result['remaining_percent'], 3)
 
     def test_selected_640_kib_profile_requires_43_mbps(self):
         result = budget.report()
         self.assertEqual(result['parameters']['transaction_proof_cap_bytes'], 655_360)
-        self.assertEqual(result['wire_bytes_per_interval'], 1_368_811_477)
+        self.assertEqual(result['wire_bytes_per_interval'], 1_369_283_487)
         self.assertEqual(result['minimum_link_mbps'], 43)
         self.assertTrue(result['meets_capacity_headroom'])
         self.assertFalse(budget.report(link_mbps=42)['meets_capacity_headroom'])
@@ -52,9 +52,9 @@ class NetworkBudgetTests(unittest.TestCase):
         for component in ('settlement_wire', 'issuance_wire_allowance', 'inventory_wire',
                           'handshake_wire_allowance', 'keepalive_wire_allowance'):
             self.assertEqual(base_components[component], larger_components[component])
-        self.assertEqual(larger['parameters']['settlement_proof_cap_bytes'], 524_288)
+        self.assertEqual(larger['parameters']['settlement_proof_cap_bytes'], 655_360)
         self.assertEqual(larger['parameters']['issuance_proof_cap_bytes'], 524_288)
-        expected_payload = 3 * (576 * (768 * 1024 + 2184 + 78) + 524_288 + 159)
+        expected_payload = 3 * (576 * (768 * 1024 + 2184 + 78) + 655_360 + 159)
         self.assertEqual(larger['transaction_settlement_payload_bytes'], expected_payload)
 
     def test_each_wire_reserve_is_added_before_capacity_headroom(self):
@@ -90,12 +90,12 @@ class NetworkBudgetTests(unittest.TestCase):
         self.assertEqual(parameters['gossip_length_prefix_bytes'], 4)
         self.assertEqual(parameters['compact_reference_bytes'], 64)
         self.assertEqual(parameters['compact_fixed_bytes'], 1525)
-        self.assertEqual(parameters['compact_payload_bytes'], 562_677)
+        self.assertEqual(parameters['compact_payload_bytes'], 693_749)
         self.assertEqual(parameters['missing_request_payload_bytes'], 1026)
         self.assertEqual(parameters['missing_request_batches_per_copy'], 36)
         self.assertFalse(parameters['hybrid_provider_qualified'])
         self.assertEqual(result['components_bytes_per_interval']['settlement_wire'], 0)
-        self.assertEqual(result['wire_bytes_per_interval'], 1_369_154_385)
+        self.assertEqual(result['wire_bytes_per_interval'], 1_369_626_397)
         self.assertEqual(result['minimum_link_mbps'], 43)
         self.assertTrue(result['meets_capacity_headroom'])
         self.assertFalse(budget.native_protocol_report(link_mbps=42)['meets_capacity_headroom'])
@@ -103,7 +103,7 @@ class NetworkBudgetTests(unittest.TestCase):
     def test_duplicate_settlement_crosses_the_43_mbps_headroom_boundary(self):
         result = budget.native_protocol_report(link_mbps=43, duplicate_settlement=True)
         self.assertTrue(result['parameters']['standalone_settlement_duplicate'])
-        self.assertEqual(result['wire_bytes_per_interval'], 1_371_043_201)
+        self.assertEqual(result['wire_bytes_per_interval'], 1_371_987_223)
         self.assertEqual(result['minimum_link_mbps'], 44)
         self.assertFalse(result['meets_capacity_headroom'])
         self.assertTrue(budget.native_protocol_report(
@@ -112,7 +112,7 @@ class NetworkBudgetTests(unittest.TestCase):
     def test_native_protocol_caps_and_reserves_remain_independent(self):
         base = budget.native_protocol_report()
         larger = budget.native_protocol_report(transaction_proof_cap=768 * 1024)
-        self.assertEqual(larger['parameters']['settlement_proof_cap_bytes'], 524_288)
+        self.assertEqual(larger['parameters']['settlement_proof_cap_bytes'], 655_360)
         self.assertEqual(larger['parameters']['issuance_proof_cap_bytes'], 524_288)
         self.assertEqual(base['parameters']['compact_payload_bytes'],
                          larger['parameters']['compact_payload_bytes'])
@@ -134,7 +134,7 @@ class NetworkBudgetTests(unittest.TestCase):
         result = budget.native_protocol_report(economic_rewards=True)
         parameters = result['parameters']
         self.assertEqual(parameters['compact_fixed_bytes'], 61_235)
-        self.assertEqual(parameters['compact_payload_bytes'], 622_387)
+        self.assertEqual(parameters['compact_payload_bytes'], 753_459)
         self.assertEqual(parameters['extra_block_record_allowance_bytes'], 8192)
         self.assertEqual(parameters['maximum_reward_notes'], 5)
         self.assertEqual(parameters['maximum_signed_fund_payouts'], 8)
@@ -142,7 +142,7 @@ class NetworkBudgetTests(unittest.TestCase):
         self.assertEqual(parameters['genesis_fund_registry_bytes'], 62_530)
         self.assertFalse(parameters['genesis_fund_registry_repeated_per_block'])
         self.assertTrue(parameters['economic_rewards'])
-        self.assertEqual(result['wire_bytes_per_interval'], 1_369_369_494)
+        self.assertEqual(result['wire_bytes_per_interval'], 1_369_841_506)
         self.assertEqual(result['minimum_link_mbps'], 43)
         self.assertTrue(result['meets_capacity_headroom'])
         self.assertFalse(budget.native_protocol_report(
@@ -152,14 +152,14 @@ class NetworkBudgetTests(unittest.TestCase):
                                  'retransmission_reserve', 'recovery_reserve'):
                 self.assertEqual(result['components_bytes_per_interval'][component], value)
         self.assertEqual(result['parameters']['transaction_proof_cap_bytes'], 655_360)
-        self.assertEqual(result['parameters']['settlement_proof_cap_bytes'], 524_288)
+        self.assertEqual(result['parameters']['settlement_proof_cap_bytes'], 655_360)
         self.assertEqual(result['parameters']['issuance_proof_cap_bytes'], 524_288)
 
     def test_eight_claim_records_are_charged_independently_of_genesis_wallet_count(self):
         result = budget.native_protocol_report(economic_rewards=True)
         p = result['parameters']
         self.assertEqual(p['compact_fixed_bytes'], 1525 + 2 + 4 * 1361 + 8 * 6783)
-        self.assertEqual(p['compact_payload_bytes'], p['compact_fixed_bytes'] + 576 * 64 + 524_288)
+        self.assertEqual(p['compact_payload_bytes'], p['compact_fixed_bytes'] + 576 * 64 + 655_360)
         # The immutable public registry is fetched with genesis, not every block.
         self.assertNotIn('genesis_fund_registry_wire', result['components_bytes_per_interval'])
         self.assertLess(p['maximum_signed_fund_payouts'], p['maximum_registered_fund_wallets'])
@@ -223,8 +223,8 @@ class NetworkBudgetTests(unittest.TestCase):
             self.assertGreaterEqual(value['remaining_percent'], 15)
         self.assertGreater(four['wire_bytes_per_interval'], one['wire_bytes_per_interval'])
         self.assertGreater(one['wire_bytes_per_interval'], empty['wire_bytes_per_interval'])
-        self.assertEqual(one['wire_bytes_per_interval'], 1_369_345_486)
-        self.assertEqual(four['wire_bytes_per_interval'], 1_375_116_004)
+        self.assertEqual(one['wire_bytes_per_interval'], 1_369_817_498)
+        self.assertEqual(four['wire_bytes_per_interval'], 1_375_588_015)
         self.assertEqual(four['minimum_link_mbps'], 44)
         self.assertFalse(budget.native_protocol_report(economic_rewards=True,
             integrated_issuances=4, link_mbps=43)['meets_capacity_headroom'])

@@ -20,6 +20,8 @@ pub const HOLDER_UNLOCK_OFFSETS: [u64; 4] = [52_560, 105_120, 157_680, 210_240];
 pub const POOL_PAYOUT_DIVISOR: u128 = 4_032;
 pub const MAX_FUND_WALLETS: usize = 32;
 pub const FUND_BASIS_POINTS: u16 = 10_000;
+/// Version 3 claims the pre-block Holder balance before adding block credits.
+pub const ECONOMICS_RULE_VERSION: u16 = 3;
 const DECAY_Q32: u64 = crate::params::DECAY_Q32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,7 +321,7 @@ fn percent(amount: u64, numerator: u64) -> u64 {
     (u128::from(amount) * u128::from(numerator) / 100) as u64
 }
 
-/// Allocate one subsidy with same-block pool credit preceding a Holder claim.
+/// Allocate one subsidy by claiming the pre-block pool before crediting it.
 /// The fund receives floor(subsidy / 10), with wallet split residuals assigned
 /// to its configured team wallet. Other splits round down to the miner note.
 pub fn allocate_reward(
@@ -338,9 +340,7 @@ pub fn allocate_reward(
     let total_fund: u64 = fund_credit.iter().sum();
     let protocol_pool_credit = percent(subsidy, 3);
     let miner_base = subsidy - total_fund - protocol_pool_credit;
-    let mut pool_after = pool_before
-        .checked_add(u128::from(protocol_pool_credit))
-        .ok_or(EconomicsError::Overflow)?;
+    let mut pool_after = pool_before;
     let mut mode_pool_credit = 0;
     let mut pool_payout = 0;
     let mut burn = 0;
@@ -363,6 +363,9 @@ pub fn allocate_reward(
                 .ok_or(EconomicsError::Overflow)?
         }
     };
+    pool_after = pool_after
+        .checked_add(u128::from(protocol_pool_credit))
+        .ok_or(EconomicsError::Overflow)?;
     reward_notes.push(RewardNote {
         index: 0,
         amount: immediate,
@@ -561,7 +564,7 @@ impl EconomicsLedger {
     /// Stream every field, including future release schedules, into a caller's
     /// authenticated state encoding without allocating a second schedule copy.
     pub fn visit_encoding(&self, emit: &mut impl FnMut(&[u8])) {
-        emit(&2u16.to_le_bytes());
+        emit(&ECONOMICS_RULE_VERSION.to_le_bytes());
         emit(&self.params.canonical_bytes());
         emit(&self.height.to_le_bytes());
         emit(&self.current_subsidy.to_le_bytes());

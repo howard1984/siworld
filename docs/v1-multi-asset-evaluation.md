@@ -41,7 +41,7 @@ The cap is at least 10% above the maximum selected body from all six processes,
 rounded up to 64 KiB. It is an enforced admission policy, not a mathematical
 upper bound for every randomized valid proof. Reject oversized encodings;
 never truncate a proof or reduce security to fit. Settlement and issuance have
-independent 524,288-byte caps. The earlier two-output `bench-d8` decoder retains
+independent 655,360-byte settlement and 524,288-byte issuance caps. The earlier two-output `bench-d8` decoder retains
 its own 512-KiB limit and does not admit this revised relation.
 
 Three samples do not bound grinding tails or shared-host contention. The
@@ -223,17 +223,17 @@ block. Launch recipients and independent basis-point shares remain unconfigured;
 ## Network, retention and remaining gates
 
 With unchanged proof caps and 576 positions, the explicit economic-record
-[wire model](v1-network-budget.md) charges 1,369,369,494 bytes per 300 seconds,
-or **36.51651984 Mbps**, including three relay copies and bounded transport,
+[wire model](v1-network-budget.md) charges 1,369,841,506 bytes per 300 seconds,
+or **36.52910683 Mbps**, including three relay copies and bounded transport,
 control, recovery and issuance allowances. A **43-Mbps minimum uplink** leaves
-15.077861% unused in that model; deployment recommends **100 Mbps**. These are
+15.048589% unused in that model; deployment recommends **100 Mbps**. These are
 conditional planning figures. Actual transport counters, queue growth and
 issuance byte/work/rate limits require separate qualification.
 
 The [storage ledger](v1-storage-and-sync.md) retains transaction, settlement
 and issuance proofs plus sidecars for three elapsed days after final
 confirmation; permanent public records are never pruned. Unchanged proof caps
-preserve the nominal 336.180-GB rolling allowance. Actual database, WAL,
+preserve the nominal 336.296-GB rolling allowance. Actual database, WAL,
 compaction, backup restoration, wallet recovery and elapsed three-day deletion
 remain integrated acceptance work.
 

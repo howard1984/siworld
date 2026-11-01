@@ -79,8 +79,8 @@ bound wallet end-to-end latency, grinding tails, independent verifier memory
 or whole-node capacity.
 
 The transaction cap is **655,360 bytes (640 KiB)**, at least 10% above the
-largest selected one/four-worker sample. Separate settlement and issuance caps
-are **524,288 bytes (512 KiB)** each. These are admission limits, not mathematical
+largest selected one/four-worker sample. Settlement uses a **655,360-byte (640 KiB)**
+cap and issuance retains a separate **524,288-byte (512 KiB)** cap. These are admission limits, not mathematical
 bounds on every randomized proof. The transaction instance reports
 **81.692 quantum-halved Johnson challenge bits**, approximately **185 classical
 conjectured bits** and **123.333 BHT commitment-collision bits** under the

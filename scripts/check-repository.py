@@ -26,19 +26,22 @@ DOCUMENTS = {
     "multi-asset-air-optimization.md", "v1-overview.md", "dependency-advisories.md",
     "native-proof-profiles.md", "v1-native-runtime.md", "v1-economics.md", "v1-wallet-protection.md",
     "v1-protocol-byte-compatibility.md",
+    "v1-native-identity.md", "v1-hybrid-handshake.md", "v1-wallet-storage.md",
+    "v1-offline-fund-keys.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
     "crates/bench-d8/artifacts/v1-native-freeze.json",
     "crates/bench-multi-asset/artifacts/v1-transaction-profile.json",
     "crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json",
+    "crates/bench-multi-asset/artifacts/v1-native-fixed576-settlement.json",
     *(f"crates/prover/keys/root-n{n}.bin" for n in (2, 4, 8, 16, 32, 64, 128)),
     "crates/prover/tests/data/root-proof-n16.bin",
     "crates/prover/tests/data/root-statement-n16.bin",
 }
 CRATES = {
     "core", "crypto", "poseidon2", "state", "circuits", "consensus",
-    "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset",
+    "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset", "fund-keytool",
 }
 NON_ENGLISH = re.compile(
     "[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]"
@@ -65,6 +68,7 @@ def allowed(path):
         return len(path.parts) == 3 and path.name in scoped.get(path.parts[1], set())
     if name in {".cargo/config.toml", "scripts/prover-launcher.rs",
                 "scripts/native-proof-artifacts.rs", "scripts/native-runtime-launcher.rs",
+                "scripts/settlement-full-load.rs",
                 "crates/bench-stark/patches/recursion-d8-w24.patch"}:
         return True
     if path.parts[0] == "scripts":

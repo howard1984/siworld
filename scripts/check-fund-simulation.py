@@ -21,6 +21,11 @@ def extract_simulation(log, output):
     if len(records) != 1:
         raise ValueError('Exactly one completed simulation record required')
     result = json.loads(records[0])
+    if (type(result.get('economics_rule_version')) is not int
+            or result['economics_rule_version'] != 3
+            or type(result.get('holder_claim_before_injection')) is not int
+            or result['holder_claim_before_injection'] != 1):
+        raise ValueError('Simulation must use claim-before-injection economics version three')
     for key in ('height', 'issued', 'miner_subsidy_credited', 'holder_pool', 'burned', 'locked_subsidy'):
         if type(result.get(key)) is not int or result[key] < 0:
             raise ValueError('Invalid simulation integer')
@@ -40,6 +45,10 @@ def extract_simulation(log, output):
     if (any(type(value) is not int or value < 0 for value in (entitlement, unlocked, spent))
             or not spent <= unlocked <= entitlement):
         raise ValueError('Invalid simulated fund balances')
+    if (result['issued'] != result['miner_subsidy_credited'] + result['holder_pool']
+            + result['burned'] + entitlement
+            or result['locked_subsidy'] > result['miner_subsidy_credited']):
+        raise ValueError('Simulation violates issuance conservation or locked-subset bounds')
     wallets = result.get('fund_wallets')
     if not isinstance(wallets, list) or len(wallets) != count:
         raise ValueError('Simulation must report every fund wallet')

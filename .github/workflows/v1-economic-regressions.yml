@@ -1,0 +1,254 @@
+name: V1 economic regressions
+
+on:
+  pull_request:
+    paths:
+      - 'crates/core/**'
+      - 'crates/native-node/**'
+      - 'crates/bench-multi-asset/**'
+      - 'scripts/v1-economics-candidate.py'
+      - 'scripts/native-proof-artifacts.rs'
+      - 'scripts/freeze-multi-asset.py'
+      - 'scripts/measure-multi-asset.py'
+      - 'scripts/tests/test_economics*.py'
+      - '.github/workflows/v1-economics.yml'
+      - '.github/workflows/v1-economic-regressions.yml'
+  workflow_dispatch:
+    inputs:
+      measure_wallet_grid:
+        description: Run the three-trial EPYC 7763 economic proof grid
+        type: boolean
+        default: false
+      hardware_profile:
+        description: Require the baseline CPU or collect explicitly separate control diagnostics
+        type: choice
+        default: epyc7763-baseline
+        options:
+          - epyc7763-baseline
+          - epyc9v45-control
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v1-economic-regressions-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RAYON_NUM_THREADS: 4
+  SIWORLD_COMPOSITION_HIDING_WORKERS: 2
+
+jobs:
+  economics:
+    name: Economic rules and twenty-year conservation simulation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - name: Test economic rules before running the full simulation
+        run: |
+          cargo test --release --locked -p siworld-core v1_economics::tests::
+          mkdir -p .local/economics-candidate/public
+      - name: Run twenty production years and retain only numeric evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked -p siworld-core v1_economics::tests::seeded_twenty_year_modes_preserve_supply_and_curve -- --ignored --exact --nocapture > .local/economics-candidate/simulation.log 2>&1
+          python3 scripts/v1-economics-candidate.py simulation .local/economics-candidate/simulation.log .local/economics-candidate/public/twenty-year-simulation.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() }}
+        with:
+          name: v1-economics-simulation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/economics-candidate/public/*.json
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  native-wallet:
+    name: Native wallet, atomic transition and reorganization tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/native-node
+      - name: Check formatting and all native targets
+        run: |
+          cargo fmt --manifest-path crates/native-node/Cargo.toml --check
+          cargo clippy --release --locked --manifest-path crates/native-node/Cargo.toml --all-targets -- -D warnings
+      - name: Run the complete native rejection, wallet recovery and rollback suite
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml
+
+  proof-candidates:
+    name: Actual AIR screening, reproduced candidate keys and diagnostics
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.local/economics-proof-target
+      HARDWARE_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.hardware_profile || 'epyc7763-baseline' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Qualify the requested CPU profile before building proof tools
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_wallet_grid }}
+        run: |
+          python3 scripts/measure-multi-asset.py --qualify-only \
+            --hardware-profile "$HARDWARE_PROFILE" \
+            --output .local/economics-candidate/public/preflight
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/bench-multi-asset -> ../../.local/economics-proof-target
+          cache-on-failure: true
+      - name: Check CPU admission before any optimized proof executable
+        run: |
+          rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/economics-cpu-check
+          /tmp/economics-cpu-check --check-cpu
+          python3 - <<'PY_CONTROL'
+          import importlib.util
+          import os
+          spec = importlib.util.spec_from_file_location('controlled', 'scripts/build-composition-intra.py')
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module.controlled_configuration(os.environ)
+          PY_CONTROL
+      - name: Test economic-candidate measurement rejection and resource reporting
+        run: python3 -m unittest discover -s scripts/tests -p 'test_economics*.py'
+      - name: Build and test revised AIRs without replacing prior freeze evidence
+        run: |
+          cargo fmt --manifest-path crates/bench-multi-asset/Cargo.toml --check
+          cargo clippy --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --all-targets -- -D warnings
+          cargo test --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --lib --bin profile-artifacts --test public_codec_rejections
+          cargo build --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --bin native-scan --bin profile-artifacts
+          python3 scripts/v1-economics-candidate.py prepare .local/economics-candidate/application
+          cargo test --release --locked --manifest-path .local/economics-candidate/application/Cargo.toml --features security-report --bin native-proof-artifacts
+          cargo build --release --locked --manifest-path .local/economics-candidate/application/Cargo.toml --features security-report --bin native-proof-artifacts
+      - name: Inspect optimized instructions and package the CPU admission guard
+        run: |
+          python3 - <<'PY_PACKAGE'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          spec = importlib.util.spec_from_file_location('isa', 'scripts/check-prover-isa.py')
+          isa = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(isa)
+          worker = Path(os.environ['CARGO_TARGET_DIR']) / 'release/native-scan'
+          evidence = isa.inspect(worker)
+          target = Path('.local/economics-candidate/package')
+          (target / 'bin').mkdir(parents=True)
+          (target / 'libexec').mkdir()
+          shutil.copy2(worker, target / 'libexec/v1-transaction-scan')
+          subprocess.run(['rustc', 'scripts/prover-launcher.rs', '--edition=2021', '-O', '-D', 'warnings',
+              '-C', 'target-cpu=x86-64', '-o', str(target / 'bin/v1-transaction-scan')], check=True)
+          public = Path('.local/economics-candidate/public')
+          public.mkdir(parents=True, exist_ok=True)
+          (public / 'isa.json').write_text(json.dumps({'status': 'candidate-pending-review',
+              'required_isa': 'x86-64-v3', 'binary_sha256': evidence['binary_sha256'],
+              'avx2_packed_multiply_instructions': evidence['avx2_packed_multiply_instructions'],
+              'acceptance': False, 'cryptographic_approval': False, 'network_activation': False}, indent=2) + '\n')
+          PY_PACKAGE
+      - name: Screen actual transaction, five-reward settlement and issuance AIRs
+        run: |
+          .local/economics-candidate/package/bin/v1-transaction-scan screen .local/economics-candidate/public/screen.json
+          python3 scripts/v1-economics-candidate.py keys "$CARGO_TARGET_DIR/release/native-proof-artifacts" .local/economics-candidate/public/screen.json .local/economics-candidate/public/keys
+      - name: Measure all requested coordinates three times on the target CPU
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_wallet_grid }}
+        run: |
+          python3 scripts/measure-multi-asset.py \
+            --executable .local/economics-candidate/package/bin/v1-transaction-scan \
+            --worker .local/economics-candidate/package/libexec/v1-transaction-scan \
+            --screen .local/economics-candidate/public/screen.json \
+            --output .local/economics-candidate/public/measurements \
+            --grid-mode full --scan-mode economics-candidate --hardware-profile "$HARDWARE_PROFILE"
+      - name: Reproduce the actually selected transaction key as pending evidence
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.measure_wallet_grid && env.HARDWARE_PROFILE == 'epyc7763-baseline' }}
+        run: |
+          python3 - <<'PY_SELECTED_KEY'
+          import hashlib
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          spec = importlib.util.spec_from_file_location('freeze', 'scripts/freeze-multi-asset.py')
+          freeze = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(freeze)
+          summary_path = Path('.local/economics-candidate/public/measurements/summary.json')
+          summary_bytes = summary_path.read_bytes()
+          summary = json.loads(summary_bytes)
+          measured = freeze.economic_summary(summary, require_admission_margin=False)
+          selected = measured['selected']
+          parameters = selected['parameters']
+          executable = Path(os.environ['CARGO_TARGET_DIR']) / 'release/profile-artifacts'
+          output = Path('.local/economics-candidate/public/selected-transaction')
+          output.mkdir(exist_ok=False)
+          paths = [output / 'public-key.json', output / 'public-key-reproduced.json']
+          for path in paths:
+              subprocess.run([str(executable), str(parameters['log_blowup']),
+                  str(parameters['num_queries']), str(parameters['query_pow_bits']), str(path)], check=True)
+          first, second = [json.loads(path.read_text()) for path in paths]
+          if first != second:
+              raise ValueError('Selected transaction key did not reproduce exactly')
+          key = freeze.verifier_key(first, parameters, selected['security'])
+          if first.get('cryptographic_approval') is not False or first.get('network_activation') is not False:
+              raise ValueError('Unexpected selected-key approval claim')
+          pending = {**first, 'status': 'candidate-pending-review', 'acceptance': False,
+              'measured_source_commit': summary['source_commit'],
+              'measurement_summary_sha256': hashlib.sha256(summary_bytes).hexdigest(),
+              'admission_margin_within_limit': measured['max_leaf_proof_bytes'] <= freeze.ECONOMICS_PROOF_MAX}
+          for path in paths:
+              path.write_text(json.dumps(pending, indent=2, allow_nan=False) + '\n')
+          (output / 'reproduction.json').write_text(json.dumps({'schema': 1,
+              'status': 'candidate-pending-review', 'parameters': parameters,
+              'public_verifier_key_sha256': key['sha256'], 'reproduced_exactly': True,
+              'measurement_summary_sha256': hashlib.sha256(summary_bytes).hexdigest(),
+              'acceptance': False, 'cryptographic_approval': False, 'network_activation': False}, indent=2) + '\n')
+          PY_SELECTED_KEY
+          python3 scripts/v1-economics-candidate.py keys "$CARGO_TARGET_DIR/release/native-proof-artifacts" .local/economics-candidate/public/screen.json .local/economics-candidate/public/selected-native-keys --measurement-summary .local/economics-candidate/public/measurements/summary.json
+      - name: Preserve an explicit pending outcome even when a required check fails
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          python3 - <<'PY_STATUS'
+          import json
+          import os
+          from pathlib import Path
+          output = Path('.local/economics-candidate/public')
+          output.mkdir(parents=True, exist_ok=True)
+          hardware_profile = os.environ['HARDWARE_PROFILE']
+          preflight = output / 'preflight/hardware-qualification.json'
+          qualification = json.loads(preflight.read_text()) if preflight.is_file() else {}
+          (output / 'workflow-status.json').write_text(json.dumps({'schema': 1,
+              'status': 'control-diagnostic-only' if hardware_profile == 'epyc9v45-control' else 'candidate-pending-review',
+              'job_status_before_upload': os.environ['RESULT'],
+              'required_hardware_profile': hardware_profile,
+              'baseline_eligible': hardware_profile == 'epyc7763-baseline'
+                  and qualification.get('profile_qualified') is True,
+              'source_commit': os.environ['GITHUB_SHA'], 'acceptance': False,
+              'prior_freeze_unchanged': True, 'cryptographic_approval': False,
+              'network_activation': False}, indent=2) + '\n')
+          PY_STATUS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: ${{ always() }}
+        with:
+          name: v1-economic-proof-candidates-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local/economics-candidate/public/**/*.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

@@ -9,8 +9,9 @@ use siworld_native_node::{
 use std::path::Path;
 fn help() {
     println!(
-        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY             Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY            Replay every proof and check every local reward receipt\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, migration, peer listener, issuance RPC listener, or public-network activation is provided."
+        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY             Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY            Replay every proof and check every local reward receipt\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, migration, peer listener, issuance RPC listener, or public-network activation is provided."
     );
+    println!("\n{}", siworld_native_node::wallet_cli::HELP);
 }
 fn cpu_admission() -> Result<(), String> {
     #[cfg(target_arch = "x86_64")]
@@ -41,6 +42,30 @@ fn run() -> Result<(), String> {
     }
     let path = Path::new(&args[1]);
     match args[0].as_str() {
+        "wallet-create" | "wallet-restore" | "wallet-address" | "wallet-configure-miner" => {
+            siworld_native_node::wallet_cli::run(&args[0], &args[1..])?;
+        }
+        "identity-init" | "identity-public" => {
+            exact(&args)?;
+            let binding = siworld_native_node::p2p::Binding::new(&config(path)?);
+            let identity = if args[0] == "identity-init" {
+                siworld_native_node::identity::NativeIdentity::initialize(path, binding)
+            } else {
+                siworld_native_node::identity::NativeIdentity::load(path, &binding)
+            }
+            .map_err(|_| "native identity initialization or authentication rejected")?;
+            let descriptor = identity
+                .descriptor()
+                .map_err(|_| "native identity descriptor rejected")?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": siworld_native_node::identity::VERSION,
+                    "fingerprint": local::hex(&descriptor.fingerprint()),
+                    "descriptor": local::hex(&descriptor.encode()),
+                })
+            );
+        }
         "configure-miner" => {
             if args.len() != 4 {
                 return Err("expected DIRECTORY voyager|holder ADDRESS_FILE".into());

@@ -15,6 +15,7 @@ use crate::wire::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 // A canonical ID lookup currently decodes one complete stored proof block.
@@ -61,6 +62,24 @@ fn invalid() -> Error {
     Error::Transport(p2p::Error::InvalidProtocol)
 }
 
+/// A move-only production result bound to one node and its preparation state.
+/// Mining may change the nonce and timestamp; the common transition still checks
+/// every resulting field and proof when the candidate is committed.
+pub struct PreparedBlock {
+    produced: ProducedBlock,
+    owner: Arc<()>,
+    generation: u64,
+    fingerprint: Hash,
+}
+impl PreparedBlock {
+    pub fn block(&self) -> &Block {
+        &self.produced.block
+    }
+    pub fn block_mut(&mut self) -> &mut Block {
+        &mut self.produced.block
+    }
+}
+
 pub struct Node<V> {
     store: Store,
     verifier: V,
@@ -68,6 +87,8 @@ pub struct Node<V> {
     padding: Pool,
     budget: Budget,
     pending_issuances: std::collections::BTreeMap<Hash, crate::issuance::IssuanceRecord>,
+    production_owner: Arc<()>,
+    production_generation: u64,
 }
 impl<V: BlockVerifier> Node<V> {
     pub fn new(store: Store, verifier: V) -> Self {
@@ -79,6 +100,8 @@ impl<V: BlockVerifier> Node<V> {
             padding: Pool::new(network),
             budget: Budget::default(),
             pending_issuances: std::collections::BTreeMap::new(),
+            production_owner: Arc::new(()),
+            production_generation: 0,
         }
     }
     pub fn state(&self) -> &State {
@@ -235,13 +258,54 @@ impl<V: BlockVerifier> Node<V> {
         blocks: &[Block],
         policy: CandidatePolicy,
     ) -> Result<BranchOutcome, Error> {
+        let next_generation = self
+            .production_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Local("production generation exhausted".into()))?;
         let result = self
             .store
             .consider_branch(ancestor, blocks, policy, &self.verifier)?;
         if matches!(result, BranchOutcome::Adopted { .. }) {
+            self.production_generation = next_generation;
             self.reconcile_pools()?;
         }
         Ok(result)
+    }
+    fn bind_produced(&self, produced: ProducedBlock) -> PreparedBlock {
+        PreparedBlock {
+            produced,
+            owner: Arc::clone(&self.production_owner),
+            generation: self.production_generation,
+            fingerprint: self.state().fingerprint(),
+        }
+    }
+    /// Preserve the authenticated recovery receipt before the durable common
+    /// state transition. Receipt storage is bound to this store's opened parent
+    /// directory and database identity; callers cannot redirect it elsewhere.
+    /// An append failure preserves the receipt as evidence and leaves the head
+    /// unchanged. Neither this method nor a preparation token bypasses proofs.
+    pub fn commit_produced(&mut self, prepared: PreparedBlock) -> Result<Hash, Error> {
+        if !Arc::ptr_eq(&self.production_owner, &prepared.owner)
+            || prepared.generation != self.production_generation
+            || prepared.fingerprint != self.state().fingerprint()
+            || prepared.produced.block.parent != self.state().tip
+            || self.state().height.checked_add(1) != Some(prepared.produced.block.height)
+        {
+            return Err(Error::Local("stale or foreign production result".into()));
+        }
+        let next_generation = self
+            .production_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Local("production generation exhausted".into()))?;
+        let produced = prepared.produced;
+        producer::validate_reward_secret(&produced.block, &produced.reward_secret)?;
+        let id = produced.block.id()?;
+        self.store
+            .save_reward_receipt(&id, &produced.reward_secret)?;
+        self.store.append(&produced.block, &self.verifier)?;
+        self.production_generation = next_generation;
+        self.reconcile_pools()?;
+        Ok(id)
     }
     pub fn precompute_one(&mut self, prover: &NativeProver) -> Result<(), Error> {
         self.padding.prune(self.store.state())?;
@@ -255,14 +319,15 @@ impl<V: BlockVerifier> Node<V> {
     }
     /// Real pending entries remain reserved until canonical inclusion. A failed
     /// candidate can consume padding reservations but never deletes wallet work.
-    /// The caller must durably save reward_secret before appending the block.
+    /// Commit with `commit_produced` after the work search completes. The recovery
+    /// receipt remains private inside the move-only preparation result.
     pub fn prepare_block(
         &mut self,
         prover: &NativeProver,
         slots: usize,
         timestamp: u64,
         settings: &producer::MiningSettings,
-    ) -> Result<ProducedBlock, Error> {
+    ) -> Result<PreparedBlock, Error> {
         if !(MIN_SLOTS..=MAX_SLOTS).contains(&slots) || !slots.is_multiple_of(GROUP) {
             return Err(invalid());
         }
@@ -286,7 +351,7 @@ impl<V: BlockVerifier> Node<V> {
             .cloned()
             .collect();
         produced.block.validate_shape()?;
-        Ok(produced)
+        Ok(self.bind_produced(produced))
     }
     fn session<S>(&self, session: &Session<S>) -> Result<(), Error>
     where
@@ -938,5 +1003,7 @@ fn decode_references(bytes: &[u8]) -> Result<Vec<Reference>, Error> {
     encode_references(&values)?;
     Ok(values)
 }
+#[cfg(all(test, unix))]
+mod production_tests;
 #[cfg(test)]
 mod tests;

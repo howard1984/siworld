@@ -17,11 +17,15 @@ pub mod wire;
 pub mod admission;
 pub mod audit;
 pub mod chain;
+pub mod identity;
 pub mod p2p;
+pub mod peer_scheduler;
 pub mod runtime;
 pub mod sync;
 pub mod wallet;
+pub mod wallet_cli;
 pub(crate) mod wallet_crypto;
+pub mod wallet_vault;
 
 #[cfg(test)]
 mod fixtures;

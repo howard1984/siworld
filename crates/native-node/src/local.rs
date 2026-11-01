@@ -102,7 +102,8 @@ pub fn initialize_asert(
     getrandom::fill(&mut network).map_err(|_| "OS entropy unavailable")?;
     initialize_config(
         path,
-        Config::asert_development(network, genesis_timestamp, target, pow_iterations)?,
+        Config::asert_development(network, genesis_timestamp, target, pow_iterations)?
+            .with_test_fund_registry()?,
     )
 }
 pub fn initialize_config(path: &Path, config: Config) -> Result<Config, String> {
@@ -155,6 +156,37 @@ pub fn save_reward(path: &Path, id: &Hash, secret: &[u8]) -> Result<(), String> 
         .and_then(|_| file.sync_all())
         .map_err(|_| "reward receipt durability failed")?;
     sync_directory(path)
+}
+
+/// Store-owned descriptor path. The owner verifies that both this directory and
+/// its database entry still identify the opened store before and after writing.
+#[cfg(unix)]
+pub(crate) fn save_reward_at(directory: &File, id: &Hash, secret: &[u8]) -> Result<(), String> {
+    use rustix::fs::{self, FileType, Mode, OFlags};
+    let stat = fs::fstat(directory).map_err(|_| "reward directory metadata unavailable")?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o077 != 0
+        || secret.is_empty()
+        || secret.len() > MAX_REWARD_SECRET
+    {
+        return Err("invalid private reward directory or receipt".into());
+    }
+    let name = format!("reward-{}.secret", hex(id));
+    let descriptor = fs::openat(
+        directory,
+        name.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )
+    .map_err(|_| "refusing to overwrite or open reward material")?;
+    let mut file = File::from(descriptor);
+    file.write_all(secret)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "reward receipt durability failed")?;
+    directory
+        .sync_all()
+        .map_err(|_| "reward directory durability failed".to_owned())
 }
 pub fn read_reward(path: &Path, id: &Hash) -> Result<Zeroizing<Vec<u8>>, String> {
     check_directory(path)?;

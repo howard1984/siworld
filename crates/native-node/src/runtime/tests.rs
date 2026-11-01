@@ -222,8 +222,16 @@ fn scripted_with_budget(
         output: output.clone(),
         timeout_at_eof: false,
     };
-    let capability = p2p::Authenticated::from_verified_provider(channel, binding, peer);
-    let session = Session::establish(capability, binding, p2p::Role::Validator, budget).unwrap();
+    let admission = p2p::test_support::admission(binding, peer, p2p::ConnectionRole::Initiator);
+    let capability = p2p::Authenticated::from_verified_provider(
+        channel,
+        &admission,
+        admission.role(),
+        admission.expected_peer().descriptor(),
+        p2p::test_support::parameters(),
+    )
+    .unwrap();
+    let session = Session::establish(capability, &admission, p2p::Role::Validator, budget).unwrap();
     (session, output)
 }
 fn sent(output: &Captured) -> Vec<(u8, u64, Vec<u8>)> {
@@ -850,10 +858,18 @@ fn timeout_session(node: &Node<TestVerifier>, peer: Hash) -> Session<Scripted> {
         output: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         timeout_at_eof: true,
     };
-    let capability = p2p::Authenticated::from_verified_provider(channel, binding, peer);
+    let admission = p2p::test_support::admission(binding, peer, p2p::ConnectionRole::Initiator);
+    let capability = p2p::Authenticated::from_verified_provider(
+        channel,
+        &admission,
+        admission.role(),
+        admission.expected_peer().descriptor(),
+        p2p::test_support::parameters(),
+    )
+    .unwrap();
     Session::establish(
         capability,
-        binding,
+        &admission,
         p2p::Role::Validator,
         node.transport_budget(),
     )
@@ -927,7 +943,7 @@ fn compact_reconstruction_exhaustion_is_retryable_and_keeps_pending_transactions
     let block = pending_compact_block(&mut node);
     let compact = CompactBlock::from_block(&block).unwrap();
     let fingerprint = node.state().fingerprint();
-    node.budget = Budget::new(128 * 1024);
+    node.budget = Budget::new(p2p::HANDSHAKE_BYTES);
     let packet = frame(
         node.binding(),
         p2p::COMPACT_BLOCK,
@@ -935,6 +951,10 @@ fn compact_reconstruction_exhaustion_is_retryable_and_keeps_pending_transactions
         &compact.encode().unwrap(),
     );
     let (mut session, _) = scripted(&node, [50; 32], vec![packet]);
+    let pressure = node
+        .transport_budget()
+        .reserve(p2p::HANDSHAKE_BYTES - 128 * 1024)
+        .unwrap();
     assert!(matches!(
         node.serve_once(&mut session),
         Err(Error::Transport(p2p::Error::ResourceExhausted))
@@ -942,6 +962,12 @@ fn compact_reconstruction_exhaustion_is_retryable_and_keeps_pending_transactions
     assert_eq!(node.state().fingerprint(), fingerprint);
     assert_eq!(node.mempool().len(), 64);
     assert!(node.transport_budget().reserve(128 * 1024).is_ok());
+    drop(pressure);
+    assert!(
+        node.transport_budget()
+            .reserve(p2p::HANDSHAKE_BYTES)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -1079,9 +1105,17 @@ fn staging_lookup_exhaustion_after_metadata_discards_attempt_and_preserves_pendi
         budget: budget.clone(),
         pressure: None,
     };
-    let capability = p2p::Authenticated::from_verified_provider(channel, binding, [53; 32]);
+    let admission = p2p::test_support::admission(binding, [53; 32], p2p::ConnectionRole::Initiator);
+    let capability = p2p::Authenticated::from_verified_provider(
+        channel,
+        &admission,
+        admission.role(),
+        admission.expected_peer().descriptor(),
+        p2p::test_support::parameters(),
+    )
+    .unwrap();
     let mut session =
-        Session::establish(capability, binding, p2p::Role::Validator, budget.clone()).unwrap();
+        Session::establish(capability, &admission, p2p::Role::Validator, budget.clone()).unwrap();
     let mut attempt = SyncAttempt::default();
     assert!(matches!(
         node.synchronize(&mut session, 92, &mut attempt),

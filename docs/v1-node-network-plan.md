@@ -276,7 +276,7 @@ of link capacity after those costs;
 Measure the deployed listener before acceptance.
 
 Set the new transaction profile's `MAX_LEAF_PROOF_LEN` to 655,360 bytes,
-independently of the 524,288-byte settlement and issuance caps. Preserve
+independently of the 655,360-byte settlement and 524,288-byte issuance caps. Preserve
 576 positions and the 80-bit quantum screen. The old 512-KiB prepared decoder
 is baseline-only. The native library uses the
 new trusted shape/key/limit with envelope and admission rejection tests; its
@@ -379,8 +379,8 @@ inputs and deployed recovery remain separate gates.
 
 The [network design](v1-network-design.md) selects dual Ed25519/ML-DSA-65
 identity authentication for ephemeral X25519 plus ML-KEM-768 and Dandelion++.
-Its reviewed combiner/library profile and routing parameters must be frozen
-before deployment. Pruned bootstrap uses explicit opt-in two-of-three
+Its proposed TLS/provider profile and routing parameters require review and
+freezing before deployment. Pruned bootstrap uses explicit opt-in two-of-three
 checkpoint trust with genesis-pinned authority identities; the release
 checkpoint-plus-PoW path is the V1 default. Full proof replay remains a future
 independently verifying alternative. Neither production hybrid authentication
@@ -403,15 +403,17 @@ sequence/nonce limits, key confirmation, cleanup and rekeying. Synthetic
 providers and loopback protocol tests do not qualify the cryptographic channel.
 The output encryption's ML-KEM dependency does not upgrade a connection.
 
-Implement a distinct versioned authenticated libp2p upgrade combining ephemeral
-X25519 and ML-KEM shared secrets through a domain-separated reviewed hybrid
-KDF. Bind network, offered/selected algorithms, both identities and the complete
-handshake transcript into authentication and key confirmation. Specify
-decapsulation failure behavior, replay resistance, key erasure and identity
-authentication separately. Do not fall back to classical Noise for V1 wallet,
-sidecar or node traffic after hybrid negotiation fails. Authentication must
-receive its own quantum-security review; hybrid key exchange alone does not
-upgrade a classical long-term signature.
+The [proposed hybrid profile](v1-hybrid-handshake.md) uses a maintained TLS 1.3
+implementation with exactly X25519MLKEM768, its standard TLS key schedule and
+record protection, followed by exporter-bound Ed25519 and ML-DSA-65 identity
+authentication. A dedicated versioned native upgrade must enforce that profile
+without a second application combiner or direct traffic-key derivation from
+component secrets. Review its dependency revisions, certificate policy, full
+transcript binding, decapsulation failure behavior, key confirmation, replay
+resistance and secret cleanup before activation. Do not fall back to classical
+Noise for V1 wallet, sidecar or node traffic after hybrid negotiation fails.
+Authentication requires its own quantum-security review; hybrid key exchange
+alone does not upgrade a classical long-term signature.
 
 Hybrid encryption addresses recorded-content confidentiality. It cannot hide
 the network endpoints from a passive observer. The selected Dandelion++
@@ -453,8 +455,8 @@ are separate N8/N9 work, for a combined planning range of 42–71 days.
 | M1 (N1) | Versioned block/public-record codec, strict proof-independent BLAKE3 statement-ID ordering and common producer/validator transition | 4–7 days | Groups, counts, swapped/duplicate ID rejection, proof/sidecar-independent identity, fee settlement, integer bounds and atomic rejection tests pass |
 | N2 | Admission service, isolated verifier workers, quotas and padding proof pool | 4–7 days | Byte accounting, adversarial decode, exhaustion, expiry and reorg tests pass |
 | N3 | Compact inventories, bounded missing-data recovery and block reconstruction | 3–5 days | Collision/missing-data/reconnect tests and full-capacity relay measurement pass |
-| N4 | Three-day proof retention, permanent public-data backup and explicit-trust checkpoint bootstrap | 4–7 days | Recovery/pruning tests and verified checkpoint-plus-PoW synchronization pass |
-| N5 | Reviewed hybrid handshake, dual identities and actual-listener failure tests | 10–17 days | Identity binding/rotation, negotiation, downgrade, key confirmation, erasure and reconnect tests pass |
+| N4 | Reviewed hybrid handshake, dual identities and actual-listener failure tests | 10–17 days | Identity binding/rotation, negotiation, downgrade, key confirmation, erasure and reconnect tests pass; Tokyo1 package can be issued |
+| N5 | Three-day proof retention, permanent public-data backup and explicit-trust checkpoint bootstrap | 4–7 days | Recovery/pruning tests and verified checkpoint-plus-PoW synchronization pass |
 | N6 | Dandelion++ integration and source-privacy analysis | 5–8 days | Bounded stem/fluff routing, failures and leakage review pass |
 | N7 | Independent engineering-network acceptance harness and execution | 3–5 days | Reproducible native acceptance and fault injection; elapsed observation windows complete separately |
 | N8 | Durable wallet integration and recovery | 6–10 days | Change keys, receipts, output self-check, reproof and exactly-once backup/recovery tests pass |
@@ -483,13 +485,19 @@ not silently generate a replacement identity on damaged or missing state.
 The wallet path must prove a complete accepted-chain cycle: backed-up seed,
 configured mining recipient, mature reward recovery, SIP transfer with both
 fee tiers, issued-asset transfer, restart and mnemonic-only restoration.
-The current seed-derived wallet primitives and private reward receipts do not
-by themselves complete protected wallet persistence or mnemonic restoration.
+The [wallet custody implementation](v1-wallet-storage.md) now supplies an
+encrypted seed vault and payment journal, mnemonic restoration and explicit
+interactive create, restore, address and miner-configuration commands. An
+opt-in genuine native-proof test implements a genesis-funded reward, payment,
+database replay and receiving-wallet restoration cycle. Its source and a passing
+build do not establish a completed run: retain an observed result for the exact
+executed source. The complete two-fee-tier, issuance and asset-transfer flow,
+local web interface and independent-host network acceptance remain pending.
 Publish only public chain and operation status; wallet seeds, note openings,
 individual fees and recipient classifications stay private.
 
 Native economics already use the shared integer transition for 87/10/3
-allocation, Voyager/Holder mode, pool credit-before-claim, one-SIP tail,
+allocation, Voyager/Holder mode, pool claim-before-injection, one-SIP tail,
 snapshot-height locks and independent configured fund-wallet allowances.
 Fund ratios and production recipients remain explicit activation inputs.
 Do not substitute a shared fund allowance or restore the superseded fixed

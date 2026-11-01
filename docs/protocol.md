@@ -30,8 +30,8 @@ recipient AEAD/commitment checks form the separate encryption boundary.
 The suite is KoalaBear D8, standard Poseidon2 W24 and twelve-element digests.
 The transaction profile is b7/q41 with 20-bit query/batch grinding, zero
 commitment grinding, binary folding and final-polynomial log length zero.
-Its engineering cap is **655,360 bytes (640 KiB)**; settlement and issuance have
-separate **524,288-byte** caps. The [relation manifest](../crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json)
+Its engineering cap is **655,360 bytes (640 KiB)**; settlement uses the same
+**655,360-byte** cap and issuance retains a separate **524,288-byte** cap. The [relation manifest](../crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json)
 records the economic transaction shape, exactly 576-position settlement and
 exactly three-initial-note issuance with source-bound public keys. The transaction
 AIR has 256 base rows, 1,392 main columns, 247 preprocessed columns and 101

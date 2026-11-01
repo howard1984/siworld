@@ -36,8 +36,15 @@ chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
 sha2 = "=0.10.9"
 getrandom = "0.4"
 zeroize = "1.9.1"
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+bip39 = { version = "=2.2.2", default-features = false, features = ["std", "zeroize"] }
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }
+rpassword = "=7.4.0"
 redb = "4.4"
 rayon = "1.11"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
 
 [lints.rust]
 unsafe_code = "forbid"

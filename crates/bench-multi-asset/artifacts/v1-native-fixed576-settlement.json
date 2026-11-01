@@ -1,0 +1,121 @@
+{
+  "source_commit": "7e0ccdf3ed722cbaa3fffd53bba1380c0554a72a",
+  "actual_cpu_models": [
+    "AMD EPYC 7763, 4 vCPU"
+  ],
+  "parameters": {
+    "log_blowup": 8,
+    "num_queries": 36,
+    "query_pow_bits": 20,
+    "commit_pow_bits": 0,
+    "batch_pow_bits": 20,
+    "max_log_arity": 1
+  },
+  "capacity": 576,
+  "workers": 4,
+  "trials": [
+    {
+      "trial": 1,
+      "proof_body_bytes": 514539,
+      "generation_ns": 5472528286,
+      "verification_ns": 20273219,
+      "setup_ns": 2998868482,
+      "memory_peak_bytes": 3159597056,
+      "event_deltas": {
+        "max": 0,
+        "oom": 0,
+        "low": 0,
+        "sock_throttled": 0,
+        "high": 0,
+        "oom_group_kill": 0,
+        "oom_kill": 0
+      }
+    },
+    {
+      "trial": 2,
+      "proof_body_bytes": 513675,
+      "generation_ns": 5475584285,
+      "verification_ns": 20148490,
+      "setup_ns": 2942908512,
+      "memory_peak_bytes": 3159633920,
+      "event_deltas": {
+        "low": 0,
+        "high": 0,
+        "oom_group_kill": 0,
+        "max": 0,
+        "sock_throttled": 0,
+        "oom_kill": 0,
+        "oom": 0
+      }
+    },
+    {
+      "trial": 3,
+      "proof_body_bytes": 507387,
+      "generation_ns": 5490914676,
+      "verification_ns": 19990673,
+      "setup_ns": 2961360537,
+      "memory_peak_bytes": 3159834624,
+      "event_deltas": {
+        "max": 0,
+        "high": 0,
+        "low": 0,
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0,
+        "sock_throttled": 0
+      }
+    }
+  ],
+  "max_proof_body_bytes": 514539,
+  "wire_cap_bytes": 655360,
+  "max_memory_peak_bytes": 3159834624,
+  "source_run": 41000973551,
+  "headroom_percent": 21.487579345703125,
+  "measurement_ceiling_bytes": 589824,
+  "schema": 1,
+  "scope": "Fixed-576 native settlement with priority-fee witnesses and five synthetic Holder reward allocations; separate maximum-claim codec diagnostic",
+  "fee_slots": 576,
+  "fee_tier": "priority",
+  "reward_notes": 5,
+  "setup_in_generation_time": false,
+  "memory_metric": "cgroup v2 memory.peak, fresh setup/prove/verify process tree and recorder",
+  "qualification_complete": false,
+  "transaction_proofs_in_claim_envelope_verified": false,
+  "combined_full_block_state_applied": false,
+  "maximum_claim_codec_diagnostic": {
+    "acceptance": false,
+    "block_decode_ns": 194998635,
+    "block_encode_ns": 190584671,
+    "block_envelope_bytes": 381600975,
+    "claim_bundle_bytes": 54264,
+    "claim_generation_ns": 1912053,
+    "claim_signatures_verified": 8,
+    "claim_verification_ns": 861932,
+    "claim_verification_scope": "synthetic genesis key generation, canonical decoding and native signature checks",
+    "compact_envelope_bytes": 2890196,
+    "consensus_state_applied": false,
+    "cryptographic_approval": false,
+    "diagnostic_wall_ns": 1392976747,
+    "fund_claims_measured": true,
+    "issuance_proofs_verified": false,
+    "issuance_records": 4,
+    "logical_connection_budget_bytes": 671088640,
+    "logical_receive_reservation_bytes": 382324055,
+    "maximum_block_bytes": 381600979,
+    "maximum_compact_bytes": 3185316,
+    "maximum_fund_claims_per_block": 8,
+    "memory_rss_measured": false,
+    "network_activation": false,
+    "ninth_claim_rejected": true,
+    "opaque_proof_fills": true,
+    "pow_seed_binds_claims": true,
+    "reward_records": 5,
+    "schema": 1,
+    "scope": "synthetic canonical maximum-size envelope and actual ML-DSA-65 claims",
+    "settlement_proof_verified": false,
+    "settlement_statement_unchanged_by_claims": true,
+    "transaction_proofs_verified": false,
+    "transaction_slots": 576,
+    "wallet_account_limit": 32
+  }
+}

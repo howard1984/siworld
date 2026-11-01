@@ -1,7 +1,8 @@
 //! Private seed-recoverable wallet primitives for native engineering chains.
 //!
-//! This module accepts a supplied 32-byte seed, not a mnemonic. Seed backup,
-//! protected persistence, user interfaces and relay transport are separate work.
+//! These primitives accept a supplied 32-byte seed. The wallet_vault module
+//! adds mnemonic entropy backup and encrypted seed custody. User interfaces,
+//! durable payment integration and relay transport require separate acceptance.
 //! Rescans authenticate ciphertext and reconstruct commitments after independent
 //! canonical replay. Wallet keys, receipts and payment bundles have no Debug or
 //! serialization implementation. Their private contents must never be sent to

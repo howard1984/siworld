@@ -27,6 +27,8 @@ outstanding.
 - [Circuit optimization](multi-asset-air-optimization.md): adopted snapshot-range and asset-comparison reductions, current measured shape and separate unreferenced layout research.
 - [Protocol-byte compatibility](v1-protocol-byte-compatibility.md): retained wire identifiers and private input unlock-height binding.
 - [Wallet and custody protection](v1-wallet-protection.md): lock recovery, delayed consolidation, threshold backups and offline signing interfaces.
+- [Encrypted native wallet storage](v1-wallet-storage.md): entropy backup, exclusive custody and authenticated recovery.
+- [Offline fund-key custody](v1-offline-fund-keys.md): holder-local generation, public submission format and backup procedure.
 
 The [two-output native baseline](../crates/bench-d8/artifacts/v1-native-freeze.json)
 remains diagnostic evidence. Its decoder and resource measurements do not
@@ -38,6 +40,7 @@ qualify the three-output native node path.
 - [Network capacity](v1-network-budget.md): separate proof caps, complete conditional wire accounting, 43-Mbps minimum and 100-Mbps recommendation.
 - [Storage and bootstrap](v1-storage-and-sync.md): permanent public records, three-day proof lifecycle, checkpoint trust, backups and recovery.
 - [Transport/checkpoint design](v1-network-design.md): proposed authenticated hybrid transport and Dandelion++.
+- [Persistent dual identities](v1-native-identity.md) and [proposed hybrid handshake](v1-hybrid-handshake.md): possession, peer pins and the pending transport review.
 - [Native operational interfaces](node-operations.md) and [RPC boundary](rpc.md): integration status and requirements.
 - [Unresolved protocol and qualification questions](11-risks-open-questions.md).
 

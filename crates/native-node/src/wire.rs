@@ -15,7 +15,12 @@ pub type Hash = [u8; 32];
 pub type DigestBytes = [u8; 48];
 
 pub const MAX_TX_PROOF: usize = 655_360;
-pub const MAX_SETTLEMENT_PROOF: usize = 524_288;
+/// Maximum settlement-proof body accepted on the native V1 wire.
+///
+/// Full-capacity measurements must stay at or below 589,824 bytes to leave
+/// ten percent of this ceiling unused. The 640 KiB admission limit is
+/// independent of the leaf limit and applies before any proof allocation.
+pub const MAX_SETTLEMENT_PROOF: usize = 655_360;
 pub const MIN_SLOTS: usize = 64;
 pub const MAX_SLOTS: usize = 576;
 pub const GROUP: usize = 16;
@@ -1135,6 +1140,7 @@ mod tests {
 
     #[test]
     fn settlement_proof_caps_and_declared_length_are_enforced() {
+        assert_eq!(MAX_SETTLEMENT_PROOF, 655_360);
         let mut value = block();
         value.settlement_proof = vec![1; MAX_SETTLEMENT_PROOF];
         let bytes = value.encode().unwrap();

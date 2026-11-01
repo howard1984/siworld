@@ -30,9 +30,9 @@ class StorageBudgetTests(unittest.TestCase):
         result = baseline_estimate(165_888, 1)
         self.assertEqual(budget.RETENTION_BLOCKS, 888)
         self.assertEqual(result['rolling_positions'], 511_488)
-        self.assertEqual(result['transaction_settlement_sidecar_rolling_bytes'], 268_672_484_352)
+        self.assertEqual(result['transaction_settlement_sidecar_rolling_bytes'], 268_788_876_288)
         self.assertEqual(result['issuance_proof_rolling_allowance_bytes'], 465_567_744)
-        self.assertEqual(result['rolling_bytes'], 269_138_052_096)
+        self.assertEqual(result['rolling_bytes'], 269_254_444_032)
 
     def test_multiyear_public_growth_does_not_repeat_the_rolling_cache(self):
         first = baseline_estimate(165_888, 1)
@@ -61,9 +61,9 @@ class StorageBudgetTests(unittest.TestCase):
         result = budget.report()
         self.assertEqual(result['parameters']['transaction_proof_cap_bytes'], 655_360)
         full = result['cases']['maximum']
-        self.assertEqual(full[0]['rolling_bytes'], 336_179_807_232)
-        self.assertEqual(full[0]['used_bytes'], 535_485_829_632)
-        self.assertEqual(full[2]['device_bytes_with_20_percent_free'], 1_485_887_399_040)
+        self.assertEqual(full[0]['rolling_bytes'], 336_296_199_168)
+        self.assertEqual(full[0]['used_bytes'], 535_602_221_568)
+        self.assertEqual(full[2]['device_bytes_with_20_percent_free'], 1_486_032_888_960)
         self.assertGreater(full[1]['device_bytes_with_20_percent_free'], 1_000_000_000_000)
         adaptive = result['cases']['transactions_50000_per_day_adaptive_packing'][2]
         uniform = result['cases']['transactions_50000_per_day_uniform_176'][2]
@@ -87,7 +87,7 @@ class StorageBudgetTests(unittest.TestCase):
     def test_cap_report_retains_all_lifetimes_and_workloads(self):
         result = budget.report(transaction_proof_cap=768 * 1024)
         self.assertEqual(result['parameters']['transaction_proof_cap_bytes'], 768 * 1024)
-        self.assertEqual(result['parameters']['settlement_proof_cap_bytes'], 524_288)
+        self.assertEqual(result['parameters']['settlement_proof_cap_bytes'], 655_360)
         self.assertEqual(result['parameters']['issuance_proof_cap_bytes'], 524_288)
         self.assertEqual(result['parameters']['retention_days_after_finality'], 3)
         for name, rows in result['cases'].items():
@@ -123,7 +123,7 @@ class StorageBudgetTests(unittest.TestCase):
                                   'permanent_issuance_allowance_bytes',
                                   'database_working_allowance_bytes', 'system_bytes'):
                     self.assertEqual(after[component], before[component])
-        self.assertEqual(result['cases']['maximum'][0]['used_bytes'], 543_020_913_152)
+        self.assertEqual(result['cases']['maximum'][0]['used_bytes'], 543_137_305_088)
 
     def test_genesis_registry_is_one_time_and_independent_of_workload(self):
         result = budget.report(economic_rewards=True)

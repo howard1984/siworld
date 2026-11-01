@@ -16,6 +16,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  native-economic-accounting:
+    name: Native economic order and per-wallet conservation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - name: Current monetary rejection tests and production-schedule simulation
+        run: |
+          cargo test --release --locked -p siworld-core v1_economics::tests::
+          mkdir -p .local/native-accounting
+          cargo test --release --locked -p siworld-core v1_economics::tests::seeded_twenty_year_modes_preserve_supply_and_curve -- --ignored --exact --nocapture > .local/native-accounting/simulation.log 2>&1
+          python3 scripts/check-fund-simulation.py .local/native-accounting/simulation.log .local/native-accounting/simulation.json
+      - name: Compare the source-bound numeric reference
+        run: |
+          python3 - <<'PY_ACCOUNTING'
+          import hashlib
+          import json
+          from pathlib import Path
+          reference = json.loads(Path('crates/core/artifacts/v1-economics-simulation.json').read_text())
+          actual = json.loads(Path('.local/native-accounting/simulation.json').read_text())
+          assert reference['simulation'] == actual['simulation'], 'Executed accounting differs from the reference'
+          for name, digest in reference['sources_sha256'].items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, 'Accounting source differs from the reference'
+          PY_ACCOUNTING
+  offline-fund-keys:
+    name: Offline fund key custody
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/fund-keytool
+      - name: Format and lint isolated custody tool
+        run: |
+          cargo fmt --manifest-path crates/fund-keytool/Cargo.toml --check
+          cargo clippy --release --locked --manifest-path crates/fund-keytool/Cargo.toml --all-targets -- -D warnings
+      - name: Synthetic custody, backup and malformed-file tests
+        run: cargo test --release --locked --manifest-path crates/fund-keytool/Cargo.toml
   secrets:
     name: Sensitive information and history
     runs-on: ubuntu-24.04
@@ -53,6 +101,7 @@ jobs:
       - name: Publication manifest and documentation
         run: |
           python3 scripts/check-repository.py
+          python3 scripts/check-native-envelope-policy.py
           python3 scripts/check-fee-settlement-evaluation.py --schema >/tmp/fee-settlement-schema.json
       - name: Audit evidence and memory declarations
         run: |

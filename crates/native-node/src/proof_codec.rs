@@ -24,7 +24,12 @@ use p3_uni_stark::{PreprocessedVerifierKey, Proof, StarkGenericConfig};
 /// Transaction body limit; public inputs are reconstructed independently.
 pub const MAX_TRANSACTION_PROOF_BODY_LEN: usize = 655_360;
 /// Fixed-capacity settlement body limit.
-pub const MAX_SETTLEMENT_PROOF_BODY_LEN: usize = 524_288;
+///
+/// This is the native decoder admission limit and must match the wire,
+/// compact-block, block-size and memory-budget constants.
+pub const MAX_SETTLEMENT_PROOF_BODY_LEN: usize = 655_360;
+/// Issuance proofs retain their independently frozen 512 KiB admission cap.
+pub const MAX_ISSUANCE_PROOF_BODY_LEN: usize = 524_288;
 
 // An additional aggregate budget covers all declared vector payloads and
 // headers. This is an admission bound, not an allocator/process RSS claim.
@@ -110,6 +115,7 @@ impl ProofShape {
         if ![
             MAX_TRANSACTION_PROOF_BODY_LEN,
             MAX_SETTLEMENT_PROOF_BODY_LEN,
+            MAX_ISSUANCE_PROOF_BODY_LEN,
         ]
         .contains(&body_limit)
             || descriptor.suite() != SuiteIdV1::ExperimentalKoalaBearD8Poseidon2W24RandomCodewordFri
@@ -918,6 +924,10 @@ mod tests {
         let shape =
             ProofShape::from_trusted(&TinyAir, &vk, &cfg, MAX_TRANSACTION_PROOF_BODY_LEN).unwrap();
         assert_eq!(shape.body_limit, 655_360);
+        assert!(ProofShape::from_trusted(&TinyAir, &vk, &cfg, MAX_ISSUANCE_PROOF_BODY_LEN).is_ok());
+        assert!(
+            ProofShape::from_trusted(&TinyAir, &vk, &cfg, MAX_ISSUANCE_PROOF_BODY_LEN + 1).is_err()
+        );
         assert_eq!(MAX_DECLARED_VECTOR_BYTES, 4_194_304);
         let mut cursor = Cursor {
             bytes: &[],
