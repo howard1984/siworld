@@ -11,6 +11,7 @@ use crate::audit::{AuditReport, replay_chain};
 use crate::proofs::NativeProver;
 use crate::state::{BlockVerifier, Config, State, base_fee};
 use crate::wallet_crypto::RecoverableViewKey;
+use crate::wallet_policy::{SpendPolicy, WalletPrivacyPolicy};
 use crate::wire::{Block, DigestBytes, Hash, PublicRecord, Sidecar, Transaction};
 use native::codec::{ProofContext, PublicTransaction, decode_digest, encode_digest};
 use native::encryption::{
@@ -181,10 +182,11 @@ pub struct BalanceDetails {
     pub next_unlock_height: Option<u64>,
 }
 
-pub const AUTO_DELAY_MIN_SECONDS: u64 = 6 * 60 * 60;
-pub const AUTO_DELAY_MAX_SECONDS: u64 = 3 * 24 * 60 * 60;
+pub const AUTO_DELAY_MIN_SECONDS: u64 = 0;
+pub const AUTO_DELAY_MAX_SECONDS: u64 = 6 * 60 * 60;
 
 pub struct Wallet {
+    privacy_policy: WalletPrivacyPolicy,
     keys: WalletKeys,
     head: Option<(u64, Hash, Hash)>,
     receipts: Vec<OwnedNote>,
@@ -196,6 +198,7 @@ impl Wallet {
         account: u32,
     ) -> Result<Self, String> {
         Ok(Self {
+            privacy_policy: WalletPrivacyPolicy::default(),
             keys: WalletKeys::from_seed(network, seed, account)?,
             head: None,
             receipts: Vec::new(),
@@ -203,6 +206,12 @@ impl Wallet {
     }
     pub fn address(&self) -> PaymentAddress {
         self.keys.address()
+    }
+    pub fn set_privacy_policy(&mut self, policy: WalletPrivacyPolicy) {
+        self.privacy_policy = policy;
+    }
+    pub fn privacy_policy(&self) -> WalletPrivacyPolicy {
+        self.privacy_policy
     }
     pub fn head(&self) -> Option<(u64, Hash, Hash)> {
         self.head
@@ -433,28 +442,68 @@ impl Wallet {
             next_unlock_height,
         })
     }
-    /// Private wallet scheduling time, reconstructed after seed recovery.
-    /// Locked inputs use this boundary for transfer preparation; automatic
-    /// consolidation also applies it to ordinary notes. Unreached unlocks and
-    /// spent/zero notes return None. Local time never changes consensus validity.
+    /// Private background schedule reconstructed from the seed and accepted
+    /// history. Engineering and testnet preferences disable the added delay.
+    /// This local schedule never alters consensus maturity or proof inputs.
     pub fn automatic_ready_timestamp(
         &self,
         commitment: &DigestBytes,
+    ) -> Result<Option<u64>, String> {
+        self.payment_ready_timestamp(commitment, SpendPolicy::Background)
+    }
+    pub fn payment_ready_timestamp(
+        &self,
+        commitment: &DigestBytes,
+        policy: SpendPolicy,
     ) -> Result<Option<u64>, String> {
         let receipt = self
             .receipts
             .iter()
             .find(|r| &r.commitment == commitment)
-            .ok_or("automatic selection requires an authenticated owned note")?;
-        self.ready_timestamp(receipt)
+            .ok_or("selection requires an authenticated owned note")?;
+        self.ready_timestamp(receipt, policy)
     }
-    fn ready_timestamp(&self, receipt: &OwnedNote) -> Result<Option<u64>, String> {
+    /// A private warning during the six hours after canonical eligibility,
+    /// independent of the sampled delay and including ordinary received notes.
+    pub fn manual_privacy_warning(
+        &self,
+        commitment: &DigestBytes,
+        now: u64,
+    ) -> Result<bool, String> {
+        let receipt = self
+            .receipts
+            .iter()
+            .find(|r| &r.commitment == commitment)
+            .ok_or("selection requires an authenticated owned note")?;
+        if receipt.spent || receipt.note.value == 0 {
+            return Ok(false);
+        }
+        let Some(eligible) = receipt.eligible_timestamp else {
+            return Ok(false);
+        };
+        let threshold = eligible
+            .checked_add(AUTO_DELAY_MAX_SECONDS)
+            .ok_or("wallet warning timestamp overflow")?;
+        Ok(now < threshold)
+    }
+    fn ready_timestamp(
+        &self,
+        receipt: &OwnedNote,
+        policy: SpendPolicy,
+    ) -> Result<Option<u64>, String> {
         if receipt.spent || receipt.note.value == 0 {
             return Ok(None);
         }
         let Some(eligible) = receipt.eligible_timestamp else {
             return Ok(None);
         };
+        if policy == SpendPolicy::Manual
+            || (policy == SpendPolicy::Background && !self.privacy_policy.background_delay)
+        {
+            // Accepted block timestamps may be ahead of this computer's clock.
+            // Height maturity is checked independently when building inputs.
+            return Ok(Some(0));
+        }
         let mut hash = blake3::Hasher::new_keyed(&self.keys.automatic_selection_key);
         hash.update(&receipt.commitment);
         let mut reader = hash.finalize_xof();
@@ -497,7 +546,7 @@ impl Wallet {
                 || receipt.note.unlock_height > state.height
                 || state.spent.contains(&receipt.nullifier)
                 || self
-                    .ready_timestamp(receipt)?
+                    .ready_timestamp(receipt, SpendPolicy::Background)?
                     .is_none_or(|ready| now < ready)
             {
                 continue;
@@ -526,7 +575,7 @@ impl Wallet {
         let Some(amount) = total.checked_sub(fee).filter(|amount| *amount > 0) else {
             return Ok(None);
         };
-        self.prepare_transfer(
+        self.prepare_transfer_with_policy(
             state,
             [Some(first.commitment), Some(second.commitment)],
             &self.address(),
@@ -534,13 +583,14 @@ impl Wallet {
             amount,
             tier,
             now,
+            SpendPolicy::Background,
         )
         .map(Some)
     }
     /// Construct a private transfer witness with one recipient and up to two
     /// asset-specific change outputs. `None` supplies a fresh zero-value input.
     /// SIP alone pays the selected canonical-snapshot standard/priority fee.
-    /// Every nonzero-unlock input waits for its private post-maturity delay.
+    /// Uses the configured manual privacy preference while preserving maturity.
     /// `now` is local wallet policy and must never enter consensus validation.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_transfer(
@@ -557,6 +607,24 @@ impl Wallet {
             state, selected, recipient, asset, amount, tier, now, None,
         )
     }
+    /// Explicit policy-aware preparation. Enhanced privacy applies the same
+    /// bounded private delay to ordinary and formerly locked inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_transfer_with_policy(
+        &self,
+        state: &State,
+        selected: [Option<DigestBytes>; 2],
+        recipient: &PaymentAddress,
+        asset: AssetId,
+        amount: u64,
+        tier: FeeTier,
+        now: u64,
+        policy: SpendPolicy,
+    ) -> Result<PreparedTransfer, String> {
+        self.prepare_transfer_with_policy_and_randomness(
+            state, selected, recipient, asset, amount, tier, now, None, policy,
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     fn prepare_transfer_with_randomness(
         &self,
@@ -568,6 +636,36 @@ impl Wallet {
         tier: FeeTier,
         now: u64,
         payment_randomness: Option<Digest>,
+    ) -> Result<PreparedTransfer, String> {
+        let policy = if self.privacy_policy.enhanced_privacy {
+            SpendPolicy::EnhancedPrivacy
+        } else {
+            SpendPolicy::Manual
+        };
+        self.prepare_transfer_with_policy_and_randomness(
+            state,
+            selected,
+            recipient,
+            asset,
+            amount,
+            tier,
+            now,
+            payment_randomness,
+            policy,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_transfer_with_policy_and_randomness(
+        &self,
+        state: &State,
+        selected: [Option<DigestBytes>; 2],
+        recipient: &PaymentAddress,
+        asset: AssetId,
+        amount: u64,
+        tier: FeeTier,
+        now: u64,
+        payment_randomness: Option<Digest>,
+        policy: SpendPolicy,
     ) -> Result<PreparedTransfer, String> {
         self.require_state(state)?;
         if amount == 0 || selected == [None, None] {
@@ -603,12 +701,12 @@ impl Wallet {
             {
                 return Err("wallet input is spent, zero-valued, or immature".into());
             }
-            if receipt.note.unlock_height != 0 {
+            if policy != SpendPolicy::Manual {
                 let ready = self
-                    .ready_timestamp(receipt)?
-                    .ok_or("wallet locked input has no canonical eligibility timestamp")?;
+                    .ready_timestamp(receipt, policy)?
+                    .ok_or("wallet input has no canonical eligibility timestamp")?;
                 if now < ready {
-                    return Err("wallet locked input privacy delay has not elapsed".into());
+                    return Err("wallet privacy delay has not elapsed".into());
                 }
             }
             let index = state

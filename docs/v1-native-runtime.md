@@ -250,10 +250,12 @@ checks authenticated recipient/change ciphertexts and reconstructed note
 commitments, derives spent status and atomically replaces private receipts.
 Replaying a replacement chain removes orphan receipts and restores orphan
 spends. It reports available/locked balances and unlock tranches with estimated
-dates and the next unlock height. Private deterministic scheduling delays use
-of matured locked notes; opt-in small-SIP consolidation shares that delay
-without changing consensus maturity. These library primitives do not provide
-a deployed wallet UI or background scheduler. The wallet can prepare fixed
+dates and the next unlock height. Manual transfers use mature inputs immediately
+with confirmation of recent-spend privacy warnings. Background selection and
+opt-in consolidation delay notes by at most six hours; engineering/test defaults
+disable that delay. Enhanced privacy applies it to manual selection too. None
+of these settings changes consensus maturity. A loopback-only protected wallet
+viewer is available; there is no automatic consolidation daemon. The wallet can prepare fixed
 two-input/three-output SIP or issued-asset
 transfers, pay standard or priority fees only in SIP, recheck all output
 encodings before proving and return the transaction, matching sidecar and

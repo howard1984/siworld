@@ -14,6 +14,12 @@ use zeroize::{Zeroize, Zeroizing};
 // Reserved for a reviewed transport provider; never admits a channel itself.
 #[allow(dead_code)]
 pub(crate) mod handshake_auth;
+#[cfg(feature = "hybrid-tls-candidate")]
+#[allow(dead_code)]
+pub(crate) mod tls_auth;
+#[cfg(feature = "hybrid-tls-candidate")]
+#[allow(dead_code)]
+pub(crate) mod tls_signer;
 
 pub const VERSION: u16 = 1;
 pub const DESCRIPTOR_BYTES: usize = 5459;

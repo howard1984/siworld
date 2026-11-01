@@ -18,8 +18,13 @@ use std::path::Path;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("native-store-meta-v2");
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("canonical-blocks-v2");
 // Created only in the same transaction as an accepted reorganization.
-// Existing M1 stores retain their exact two-table schema until that operation.
+// Legacy stores acquire this evidence table only on an accepted reorganization.
 const DETACHED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("detached-blocks-v1");
+// Local receipt ownership is private node metadata, never consensus data.
+const LOCAL_REWARDS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("local-production-receipts-v1");
+const LOCAL_REWARDS_MARKER: &str = "local-production-receipts";
+const LOCAL_REWARDS_VERSION: &[u8] = b"\x01\0\0\0\0\0\0\0\0";
 const HEAD_BYTES: usize = 72;
 const FINGERPRINT_BYTES: usize = 32;
 mod receipts;
@@ -74,11 +79,15 @@ impl Store {
             sync_parent(path)?;
         }
         let state = replay(&database, config, verifier)?;
-        Ok(Self {
+        let store = Self {
             database,
             state,
             receipt_owner,
-        })
+        };
+        if store.has_local_reward_index()? {
+            store.verify_local_rewards()?;
+        }
+        Ok(store)
     }
 
     pub fn state(&self) -> &State {
@@ -91,6 +100,136 @@ impl Store {
         secret: &[u8],
     ) -> Result<(), String> {
         self.receipt_owner.save(id, secret)
+    }
+
+    /// New stores record local production independently of imported history.
+    /// Legacy stores remain readable but cannot silently acquire this claim.
+    pub fn has_local_reward_index(&self) -> Result<bool, String> {
+        let txn = self
+            .database
+            .begin_read()
+            .map_err(|_| "native database read unavailable")?;
+        let indexed = validate_tables(
+            txn.list_tables()
+                .map_err(|_| "native database schema unreadable")?,
+            txn.list_multimap_tables()
+                .map_err(|_| "native database schema unreadable")?
+                .next()
+                .is_some(),
+        )?;
+        let meta = txn
+            .open_table(META)
+            .map_err(|_| "native metadata unavailable")?;
+        check_metadata(&meta, &self.state.config, &head(&self.state))?;
+        check_index_marker(&meta, indexed)?;
+        if indexed {
+            let rows = txn
+                .open_table(LOCAL_REWARDS)
+                .map_err(|_| "native local reward index unavailable")?;
+            if rows
+                .len()
+                .map_err(|_| "native local reward count unreadable")?
+                != local_reward_count(&meta)?
+            {
+                return Err("native local reward index count mismatch".into());
+            }
+        }
+        Ok(indexed)
+    }
+
+    /// Resident networking requires a history whose local ownership was indexed
+    /// from genesis, or a separately reviewed explicit migration.
+    pub fn require_local_reward_index(&self) -> Result<(), String> {
+        if !self.has_local_reward_index()? {
+            return Err(
+                "legacy unindexed local rewards require explicit qualification before networking"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Authenticate every indexed local reward, including detached production.
+    /// Imported blocks normally have no local receipt and never create rows.
+    /// Missing or modified local evidence is fatal rather than inferred remote.
+    pub fn verify_local_rewards(&self) -> Result<u64, String> {
+        self.require_local_reward_index()?;
+        let txn = self
+            .database
+            .begin_read()
+            .map_err(|_| "native database read unavailable")?;
+        let table = txn
+            .open_table(LOCAL_REWARDS)
+            .map_err(|_| "native local reward index unavailable")?;
+        let canonical = txn
+            .open_table(BLOCKS)
+            .map_err(|_| "native canonical table unavailable")?;
+        let has_detached = txn
+            .list_tables()
+            .map_err(|_| "native database schema unreadable")?
+            .any(|table| table.name() == DETACHED.name());
+        let detached = if has_detached {
+            Some(
+                txn.open_table(DETACHED)
+                    .map_err(|_| "native detached table unavailable")?,
+            )
+        } else {
+            None
+        };
+        let mut checked = 0u64;
+        for row in table
+            .iter()
+            .map_err(|_| "native local reward index unreadable")?
+        {
+            let (key, value) = row.map_err(|_| "native local reward row unreadable")?;
+            let id: crate::wire::Hash = key
+                .value()
+                .try_into()
+                .map_err(|_| "invalid local reward block identity")?;
+            let bytes = value.value();
+            if bytes.len() != 40 {
+                return Err("invalid local reward ownership record".into());
+            }
+            let height =
+                u64::from_le_bytes(bytes[..8].try_into().expect("bounded local reward height"));
+            if height == 0 {
+                return Err("invalid local reward height".into());
+            }
+            let canonical_block = canonical
+                .get(height)
+                .map_err(|_| "native canonical record unreadable")?
+                .map(|record| {
+                    let (bytes, _) = split_record(record.value())?;
+                    Block::decode(bytes, &self.state.config.network)
+                })
+                .transpose()?;
+            let block = if let Some(block) =
+                canonical_block.filter(|block| block.id().is_ok_and(|got| got == id))
+            {
+                block
+            } else {
+                let record = detached
+                    .as_ref()
+                    .ok_or("indexed local block is neither canonical nor retained")?
+                    .get(id.as_slice())
+                    .map_err(|_| "native detached local record unreadable")?
+                    .ok_or("indexed local detached block missing")?;
+                let (bytes, _) = split_record(detached_record(record.value())?)?;
+                Block::decode(bytes, &self.state.config.network)?
+            };
+            if block.height != height || block.id()? != id {
+                return Err("indexed local block identity mismatch".into());
+            }
+            let receipt = self.receipt_owner.read(&id)?;
+            if local_receipt_digest(&id, &receipt).as_slice() != &bytes[8..] {
+                return Err("indexed local reward receipt digest mismatch".into());
+            }
+            crate::producer::validate_reward_secret(&block, &receipt)?;
+            checked = checked
+                .checked_add(1)
+                .ok_or("local reward count exhausted")?;
+        }
+        Ok(checked)
     }
 
     /// Returns the complete canonical block, including proofs, for local receipt
@@ -265,7 +404,7 @@ impl Store {
             .map_err(|_| local("native database write unavailable"))?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| local("native database durability unavailable"))?;
-        validate_tables(
+        let indexed = validate_tables(
             txn.list_tables()
                 .map_err(|_| local("native database schema unreadable"))?,
             txn.list_multimap_tables()
@@ -285,6 +424,7 @@ impl Store {
                 .map_err(|_| local("native metadata table unavailable"))?;
             check_metadata(&meta, &self.state.config, &head(&self.state))
                 .map_err(ChainError::Local)?;
+            check_index_marker(&meta, indexed).map_err(ChainError::Local)?;
             let mut canonical = txn
                 .open_table(BLOCKS)
                 .map_err(|_| local("native canonical table unavailable"))?;
@@ -391,6 +531,33 @@ impl Store {
     /// Commits a verified canonical block and its resulting fingerprint together.
     /// Accepted in-memory state changes only after the durable commit succeeds.
     pub fn append(&mut self, block: &Block, verifier: &impl BlockVerifier) -> Result<(), String> {
+        self.append_inner(block, None, verifier)
+    }
+
+    /// Only the production owner calls this after preserving recovery evidence.
+    /// The ownership row, canonical block and accepted head commit atomically.
+    pub(crate) fn append_produced(
+        &mut self,
+        block: &Block,
+        secret: &[u8],
+        verifier: &impl BlockVerifier,
+    ) -> Result<(), String> {
+        let id = block.id()?;
+        let receipt = self.receipt_owner.read(&id)?;
+        let digest = local_receipt_digest(&id, secret);
+        if local_receipt_digest(&id, &receipt) != digest {
+            return Err("saved local reward receipt differs before commit".into());
+        }
+        crate::producer::validate_reward_secret(block, &receipt)?;
+        self.append_inner(block, Some(digest), verifier)
+    }
+
+    fn append_inner(
+        &mut self,
+        block: &Block,
+        local_receipt: Option<crate::wire::Hash>,
+        verifier: &impl BlockVerifier,
+    ) -> Result<(), String> {
         let mut accepted = self.state.clone();
         accepted.apply(block, verifier)?;
         let mut record = block.encode()?;
@@ -401,7 +568,7 @@ impl Store {
             .map_err(|_| "native database write unavailable")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "native database durability unavailable")?;
-        validate_tables(
+        let indexed = validate_tables(
             txn.list_tables()
                 .map_err(|_| "native database schema unreadable")?,
             txn.list_multimap_tables()
@@ -414,6 +581,47 @@ impl Store {
                 .open_table(META)
                 .map_err(|_| "native metadata table missing or incompatible")?;
             check_metadata(&meta, &self.state.config, &head(&self.state))?;
+            check_index_marker(&meta, indexed)?;
+            if let Some(digest) = local_receipt.filter(|_| indexed) {
+                let id = block.id()?;
+                let mut record = [0u8; 40];
+                record[..8].copy_from_slice(&block.height.to_le_bytes());
+                record[8..].copy_from_slice(&digest);
+                let mut ownership = txn
+                    .open_table(LOCAL_REWARDS)
+                    .map_err(|_| "native local reward index unavailable")?;
+                let count = local_reward_count(&meta)?;
+                if ownership
+                    .len()
+                    .map_err(|_| "native local reward count unreadable")?
+                    != count
+                {
+                    return Err("native local reward index count mismatch".into());
+                }
+                let existing = ownership
+                    .get(id.as_slice())
+                    .map_err(|_| "native local reward ownership unreadable")?
+                    .map(|prior| prior.value().to_vec());
+                if let Some(prior) = existing {
+                    if prior != record {
+                        return Err("conflicting local reward ownership record".into());
+                    }
+                } else {
+                    ownership
+                        .insert(id.as_slice(), record.as_slice())
+                        .map_err(|_| "native local reward ownership write failed")?;
+                    let mut marker = [0u8; 9];
+                    marker[0] = 1;
+                    marker[1..].copy_from_slice(
+                        &count
+                            .checked_add(1)
+                            .ok_or("native local reward count exhausted")?
+                            .to_le_bytes(),
+                    );
+                    meta.insert(LOCAL_REWARDS_MARKER, marker.as_slice())
+                        .map_err(|_| "native local reward count write failed")?;
+                }
+            }
             let mut blocks = txn
                 .open_table(BLOCKS)
                 .map_err(|_| "native block table missing or incompatible")?;
@@ -473,6 +681,12 @@ fn initialize(database: &Database, config: &Config) -> Result<(), String> {
         let _ = meta
             .insert("head", initial.as_slice())
             .map_err(|_| "native genesis write failed")?;
+        meta.insert(LOCAL_REWARDS_MARKER, LOCAL_REWARDS_VERSION)
+            .map_err(|_| "native local reward marker initialization failed")?;
+        drop(
+            txn.open_table(LOCAL_REWARDS)
+                .map_err(|_| "native local reward index initialization failed")?,
+        );
         drop(
             txn.open_table(BLOCKS)
                 .map_err(|_| "native block table initialization failed")?,
@@ -483,14 +697,69 @@ fn initialize(database: &Database, config: &Config) -> Result<(), String> {
 }
 
 fn replay(
-    database: &Database,
+    database: &impl ReadableDatabase,
     config: Config,
     verifier: &impl BlockVerifier,
 ) -> Result<State, String> {
+    replay_history(database, config, verifier, None).map(|(state, _)| state)
+}
+
+/// Verify bounded idle history without initialization, repair or writes.
+/// These limits protect a local wallet scan and are not consensus limits.
+pub(crate) fn read_only_history(
+    path: &Path,
+    config: Config,
+    verifier: &impl BlockVerifier,
+    max_blocks: u64,
+    max_bytes: usize,
+) -> Result<(State, Vec<Block>), String> {
+    config.validate()?;
+    if max_blocks == 0 || max_bytes == 0 {
+        return Err("wallet replay resource limits must be positive".into());
+    }
+    let before = std::fs::symlink_metadata(path).map_err(|_| "initialized history unavailable")?;
+    if !before.is_file() || before.file_type().is_symlink() || before.len() == 0 {
+        return Err("wallet history must be an existing regular database".into());
+    }
+    let mut builder = Database::builder();
+    builder.set_cache_size(32 * 1024 * 1024);
+    let database = builder.open_read_only(path).map_err(
+        |_| "wallet history is active, damaged or unavailable; stop the writer before rescan",
+    )?;
+    let after = std::fs::symlink_metadata(path).map_err(|_| "wallet history path changed")?;
+    if !after.is_file() || !same_file(&before, &after) {
+        return Err("wallet history path changed".into());
+    }
+    replay_history(&database, config, verifier, Some((max_blocks, max_bytes)))
+}
+
+fn replay_history(
+    database: &impl ReadableDatabase,
+    config: Config,
+    verifier: &impl BlockVerifier,
+    limits: Option<(u64, usize)>,
+) -> Result<(State, Vec<Block>), String> {
+    let mut retained = Vec::new();
+    let mut inspected_bytes = 0usize;
+    let mut inspected_blocks = 0u64;
+    let mut account = |bytes: usize| -> Result<(), String> {
+        inspected_bytes = inspected_bytes
+            .checked_add(bytes)
+            .ok_or("wallet replay byte overflow")?;
+        inspected_blocks = inspected_blocks
+            .checked_add(1)
+            .ok_or("wallet replay count overflow")?;
+        if limits
+            .is_some_and(|(blocks, bytes)| inspected_blocks > blocks || inspected_bytes > bytes)
+        {
+            return Err("wallet replay local resource limit exceeded".into());
+        }
+        Ok(())
+    };
     let txn = database
         .begin_read()
         .map_err(|_| "native database read unavailable")?;
-    validate_tables(
+    let indexed = validate_tables(
         txn.list_tables()
             .map_err(|_| "native database schema unreadable")?,
         txn.list_multimap_tables()
@@ -512,6 +781,7 @@ fn replay(
         {
             let (key, record) = row.map_err(|_| "native detached record unreadable")?;
             let (bytes, _) = split_record(detached_record(record.value())?)?;
+            account(bytes.len())?;
             let block = Block::decode(bytes, &config.network)?;
             if key.value() != block.id()?.as_slice() {
                 return Err("native detached identity mismatch".into());
@@ -521,14 +791,14 @@ fn replay(
     let meta = txn
         .open_table(META)
         .map_err(|_| "native metadata table missing or incompatible")?;
+    check_index_marker(&meta, indexed)?;
     let encoded = configuration(&config);
-    if meta.len().map_err(|_| "native metadata unreadable")? != 2
-        || meta
-            .get("config")
-            .map_err(|_| "native configuration unreadable")?
-            .ok_or("native configuration missing")?
-            .value()
-            != encoded
+    if meta
+        .get("config")
+        .map_err(|_| "native configuration unreadable")?
+        .ok_or("native configuration missing")?
+        .value()
+        != encoded
     {
         return Err("native configuration or metadata mismatch".into());
     }
@@ -560,16 +830,20 @@ fn replay(
             return Err("missing or gapped canonical block".into());
         }
         let (bytes, fingerprint) = split_record(value.value())?;
+        account(bytes.len())?;
         let block = Block::decode(bytes, &state.config.network)?;
         state.apply(&block, verifier)?;
         if state.fingerprint().as_slice() != fingerprint {
             return Err("native block state fingerprint mismatch".into());
         }
+        if limits.is_some() {
+            retained.push(block);
+        }
     }
     if head(&state).as_slice() != saved.value() {
         return Err("native replay disagrees with committed head".into());
     }
-    Ok(state)
+    Ok((state, retained))
 }
 
 fn check_metadata(
@@ -578,13 +852,13 @@ fn check_metadata(
     expected_head: &[u8; HEAD_BYTES],
 ) -> Result<(), String> {
     let expected_config = configuration(config);
-    if table.len().map_err(|_| "native metadata unreadable")? != 2
-        || table
-            .get("config")
-            .map_err(|_| "native configuration unreadable")?
-            .ok_or("native configuration missing")?
-            .value()
-            != expected_config
+    metadata_indexed(table)?;
+    if table
+        .get("config")
+        .map_err(|_| "native configuration unreadable")?
+        .ok_or("native configuration missing")?
+        .value()
+        != expected_config
         || table
             .get("head")
             .map_err(|_| "native head unreadable")?
@@ -597,21 +871,65 @@ fn check_metadata(
     Ok(())
 }
 
+fn metadata_indexed(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<bool, String> {
+    let marker = table
+        .get(LOCAL_REWARDS_MARKER)
+        .map_err(|_| "native local reward marker unreadable")?;
+    let indexed = match marker {
+        Some(marker) if marker.value().len() == 9 && marker.value()[0] == 1 => true,
+        Some(_) => return Err("unsupported local reward ownership marker".into()),
+        None => false,
+    };
+    let expected = if indexed { 3 } else { 2 };
+    if table.len().map_err(|_| "native metadata unreadable")? != expected {
+        return Err("native metadata or local reward marker mismatch".into());
+    }
+    Ok(indexed)
+}
+fn local_reward_count(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<u64, String> {
+    let marker = table
+        .get(LOCAL_REWARDS_MARKER)
+        .map_err(|_| "native local reward marker unreadable")?
+        .ok_or("native local reward marker missing")?;
+    let bytes = marker.value();
+    if bytes.len() != 9 || bytes[0] != 1 {
+        return Err("invalid local reward count marker".into());
+    }
+    Ok(u64::from_le_bytes(
+        bytes[1..].try_into().expect("bounded local reward count"),
+    ))
+}
+fn check_index_marker(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    indexed: bool,
+) -> Result<(), String> {
+    if metadata_indexed(table)? != indexed {
+        return Err("native local reward marker and index disagree".into());
+    }
+    Ok(())
+}
 fn validate_tables(
     tables: impl Iterator<Item = redb::UntypedTableHandle>,
     has_multimap: bool,
-) -> Result<(), String> {
-    let names: BTreeSet<_> = tables.map(|table| table.name().to_owned()).collect();
+) -> Result<bool, String> {
+    let mut names: BTreeSet<_> = tables.map(|table| table.name().to_owned()).collect();
+    let indexed = names.remove(LOCAL_REWARDS.name());
+    names.remove(DETACHED.name());
     let expected = BTreeSet::from([META.name().to_owned(), BLOCKS.name().to_owned()]);
-    let extended = BTreeSet::from([
-        META.name().to_owned(),
-        BLOCKS.name().to_owned(),
-        DETACHED.name().to_owned(),
-    ]);
-    if has_multimap || (names != expected && names != extended) {
+    if has_multimap || names != expected {
         return Err("native database schema mismatch".into());
     }
-    Ok(())
+    Ok(indexed)
+}
+fn local_receipt_digest(id: &crate::wire::Hash, secret: &[u8]) -> crate::wire::Hash {
+    let mut hasher = blake3::Hasher::new_derive_key("siworld native local reward evidence v1");
+    hasher.update(id);
+    hasher.update(secret);
+    *hasher.finalize().as_bytes()
 }
 
 fn configuration(config: &Config) -> Vec<u8> {
@@ -726,3 +1044,6 @@ fn sync_parent(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod local_reward_tests;

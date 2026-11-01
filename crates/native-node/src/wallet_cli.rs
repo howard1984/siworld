@@ -8,8 +8,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use zeroize::Zeroizing;
+mod operations;
+mod payment_confirmation;
 
-pub const HELP: &str = "wallet-create WALLET_DIR NETWORK_DIR [ACCOUNT]  Create an encrypted wallet after a local mnemonic-backup challenge\nwallet-restore WALLET_DIR NETWORK_DIR [ACCOUNT] Restore from hidden 24-word input to a new directory\nwallet-address WALLET_DIR NETWORK_DIR          Authenticate and export the public address and recovery descriptor\nwallet-configure-miner WALLET_DIR NETWORK_DIR voyager|holder  Authenticate and set the next template's reward destination";
+pub const HELP: &str = "wallet-create WALLET_DIR NETWORK_DIR [ACCOUNT]  Create an encrypted wallet after a local mnemonic-backup challenge\nwallet-restore WALLET_DIR NETWORK_DIR [ACCOUNT] Restore from hidden 24-word input to a new directory\nwallet-address WALLET_DIR NETWORK_DIR          Authenticate and export the public address and recovery descriptor\nwallet-configure-miner WALLET_DIR NETWORK_DIR voyager|holder  Authenticate and set the next template's reward destination\nwallet-balance WALLET_DIR NETWORK_DIR  Privately rescan an idle engineering node (at most 64 blocks)\nwallet-privacy WALLET_DIR NETWORK_DIR on|off  Authenticate and save the optional enhanced privacy setting\nwallet-pay WALLET_DIR NETWORK_DIR RECIPIENT_DESCRIPTOR AMOUNT_ATOMS standard|priority [--enhanced-privacy|--skip-privacy-delay|--no-privacy-delay]  Confirm, prove, persist and mine a SIP payment on an idle node; mature inputs are immediately usable by default\nwallet-retry-payment WALLET_DIR NETWORK_DIR PAYMENT_ID  Retry only a durably stored identical payment";
 const TERMINAL_ERROR: &str =
     "wallet custody requires a trusted interactive terminal on stdin and stderr";
 const ADDRESS_BYTES: usize = 1232;
@@ -186,6 +188,12 @@ fn miner_status(
 /// `args` excludes the command name. Reject noninteractive use before generating
 /// entropy. Success writes public JSON only; recovery words go directly to TTY.
 pub fn run(command: &str, args: &[String]) -> Result<(), String> {
+    if matches!(
+        command,
+        "wallet-balance" | "wallet-pay" | "wallet-retry-payment" | "wallet-privacy"
+    ) {
+        return operations::run(command, args);
+    }
     let request = prepare_request(
         command,
         args,

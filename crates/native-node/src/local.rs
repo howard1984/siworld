@@ -173,21 +173,130 @@ pub(crate) fn save_reward_at(directory: &File, id: &Hash, secret: &[u8]) -> Resu
         return Err("invalid private reward directory or receipt".into());
     }
     let name = format!("reward-{}.secret", hex(id));
-    let descriptor = fs::openat(
+    let (descriptor, created) = match fs::openat(
         directory,
         name.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
-    )
-    .map_err(|_| "refusing to overwrite or open reward material")?;
+    ) {
+        Ok(descriptor) => (descriptor, true),
+        Err(rustix::io::Errno::EXIST) => (
+            fs::openat(
+                directory,
+                name.as_str(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|_| "existing reward evidence cannot be opened safely")?,
+            false,
+        ),
+        Err(_) => return Err("reward receipt creation failed".into()),
+    };
     let mut file = File::from(descriptor);
-    file.write_all(secret)
-        .and_then(|_| file.sync_all())
+    let identity = fs::fstat(&file).map_err(|_| "reward receipt metadata unavailable")?;
+    let private_regular = |stat: &rustix::fs::Stat| {
+        FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+            && stat.st_uid == rustix::process::geteuid().as_raw()
+            && stat.st_mode & 0o077 == 0
+            && stat.st_nlink == 1
+    };
+    if !private_regular(&identity) {
+        return Err("reward receipt must be an owned private singly linked regular file".into());
+    }
+    if created {
+        file.write_all(secret)
+            .map_err(|_| "reward receipt write failed")?;
+    } else {
+        if usize::try_from(identity.st_size).ok() != Some(secret.len()) {
+            return Err("existing reward receipt differs; evidence preserved".into());
+        }
+        let mut existing = Zeroizing::new(Vec::with_capacity(secret.len()));
+        Read::by_ref(&mut file)
+            .take((MAX_REWARD_SECRET + 1) as u64)
+            .read_to_end(&mut existing)
+            .map_err(|_| "existing reward receipt read failed")?;
+        if existing.len() != secret.len()
+            || existing
+                .iter()
+                .zip(secret)
+                .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                != 0
+        {
+            return Err("existing reward receipt differs; evidence preserved".into());
+        }
+    }
+    // A retry after a crash must reestablish both durability boundaries even
+    // when byte-identical evidence was already present before the append.
+    file.sync_all()
         .map_err(|_| "reward receipt durability failed")?;
+    let current = fs::fstat(&file).map_err(|_| "reward receipt metadata unavailable")?;
+    let named = fs::statat(directory, name.as_str(), fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| "reward receipt entry changed")?;
+    if !private_regular(&current)
+        || !private_regular(&named)
+        || current.st_dev != identity.st_dev
+        || current.st_ino != identity.st_ino
+        || named.st_dev != current.st_dev
+        || named.st_ino != current.st_ino
+        || usize::try_from(current.st_size).ok() != Some(secret.len())
+        || current.st_size != named.st_size
+    {
+        return Err("reward receipt identity changed; evidence preserved".into());
+    }
     directory
         .sync_all()
         .map_err(|_| "reward directory durability failed".to_owned())
 }
+
+/// Read through the store-owned parent descriptor without following links.
+#[cfg(unix)]
+pub(crate) fn read_reward_at(directory: &File, id: &Hash) -> Result<Zeroizing<Vec<u8>>, String> {
+    use rustix::fs::{self, FileType, Mode, OFlags};
+    let name = format!("reward-{}.secret", hex(id));
+    let descriptor = fs::openat(
+        directory,
+        name.as_str(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|_| "indexed reward receipt unavailable")?;
+    let mut file = File::from(descriptor);
+    let identity = fs::fstat(&file).map_err(|_| "reward receipt metadata unavailable")?;
+    if FileType::from_raw_mode(identity.st_mode) != FileType::RegularFile
+        || identity.st_uid != rustix::process::geteuid().as_raw()
+        || identity.st_mode & 0o077 != 0
+        || identity.st_nlink != 1
+        || identity.st_size <= 0
+        || usize::try_from(identity.st_size).map_or(true, |n| n > MAX_REWARD_SECRET)
+    {
+        return Err("indexed reward receipt is not an owned private regular file".into());
+    }
+    let mut secret = Zeroizing::new(Vec::with_capacity(identity.st_size as usize));
+    Read::by_ref(&mut file)
+        .take((MAX_REWARD_SECRET + 1) as u64)
+        .read_to_end(&mut secret)
+        .map_err(|_| "indexed reward receipt read failed")?;
+    let current = fs::fstat(&file).map_err(|_| "reward receipt metadata unavailable")?;
+    let named = fs::statat(directory, name.as_str(), fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| "indexed reward receipt entry changed")?;
+    if current.st_dev != identity.st_dev
+        || current.st_ino != identity.st_ino
+        || current.st_mode != identity.st_mode
+        || current.st_uid != identity.st_uid
+        || current.st_nlink != 1
+        || current.st_size != identity.st_size
+        || named.st_dev != current.st_dev
+        || named.st_ino != current.st_ino
+        || named.st_mode != current.st_mode
+        || named.st_nlink != 1
+        || named.st_size != current.st_size
+        || secret.len() != identity.st_size as usize
+    {
+        return Err("indexed reward receipt identity changed".into());
+    }
+    Ok(secret)
+}
+
 pub fn read_reward(path: &Path, id: &Hash) -> Result<Zeroizing<Vec<u8>>, String> {
     check_directory(path)?;
     let path = reward_path(path, id);

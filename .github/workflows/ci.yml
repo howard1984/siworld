@@ -380,21 +380,21 @@ jobs:
       - name: Native runtime format and lints
         run: |
           cargo fmt --manifest-path crates/native-node/Cargo.toml --check
-          cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --all-targets -- -D warnings
       - name: Native protocol, transition, persistence and audit rejection tests
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p
       - name: Actual fixed-profile transaction and settlement mutation rejection
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --lib proofs::tests::fixed_profiles_roundtrip_rejects_context_and_body_mutation -- --ignored --exact
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib proofs::tests::fixed_profiles_roundtrip_rejects_context_and_body_mutation -- --ignored --exact
       - name: Actual wallet transfer proof, admission and receiver authentication
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --lib wallet::tests::actual_native_wallet_proof_passes_admission_and_recipient_authentication -- --ignored --exact
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib wallet::tests::actual_native_wallet_proof_passes_admission_and_recipient_authentication -- --ignored --exact
       - name: Actual issuance block, durable registry and seed-wallet rescan
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --lib wallet::tests::actual_native_issuance_block_recovers_registry_and_seed_wallet_after_restart -- --ignored --exact
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib wallet::tests::actual_native_issuance_block_recovers_registry_and_seed_wallet_after_restart -- --ignored --exact
       - name: Actual proof block, restart and private reward recovery
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --lib producer::tests::actual_block_persists_replays_and_recovers_the_reward -- --ignored --exact
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib producer::tests::actual_block_persists_replays_and_recovers_the_reward -- --ignored --exact
       - name: Actual resident service lifecycle and final independent replay
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --lib service::tests::actual_continuous_service_exports_stops_and_replays -- --ignored --exact
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib service::tests::actual_continuous_service_exports_stops_and_replays -- --ignored --exact
       - name: Controlled native runtime package and CPU admission
         run: |
-          python3 scripts/build-native-runtime.py --output .local/native-runtime-release
+          python3 scripts/build-native-runtime.py --engineering-network --output .local/native-runtime-release
           .local/native-runtime-release/bin/siworld-native-node --check-cpu
           .local/native-runtime-release/bin/siworld-native-node --help

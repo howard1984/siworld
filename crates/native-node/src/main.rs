@@ -2,6 +2,7 @@
 use siworld_native_node::{
     audit, local, producer,
     proofs::{NativeProver, NativeVerifier},
+    runtime::Node,
     service,
     state::Config,
     store::Store,
@@ -9,9 +10,16 @@ use siworld_native_node::{
 use std::path::Path;
 fn help() {
     println!(
-        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY             Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY            Replay every proof and check every local reward receipt\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, migration, peer listener, issuance RPC listener, or public-network activation is provided."
+        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Replay every proof and check every local reward receipt\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
+    );
+    #[cfg(feature = "native-p2p")]
+    println!(
+        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\nPublic peer discovery and public-network activation are disabled."
     );
     println!("\n{}", siworld_native_node::wallet_cli::HELP);
+    println!(
+        "\nengineering-keys CUSTODY_DIRECTORY  Create independent private test custody on an operations host\ninit-engineering-genesis DIRECTORY CUSTODY_DIRECTORY  Seal siworld-eng-1 with production timings and one test fund account"
+    );
 }
 fn cpu_admission() -> Result<(), String> {
     #[cfg(target_arch = "x86_64")]
@@ -23,12 +31,54 @@ fn cpu_admission() -> Result<(), String> {
 fn config(path: &Path) -> Result<Config, String> {
     local::load(path)
 }
+fn genesis_identifier(path: &Path) -> Result<String, String> {
+    // The public rules are sufficient; do not lease or open the live store.
+    Ok(local::hex(&config(path)?.genesis_id()))
+}
 fn exact(args: &[String]) -> Result<(), String> {
     if args.len() != 2 {
         Err("unexpected argument".into())
     } else {
         Ok(())
     }
+}
+fn stop_command(args: &[String]) -> Result<(), String> {
+    match args {
+        [command, directory] if command == "stop" => service::request_stop(Path::new(directory)),
+        [command, directory, expected_run_id] if command == "stop" => {
+            service::request_stop_expected(Path::new(directory), expected_run_id)
+        }
+        _ => Err("expected stop DIRECTORY [EXPECTED_RUN_ID]".into()),
+    }
+}
+fn check_json(args: &[String]) -> Result<bool, String> {
+    match args {
+        [command, _] if command == "check" => Ok(false),
+        [command, _, flag] if command == "check" && flag == "--json" => Ok(true),
+        _ => Err("expected check DIRECTORY [--json]".into()),
+    }
+}
+#[cfg(feature = "native-p2p")]
+fn peer_genesis(source: &Path, expected_genesis: &str) -> Result<Config, String> {
+    if expected_genesis.len() != 64
+        || !expected_genesis
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("expected an independently checked lowercase genesis identifier".into());
+    }
+    // Read the immutable public configuration only. Identity seeds, database
+    // history, wallet custody, receipts and service records are never copied.
+    let config = local::load(source)?;
+    if local::hex(&config.genesis_id()) != expected_genesis {
+        return Err("genesis configuration differs from the expected genesis identifier".into());
+    }
+    if config.fixture || config.fund_allocation.is_none() {
+        return Err(
+            "peer initialization requires ASERT rules and an immutable fund allocation".into(),
+        );
+    }
+    Ok(config)
 }
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -37,13 +87,49 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     cpu_admission()?;
+    if matches!(
+        args[0].as_str(),
+        "wallet-create"
+            | "wallet-restore"
+            | "wallet-address"
+            | "wallet-configure-miner"
+            | "wallet-balance"
+            | "wallet-pay"
+            | "wallet-retry-payment"
+            | "wallet-privacy"
+    ) {
+        return siworld_native_node::wallet_cli::run(&args[0], &args[1..]);
+    }
     if args.len() < 2 || args.len() > 4 {
         return Err("expected command and explicit engineering directory; use --help".into());
     }
     let path = Path::new(&args[1]);
     match args[0].as_str() {
-        "wallet-create" | "wallet-restore" | "wallet-address" | "wallet-configure-miner" => {
-            siworld_native_node::wallet_cli::run(&args[0], &args[1..])?;
+        "engineering-keys" => {
+            exact(&args)?;
+            let public = siworld_native_node::engineering_genesis::prepare(path)?;
+            println!("{public}");
+        }
+        "init-engineering-genesis" => {
+            if args.len() != 3 {
+                return Err("expected DIRECTORY CUSTODY_DIRECTORY".into());
+            }
+            let (timestamp, target, iterations) = service::calibrate()?;
+            let config = siworld_native_node::engineering_genesis::initialize(
+                path,
+                Path::new(&args[2]),
+                timestamp,
+                target,
+                iterations,
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({"name": "siworld-eng-1", "genesis_id": local::hex(&config.genesis_id()), "checkpoint_startup": "inactive"})
+            );
+        }
+        "genesis-id" => {
+            exact(&args)?;
+            println!("{}", genesis_identifier(path)?);
         }
         "identity-init" | "identity-public" => {
             exact(&args)?;
@@ -81,13 +167,44 @@ fn run() -> Result<(), String> {
             )?;
             println!("mining preference saved for the next block template");
         }
+        #[cfg(feature = "native-p2p")]
+        "init-peer" => {
+            if args.len() != 4 {
+                return Err("expected DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID".into());
+            }
+            let public_rules = peer_genesis(Path::new(&args[2]), &args[3])?;
+            let config = local::initialize_config(path, public_rules)?;
+            let _lease = service::Lease::acquire(path)?;
+            let verifier = NativeVerifier::new()?;
+            let store = Store::open(path.join("chain.redb"), config, &verifier)?;
+            println!(
+                "initialized native engineering peer: network={}, height={}, genesis={}",
+                local::hex(&store.state().config.network),
+                store.state().height,
+                local::hex(&store.state().config.genesis_id())
+            );
+        }
+        #[cfg(feature = "native-p2p")]
+        "run-network" => {
+            if args.len() != 3 {
+                return Err("expected DIRECTORY PEER_CONFIG".into());
+            }
+            service::run_network(path, Path::new(&args[2]))?;
+        }
+        #[cfg(feature = "native-p2p")]
+        "peer-pin" => {
+            if args.len() != 4 {
+                return Err("expected DIRECTORY DESCRIPTOR_FILE EXPECTED_FINGERPRINT".into());
+            }
+            service::network::pin_peer(path, Path::new(&args[2]), &args[3])?;
+            println!("independently verified peer pin persisted");
+        }
         "run" => {
             exact(&args)?;
             service::run(path)?;
         }
         "stop" => {
-            exact(&args)?;
-            service::request_stop(path)?;
+            stop_command(&args)?;
             println!("graceful stop requested for the exported service run");
         }
         "service-status" => {
@@ -115,6 +232,25 @@ fn run() -> Result<(), String> {
             );
         }
         "status" | "check" | "audit" => {
+            if args[0] == "check" {
+                let as_json = check_json(&args)?;
+                let checked = service::check_offline(path)?;
+                if as_json {
+                    println!("{checked}");
+                } else {
+                    println!(
+                        "verified engineering state: height={}, tip={}, state={}",
+                        checked["height"]
+                            .as_u64()
+                            .ok_or("checked height unavailable")?,
+                        checked["tip"].as_str().ok_or("checked tip unavailable")?,
+                        checked["state_fingerprint"]
+                            .as_str()
+                            .ok_or("checked fingerprint unavailable")?,
+                    );
+                }
+                return Ok(());
+            }
             exact(&args)?;
             if args[0] == "status" && path.join(service::STATUS_FILE).exists() {
                 println!("{}", service::exported_status(path)?);
@@ -148,14 +284,6 @@ fn run() -> Result<(), String> {
                 println!("{}", audit_summary(&report));
                 return Ok(());
             }
-            if args[0] == "check" {
-                for height in 1..=store.state().height {
-                    let block = store.block(height)?;
-                    let id = block.id()?;
-                    let secret = local::read_reward(path, &id)?;
-                    producer::validate_reward_secret(&block, &secret)?;
-                }
-            }
             println!(
                 "verified engineering state: height={}, tip={}, state={}",
                 store.state().height,
@@ -172,19 +300,23 @@ fn run() -> Result<(), String> {
             }
             let _lease = service::Lease::acquire(path)?;
             let verifier = NativeVerifier::new()?;
-            let mut store =
-                Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+            let store = Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+            let mut node = Node::new(store, verifier);
             let prover = NativeProver::new()?;
-            let settings = siworld_native_node::mining::load(path, store.state().config.network)?;
-            let produced = producer::produce(store.state(), &prover, slots, &settings)?;
-            let id = produced.block.id()?;
-            producer::validate_reward_secret(&produced.block, &produced.reward_secret)?;
-            local::save_reward(path, &id, &produced.reward_secret)?;
-            store.append(&produced.block, &verifier)?;
+            let settings = siworld_native_node::mining::load(path, node.state().config.network)?;
+            let permit = node
+                .begin_production()
+                .map_err(|_| "production preparation state unavailable")?;
+            let produced = producer::produce(node.state(), &prover, slots, &settings)?;
+            let prepared = node
+                .bind_produced(permit, produced)
+                .map_err(|_| "completed production no longer matches the node state")?;
+            node.commit_produced(prepared)
+                .map_err(|_| "native production receipt or canonical commit rejected")?;
             println!(
                 "accepted engineering block: height={}, tip={}",
-                store.state().height,
-                local::hex(&store.state().tip)
+                node.state().height,
+                local::hex(&node.state().tip)
             );
         }
         _ => return Err("unknown command; use --help".into()),
@@ -316,6 +448,257 @@ mod tests {
             assert_eq!(
                 check_audit_head(&changed, &state).unwrap_err(),
                 "offline issuance audit head differs from verified store"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_command_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "siworld-control-command-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn arguments(command: &str, directory: &Path, extra: &[&str]) -> Vec<String> {
+        std::iter::once(command.to_owned())
+            .chain(std::iter::once(directory.to_str().unwrap().to_owned()))
+            .chain(extra.iter().map(|value| (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn stop_cli_rejects_malformed_mismatched_and_extra_arguments_before_mutation() {
+        let directory = Directory::new();
+        let run_id = "b".repeat(64);
+        let stale = "a".repeat(64);
+        let uppercase = "B".repeat(64);
+        let status = directory.0.join(service::STATUS_FILE);
+        std::fs::write(
+            &status,
+            serde_json::to_vec(&serde_json::json!({
+                "run_id": run_id, "phase": "networking"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&status, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        for extra in [
+            vec![""],
+            vec!["invalid"],
+            vec![uppercase.as_str()],
+            vec![stale.as_str()],
+            vec![run_id.as_str(), "extra"],
+        ] {
+            assert!(stop_command(&arguments("stop", &directory.0, &extra)).is_err());
+            assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+            assert!(!service::stop_requested(&directory.0, &run_id).unwrap());
+        }
+        assert!(stop_command(&["stop".into()]).is_err());
+        stop_command(&arguments("stop", &directory.0, &[&run_id])).unwrap();
+        assert!(service::stop_requested(&directory.0, &run_id).unwrap());
+    }
+
+    #[test]
+    fn check_cli_accepts_only_an_optional_exact_json_flag() {
+        let directory = Path::new("unused");
+        assert!(!check_json(&arguments("check", directory, &[])).unwrap());
+        assert!(check_json(&arguments("check", directory, &["--json"])).unwrap());
+        for extra in [
+            vec!["json"],
+            vec!["--JSON"],
+            vec!["--json", "extra"],
+            vec!["--json", "--json"],
+        ] {
+            assert!(check_json(&arguments("check", directory, &extra)).is_err());
+        }
+        assert!(check_json(&["check".into()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod peer_initialization_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "siworld-peer-genesis-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn asert() -> Config {
+        let fixture = Config::development([83; 32], 0).unwrap();
+        Config::asert_development(fixture.network, 1, [0xff; 32], 1)
+            .unwrap()
+            .with_fund_wallets(
+                fixture.fund_allocation.unwrap(),
+                fixture.fund_verifying_keys,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn genesis_identifier_reads_only_validated_rules_and_binds_rule_changes() {
+        let parent = Directory::new();
+        let source = parent.0.join("source");
+        let original = asert();
+        local::initialize_config(&source, original.clone()).unwrap();
+        // Runtime sentinels are deliberately unusable as files. Reading the
+        // public rules must not acquire a lease, open history or read secrets.
+        for name in [
+            "chain.redb",
+            "native-peer-identity.secret",
+            "reward-fixture.secret",
+            "service-status.json",
+        ] {
+            std::fs::create_dir(source.join(name)).unwrap();
+        }
+        let before = std::fs::read(source.join("engineering-network.bin")).unwrap();
+        let identifier = genesis_identifier(&source).unwrap();
+        assert_eq!(identifier, local::hex(&original.genesis_id()));
+        assert_eq!(identifier.len(), 64);
+        assert!(
+            identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            std::fs::read(source.join("engineering-network.bin")).unwrap(),
+            before
+        );
+        assert_eq!(std::fs::read_dir(&source).unwrap().count(), 5);
+
+        let modified = parent.0.join("modified");
+        let mut altered = original.clone();
+        altered.pow_iterations += 1;
+        local::initialize_config(&modified, altered).unwrap();
+        assert_eq!(local::load(&modified).unwrap().network, original.network);
+        assert_ne!(genesis_identifier(&modified).unwrap(), identifier);
+
+        let mut malformed = before;
+        malformed[0] ^= 1;
+        std::fs::write(source.join("engineering-network.bin"), malformed).unwrap();
+        assert!(genesis_identifier(&source).is_err());
+        let absent = parent.0.join("absent");
+        assert!(genesis_identifier(&absent).is_err());
+        assert!(!absent.exists());
+    }
+
+    #[cfg(feature = "native-p2p")]
+    #[test]
+    fn peer_genesis_requires_the_exact_explicit_genesis_and_an_asert_fund_registry() {
+        let parent = Directory::new();
+        let source = parent.0.join("source");
+        let original = asert();
+        local::initialize_config(&source, original.clone()).unwrap();
+        let genesis = local::hex(&original.genesis_id());
+        assert_eq!(peer_genesis(&source, &genesis).unwrap(), original);
+        for invalid in [
+            "".to_owned(),
+            "0".repeat(63),
+            "f".repeat(64),
+            "A".repeat(64),
+        ] {
+            assert!(peer_genesis(&source, &invalid).is_err());
+        }
+        let fixture = parent.0.join("fixture");
+        local::initialize_config(&fixture, Config::development(original.network, 0).unwrap())
+            .unwrap();
+        let fixture_id = local::hex(&local::load(&fixture).unwrap().genesis_id());
+        assert!(peer_genesis(&fixture, &fixture_id).is_err());
+        let unallocated = parent.0.join("unallocated");
+        local::initialize_config(
+            &unallocated,
+            Config::asert_development(original.network, 1, [0xff; 32], 1).unwrap(),
+        )
+        .unwrap();
+        let unallocated_id = local::hex(&local::load(&unallocated).unwrap().genesis_id());
+        assert!(peer_genesis(&unallocated, &unallocated_id).is_err());
+        let modified = parent.0.join("modified");
+        let mut altered = original.clone();
+        altered.pow_iterations += 1;
+        local::initialize_config(&modified, altered).unwrap();
+        assert_eq!(local::load(&modified).unwrap().network, original.network);
+        assert!(peer_genesis(&modified, &genesis).is_err());
+    }
+
+    #[cfg(feature = "native-p2p")]
+    #[test]
+    fn same_genesis_provisioning_copies_only_public_rules_and_refuses_existing_destinations() {
+        let parent = Directory::new();
+        let source = parent.0.join("source");
+        let target = parent.0.join("target");
+        let original = asert();
+        local::initialize_config(&source, original.clone()).unwrap();
+        // Synthetic sentinels represent source-owned runtime material. They
+        // must never be opened, interpreted or copied by genesis provisioning.
+        for name in [
+            "chain.redb",
+            "native-peer-identity.secret",
+            "reward-fixture.secret",
+            "service-status.json",
+        ] {
+            std::fs::write(source.join(name), b"synthetic source-only sentinel").unwrap();
+        }
+        let config = peer_genesis(&source, &local::hex(&original.genesis_id())).unwrap();
+        local::initialize_config(&target, config).unwrap();
+        assert_eq!(local::load(&target).unwrap(), original);
+        assert_eq!(
+            local::load(&target).unwrap().genesis_id(),
+            original.genesis_id()
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+        assert!(local::initialize_config(&target, original).is_err());
+        for name in [
+            "chain.redb",
+            "native-peer-identity.secret",
+            "reward-fixture.secret",
+            "service-status.json",
+        ] {
+            assert!(!target.join(name).exists());
+            assert_eq!(
+                std::fs::read(source.join(name)).unwrap(),
+                b"synthetic source-only sentinel"
             );
         }
     }

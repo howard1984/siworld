@@ -14,16 +14,19 @@ Recover unlock heights by decrypting authenticated permanent ciphertexts,
 rebuilding note commitments and reconciling permanent nullifiers. A seed-only
 restore must find old unspent locked notes even after proofs are deleted.
 
-After a locked note reaches its prescribed unlock height, every wallet transfer
-preparation waits for a private delay of six hours through three days. This
-applies to either selected input and includes reward maturity as well as Holder
-tranches; explicit note selection cannot bypass the delay. Ordinary notes with
-unlock height zero remain immediately available for manual transfers. Opt-in
-automatic consolidation applies the same delay to ordinary notes as well.
+Manual transfers immediately prepare and submit consensus-mature inputs after
+normal fee, reservation and proof checks. A recent arrival or recently unlocked
+note produces an immediate-spend privacy warning that requires explicit user
+confirmation; it does not add a mandatory waiting period. Background selection
+and optional consolidation retain a deterministic private delay from zero
+through six hours. Engineering and test networks disable background delay by
+default. Main-network background policy enables it by default. Opt-in enhanced
+privacy also applies the delay to manual transfers. No setting permits spending
+before consensus maturity or a Holder unlock height.
 
 Derive each independent delay from the seed-derived scheduling key and note
 commitment. Start it at the canonical block timestamp where the note first
-becomes spendable. Canonical replay reconstructs the same schedule after seed
+becomes spendable (or arrives, for an unrestricted ordinary note). Canonical replay reconstructs the same schedule after seed
 recovery; reorganization recomputes eligibility and removes orphan receipts.
 Missing canonical eligibility fails closed. The caller supplies local time only
 to wallet preparation; it never affects consensus validity or permits early

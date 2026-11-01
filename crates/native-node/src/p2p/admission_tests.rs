@@ -213,7 +213,7 @@ fn cancellation_during_hello_releases_the_gate_before_another_io() {
 }
 
 #[test]
-fn successful_admission_preserves_the_expected_peer_and_releases_the_gate() {
+fn successful_admission_preserves_peer_and_bytes_while_releasing_the_gate() {
     let mut admission = test_support::admission(binding(), [11; 32], ConnectionRole::Initiator);
     admission.deadline.elapsed = Some(Arc::new(AtomicU64::new(0)));
     let channel = scripted(&admission, 0);
@@ -222,6 +222,14 @@ fn successful_admission_preserves_the_expected_peer_and_releases_the_gate() {
     let session = Session::establish(auth, &admission, Role::Miner, budget.clone()).unwrap();
     assert_eq!(session.peer(), admission.expected_peer().fingerprint());
     assert_eq!(session.role(), Role::Validator);
+    {
+        let usage = budget.0.usage.lock().unwrap();
+        assert_eq!(
+            (usage.bytes, usage.handshakes, usage.handshake_bytes),
+            (HANDSHAKE_BYTES, 0, 0)
+        );
+    }
+    drop(session);
     assert_released(&budget);
 }
 

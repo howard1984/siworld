@@ -1224,3 +1224,121 @@ fn corrupted_detached_evidence_fails_reopen_without_reinitialization() {
     assert_eq!(txn.open_table(BLOCKS).unwrap().len().unwrap(), 2);
     assert_eq!(txn.open_table(DETACHED).unwrap().len().unwrap(), 1);
 }
+
+#[test]
+fn read_only_wallet_replay_verifies_every_proof_and_enforces_local_bounds() {
+    let dir = TestDir::new();
+    let mut store = Store::open(dir.db(), config(), &TestVerifier::default()).unwrap();
+    for seed in [1, 100000] {
+        let block = candidate(store.state(), seed);
+        store.append(&block, &TestVerifier::default()).unwrap();
+    }
+    let fingerprint = store.state().fingerprint();
+    drop(store);
+    assert!(
+        read_only_history(&dir.db(), config(), &TestVerifier::default(), 1, usize::MAX).is_err()
+    );
+    assert!(read_only_history(&dir.db(), config(), &TestVerifier::default(), 4096, 1).is_err());
+    let before = std::fs::read(dir.db()).unwrap();
+    let verifier = TestVerifier::default();
+    let (state, blocks) =
+        read_only_history(&dir.db(), config(), &verifier, 4096, 512 * 1024 * 1024).unwrap();
+    assert_eq!(state.fingerprint(), fingerprint);
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(std::fs::read(dir.db()).unwrap(), before);
+    assert_eq!(verifier.transactions.get(), 128);
+    assert_eq!(verifier.settlements.get(), 2);
+    assert!(
+        read_only_history(
+            &dir.db(),
+            config(),
+            &TestVerifier {
+                reject: true,
+                ..Default::default()
+            },
+            4096,
+            512 * 1024 * 1024
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn read_only_wallet_replay_rejects_wrong_configuration_without_writes() {
+    let dir = TestDir::new();
+    drop(Store::open(dir.db(), config(), &TestVerifier::default()).unwrap());
+    let before = std::fs::read(dir.db()).unwrap();
+    let other = Config::development([92; 32], 0).unwrap();
+    assert!(
+        read_only_history(
+            &dir.db(),
+            other,
+            &TestVerifier::default(),
+            64,
+            4 * 1024 * 1024
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(dir.db()).unwrap(), before);
+}
+
+#[test]
+fn read_only_wallet_replay_rejects_nonpositive_limits_before_filesystem_access() {
+    let dir = TestDir::new();
+    for (blocks, bytes) in [(0, 1), (1, 0), (0, 0)] {
+        let error =
+            match read_only_history(&dir.db(), config(), &TestVerifier::default(), blocks, bytes) {
+                Ok(_) => panic!("nonpositive local scan limits must fail"),
+                Err(error) => error,
+            };
+        assert_eq!(error, "wallet replay resource limits must be positive");
+        assert!(!dir.db().exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_wallet_replay_rejects_symlink_without_touching_target() {
+    let dir = TestDir::new();
+    drop(Store::open(dir.db(), config(), &TestVerifier::default()).unwrap());
+    let before = std::fs::read(dir.db()).unwrap();
+    let alias = dir.0.join("readonly-alias.redb");
+    std::os::unix::fs::symlink(dir.db(), &alias).unwrap();
+    assert!(
+        read_only_history(
+            &alias,
+            config(),
+            &TestVerifier::default(),
+            64,
+            4 * 1024 * 1024
+        )
+        .is_err()
+    );
+    assert!(
+        std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(dir.db()).unwrap(), before);
+}
+
+#[test]
+fn read_only_wallet_replay_rejects_corruption_without_repair() {
+    let dir = TestDir::new();
+    drop(Store::open(dir.db(), config(), &TestVerifier::default()).unwrap());
+    let mut damaged = std::fs::read(dir.db()).unwrap();
+    damaged[0] ^= 0x80;
+    std::fs::write(dir.db(), &damaged).unwrap();
+    assert!(
+        read_only_history(
+            &dir.db(),
+            config(),
+            &TestVerifier::default(),
+            64,
+            4 * 1024 * 1024
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(dir.db()).unwrap(), damaged);
+}

@@ -47,6 +47,8 @@ def package(worker, output, receipt, release):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--engineering-network', action='store_true',
+                        help='Include the explicit pinned-peer engineering listener')
     args = parser.parse_args()
     spec = importlib.util.spec_from_file_location('controlled_release', ROOT / 'scripts/build-prover-release.py')
     release = importlib.util.module_from_spec(spec)
@@ -57,8 +59,12 @@ def main():
     if args.output.exists():
         raise ValueError('Refusing to overwrite a release directory')
     manifest = ROOT / 'crates/native-node/Cargo.toml'
-    subprocess.run(['cargo', 'build', '--release', '--locked', '--manifest-path', str(manifest),
-                    '--bin', 'siworld-native-node'], cwd=ROOT, check=True)
+    features = ['native-p2p'] if args.engineering_network else []
+    command = ['cargo', 'build', '--release', '--locked', '--manifest-path', str(manifest),
+               '--bin', 'siworld-native-node']
+    if features:
+        command += ['--features', ','.join(features)]
+    subprocess.run(command, cwd=ROOT, check=True)
     target = Path(os.environ.get('CARGO_TARGET_DIR', str(manifest.parent / 'target')))
     if not target.is_absolute():
         target = ROOT / target
@@ -68,6 +74,7 @@ def main():
         'effective_rustflags': ' '.join(release.V3_FLAGS),
         'cargo_working_directory': 'repository-root',
         'repository_config_sha256': release.digest(ROOT / '.cargo/config.toml'),
+        'cargo_features': features,
     }
     package(worker, args.output.resolve(), receipt, release)
     print(json.dumps({'worker': 'siworld-native-node', 'packaged': True}))

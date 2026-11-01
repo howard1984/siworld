@@ -68,6 +68,12 @@ impl Owner {
         crate::local::save_reward_at(&self.directory, id, secret)?;
         self.check(true)
     }
+    pub(super) fn read(&self, id: &Hash) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        self.check(true)?;
+        let secret = crate::local::read_reward_at(&self.directory, id)?;
+        self.check(true)?;
+        Ok(secret)
+    }
 }
 
 #[cfg(not(unix))]
@@ -78,6 +84,9 @@ impl Owner {
         Ok(Self)
     }
     pub(super) fn save(&self, _: &Hash, _: &[u8]) -> Result<(), String> {
+        Err("store-owned reward receipts require a qualified Unix platform".into())
+    }
+    pub(super) fn read(&self, _: &Hash) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
         Err("store-owned reward receipts require a qualified Unix platform".into())
     }
 }

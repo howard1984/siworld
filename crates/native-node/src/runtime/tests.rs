@@ -306,6 +306,7 @@ fn scripted_gossip_admits_only_a_matching_sidecar_and_exact_compact_recovery_omi
         (responses[1].0, responses[1].1, responses[1].2.len()),
         (p2p::END_BATCH, 72, 0)
     );
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -359,6 +360,7 @@ fn serving_a_locator_echoes_the_request_and_streams_valid_bound_blocks() {
             }
         );
     }
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -391,6 +393,7 @@ fn synchronization_rejects_each_wrong_response_request_without_mutating_or_retai
         assert!(
             attempt.peer.is_none() && attempt.staging.is_none() && attempt.reservations.is_empty()
         );
+        drop(session);
         assert!(full_budget_available(&node.transport_budget()));
     }
 }
@@ -416,6 +419,7 @@ fn a_verified_work_extension_is_adopted_and_all_packet_reservations_are_released
     let requests = sent(&output);
     assert_eq!((requests[0].0, requests[0].1), (p2p::GET_BLOCKS, 76));
     assert_eq!(requests.len(), 1);
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -455,6 +459,7 @@ fn staged_lower_work_forks_hold_guards_until_adoption_then_release_every_batch()
         if index > 0 {
             assert_eq!(requests[0].2, encode_continue(base, after));
         }
+        drop(session);
         if index < 2 {
             assert_eq!(node.state().fingerprint(), original);
             assert_eq!(attempt.reservations.len(), index + 1);
@@ -494,6 +499,7 @@ fn retryable_remote_unavailability_discards_the_staged_attempt_and_its_guards() 
     let (mut session, _) = scripted(&node, [46; 32], replies(&node, 83, meta, &[block]));
     let mut attempt = SyncAttempt::default();
     node.synchronize(&mut session, 83, &mut attempt).unwrap();
+    drop(session);
     assert!(!full_budget_available(&node.transport_budget()));
     let fingerprint = node.state().fingerprint();
     let unavailable = frame(node.binding(), p2p::UNAVAILABLE, 84, &[]);
@@ -504,6 +510,7 @@ fn retryable_remote_unavailability_discards_the_staged_attempt_and_its_guards() 
     ));
     assert_eq!(node.state().fingerprint(), fingerprint);
     assert!(attempt.peer.is_none() && attempt.staging.is_none() && attempt.reservations.is_empty());
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -538,6 +545,7 @@ fn exact_missing_proof_responses_retain_guards_without_admitting_sidecarless_tra
         ];
         let (mut session, _) = scripted(&node, [47; 32], packets);
         let result = node.fetch_missing(&mut session, 85, &[reference]);
+        drop(session);
         if mismatch == 0 {
             let recovered = result.unwrap();
             assert_eq!(recovered.transactions(), std::slice::from_ref(&transaction));
@@ -613,6 +621,7 @@ fn compact_adoption_rechecks_proofs_and_releases_all_pending_and_transport_reser
         sent(&output),
         vec![(p2p::END_BATCH, 88, block.id().unwrap().to_vec())]
     );
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -667,6 +676,7 @@ fn compact_relay_fetches_every_missing_slot_and_exact_proof_before_atomic_import
         sent.last().unwrap(),
         &(p2p::END_BATCH, request, block.id().unwrap().to_vec())
     );
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -720,6 +730,7 @@ fn compact_recovery_requests_only_missing_exact_references() {
         .collect();
     assert_eq!(requested.len(), 63);
     assert!(!requested.contains(&known_reference));
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -748,6 +759,7 @@ fn compact_retry_acknowledges_only_the_exact_previously_accepted_skeleton() {
         sent(&output),
         vec![(p2p::END_BATCH, 105, compact.expected_id.to_vec())]
     );
+    drop(session);
     let mut forged = compact;
     forged.settlement.push(2);
     let (mut session, output) = scripted(
@@ -766,6 +778,7 @@ fn compact_retry_acknowledges_only_the_exact_previously_accepted_skeleton() {
     ));
     assert!(sent(&output).is_empty());
     assert_eq!(node.state().fingerprint(), before);
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -806,6 +819,7 @@ fn compact_sender_serves_requested_proofs_from_owned_block_after_mempool_pruning
         );
     }
     assert_eq!(sent.last().unwrap(), &(p2p::END_BATCH, request, vec![]));
+    drop(session);
     assert!(full_budget_available(&node.transport_budget()));
 }
 
@@ -841,6 +855,7 @@ fn missing_compact_proof_tampering_does_not_change_state_or_keep_buffers() {
         ));
         assert_eq!(node.state().fingerprint(), before);
         assert!(node.mempool().is_empty());
+        drop(session);
         assert!(full_budget_available(&node.transport_budget()));
     }
 }
@@ -943,7 +958,7 @@ fn compact_reconstruction_exhaustion_is_retryable_and_keeps_pending_transactions
     let block = pending_compact_block(&mut node);
     let compact = CompactBlock::from_block(&block).unwrap();
     let fingerprint = node.state().fingerprint();
-    node.budget = Budget::new(p2p::HANDSHAKE_BYTES);
+    node.budget = Budget::new(2 * p2p::HANDSHAKE_BYTES);
     let packet = frame(
         node.binding(),
         p2p::COMPACT_BLOCK,
@@ -963,9 +978,14 @@ fn compact_reconstruction_exhaustion_is_retryable_and_keeps_pending_transactions
     assert_eq!(node.mempool().len(), 64);
     assert!(node.transport_budget().reserve(128 * 1024).is_ok());
     drop(pressure);
+    assert_eq!(
+        node.transport_budget().available().unwrap(),
+        p2p::HANDSHAKE_BYTES
+    );
+    drop(session);
     assert!(
         node.transport_budget()
-            .reserve(p2p::HANDSHAKE_BYTES)
+            .reserve(2 * p2p::HANDSHAKE_BYTES)
             .is_ok()
     );
 }
@@ -987,7 +1007,9 @@ fn outgoing_locator_lookup_exhaustion_precedes_get_blocks_and_preserves_pending(
     let fingerprint = node.state().fingerprint();
     let (mut session, output) = scripted(&node, [51; 32], Vec::new());
     let budget = node.transport_budget();
-    let pressure = budget.reserve(p2p::CONNECTION_BYTES - 65_536).unwrap();
+    let pressure = budget
+        .reserve(p2p::CONNECTION_BYTES - p2p::HANDSHAKE_BYTES - 65_536)
+        .unwrap();
     let available = budget.available().unwrap();
     let mut attempt = SyncAttempt::default();
     assert!(matches!(
@@ -1001,6 +1023,11 @@ fn outgoing_locator_lookup_exhaustion_precedes_get_blocks_and_preserves_pending(
     assert!(attempt.peer.is_none() && attempt.staging.is_none() && attempt.reservations.is_empty());
     assert_eq!(budget.available().unwrap(), available);
     drop(pressure);
+    assert_eq!(
+        budget.available().unwrap(),
+        p2p::CONNECTION_BYTES - p2p::HANDSHAKE_BYTES
+    );
+    drop(session);
     assert!(full_budget_available(&budget));
 }
 
@@ -1024,7 +1051,9 @@ fn incoming_locator_lookup_exhaustion_is_retryable_and_preserves_pending() {
     let packet = frame(node.binding(), p2p::GET_BLOCKS, 91, &request);
     let (mut session, output) = scripted(&node, [52; 32], vec![packet]);
     let budget = node.transport_budget();
-    let pressure = budget.reserve(p2p::CONNECTION_BYTES - 65_536).unwrap();
+    let pressure = budget
+        .reserve(p2p::CONNECTION_BYTES - p2p::HANDSHAKE_BYTES - 65_536)
+        .unwrap();
     let available = budget.available().unwrap();
     assert!(matches!(
         node.serve_once(&mut session),
@@ -1036,6 +1065,11 @@ fn incoming_locator_lookup_exhaustion_is_retryable_and_preserves_pending() {
     assert_eq!(node.mempool().len(), 1);
     assert_eq!(budget.available().unwrap(), available);
     drop(pressure);
+    assert_eq!(
+        budget.available().unwrap(),
+        p2p::CONNECTION_BYTES - p2p::HANDSHAKE_BYTES
+    );
+    drop(session);
     assert!(full_budget_available(&budget));
 }
 

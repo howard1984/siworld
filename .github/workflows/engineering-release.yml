@@ -1,0 +1,67 @@
+name: Engineering release
+
+on:
+  push:
+    tags: ['v1.*-eng.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/native-node
+      - name: Build guarded node, miner and wallet CLI
+        run: |
+          python3 scripts/build-native-runtime.py --engineering-network --output .local/engineering-release
+          .local/engineering-release/bin/siworld-native-node --check-cpu
+          .local/engineering-release/bin/siworld-native-node --help
+      - name: Record source and package digests
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path('.local/engineering-release')
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          manifest = {'schema': 1, 'version': os.environ['RELEASE_VERSION'],
+              'source_commit': os.environ['SOURCE_COMMIT'],
+              'worker_sha256': digest(root / 'libexec/siworld-native-node'),
+              'roles': ['validator', 'miner', 'wallet-cli'], 'cargo_features': ['native-p2p'],
+              'network_class': 'resettable-engineering'}
+          (root / 'release-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          files = sorted(p for p in root.rglob('*') if p.is_file())
+          (root / 'SHA256SUMS').write_text(''.join(digest(p) + '  ' + str(p.relative_to(root)) + '\n' for p in files))
+          PY
+          mkdir -p .local/release-assets
+          tar -czf .local/release-assets/siworld-linux-x86_64.tar.gz -C .local engineering-release
+          cd .local/release-assets
+          sha256sum siworld-linux-x86_64.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: engineering-linux-x86_64
+          path: .local/release-assets/*
+          retention-days: 14
+      - name: Publish tagged engineering assets
+        if: startsWith(github.ref, 'refs/tags/v1.')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null
+          gh release upload "$RELEASE_TAG" .local/release-assets/*

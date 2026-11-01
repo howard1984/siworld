@@ -113,6 +113,168 @@ fn immutable_receipts_and_run_bound_stop_requests() {
     assert!(!stop_requested(&directory.0, &other.run_id).unwrap());
 }
 
+fn active_status(directory: &Path, run_id: &str) {
+    atomic_json(
+        &directory.join(STATUS_FILE),
+        &json!({"run_id": run_id, "phase": "networking"}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn expected_run_stop_rejects_malformed_or_replaced_runs_without_mutation() {
+    let directory = Directory::new();
+    let expected = "a".repeat(64);
+    let replacement = "b".repeat(64);
+    active_status(&directory.0, &replacement);
+    let before = fs::read(directory.0.join(STATUS_FILE)).unwrap();
+    for invalid in [
+        String::new(),
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "g".repeat(64),
+        format!("../{}", "a".repeat(64)),
+        expected,
+    ] {
+        assert!(request_stop_expected(&directory.0, &invalid).is_err());
+        assert_eq!(fs::read(directory.0.join(STATUS_FILE)).unwrap(), before);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+        assert!(!stop_requested(&directory.0, &replacement).unwrap());
+    }
+    request_stop_expected(&directory.0, &replacement).unwrap();
+    assert!(stop_requested(&directory.0, &replacement).unwrap());
+    request_stop_expected(&directory.0, &replacement).unwrap();
+}
+
+#[test]
+fn explicitly_requested_stop_file_cannot_stop_a_later_replacement_run() {
+    let directory = Directory::new();
+    let expected = "a".repeat(64);
+    let replacement = "b".repeat(64);
+    active_status(&directory.0, &expected);
+    request_stop_expected(&directory.0, &expected).unwrap();
+    active_status(&directory.0, &replacement);
+    assert!(stop_requested(&directory.0, &expected).unwrap());
+    assert!(!stop_requested(&directory.0, &replacement).unwrap());
+    assert!(request_stop_expected(&directory.0, &expected).is_err());
+    assert!(!stop_requested(&directory.0, &replacement).unwrap());
+    request_stop(&directory.0).unwrap();
+    assert!(stop_requested(&directory.0, &replacement).unwrap());
+}
+
+#[test]
+fn expected_run_stop_requires_an_active_export() {
+    let directory = Directory::new();
+    let run_id = "a".repeat(64);
+    assert!(request_stop_expected(&directory.0, &run_id).is_err());
+    for status in [
+        json!({"run_id": run_id, "phase": "stopped"}),
+        json!({"run_id": run_id, "phase": "error"}),
+        json!({"run_id": run_id}),
+        json!({"phase": "networking"}),
+    ] {
+        atomic_json(&directory.0.join(STATUS_FILE), &status).unwrap();
+        assert!(request_stop_expected(&directory.0, &run_id).is_err());
+        assert!(!stop_requested(&directory.0, &run_id).unwrap());
+    }
+}
+
+#[test]
+fn offline_check_reports_only_replayed_state_and_integer_receipt_count() {
+    let parent = Directory::new();
+    let directory = parent.0.join("network");
+    let config = local::initialize(&directory, 0).unwrap();
+    let store = Store::open(
+        directory.join("chain.redb"),
+        config,
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    let state = store.state().clone();
+    drop(store);
+    // An exported status is not independent verification evidence.
+    atomic_json(
+        &directory.join(STATUS_FILE),
+        &json!({"height": 999, "proof_replay_checked": true}),
+    )
+    .unwrap();
+    let summary = check_offline(&directory).unwrap();
+    assert_eq!(
+        summary,
+        json!({
+            "schema": 1,
+            "height": 0,
+            "tip": local::hex(&state.tip),
+            "state_fingerprint": local::hex(&state.fingerprint()),
+            "proof_replay_checked": true,
+            "local_reward_receipts_checked": 0,
+            "validation_scope": "indexed-local-rewards",
+        })
+    );
+    assert!(summary["local_reward_receipts_checked"].is_u64());
+    for field in ["tip", "state_fingerprint"] {
+        assert!(hash_text(summary[field].as_str().unwrap()));
+    }
+    let lease = Lease::acquire(&directory).unwrap();
+    assert!(check_offline(&directory).is_err());
+    drop(lease);
+}
+
+#[test]
+fn offline_check_preserves_the_strict_legacy_receipt_scope() {
+    let parent = Directory::new();
+    let directory = parent.0.join("network");
+    let config = local::initialize(&directory, 0).unwrap();
+    let store = Store::open(
+        directory.join("chain.redb"),
+        config,
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    drop(store);
+    let database = redb::Database::open(directory.join("chain.redb")).unwrap();
+    let transaction = database.begin_write().unwrap();
+    let rewards: redb::TableDefinition<&[u8], &[u8]> =
+        redb::TableDefinition::new("local-production-receipts-v1");
+    let metadata: redb::TableDefinition<&str, &[u8]> =
+        redb::TableDefinition::new("native-store-meta-v2");
+    transaction.delete_table(rewards).unwrap();
+    transaction
+        .open_table(metadata)
+        .unwrap()
+        .remove("local-production-receipts")
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(database);
+    let summary = check_offline(&directory).unwrap();
+    assert_eq!(summary["validation_scope"], "strict-legacy-rewards");
+    assert_eq!(summary["local_reward_receipts_checked"], 0);
+    assert_eq!(summary["proof_replay_checked"], true);
+}
+
+#[test]
+fn offline_check_rejects_non_native_proofs_even_when_saved_state_is_consistent() {
+    let parent = Directory::new();
+    let directory = parent.0.join("network");
+    let config = local::initialize(&directory, 0).unwrap();
+    let mut store = Store::open(
+        directory.join("chain.redb"),
+        config,
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    let block = crate::fixtures::candidate(store.state(), 410_000);
+    store
+        .append(&block, &crate::fixtures::TestVerifier)
+        .unwrap();
+    assert_eq!(store.state().height, 1);
+    assert_eq!(store.verify_local_rewards().unwrap(), 0);
+    drop(store);
+    assert!(check_offline(&directory).is_err());
+    assert!(directory.join("chain.redb").exists());
+}
+
 #[test]
 fn calibration_uses_integer_hash_rate_and_rejects_empty_measurements() {
     assert!(calibration_target(0, 1).is_err());
@@ -236,6 +398,10 @@ fn actual_continuous_service_exports_stops_and_replays() {
     );
     let _lease = Lease::acquire(&network).unwrap();
     let replayed = Store::open_existing(network.join("chain.redb"), config, &verifier).unwrap();
+    assert_eq!(
+        replayed.verify_local_rewards().unwrap(),
+        replayed.state().height
+    );
     assert_eq!(final_status["tip"], local::hex(&replayed.state().tip));
     assert_eq!(
         final_status["state_fingerprint"],
@@ -247,6 +413,26 @@ fn actual_continuous_service_exports_stops_and_replays() {
         producer::validate_reward_secret(&block, &local::read_reward(&network, &id).unwrap())
             .unwrap();
     }
+    let height = replayed.state().height;
+    let reward_id = replayed.block(height).unwrap().id().unwrap();
+    drop(replayed);
+    drop(_lease);
+    let checked = check_offline(&network).unwrap();
+    assert_eq!(checked["height"], height);
+    assert_eq!(checked["tip"], final_status["tip"]);
+    assert_eq!(
+        checked["state_fingerprint"],
+        final_status["state_fingerprint"]
+    );
+    assert_eq!(checked["proof_replay_checked"], true);
+    assert_eq!(checked["local_reward_receipts_checked"], height);
+    assert_eq!(checked["validation_scope"], "indexed-local-rewards");
+    let receipt = network.join(format!("reward-{}.secret", local::hex(&reward_id)));
+    let retained = network.join("retained-reward-evidence.secret");
+    std::fs::rename(&receipt, &retained).unwrap();
+    assert!(check_offline(&network).is_err());
+    assert!(retained.is_file());
+    assert!(!receipt.exists());
 }
 
 #[cfg(unix)]

@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // A canonical ID lookup currently decodes one complete stored proof block.
+#[cfg(feature = "native-p2p")]
+pub(crate) mod resident;
+
 const BLOCK_LOOKUP_BYTES: usize = MAX_BLOCK_BYTES + 65_536;
 fn transaction_has_output(tx: &Transaction, commitment: &crate::wire::DigestBytes) -> bool {
     native::codec::PublicTransaction::decode(&tx.record.body).is_ok_and(|p| {
@@ -60,6 +63,15 @@ impl From<String> for Error {
 }
 fn invalid() -> Error {
     Error::Transport(p2p::Error::InvalidProtocol)
+}
+
+/// A move-only authorization for work prepared from one canonical node state.
+/// Capture this before handing a state snapshot to a worker. It grants no proof
+/// or consensus bypass and cannot be used after adoption or owner restart.
+pub struct ProductionPermit {
+    owner: Arc<()>,
+    generation: u64,
+    fingerprint: Hash,
 }
 
 /// A move-only production result bound to one node and its preparation state.
@@ -271,19 +283,48 @@ impl<V: BlockVerifier> Node<V> {
         }
         Ok(result)
     }
-    fn bind_produced(&self, produced: ProducedBlock) -> PreparedBlock {
-        PreparedBlock {
-            produced,
+    /// Reserve the identity of the current canonical state before asynchronous
+    /// proof generation or work search. The node remains the sole store owner.
+    pub fn begin_production(&self) -> Result<ProductionPermit, Error> {
+        self.production_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Local("production generation exhausted".into()))?;
+        Ok(ProductionPermit {
             owner: Arc::clone(&self.production_owner),
             generation: self.production_generation,
             fingerprint: self.state().fingerprint(),
+        })
+    }
+    /// Bind completed worker output only to the state for which work began.
+    /// The returned move-only result still requires the common verified commit.
+    pub fn bind_produced(
+        &self,
+        permit: ProductionPermit,
+        produced: ProducedBlock,
+    ) -> Result<PreparedBlock, Error> {
+        if !Arc::ptr_eq(&self.production_owner, &permit.owner)
+            || permit.generation != self.production_generation
+            || permit.fingerprint != self.state().fingerprint()
+            || produced.block.network != self.state().config.network
+            || produced.block.parent != self.state().tip
+            || self.state().height.checked_add(1) != Some(produced.block.height)
+        {
+            return Err(Error::Local("stale or foreign production result".into()));
         }
+        Ok(PreparedBlock {
+            produced,
+            owner: permit.owner,
+            generation: permit.generation,
+            fingerprint: permit.fingerprint,
+        })
     }
     /// Preserve the authenticated recovery receipt before the durable common
     /// state transition. Receipt storage is bound to this store's opened parent
     /// directory and database identity; callers cannot redirect it elsewhere.
     /// An append failure preserves the receipt as evidence and leaves the head
-    /// unchanged. Neither this method nor a preparation token bypasses proofs.
+    /// unchanged. An identical durable receipt can be reused after interrupted
+    /// append; partial or conflicting evidence is never overwritten. Neither
+    /// this method nor a preparation token bypasses proofs.
     pub fn commit_produced(&mut self, prepared: PreparedBlock) -> Result<Hash, Error> {
         if !Arc::ptr_eq(&self.production_owner, &prepared.owner)
             || prepared.generation != self.production_generation
@@ -302,11 +343,25 @@ impl<V: BlockVerifier> Node<V> {
         let id = produced.block.id()?;
         self.store
             .save_reward_receipt(&id, &produced.reward_secret)?;
-        self.store.append(&produced.block, &self.verifier)?;
+        self.store
+            .append_produced(&produced.block, &produced.reward_secret, &self.verifier)?;
         self.production_generation = next_generation;
         self.reconcile_pools()?;
         Ok(id)
     }
+    /// Select already verified pending inputs for an off-thread producer.
+    /// Private fee openings stay in this local work item; originals remain
+    /// reserved until canonical inclusion and stale work never removes them.
+    pub fn select_pending(&mut self, slots: usize) -> Result<Vec<crate::pool::Padding>, Error> {
+        if !(MIN_SLOTS..=MAX_SLOTS).contains(&slots) || !slots.is_multiple_of(GROUP) {
+            return Err(invalid());
+        }
+        self.reconcile_pools()?;
+        self.mempool
+            .select(self.store.state(), slots)
+            .map_err(Into::into)
+    }
+
     pub fn precompute_one(&mut self, prover: &NativeProver) -> Result<(), Error> {
         self.padding.prune(self.store.state())?;
         if !self.padding.can_grow() {
@@ -332,6 +387,7 @@ impl<V: BlockVerifier> Node<V> {
             return Err(invalid());
         }
         self.reconcile_pools()?;
+        let permit = self.begin_production()?;
         let mut values = self.mempool.select(self.store.state(), slots)?;
         let remaining = slots - values.len();
         values.extend(self.padding.take_for_fill(self.store.state(), remaining)?);
@@ -351,7 +407,7 @@ impl<V: BlockVerifier> Node<V> {
             .cloned()
             .collect();
         produced.block.validate_shape()?;
-        Ok(self.bind_produced(produced))
+        self.bind_produced(permit, produced)
     }
     fn session<S>(&self, session: &Session<S>) -> Result<(), Error>
     where
@@ -757,6 +813,10 @@ impl<V: BlockVerifier> Node<V> {
             attempt.clear();
             return Ok(false);
         }
+        let next_generation = self
+            .production_generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Local("production generation exhausted".into()))?;
         let result = attempt
             .staging
             .as_mut()
@@ -772,6 +832,7 @@ impl<V: BlockVerifier> Node<V> {
                 &self.verifier,
             )?;
         if matches!(result, BranchOutcome::Adopted { .. }) {
+            self.production_generation = next_generation;
             attempt.reservations.clear();
             self.reconcile_pools()?;
         } else {

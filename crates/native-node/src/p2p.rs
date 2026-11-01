@@ -1,6 +1,6 @@
-//! Bounded native protocol over an externally authenticated hybrid channel.
-//! No production authenticator or classical/plaintext fallback is supplied.
-//! The identity, combiner and record-layer implementation require separate review.
+//! Bounded native protocol over an independently pinned hybrid channel.
+//! The optional engineering transport requires composition and resource review.
+//! No classical or plaintext fallback is supplied.
 use crate::identity::{Descriptor, PeerPin};
 use crate::state::Config;
 use crate::wire::{Block, Hash, MAX_BLOCK_BYTES, MAX_ENVELOPE_BYTES, SUITE_ID};
@@ -8,6 +8,14 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// The candidate-only feature is opaque. native-p2p explicitly adds the
+// engineering bridge; the complete composition still requires review.
+#[cfg(feature = "hybrid-tls-candidate")]
+#[allow(dead_code)]
+pub(crate) mod hybrid_tls;
+#[cfg(feature = "native-p2p")]
+pub use hybrid_tls::native::{NativeTlsAuthenticator, NativeTlsChannel};
 
 pub const VERSION: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
@@ -111,7 +119,7 @@ impl Budget {
         usage.bytes = next_bytes;
         usage.handshakes += 1;
         usage.handshake_bytes = next_handshake_bytes;
-        Ok(HandshakeReservation(self.0.clone()))
+        Ok(HandshakeReservation(self.0.clone(), true))
     }
 }
 impl Default for Budget {
@@ -126,6 +134,12 @@ pub struct Reservation {
     budget: Arc<BudgetInner>,
     bytes: usize,
 }
+impl Reservation {
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn covers(&self, budget: &Budget, bytes: usize) -> bool {
+        Arc::ptr_eq(&self.budget, &budget.0) && self.bytes >= bytes
+    }
+}
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut usage = self
@@ -136,9 +150,31 @@ impl Drop for Reservation {
         usage.bytes = usage.bytes.saturating_sub(self.bytes);
     }
 }
-struct HandshakeReservation(Arc<BudgetInner>);
+/// Opaque admission ownership, transferred by a provider without releasing its
+/// shared byte charge. Only the node budget can create this guard.
+pub struct HandshakeReservation(Arc<BudgetInner>, bool);
+impl HandshakeReservation {
+    fn established(mut self) -> Reservation {
+        let budget = self.0.clone();
+        {
+            let mut usage = budget.usage.lock().unwrap_or_else(|p| p.into_inner());
+            usage.handshakes = usage.handshakes.saturating_sub(1);
+            usage.handshake_bytes = usage.handshake_bytes.saturating_sub(HANDSHAKE_BYTES);
+        }
+        // The reservation moves from the admission category to established
+        // ownership in the same locked state; its byte charge never disappears.
+        self.1 = false;
+        Reservation {
+            budget,
+            bytes: HANDSHAKE_BYTES,
+        }
+    }
+}
 impl Drop for HandshakeReservation {
     fn drop(&mut self) {
+        if !self.1 {
+            return;
+        }
         let mut usage = self
             .0
             .usage
@@ -256,7 +292,17 @@ pub struct AdmissionContext {
 }
 impl AdmissionContext {
     pub fn new(expected: ExpectedPeer, role: ConnectionRole, cancellation: Cancellation) -> Self {
+        Self::new_started(expected, role, cancellation, Instant::now())
+    }
+    /// Starts the shared deadline before routing or dialing a peer.
+    pub fn new_started(
+        expected: ExpectedPeer,
+        role: ConnectionRole,
+        cancellation: Cancellation,
+        started: Instant,
+    ) -> Self {
         let mut deadline = Deadline::new(HELLO_TIMEOUT);
+        deadline.started = started;
         deadline.cancellation = cancellation;
         Self {
             expected,
@@ -341,8 +387,16 @@ impl<S: Write> Write for Timed<'_, S> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.deadline.check()?;
-        self.channel.flush()?;
-        self.deadline.check()
+        loop {
+            self.deadline.check()?;
+            match self.channel.flush() {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => {
+                    result?;
+                    return self.deadline.check();
+                }
+            }
+        }
     }
 }
 
@@ -416,9 +470,9 @@ impl Hello {
     }
 }
 /// Capability produced only inside this crate after a reviewed provider verifies
-/// pinned hybrid identity, transcript and both key confirmations. No production
-/// provider is implemented here. The provider owns record authentication,
-/// sequence numbers, nonce limits, secret cleanup and rekeying.
+/// pinned hybrid identity, transcript and both key confirmations. The opt-in
+/// engineering provider owns record authentication, sequence numbers,
+/// connection limits and secret cleanup.
 pub struct Authenticated<S> {
     channel: S,
     admission: AdmissionContext,
@@ -463,6 +517,18 @@ pub trait HybridAuthenticator {
         socket: TcpStream,
         admission: &AdmissionContext,
     ) -> Result<Authenticated<Self::Channel>, Error>;
+    /// Keeps the node's original reservation through provider authentication.
+    /// Concrete providers may consume it internally, but must return the same
+    /// live guard after success. Failure drops all admission-owned state.
+    fn authenticate_reserved(
+        &mut self,
+        socket: TcpStream,
+        admission: &AdmissionContext,
+        permit: HandshakeReservation,
+    ) -> Result<(Authenticated<Self::Channel>, HandshakeReservation), Error> {
+        self.authenticate(socket, admission)
+            .map(|auth| (auth, permit))
+    }
 }
 /// No default authenticator or unauthenticated production constructor exists.
 /// Discard a session after any framing/I/O error; reconnecting requires a fresh
@@ -473,6 +539,7 @@ pub struct Session<S> {
     peer: Hash,
     role: Role,
     budget: Budget,
+    _transport: Option<Reservation>,
 }
 pub enum Packet {
     Control {
@@ -502,9 +569,9 @@ impl<S: Read + Write> Session<S> {
         admission: &AdmissionContext,
         role: Role,
         budget: Budget,
-        _permit: HandshakeReservation,
+        permit: HandshakeReservation,
     ) -> Result<Self, Error> {
-        if !auth.admission.same_attempt(admission) {
+        if !auth.admission.same_attempt(admission) || !Arc::ptr_eq(&permit.0, &budget.0) {
             return Err(Error::InvalidProtocol);
         }
         admission.check()?;
@@ -521,12 +588,14 @@ impl<S: Read + Write> Session<S> {
         let mut hello = [0; HELLO_BYTES];
         timed.read_exact(&mut hello).map_err(io_error)?;
         let hello = Hello::decode(&hello, &binding)?;
+        admission.check()?;
         Ok(Self {
             channel,
             binding,
             peer: admission.expected.fingerprint(),
             role: hello.role,
             budget,
+            _transport: Some(permit.established()),
         })
     }
     pub(crate) fn shares_budget(&self, budget: &Budget) -> bool {
@@ -610,7 +679,33 @@ impl<S: Read + Write> Session<S> {
     pub(crate) fn receive_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
         self.receive_deadline(deadline.clone())
     }
-    fn receive_deadline(&mut self, mut deadline: Deadline) -> Result<Packet, Error> {
+    /// A paired sync request may follow synchronous proof verification by the
+    /// remote owner. Only its header uses the caller's absolute wait bound;
+    /// its bounded control body still has the ordinary ten-second deadline.
+    #[cfg(any(feature = "native-p2p", test))]
+    pub(crate) fn receive_sync_request_before(
+        &mut self,
+        deadline: &Deadline,
+    ) -> Result<Packet, Error> {
+        self.receive_frame(deadline.clone(), Some(&[GET_BLOCKS]))
+    }
+    /// A resident relay follows remote canonical validation. Wait for its
+    /// header within one exchange, then retain the ten-second body limit.
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn receive_relay_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
+        self.receive_frame(
+            deadline.clone(),
+            Some(&[TRANSACTION, END_BATCH, UNAVAILABLE]),
+        )
+    }
+    fn receive_deadline(&mut self, deadline: Deadline) -> Result<Packet, Error> {
+        self.receive_frame(deadline, None)
+    }
+    fn receive_frame(
+        &mut self,
+        mut deadline: Deadline,
+        permitted_control: Option<&[u8]>,
+    ) -> Result<Packet, Error> {
         let mut header = [0; HEADER_BYTES];
         Timed {
             channel: &mut self.channel,
@@ -627,7 +722,15 @@ impl<S: Read + Write> Session<S> {
         let kind = header[6];
         let request = u64::from_le_bytes(header[7..15].try_into().expect("fixed request"));
         let length = u32::from_le_bytes(header[47..51].try_into().expect("fixed length")) as usize;
+        if permitted_control.is_some_and(|allowed| !allowed.contains(&kind)) {
+            return Err(Error::InvalidProtocol);
+        }
         frame_header(kind, request, &self.binding.network, length)?;
+        if permitted_control.is_some() {
+            let mut body_deadline = Deadline::new(CONTROL_TIMEOUT);
+            body_deadline.cancellation = deadline.cancellation.clone();
+            deadline = body_deadline;
+        }
         let extra = if kind == BLOCK {
             MAX_ENVELOPE_BYTES + 65536
         } else {
@@ -677,6 +780,7 @@ impl<S: Read + Write> Session<S> {
             peer: [9; 32],
             role: Role::Validator,
             budget,
+            _transport: None,
         }
     }
 }
@@ -725,15 +829,27 @@ pub fn accept_once<A: HybridAuthenticator>(
     cancellation: Cancellation,
 ) -> Result<Session<A::Channel>, Error> {
     let (socket, _) = listener.accept().map_err(io_error)?;
-    let permit = budget.handshake()?;
     let admission =
         AdmissionContext::new(expected.clone(), ConnectionRole::Responder, cancellation);
-    admission.check()?;
-    timeout(&socket)?;
-    let channel = auth.authenticate(socket, &admission)?;
-    admission.check()?;
-    Session::establish_reserved(channel, &admission, role, budget, permit)
+    establish_socket(socket, auth, &admission, role, budget)
 }
+/// Completes one already accepted or dialed socket using a context created
+/// before any routing prefix. No peer may refresh the context after TLS starts.
+pub fn establish_socket<A: HybridAuthenticator>(
+    socket: TcpStream,
+    auth: &mut A,
+    admission: &AdmissionContext,
+    role: Role,
+    budget: Budget,
+) -> Result<Session<A::Channel>, Error> {
+    admission.check()?;
+    let permit = budget.handshake()?;
+    timeout(&socket)?;
+    let (channel, permit) = auth.authenticate_reserved(socket, admission, permit)?;
+    admission.check()?;
+    Session::establish_reserved(channel, admission, role, budget, permit)
+}
+
 pub fn connect<A: HybridAuthenticator>(
     endpoint: SocketAddr,
     auth: &mut A,
@@ -755,7 +871,7 @@ pub fn connect<A: HybridAuthenticator>(
     let socket = TcpStream::connect_timeout(&endpoint, remaining).map_err(io_error)?;
     admission.check()?;
     timeout(&socket)?;
-    let channel = auth.authenticate(socket, &admission)?;
+    let (channel, permit) = auth.authenticate_reserved(socket, &admission, permit)?;
     admission.check()?;
     Session::establish_reserved(channel, &admission, role, budget, permit)
 }

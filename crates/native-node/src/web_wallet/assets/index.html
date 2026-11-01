@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>SIWORLD local wallet</title>
+  <link rel="stylesheet" href="/wallet.css">
+  <link rel="stylesheet" href="/startup.css">
+  <script src="/startup.js" defer></script>
+  <script src="/wallet.js" defer></script>
+</head>
+<body><main>
+  <section id="startup-stage" data-profile="wallet" data-state="active" aria-label="Client startup">
+    <header class="startup-header"><div class="startup-brand"><span data-startup-logo></span><div><div class="startup-wordmark">SIWORLD</div><div class="startup-edition">Native local client</div></div></div><span class="startup-pill">ENGINEERING BUILD</span></header>
+    <div class="startup-visual" aria-hidden="true"></div><p class="startup-caption">FIXED FORMAT / PRIVATE CONTENTS</p>
+    <div role="status" aria-live="polite" aria-atomic="true"><p data-startup-label>Waiting for startup</p><p data-startup-detail>Stage progress follows verified application events.</p></div><ol data-startup-steps aria-label="Startup stages"></ol>
+    <footer class="startup-footer"><span>Decorative parcels · not transaction activity</span><button type="button" class="startup-toggle" data-startup-toggle aria-pressed="false">Pause motion</button></footer>
+  </section>
+  <section class="notice"><strong>Private local wallet view</strong><p id="scope">Open an existing password-protected wallet, then verify and rescan the idle local chain. Confirmed ownership remains visible while rewards await block maturity. Manual transfers normally have no wallet delay; enhanced privacy and background selection use separate local policy.</p><p>Wallet creation, backup recovery, sending and asset issuance are not available in this view. Keep your recovery words offline.</p></section>
+  <p id="message" role="status" aria-live="polite">Authenticate this browser session.</p>
+  <section id="login-panel" class="panel"><h1>Open a local session</h1><form id="login-form" autocomplete="off"><label for="token">Local access token</label><input id="token" type="password" autocomplete="off" spellcheck="false" required maxlength="64"><button>Authenticate</button></form></section>
+  <div id="private-panel" hidden>
+    <section id="miner-panel" class="panel" hidden><h2>Mining service</h2><dl id="miner-details"></dl><button id="refresh-miner">Refresh verified export</button><p>This reads the configured service export. Private wallet balances are not included.</p></section>
+    <div id="wallet-panel">
+      <section class="panel"><h2>Protected wallet</h2><p id="wallet-state">Locked</p>
+        <p id="vault-notice" hidden>No existing password-protected wallet is configured. Create or recover it with the native wallet tool before using this view.</p>
+        <form id="unlock-form" autocomplete="off"><label for="passphrase">Wallet passphrase</label><input id="passphrase" type="password" autocomplete="off" spellcheck="false" required maxlength="1024"><button id="unlock">Unlock wallet</button></form>
+        <div class="actions"><button id="rescan" disabled>Verify and rescan</button><button id="lock" disabled>Lock private view</button><button id="refresh">Refresh status</button></div>
+        <p id="verification">Balances unknown. Run a verified rescan.</p>
+      </section>
+      <section class="panel" aria-labelledby="balance-heading"><h2 id="balance-heading">Confirmed wallet balance</h2>
+        <p>Current owned unspent notes, including received payments and change. This is not a cumulative mining total.</p>
+        <p id="balance-placeholder">Unlock the wallet and complete a verified rescan to view balances.</p>
+        <div id="balances"></div>
+        <p id="privacy-policy" class="status-note"></p>
+        <p id="privacy-warning" class="status-note" role="note" hidden></p>
+        <p id="payment-gate" class="status-note" hidden></p>
+        <div id="balance-explanation" hidden><p>Confirmed balance = block unlock reached + awaiting block unlock. Block unlock reached = manual privacy delay pending + eligible for manual input selection. Enhanced privacy delays are included in the confirmed balance; background delays do not block normal manual selection.</p><p>Manual input-selection eligibility is before reservation, input-count and fee checks; it does not guarantee that a payment can be submitted.</p></div>
+      </section>
+      <section class="panel"><h2>Unlock schedule</h2><p id="next-unlock"></p><div id="tranches"></div><p>Voyager rewards and the first Holder reward note require 24-block maturity. Holder's four scheduled notes unlock at their respective block heights. Consensus unlock heights always apply. A local randomized delay applies to background selection when enabled, and to manual transfers only with enhanced privacy.</p><p>Estimated dates follow the block target interval. Accepted height determines consensus eligibility.</p></section>
+      <section class="panel"><h2>Receive</h2><label for="address">Payment address (canonical bytes in hexadecimal)</label><textarea id="address" rows="3" readonly spellcheck="false"></textarea><button id="copy-address" disabled>Copy address</button></section>
+    </div>
+    <section class="panel"><h2>Local session</h2><p>10-minute inactivity lock; 1-hour maximum session. Closing a tab does not instantly stop the local process.</p><button id="shutdown" class="secondary">Lock and stop this wallet service</button></section>
+  </div>
+</main></body>
+</html>

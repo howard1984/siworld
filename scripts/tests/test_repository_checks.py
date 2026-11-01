@@ -16,6 +16,12 @@ repository_spec.loader.exec_module(repository)
 
 
 class RepositoryManifestTests(unittest.TestCase):
+    def test_wallet_text_assets_are_exactly_scoped(self):
+        for name in repository.PUBLIC_TEXT_ASSETS:
+            self.assertTrue(repository.allowed(Path(name)))
+        for name in ("private.json", "screenshot.png", "other.js", "startup.js.bak"):
+            self.assertFalse(repository.allowed(Path("crates/native-node/src/web_wallet/assets") / name))
+
     def test_removed_sp1_workspace_is_outside_publication_boundary(self):
         for name in (
             "Cargo.toml", "Cargo.lock", "README.md",

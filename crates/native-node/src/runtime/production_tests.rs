@@ -42,7 +42,11 @@ fn setup(directory: &Directory) -> Node<TestVerifier> {
     )
 }
 fn prepared(node: &Node<TestVerifier>, seed: u32) -> PreparedBlock {
-    node.bind_produced(crate::producer::production_fixture(node.state(), seed))
+    node.bind_produced(
+        node.begin_production().unwrap(),
+        crate::producer::production_fixture(node.state(), seed),
+    )
+    .unwrap()
 }
 fn assert_unchanged(node: &Node<TestVerifier>, fingerprint: Hash) {
     assert_eq!(node.state().fingerprint(), fingerprint);
@@ -133,8 +137,9 @@ fn identical_state_does_not_authorize_another_node_or_retired_generation() {
 fn exhausted_generation_rejects_production_and_branch_before_writing() {
     let directory = Directory::new();
     let mut node = setup(&directory);
-    node.production_generation = u64::MAX;
     let produced = prepared(&node, 100_000);
+    node.production_generation = u64::MAX;
+    assert!(node.begin_production().is_err());
     let id = produced.block().id().unwrap();
     let fingerprint = node.state().fingerprint();
     assert!(node.commit_produced(produced).is_err());
@@ -269,9 +274,116 @@ fn accepted_production_reconciles_all_pending_queues() {
         .block
         .transactions
         .sort_by_key(|tx| tx.record.statement_id(&produced.block.network));
-    let prepared = node.bind_produced(produced);
+    let prepared = node
+        .bind_produced(node.begin_production().unwrap(), produced)
+        .unwrap();
     node.commit_produced(prepared).unwrap();
     assert_eq!(node.mempool.len(), 0);
     assert_eq!(node.padding.len(), 0);
     assert_eq!(node.pending_issuance_count(), 0);
+}
+
+#[test]
+fn external_production_permit_rejects_foreign_stale_and_restarted_owners() {
+    let first = Directory::new();
+    let second = Directory::new();
+    let mut node = setup(&first);
+    let other = setup(&second);
+    let permit = node.begin_production().unwrap();
+    let produced = crate::producer::production_fixture(node.state(), 150_000);
+    let id = produced.block.id().unwrap();
+    assert!(other.bind_produced(permit, produced).is_err());
+    assert!(!first.receipt(&id).exists());
+    assert!(!second.receipt(&id).exists());
+
+    let permit = node.begin_production().unwrap();
+    let produced = crate::producer::production_fixture(node.state(), 160_000);
+    let id = produced.block.id().unwrap();
+    node.import_branch(
+        0,
+        &[candidate(node.state(), 170_000)],
+        CandidatePolicy::default(),
+    )
+    .unwrap();
+    assert!(node.bind_produced(permit, produced).is_err());
+    assert!(!first.receipt(&id).exists());
+
+    let permit = node.begin_production().unwrap();
+    let produced = crate::producer::production_fixture(node.state(), 180_000);
+    let id = produced.block.id().unwrap();
+    let config = node.state().config.clone();
+    drop(node);
+    let node = Node::new(
+        Store::open_existing(first.0.join("chain.redb"), config, &TestVerifier).unwrap(),
+        TestVerifier,
+    );
+    assert!(node.bind_produced(permit, produced).is_err());
+    assert!(!first.receipt(&id).exists());
+}
+
+#[test]
+fn durable_receipt_before_interrupted_append_can_resume_after_restart() {
+    let directory = Directory::new();
+    let node = setup(&directory);
+    let produced = crate::producer::production_fixture(node.state(), 190_000);
+    let id = produced.block.id().unwrap();
+    let config = node.state().config.clone();
+    let expected_receipt = produced.reward_secret.clone();
+    node.store()
+        .save_reward_receipt(&id, &produced.reward_secret)
+        .unwrap();
+    let fingerprint = node.state().fingerprint();
+    drop(node);
+    let mut node = Node::new(
+        Store::open_existing(directory.0.join("chain.redb"), config, &TestVerifier).unwrap(),
+        TestVerifier,
+    );
+    assert_eq!(node.state().fingerprint(), fingerprint);
+    assert_eq!(node.state().height, 0);
+    let prepared = node
+        .bind_produced(node.begin_production().unwrap(), produced)
+        .unwrap();
+    assert_eq!(node.commit_produced(prepared).unwrap(), id);
+    assert_eq!(node.state().height, 1);
+    assert_eq!(
+        crate::local::read_reward(&directory.0, &id)
+            .unwrap()
+            .as_slice(),
+        expected_receipt.as_slice()
+    );
+}
+
+#[test]
+fn partial_or_linked_receipts_never_resume_or_change_the_canonical_head() {
+    use std::os::unix::fs::PermissionsExt;
+    for variant in 0..4 {
+        let directory = Directory::new();
+        let mut node = setup(&directory);
+        let prepared = prepared(&node, 200_000);
+        let id = prepared.block().id().unwrap();
+        let fingerprint = node.state().fingerprint();
+        crate::local::save_reward(&directory.0, &id, &prepared.produced.reward_secret).unwrap();
+        match variant {
+            0 => {
+                let mut bytes = std::fs::read(directory.receipt(&id)).unwrap();
+                bytes.pop();
+                std::fs::write(directory.receipt(&id), bytes).unwrap();
+            }
+            1 => {
+                let mut bytes = std::fs::read(directory.receipt(&id)).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(directory.receipt(&id), bytes).unwrap();
+            }
+            2 => std::fs::hard_link(directory.receipt(&id), directory.0.join("linked")).unwrap(),
+            _ => std::fs::set_permissions(
+                directory.receipt(&id),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap(),
+        }
+        let existing = std::fs::read(directory.receipt(&id)).unwrap();
+        assert!(node.commit_produced(prepared).is_err());
+        assert_unchanged(&node, fingerprint);
+        assert_eq!(std::fs::read(directory.receipt(&id)).unwrap(), existing);
+    }
 }

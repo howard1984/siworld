@@ -373,6 +373,222 @@ fn reused_exchange_deadline_does_not_reset_between_missing_proof_frames() {
 }
 
 #[test]
+fn paired_request_header_can_arrive_after_the_ordinary_control_deadline() {
+    struct DelayedHeader {
+        input: Cursor<Vec<u8>>,
+        clock: Arc<AtomicU64>,
+    }
+    impl Read for DelayedHeader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let count = self.input.read(bytes)?;
+            self.clock.store(11_100, Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+    impl Write for DelayedHeader {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let clock = Arc::new(AtomicU64::new(0));
+    let budget = Budget::default();
+    let mut session = Session::from_test_channel(
+        DelayedHeader {
+            input: Cursor::new(incoming(GET_BLOCKS, 7, b"bounded locator")),
+            clock: clock.clone(),
+        },
+        binding(),
+        budget.clone(),
+    );
+    let deadline = Deadline {
+        started: Instant::now(),
+        limit: Duration::from_secs(180),
+        cancellation: Cancellation::default(),
+        elapsed: Some(clock),
+    };
+    let packet = session.receive_sync_request_before(&deadline).unwrap();
+    assert!(matches!(
+        packet,
+        Packet::Control {
+            kind: GET_BLOCKS,
+            request: 7,
+            ..
+        }
+    ));
+    drop(packet);
+    assert_eq!(budget.available().unwrap(), CONNECTION_BYTES);
+}
+
+#[test]
+fn paired_request_header_deadline_is_absolute_under_fragmentation() {
+    struct Trickle {
+        input: Cursor<Vec<u8>>,
+        clock: Arc<AtomicU64>,
+    }
+    impl Read for Trickle {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            let count = self.input.read(&mut bytes[..1])?;
+            self.clock.fetch_add(30_000, Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+    impl Write for Trickle {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let clock = Arc::new(AtomicU64::new(0));
+    let budget = Budget::default();
+    let mut session = Session::from_test_channel(
+        Trickle {
+            input: Cursor::new(incoming(GET_BLOCKS, 7, b"bounded locator")),
+            clock: clock.clone(),
+        },
+        binding(),
+        budget.clone(),
+    );
+    let deadline = Deadline {
+        started: Instant::now(),
+        limit: Duration::from_secs(180),
+        cancellation: Cancellation::default(),
+        elapsed: Some(clock),
+    };
+    assert_eq!(
+        session.receive_sync_request_before(&deadline).err(),
+        Some(Error::Unavailable)
+    );
+    assert_eq!(session.channel.input.position(), 6);
+    assert_eq!(budget.available().unwrap(), CONNECTION_BYTES);
+}
+
+#[test]
+fn paired_request_rejects_other_frame_kinds_before_reserving_or_reading_the_body() {
+    for kind in SYNC_META..=END_BATCH {
+        let budget = Budget::new(1);
+        let raw = frame_header(kind, 1, &binding().network, 1).unwrap();
+        let mut session =
+            Session::from_test_channel(Cursor::new(raw.to_vec()), binding(), budget.clone());
+        assert_eq!(
+            session
+                .receive_sync_request_before(&Deadline::new(Duration::from_secs(180)))
+                .err(),
+            Some(Error::InvalidProtocol),
+            "unexpected frame kind {kind}"
+        );
+        assert_eq!(session.channel.position(), HEADER_BYTES as u64);
+        assert_eq!(budget.available().unwrap(), 1);
+    }
+}
+
+#[test]
+fn paired_request_cancellation_precedes_any_header_read() {
+    let cancellation = Cancellation::default();
+    let mut deadline = Deadline::new(Duration::from_secs(180));
+    deadline.cancellation = cancellation.clone();
+    let budget = Budget::default();
+    let mut session = Session::from_test_channel(
+        Cursor::new(incoming(GET_BLOCKS, 1, b"locator")),
+        binding(),
+        budget.clone(),
+    );
+    cancellation.cancel();
+    assert_eq!(
+        session.receive_sync_request_before(&deadline).err(),
+        Some(Error::Unavailable)
+    );
+    assert_eq!(session.channel.position(), 0);
+    assert_eq!(budget.available().unwrap(), CONNECTION_BYTES);
+}
+
+#[test]
+fn paired_request_body_preserves_cancellation_and_releases_its_reservation() {
+    struct CancelBody {
+        input: Cursor<Vec<u8>>,
+        cancel: Cancellation,
+    }
+    impl Read for CancelBody {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.input.position() >= HEADER_BYTES as u64 {
+                self.cancel.cancel();
+            }
+            self.input.read(bytes)
+        }
+    }
+    impl Write for CancelBody {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let cancel = Cancellation::default();
+    let mut deadline = Deadline::new(Duration::from_secs(180));
+    deadline.cancellation = cancel.clone();
+    let budget = Budget::default();
+    let mut session = Session::from_test_channel(
+        CancelBody {
+            input: Cursor::new(incoming(GET_BLOCKS, 1, b"locator")),
+            cancel,
+        },
+        binding(),
+        budget.clone(),
+    );
+    assert_eq!(
+        session.receive_sync_request_before(&deadline).err(),
+        Some(Error::Unavailable)
+    );
+    assert_eq!(budget.available().unwrap(), CONNECTION_BYTES);
+}
+
+#[test]
+fn paired_request_body_keeps_the_ten_second_control_bound() {
+    struct SlowBody {
+        input: Cursor<Vec<u8>>,
+        timer: std::sync::mpsc::Receiver<()>,
+    }
+    impl Read for SlowBody {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            if self.input.position() >= HEADER_BYTES as u64 {
+                let _ = self.timer.recv_timeout(Duration::from_millis(11_100));
+            }
+            self.input.read(bytes)
+        }
+    }
+    impl Write for SlowBody {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (_keep_open, timer) = std::sync::mpsc::channel();
+    let budget = Budget::default();
+    let mut session = Session::from_test_channel(
+        SlowBody {
+            input: Cursor::new(incoming(GET_BLOCKS, 1, b"locator")),
+            timer,
+        },
+        binding(),
+        budget.clone(),
+    );
+    assert_eq!(
+        session
+            .receive_sync_request_before(&Deadline::new(Duration::from_secs(180)))
+            .err(),
+        Some(Error::Unavailable)
+    );
+    assert_eq!(budget.available().unwrap(), CONNECTION_BYTES);
+}
+
+#[test]
 fn bounded_issuance_artifacts_only_raise_the_compact_frame_limit() {
     assert!(frame_header(COMPACT_BLOCK, 1, &binding().network, MAX_CONTROL_BYTES + 1).is_ok());
     assert_eq!(

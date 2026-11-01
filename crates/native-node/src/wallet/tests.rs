@@ -280,7 +280,7 @@ fn voyager_reward_recovers_as_one_maturing_note() {
 }
 
 #[test]
-fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
+fn enhanced_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
     use siworld_core::v1_economics::EconomicsParams;
     let network = [55; 32];
     let config = Config::development(network, 0)
@@ -289,6 +289,9 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
         .unwrap();
     let mut state = State::new(config.clone()).unwrap();
     let mut sender = wallet(network, 56);
+    sender.set_privacy_policy(WalletPrivacyPolicy::for_network(
+        crate::wallet_policy::WalletNetwork::Mainnet,
+    ));
     let receiver = wallet(network, 57);
     let mut blocks = Vec::new();
     for height in 1..=60u32 {
@@ -313,7 +316,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
     for selected in [[Some(commitment), None], [None, Some(commitment)]] {
         assert_eq!(
             sender
-                .prepare_transfer(
+                .prepare_transfer_with_policy(
                     &state,
                     selected,
                     &receiver.address(),
@@ -321,12 +324,27 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
                     100_000,
                     FeeTier::Standard,
                     u64::MAX,
+                    SpendPolicy::EnhancedPrivacy,
                 )
                 .err()
                 .as_deref(),
             Some("wallet input is spent, zero-valued, or immature")
         );
     }
+
+    assert!(
+        sender
+            .prepare_transfer(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                u64::MAX,
+            )
+            .is_err()
+    );
 
     let parent = state.clone();
     let mature = candidate(&state, 2_000_000);
@@ -345,25 +363,25 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
             .contains(&ready)
     );
     for selected in [[Some(commitment), None], [None, Some(commitment)]] {
-        for now in [maturity_timestamp, ready - 1] {
-            assert_eq!(
-                sender
-                    .prepare_transfer(
-                        &state,
-                        selected,
-                        &receiver.address(),
-                        SIP_ASSET_ID,
-                        100_000,
-                        FeeTier::Standard,
-                        now,
-                    )
-                    .err()
-                    .as_deref(),
-                Some("wallet locked input privacy delay has not elapsed")
-            );
-        }
+        let now = ready - 1;
+        assert_eq!(
+            sender
+                .prepare_transfer_with_policy(
+                    &state,
+                    selected,
+                    &receiver.address(),
+                    SIP_ASSET_ID,
+                    100_000,
+                    FeeTier::Standard,
+                    now,
+                    SpendPolicy::EnhancedPrivacy,
+                )
+                .err()
+                .as_deref(),
+            Some("wallet privacy delay has not elapsed")
+        );
         let prepared = sender
-            .prepare_transfer(
+            .prepare_transfer_with_policy(
                 &state,
                 selected,
                 &receiver.address(),
@@ -371,6 +389,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
                 100_000,
                 FeeTier::Standard,
                 ready,
+                SpendPolicy::EnhancedPrivacy,
             )
             .unwrap_or_else(|error| panic!("ready locked-input transfer failed: {error}"));
         let input = selected.iter().position(Option::is_some).unwrap();
@@ -378,13 +397,51 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
         assert!(!prepared.witness().slot.inputs[input].dummy);
     }
 
+    assert!(
+        sender
+            .prepare_transfer(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                0,
+            )
+            .is_ok()
+    );
+    assert!(
+        sender
+            .manual_privacy_warning(&commitment, maturity_timestamp)
+            .unwrap()
+    );
+    assert!(
+        sender
+            .manual_privacy_warning(&commitment, maturity_timestamp + AUTO_DELAY_MAX_SECONDS - 1)
+            .unwrap()
+    );
+    assert!(
+        !sender
+            .manual_privacy_warning(&commitment, maturity_timestamp + AUTO_DELAY_MAX_SECONDS)
+            .unwrap()
+    );
+
     let mut restored = wallet(network, 56);
+    restored.set_privacy_policy(sender.privacy_policy());
     restored
         .reconcile(config.clone(), &blocks, &TestVerifier)
         .unwrap();
     assert_eq!(
         restored.automatic_ready_timestamp(&commitment).unwrap(),
         Some(ready)
+    );
+    assert_eq!(
+        restored
+            .manual_privacy_warning(&commitment, maturity_timestamp)
+            .unwrap(),
+        sender
+            .manual_privacy_warning(&commitment, maturity_timestamp)
+            .unwrap()
     );
     restored
         .receipts
@@ -394,7 +451,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
         .eligible_timestamp = None;
     assert_eq!(
         restored
-            .prepare_transfer(
+            .prepare_transfer_with_policy(
                 &state,
                 [Some(commitment), None],
                 &receiver.address(),
@@ -402,10 +459,11 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
                 100_000,
                 FeeTier::Standard,
                 u64::MAX,
+                SpendPolicy::EnhancedPrivacy,
             )
             .err()
             .as_deref(),
-        Some("wallet locked input has no canonical eligibility timestamp")
+        Some("wallet input has no canonical eligibility timestamp")
     );
 
     let mut replacement = candidate(&parent, 2_100_000);
@@ -426,7 +484,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
     assert_eq!(replacement_ready, ready + 60);
     assert_eq!(
         restored
-            .prepare_transfer(
+            .prepare_transfer_with_policy(
                 &replacement_state,
                 [Some(commitment), None],
                 &receiver.address(),
@@ -434,13 +492,14 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
                 100_000,
                 FeeTier::Standard,
                 replacement_ready - 1,
+                SpendPolicy::EnhancedPrivacy,
             )
             .err()
             .as_deref(),
-        Some("wallet locked input privacy delay has not elapsed")
+        Some("wallet privacy delay has not elapsed")
     );
     let prepared = restored
-        .prepare_transfer(
+        .prepare_transfer_with_policy(
             &replacement_state,
             [Some(commitment), None],
             &receiver.address(),
@@ -448,6 +507,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
             100_000,
             FeeTier::Standard,
             replacement_ready,
+            SpendPolicy::EnhancedPrivacy,
         )
         .unwrap_or_else(|error| panic!("replayed ready transfer failed: {error}"));
     assert_eq!(prepared.witness().slot.inputs[0].unlock_height, 61);
@@ -461,7 +521,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
     );
     assert_eq!(
         restored
-            .prepare_transfer(
+            .prepare_transfer_with_policy(
                 &parent,
                 [Some(commitment), None],
                 &receiver.address(),
@@ -469,6 +529,7 @@ fn locked_input_spending_waits_for_private_delay_and_rebuilds_after_reorg() {
                 100_000,
                 FeeTier::Standard,
                 u64::MAX,
+                SpendPolicy::EnhancedPrivacy,
             )
             .err()
             .as_deref(),
@@ -482,6 +543,9 @@ fn automatic_consolidation_is_delayed_seed_recoverable_and_sip_only() {
     let config = Config::development(network, 0).unwrap();
     let mut state = State::new(config.clone()).unwrap();
     let mut sender = wallet(network, 46);
+    sender.set_privacy_policy(WalletPrivacyPolicy::for_network(
+        crate::wallet_policy::WalletNetwork::Mainnet,
+    ));
     let (record, _, _) = encrypted_record(&state, &sender, SIP_ASSET_ID, 5_000_000, 5000);
     let mut block = candidate(&state, 100_000);
     insert_record(&mut block, record);
@@ -511,6 +575,7 @@ fn automatic_consolidation_is_delayed_seed_recoverable_and_sip_only() {
         );
     }
     let mut recovered = wallet(network, 46);
+    recovered.set_privacy_policy(sender.privacy_policy());
     recovered
         .reconcile(config, &[block.clone()], &TestVerifier)
         .unwrap();
@@ -1310,4 +1375,184 @@ fn actual_native_issuance_block_recovers_registry_and_seed_wallet_after_restart(
     );
     drop(reopened);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn manual_transfer_accepts_a_mature_reward_before_private_background_delay() {
+    let network = [71; 32];
+    let config = Config::development(network, 0).unwrap();
+    let mut state = State::new(config.clone()).unwrap();
+    let mut sender = wallet(network, 72);
+    let recipient = wallet(network, 73);
+    let mut blocks = Vec::new();
+    for height in 1..=25u32 {
+        let block = if height == 1 {
+            reward_block(&state, &sender, crate::state::RewardMode::Voyager, 100_000)
+        } else {
+            candidate(&state, 100_000 + height * 20_000)
+        };
+        state.apply(&block, &TestVerifier).unwrap();
+        blocks.push(block);
+    }
+    sender.reconcile(config, &blocks, &TestVerifier).unwrap();
+    let commitment = sender
+        .receipts()
+        .iter()
+        .find(|receipt| receipt.note().unlock_height == 25)
+        .unwrap()
+        .commitment;
+    assert!(
+        sender
+            .prepare_transfer(
+                &state,
+                [Some(commitment), None],
+                &recipient.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                state.timestamp(),
+            )
+            .is_ok(),
+        "manual payment must not wait after consensus reward maturity"
+    );
+}
+
+#[test]
+fn engineering_background_is_immediate_but_enhanced_manual_covers_received_notes() {
+    let network = [74; 32];
+    let config = Config::development(network, 0).unwrap();
+    let mut state = State::new(config.clone()).unwrap();
+    let mut sender = wallet(network, 75);
+    let receiver = wallet(network, 76);
+    let (record, _, _) = encrypted_record(&state, &sender, SIP_ASSET_ID, 5_000_000, 5000);
+    let mut block = candidate(&state, 100_000);
+    insert_record(&mut block, record);
+    state.apply(&block, &TestVerifier).unwrap();
+    sender
+        .reconcile(config, &[block.clone()], &TestVerifier)
+        .unwrap();
+    let commitment = sender
+        .receipts()
+        .iter()
+        .find(|r| r.note().value == 5_000_000)
+        .unwrap()
+        .commitment;
+    assert_eq!(
+        sender.automatic_ready_timestamp(&commitment).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        sender
+            .payment_ready_timestamp(&commitment, SpendPolicy::Manual)
+            .unwrap(),
+        Some(0)
+    );
+    let ready = sender
+        .payment_ready_timestamp(&commitment, SpendPolicy::EnhancedPrivacy)
+        .unwrap()
+        .unwrap();
+    assert!((block.timestamp..=block.timestamp + 21_600).contains(&ready));
+    assert!(
+        sender
+            .manual_privacy_warning(&commitment, block.timestamp)
+            .unwrap()
+    );
+    assert!(
+        sender
+            .manual_privacy_warning(&commitment, block.timestamp + AUTO_DELAY_MAX_SECONDS - 1)
+            .unwrap()
+    );
+    assert!(
+        !sender
+            .manual_privacy_warning(&commitment, block.timestamp + AUTO_DELAY_MAX_SECONDS)
+            .unwrap()
+    );
+    assert_eq!(
+        sender
+            .prepare_transfer_with_policy(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                ready - 1,
+                SpendPolicy::EnhancedPrivacy,
+            )
+            .err()
+            .as_deref(),
+        Some("wallet privacy delay has not elapsed")
+    );
+    assert!(
+        sender
+            .prepare_transfer_with_policy(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                ready,
+                SpendPolicy::EnhancedPrivacy,
+            )
+            .is_ok()
+    );
+    assert!(
+        sender
+            .prepare_transfer(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                0,
+            )
+            .is_ok()
+    );
+    let mut policy = sender.privacy_policy();
+    policy.enhanced_privacy = true;
+    sender.set_privacy_policy(policy);
+    assert_eq!(
+        sender
+            .prepare_transfer(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                ready - 1,
+            )
+            .err()
+            .as_deref(),
+        Some("wallet privacy delay has not elapsed")
+    );
+    assert!(
+        sender
+            .prepare_transfer(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                ready,
+            )
+            .is_ok()
+    );
+    assert!(
+        sender
+            .prepare_transfer_with_policy(
+                &state,
+                [Some(commitment), None],
+                &receiver.address(),
+                SIP_ASSET_ID,
+                100_000,
+                FeeTier::Standard,
+                0,
+                SpendPolicy::Manual,
+            )
+            .is_ok()
+    );
 }

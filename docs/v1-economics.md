@@ -112,10 +112,13 @@ Wallet recovery must reconstruct all note fields, including unlock heights,
 from authenticated ciphertexts and reconcile spent status against permanent
 nullifiers. The wallet shows available and locked balances by asset, lists
 scheduled batches and the next unlock, and labels date estimates as estimates
-from block intervals. After maturity, wallet preparation delays use of every
-nonzero-unlock note by a private six-hour to three-day interval, including when
-inputs are selected explicitly. Scheduling and small-note consolidation remain
-local policy; they cannot bypass a consensus lock or change proof validity. See
+from block intervals. Manual transfers can immediately use consensus-mature
+inputs; spending a recent arrival or recently unlocked note requires a privacy
+warning and explicit confirmation. Background selection and optional automatic
+consolidation use a private deterministic delay of at most six hours. Engineering
+and test networks disable this delay by default. Enhanced-privacy mode also
+applies the delay to manual transfers. This local policy cannot bypass a
+consensus lock or change proof validity. See
 the [wallet protection design](v1-wallet-protection.md).
 
 ## Development-fund vesting and spending

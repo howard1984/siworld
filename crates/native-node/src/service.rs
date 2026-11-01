@@ -20,6 +20,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "native-p2p")]
+pub mod network;
+
 pub const LEASE_FILE: &str = "service.lock";
 pub const STATUS_FILE: &str = "service-status.json";
 pub const OBSERVATION_TARGET_MS: u64 = 86_400_000;
@@ -239,6 +242,7 @@ pub struct RunIdentity {
     binary_sha256: String,
     configuration_sha256: String,
     started_unix_ms: u64,
+    peer_configuration_sha256: Option<String>,
 }
 impl RunIdentity {
     pub fn new(
@@ -263,10 +267,11 @@ impl RunIdentity {
             binary_sha256: binary,
             configuration_sha256: configuration,
             started_unix_ms,
+            peer_configuration_sha256: None,
         })
     }
     fn receipt(&self) -> Value {
-        json!({"schema_version":1,"run_id":self.run_id,"process_id":self.process_id,"network_id":local::hex(&self.network),"binary_sha256":self.binary_sha256,"configuration_sha256":self.configuration_sha256,"started_unix_ms":self.started_unix_ms,"observation_target_ms":OBSERVATION_TARGET_MS})
+        json!({"schema_version":1,"run_id":self.run_id,"process_id":self.process_id,"network_id":local::hex(&self.network),"binary_sha256":self.binary_sha256,"configuration_sha256":self.configuration_sha256,"started_unix_ms":self.started_unix_ms,"observation_target_ms":OBSERVATION_TARGET_MS,"peer_configuration_sha256":self.peer_configuration_sha256})
     }
 }
 pub struct Status {
@@ -283,6 +288,7 @@ pub struct Status {
     progress_sequence: u64,
     last_progress_elapsed_ms: u64,
     error_code: Option<&'static str>,
+    network_status: Option<Value>,
 }
 impl Status {
     pub fn new(_identity: &RunIdentity) -> Self {
@@ -300,6 +306,7 @@ impl Status {
             progress_sequence: 0,
             last_progress_elapsed_ms: 0,
             error_code: None,
+            network_status: None,
         }
     }
     pub fn observation_elapsed_ms(&self, now: Instant) -> u64 {
@@ -332,7 +339,7 @@ impl Status {
     ) -> Result<Value, String> {
         let observation = self.observation_elapsed_ms(now);
         Ok(
-            json!({"schema_version":1,"run_id":identity.run_id,"process_id":identity.process_id,"network_id":local::hex(&identity.network),"binary_sha256":identity.binary_sha256,"configuration_sha256":identity.configuration_sha256,"sequence":sequence,"phase":self.phase,"height":self.height,"tip":local::hex(&self.tip),"state_fingerprint":local::hex(&self.state_fingerprint),"cumulative_work":self.cumulative_work,"state_available":self.state_available,"updated_unix_ms":wall_ms()?,"started_unix_ms":identity.started_unix_ms,"elapsed_monotonic_ms":elapsed_ms(self.started,now),"observation_elapsed_ms":observation,"observation_target_ms":OBSERVATION_TARGET_MS,"observation_complete":observation_complete(observation) && self.error_code.is_none(),"pow_attempts":self.pow_attempts,"progress_sequence":self.progress_sequence,"last_progress_elapsed_ms":self.last_progress_elapsed_ms,"error_code":self.error_code}),
+            json!({"schema_version":1,"run_id":identity.run_id,"process_id":identity.process_id,"network_id":local::hex(&identity.network),"binary_sha256":identity.binary_sha256,"configuration_sha256":identity.configuration_sha256,"sequence":sequence,"phase":self.phase,"height":self.height,"tip":local::hex(&self.tip),"state_fingerprint":local::hex(&self.state_fingerprint),"cumulative_work":self.cumulative_work,"state_available":self.state_available,"updated_unix_ms":wall_ms()?,"started_unix_ms":identity.started_unix_ms,"elapsed_monotonic_ms":elapsed_ms(self.started,now),"observation_elapsed_ms":observation,"observation_target_ms":OBSERVATION_TARGET_MS,"observation_complete":observation_complete(observation) && self.error_code.is_none(),"pow_attempts":self.pow_attempts,"progress_sequence":self.progress_sequence,"last_progress_elapsed_ms":self.last_progress_elapsed_ms,"error_code":self.error_code,"network":self.network_status,"peer_configuration_sha256":identity.peer_configuration_sha256}),
         )
     }
 }
@@ -634,6 +641,13 @@ fn exporter(control: Arc<Control>) {
     }
 }
 fn verify_rewards(directory: &Path, store: &Store, control: &Control) -> Result<(), String> {
+    if store.has_local_reward_index()? {
+        control.progress()?;
+        store.verify_local_rewards()?;
+        return control.progress();
+    }
+    // Legacy isolated histories predate the local ownership index. Preserve
+    // their strict all-block receipt requirement without inferring remote work.
     for height in 1..=store.state().height {
         let block = store.block(height)?;
         let id = block.id()?;
@@ -670,11 +684,23 @@ fn mine(
     control: &Control,
     done: &AtomicBool,
 ) -> Result<bool, String> {
+    mine_guarded(block, state, control, done, None)
+}
+fn mine_guarded(
+    block: &mut crate::wire::Block,
+    state: &State,
+    control: &Control,
+    done: &AtomicBool,
+    cancellation: Option<&AtomicBool>,
+) -> Result<bool, String> {
     let result = (|| {
         let mut seed = block.pow_seed()?;
         let mut since_progress = 0u64;
         let mut progress_at = Instant::now();
         loop {
+            if cancellation.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                return Ok(false);
+            }
             let work = siworld_core::pow::pow_hash(&seed, block.nonce, state.config.pow_iterations);
             since_progress = since_progress
                 .checked_add(1)
@@ -736,14 +762,15 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
     }
     let verifier = NativeVerifier::new()?;
     control.phase("replaying")?;
-    let mut store = Store::open_existing(directory.join("chain.redb"), config.clone(), &verifier)?;
+    let store = Store::open_existing(directory.join("chain.redb"), config.clone(), &verifier)?;
     verify_rewards(directory, &store, control)?;
-    control.state(store.state())?;
+    let mut node = crate::runtime::Node::new(store, NativeVerifier::new()?);
+    control.state(node.state())?;
     control.phase("preparing")?;
     let prover = NativeProver::new()?;
     let mut pool = Pool::new(config.network);
     if refill(
-        store.state(),
+        node.state(),
         &prover,
         &verifier,
         &mut pool,
@@ -764,7 +791,7 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
             }
             control.phase("refilling")?;
             if !refill(
-                store.state(),
+                node.state(),
                 &prover,
                 &verifier,
                 &mut pool,
@@ -773,10 +800,9 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
             )? {
                 break;
             }
-            let positions = pool.take(store.state(), MIN_READY)?;
+            let positions = pool.take(node.state(), MIN_READY)?;
             let timestamp = (control.checked_wall()? / 1000).max(
-                store
-                    .state()
+                node.state()
                     .median_time_past()
                     .checked_add(1)
                     .ok_or("timestamp exhausted")?,
@@ -784,8 +810,11 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
             // Snapshot the explicit preference once. Later changes apply only to
             // the next candidate, never to this proof or ongoing work search.
             let settings = crate::mining::load(directory, config.network)?;
+            let permit = node
+                .begin_production()
+                .map_err(|_| "production preparation state unavailable")?;
             let mut produced =
-                producer::assemble(store.state(), &prover, positions, timestamp, &settings)?;
+                producer::assemble(node.state(), &prover, positions, timestamp, &settings)?;
             if control.stop()? {
                 break;
             }
@@ -793,7 +822,7 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
             let done = AtomicBool::new(false);
             let mined = std::thread::scope(|scope| {
                 let block = &mut produced.block;
-                let state = store.state();
+                let state = node.state();
                 let done_ref = &done;
                 let worker = scope.spawn(move || mine(block, state, control, done_ref));
                 // Proof generation runs ahead during real work search. A single
@@ -825,26 +854,27 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
                 break;
             }
             control.phase("committing")?;
-            let id = produced.block.id()?;
-            producer::validate_reward_secret(&produced.block, &produced.reward_secret)?;
-            // Receipt is durable before its block can become accepted. Failure
-            // leaves evidence for review and never restores an older database.
-            local::save_reward(directory, &id, &produced.reward_secret)?;
-            store.append(&produced.block, &verifier)?;
-            control.state(store.state())?;
+            let prepared = node
+                .bind_produced(permit, produced)
+                .map_err(|_| "completed production no longer matches the node state")?;
+            // The same owner writes durable recovery evidence, indexes local
+            // ownership and commits the fully verified canonical transition.
+            node.commit_produced(prepared)
+                .map_err(|_| "native production receipt or canonical commit rejected")?;
+            control.state(node.state())?;
             control.progress()?;
             control.event("block_accepted")?;
-            pool.prune(store.state())?;
+            pool.prune(node.state())?;
         }
     }
     control.phase("stopping")?;
     let expected = (
-        store.state().height,
-        store.state().tip,
-        store.state().fingerprint(),
-        store.state().cumulative_work,
+        node.state().height,
+        node.state().tip,
+        node.state().fingerprint(),
+        node.state().cumulative_work,
     );
-    drop(store);
+    drop(node);
     // Graceful stop requires a full independent replay and every reward receipt.
     let replayed = Store::open_existing(directory.join("chain.redb"), config, &verifier)?;
     verify_rewards(directory, &replayed, control)?;
@@ -879,13 +909,59 @@ pub fn run(directory: &Path) -> Result<(), String> {
     let rayon = std::env::var("RAYON_NUM_THREADS").ok();
     let hiding = std::env::var("SIWORLD_COMPOSITION_HIDING_WORKERS").ok();
     check_workers(rayon.as_deref(), hiding.as_deref())?;
+    run_controlled(directory, &config, None, |control| {
+        continuous(directory, control)
+    })
+}
+
+/// Listen only for explicitly pinned engineering peers. Public discovery and
+/// public-network activation remain unavailable.
+#[cfg(feature = "native-p2p")]
+pub fn run_network(directory: &Path, peer_file: &Path) -> Result<(), String> {
+    let _lease = Lease::acquire(directory)?;
+    let config = local::load(directory)?;
+    let binding = crate::p2p::Binding::new(&config);
+    let identity = crate::identity::NativeIdentity::load(directory, &binding)
+        .map_err(|_| "persistent native identity unavailable")?;
+    let local_id = identity
+        .descriptor()
+        .map_err(|_| "local descriptor unavailable")?
+        .fingerprint();
+    let peers = network::Configuration::load(directory, peer_file, binding, local_id)?;
+    if peers.mining_enabled() {
+        if config.fund_allocation.is_none() || config.fixture {
+            return Err(
+                "network production requires an ASERT configuration and fund allocation".into(),
+            );
+        }
+        crate::mining::load(directory, config.network)?;
+        check_workers(
+            std::env::var("RAYON_NUM_THREADS").ok().as_deref(),
+            std::env::var("SIWORLD_COMPOSITION_HIDING_WORKERS")
+                .ok()
+                .as_deref(),
+        )?;
+    }
+    let digest = peers.digest().to_owned();
+    run_controlled(directory, &config, Some(digest), |control| {
+        network::continuous(directory, control, peers)
+    })
+}
+
+fn run_controlled(
+    directory: &Path,
+    config: &crate::state::Config,
+    peer_digest: Option<String>,
+    action: impl FnOnce(&Arc<Control>) -> Result<(), String> + Send,
+) -> Result<(), String> {
     let binary = std::env::current_exe().map_err(|_| "running binary identity unavailable")?;
-    let identity = RunIdentity::new(
+    let mut identity = RunIdentity::new(
         config.network,
         sha256_file(&binary, false)?,
         sha256_file(&directory.join("engineering-network.bin"), true)?,
         wall_ms()?,
     )?;
+    identity.peer_configuration_sha256 = peer_digest;
     write_run_receipt(directory, &identity)?;
     let status = Status::new(&identity);
     let control = Arc::new(Control {
@@ -905,7 +981,7 @@ pub fn run(directory: &Path) -> Result<(), String> {
             .thread_name(|index| format!("native-prover-{index}"))
             .build()
             .map_err(|_| "resident prover worker-pool creation failed")?;
-        workers.install(|| continuous(directory, &control))
+        workers.install(|| action(&control))
     })();
     if result.is_err() {
         control.fail("service_operation_failed");
@@ -941,8 +1017,7 @@ pub fn run(directory: &Path) -> Result<(), String> {
     )?;
     result
 }
-pub fn request_stop(directory: &Path) -> Result<(), String> {
-    let status = exported_status(directory)?;
+fn active_run(status: &Value) -> Result<&str, String> {
     let run = status
         .get("run_id")
         .and_then(Value::as_str)
@@ -956,12 +1031,66 @@ pub fn request_stop(directory: &Path) -> Result<(), String> {
                 | "refilling"
                 | "mining"
                 | "committing"
+                | "networking"
                 | "stopping"
         )
     ) {
         return Err("no active service run is exported".into());
     }
+    Ok(run)
+}
+pub fn request_stop(directory: &Path) -> Result<(), String> {
+    let status = exported_status(directory)?;
+    let run = active_run(&status)?;
     write_stop_request(directory, run)
+}
+
+/// Stop only the explicitly identified run. A concurrently replaced status
+/// cannot redirect this request to a newer service invocation.
+pub fn request_stop_expected(directory: &Path, expected_run_id: &str) -> Result<(), String> {
+    stop_path(directory, expected_run_id)?;
+    let status = exported_status(directory)?;
+    if active_run(&status)? != expected_run_id {
+        return Err("exported service run differs from the expected run identity".into());
+    }
+    // Use the caller's immutable selection even if the export now changes.
+    write_stop_request(directory, expected_run_id)
+}
+
+/// Independently replay the idle canonical store and authenticate its local
+/// reward evidence. Exported service status is never accepted as proof.
+pub fn check_offline(directory: &Path) -> Result<Value, String> {
+    let _lease = Lease::acquire(directory)?;
+    let verifier = NativeVerifier::new()?;
+    let store = Store::open_existing(
+        directory.join("chain.redb"),
+        local::load(directory)?,
+        &verifier,
+    )?;
+    let (checked, scope) = if store.has_local_reward_index()? {
+        (store.verify_local_rewards()?, "indexed-local-rewards")
+    } else {
+        // An unindexed legacy history must authenticate every block receipt.
+        // Missing ownership metadata never implies remote production.
+        let mut checked = 0u64;
+        for height in 1..=store.state().height {
+            let block = store.block(height)?;
+            let id = block.id()?;
+            let secret = local::read_reward(directory, &id)?;
+            producer::validate_reward_secret(&block, &secret)?;
+            checked += 1;
+        }
+        (checked, "strict-legacy-rewards")
+    };
+    Ok(json!({
+        "schema": 1,
+        "height": store.state().height,
+        "tip": local::hex(&store.state().tip),
+        "state_fingerprint": local::hex(&store.state().fingerprint()),
+        "proof_replay_checked": true,
+        "local_reward_receipts_checked": checked,
+        "validation_scope": scope,
+    }))
 }
 
 #[cfg(test)]

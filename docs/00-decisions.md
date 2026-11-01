@@ -63,10 +63,11 @@ ML-DSA-65 public key and an explicit development-team wallet index. First
 compute `T = floor(subsidy / 10)`, then `floor(T * share[i] / 10000)` for each
 wallet; credit the residue to the team wallet. No V1 key or share replacement
 mechanism exists. Main-network activation requires an approved real registry;
-its importer and activation validation remain unimplemented. A distinct
-resettable ASERT engineering genesis uses 24 reproducible test keys, 23 shares
-of 400 basis points and a team share of 800 basis points, without waiting for
-main-network keys. Test keys and shares never select a main-network allocation.
+its importer and activation validation remain unimplemented. The resettable `siworld-eng-1` ASERT engineering genesis uses one independent
+random test account with 10,000 basis points and team index zero. Generate its
+ML-DSA-65 test custody only on an operations host. The older 24-key reproducible
+registry remains an isolated fixture and must not fund a running engineering
+chain. Test keys and shares never select a main-network allocation.
 
 Each wallet accumulates entitlement without a per-block output. Up to eight
 signed claims may enter one block, with independent wallet counters and

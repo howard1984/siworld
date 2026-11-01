@@ -15,6 +15,60 @@ deployment platforms remain subject to acceptance. This document does not change
 [Decisions](00-decisions.md), [native transaction design](route-a-v1.md) and the
 [node integration plan](v1-node-network-plan.md) define protocol requirements.
 
+## Resettable engineering release
+
+`siworld-eng-1` uses the native resident pinned-peer driver behind the explicit
+`native-p2p` feature. One guarded executable supplies validator, miner and wallet
+CLI commands. Build on Linux x86-64 from the pinned release source:
+
+```sh
+python3 scripts/build-native-runtime.py --engineering-network --output .local/engineering-release
+.local/engineering-release/bin/siworld-native-node --check-cpu
+.local/engineering-release/bin/siworld-native-node --help
+```
+
+The baseline launcher checks x86-64-v3 before executing the optimized worker.
+Build receipts bind the worker digest, repository ISA configuration and selected
+features. Tagged engineering assets also contain source commit and checksums.
+A release tag does not attest to sustained network or maximum-load acceptance.
+
+On a designated operations host, run `engineering-keys CUSTODY_DIRECTORY` once.
+It creates independent random ML-DSA-65 test fund and checkpoint seeds, private
+owner-only files and a public manifest. It refuses existing paths and never
+prints private seeds. Run `init-engineering-genesis DIRECTORY CUSTODY_DIRECTORY`
+when sealing the chain. This initializes ASERT work once, retains the production
+300-second interval and economic timings, and configures one test fund account
+at 10,000 basis points with team index zero. It creates no premine. The reserved
+2-of-3 checkpoint public roster is explicitly inactive until authenticated
+checkpoint startup exists; it has no current consensus or bootstrap authority.
+
+Import only immutable public rules using
+`init-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID`. Independently check
+the genesis identifier, export each host's public identity and persist peer pins
+with `peer-pin` before `run-network`. Private identity seeds, custody, databases,
+receipts and prior service records must not be copied between hosts. Validators
+set `mining: false`; the separately provisioned miner sets `mining: true` and
+explicitly configures Holder rewards to a locally retained wallet. Preserve old
+chain directories and gracefully stop prior writers before a service switch.
+Peer configuration and host inventories stay in private operations storage.
+Only the approved P2P TCP port is exposed; wallet services remain loopback-only.
+
+Manual wallet transfers are not delayed by default. Engineering background
+delay is disabled; the 24-block reward maturity and Holder locks remain intact.
+Start real low-value standard/priority transfers only after actual mature funds
+exist. A command exit alone never establishes payment acceptance or receipt.
+Private transaction coverage checks must not publish real/padding counts, fee
+tiers, private balances or note-to-time associations as per-block telemetry.
+
+Known incomplete work includes Dandelion++, authenticated checkpoint startup,
+three-day proof pruning, production transport qualification, OIDC operations
+roles and miner template pipelining. The engineering transport uses pinned
+Ed25519/ML-DSA-65 identities with the hybrid TLS candidate; it does not establish
+permissionless discovery or sustained Internet acceptance. Until pruning exists,
+monitor actual disk growth and preserve records; do not claim a bounded
+three-day on-disk history. Existing smaller engineering disks are a temporary
+operating constraint, not the documented 500-GB deployment qualification.
+
 ## Roles and fault domains
 
 Every full validator applies the same consensus rules and independently verifies

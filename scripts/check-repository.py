@@ -43,6 +43,13 @@ CRATES = {
     "core", "crypto", "poseidon2", "state", "circuits", "consensus",
     "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset", "fund-keytool",
 }
+PUBLIC_TEXT_ASSETS = {
+    "crates/native-node/src/web_wallet/assets/index.html",
+    "crates/native-node/src/web_wallet/assets/startup.css",
+    "crates/native-node/src/web_wallet/assets/startup.js",
+    "crates/native-node/src/web_wallet/assets/wallet.css",
+    "crates/native-node/src/web_wallet/assets/wallet.js",
+}
 NON_ENGLISH = re.compile(
     "[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]"
 )
@@ -81,7 +88,7 @@ def allowed(path):
         return path.suffix in {".yml", ".yaml", ".md"} or path.name == "CODEOWNERS"
     if path.parts[0] == "crates" and path.parts[1] in CRATES:
         return (
-            name in PUBLIC_ARTIFACTS
+            name in PUBLIC_ARTIFACTS or name in PUBLIC_TEXT_ASSETS
             or path.suffix in {".rs", ".toml", ".lock", ".py"}
             or path.name == "README.md"
         )
