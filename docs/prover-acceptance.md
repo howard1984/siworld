@@ -159,8 +159,10 @@ V2 history-compression upgrade and is not a V1 launch gate.
 ## Gate 5: deployment resources and timing
 
 Use the [minimum deployment configuration](v1-deployment.md): x86-64-v3 with
-CPU/OS-state checks, at least four available vCPUs, 16 GiB RAM for validators
-and 32 GiB for miners. The Linux measurement adapter requires Ubuntu 24.04
+CPU/OS-state checks, at least four available vCPUs, 16 GB RAM for validators
+and 32 GB for miners. Require at least 15 GiB / 30 GiB of system-visible
+memory respectively, including visible deployment cgroup limits. The Linux
+measurement adapter requires Ubuntu 24.04
 and cgroup v2. Record actual CPU model, exposed core/vCPU counts, memory,
 virtualization, ISA, compiler, dependency and resource-controller identities;
 CPU model is not an admission requirement. Existing EPYC 7763 results describe

@@ -108,8 +108,9 @@ reconstruct deleted historical proof validity.
 
 Every validator enforces consensus independently. A miner adds production;
 bootstrap services and the panel have no consensus authority. Initial
-qualification profiles start at **16 GiB RAM for validators** and a separate
-**32 GiB for miners**. These are unqualified profiles. The 5-GiB diagnostic
+qualification profiles start at **16 GB RAM for validators** and a separate
+**32 GB for miners**, with at least **15 GiB / 30 GiB of system-visible memory**
+respectively. These are unqualified profiles. The 5-GiB diagnostic
 proof scope is not a miner RAM requirement. Both roles use a 500-GB usable SSD
 installation floor and 1-TB recommendation; actual lifetime depends on load,
 issuance and database costs. One TB does not cover three full-load years under

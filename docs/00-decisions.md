@@ -268,7 +268,7 @@ The retained seven-node network, history and keys remain unchanged.
 
 The 5-GiB zero-swap generation measurements do not set a formal miner RAM
 requirement. The [qualification profiles](v1-deployment.md) start at four
-vCPUs/16 GiB for validators and at least four vCPUs/32 GiB for
+vCPUs/16 GB for validators and at least four vCPUs/32 GB for
 miners, with 500 GB usable SSD minimum and 1 TB recommended, plus separately
 budgeted backups. These profiles
 are unqualified until sustained integrated measurements pass. Linux x86-64-v3
@@ -280,10 +280,12 @@ and qualify actual full-capacity relay/recovery at both bandwidth classes.
 
 Hardware qualification changes from a specified CPU model to minimum
 configuration checks. Require x86-64-v3 CPU and operating-system support,
-at least four online and affinity-available vCPUs, and at least 16 GiB of
-visible deployment memory for validators or 32 GiB for miners. Visible
-inherited CPU or memory limits must not reduce that allocation below the
-role minimum. CPU vendor, model, exact core topology and virtualization are
+at least four online and affinity-available vCPUs, and advertised RAM of
+16 GB for validators or 32 GB for miners. Memory admission uses system-visible
+capacity: at least 15 GiB for validators or 30 GiB for miners. Visible
+inherited CPU or memory limits must not reduce that allocation below these
+admission floors. The advertised labels do not replace the visible-memory
+checks. CPU vendor, model, exact core topology and virtualization are
 measurement metadata, not admission requirements. The Linux collection
 adapter currently requires Ubuntu 24.04 and cgroup v2; other operating
 systems need qualified adapters.

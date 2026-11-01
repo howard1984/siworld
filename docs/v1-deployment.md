@@ -68,17 +68,19 @@ budget and does not replace the deployment memory requirement.
 
 | Role | Minimum configuration |
 | --- | --- |
-| Full validator | At least four vCPUs, 16 GiB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
-| Miner/full validator | At least four vCPUs, 32 GiB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
+| Full validator | At least four vCPUs, 16 GB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
+| Miner/full validator | At least four vCPUs, 32 GB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
 | Bootstrap or telemetry collector | Separate host; size after peer/load and retention tests |
 
-Memory qualification uses Linux `MemTotal` in bytes and checks visible
-deployment cgroup limits before creating proof scopes. It does not round a
-smaller visible allocation up to a provider's nominal RAM label. The workflow
-runs both validator and miner roles; an insufficient runner fails before
-optimized proof execution. An explicitly authorized larger or self-hosted
-runner can be selected at dispatch. Standard hosted labels do not guarantee
-the 32-GiB miner minimum.
+The advertised RAM profiles are 16 GB and 32 GB. Memory qualification uses
+Linux `MemTotal` in bytes: at least 15 GiB for validators or 30 GiB for miners.
+Visible deployment cgroup limits must also meet that role's admission floor
+before proof scopes are created. A nominal provider label alone does not
+qualify a smaller visible allocation. The workflow runs both validator and
+miner roles; an insufficient runner fails before optimized proof execution.
+An explicitly authorized larger or self-hosted runner can be selected at
+dispatch. Standard hosted labels do not guarantee the 30-GiB visible miner
+minimum.
 
 The hardware suite reproduces the frozen public keys, runs three transaction
 trials at each of one and four workers, and runs three four-worker fixed-576

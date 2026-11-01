@@ -35,8 +35,9 @@ AArch64 has a separate build target and requires its own hardware/resource
 qualification. Historical M1 measurements do not qualify every AArch64 machine.
 Native V1 hosted proof measurements used a 5-GiB zero-swap cgroup; that
 boundary does not set minimum miner RAM. The [deployment profiles](../v1-deployment.md)
-start qualification at 16 GiB for a full validator, 32 GiB for a miner and
-500 GB usable SSD minimum and 1 TB recommended, with 100-Mbps uplink
+start qualification at 16 GB for a full validator and 32 GB for a miner,
+with at least 15 GiB / 30 GiB of system-visible memory respectively. Storage
+requires 500 GB usable SSD minimum and 1 TB recommended, with 100-Mbps uplink
 recommended over the 43-Mbps minimum derived from the frozen proof cap and
 [complete bounded wire budget](../v1-network-budget.md).
 These admission floors do not establish sustained workload acceptance. Account separately for

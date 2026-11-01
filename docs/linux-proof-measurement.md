@@ -8,8 +8,10 @@ integration and independent review remain separate gates.
 ## Baseline and comparison hardware
 
 Use the [minimum deployment configuration](v1-deployment.md#minimum-host-configuration):
-x86-64-v3 CPU/OS support, at least four available vCPUs, and at least 16 GiB RAM
-for validators or 32 GiB for miners. The collection adapter requires Ubuntu
+x86-64-v3 CPU/OS support, at least four available vCPUs, and advertised RAM of
+16 GB for validators or 32 GB for miners. Require at least 15 GiB / 30 GiB of
+system-visible memory respectively, including visible deployment cgroup
+limits. The collection adapter requires Ubuntu
 24.04 and cgroup v2. Record full `lscpu`, exposed core/socket/logical topology,
 affinity, VM detection, actual CPU model and ISA flags, RAM, OS/kernel and
 resource constraints before each series. CPU vendor, model, exact topology and

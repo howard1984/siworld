@@ -83,7 +83,7 @@ budget requires **43 Mbps minimum uplink**, with **100 Mbps recommended**.
 | --- | --- |
 | Linux qualification minimum | Ubuntu 24.04 collector, x86-64-v3 CPU/OS support, at least four available vCPUs; record each actual allocation |
 | x86_64 release baseline | Fixed `x86-64-v3`, including AVX2 and CPU/OS-state admission checks; no scalar fallback |
-| Validator / miner minimum RAM | 16 GiB validator; 32 GiB miner; sustained integrated qualification remains separate |
+| Validator / miner minimum RAM | 16 GB validator / 32 GB miner; at least 15 GiB / 30 GiB system-visible memory respectively; sustained integrated qualification remains separate |
 | Usable SSD | 500-GB installation floor; 1 TB recommended; lifetime depends on workload |
 | Uplink | Conditional 43-Mbps minimum; 100 Mbps recommended |
 | macOS / Windows | Native packaging, resource and recovery qualification pending |

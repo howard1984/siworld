@@ -123,7 +123,8 @@ Historical Linux measurements used an EPYC 7763 Ubuntu 24.04 VM exposing two
 cores and four vCPUs, with EPYC 9V45 as a comparison environment. These models
 are not hardware requirements. Current qualification uses the minimum
 configuration: x86-64-v3 CPU/OS support, at least four available vCPUs and
-16 GiB for validators or 32 GiB for miners, with no scalar fallback. See the
+16 GB for validators or 32 GB for miners, with at least 15 GiB / 30 GiB of
+system-visible memory respectively and no scalar fallback. See the
 [hardware qualification requirements](../linux-proof-measurement.md#baseline-and-comparison-hardware).
 
 Retained D4/W16 leaf-B and uniform-q92 setup-excluding timing medians are

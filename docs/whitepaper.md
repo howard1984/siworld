@@ -224,8 +224,8 @@ A new node starts from a checkpoint signed by the genesis-fixed 2-of-3 authority
 
 | Role | Memory | Storage | Network |
 | --- | --- | --- | --- |
-| Validating node | 16 GiB | SSD, 500 GB minimum, 1 TB recommended | 43 Mbps minimum, 100 Mbps recommended |
-| Miner | 32 GiB | SSD, 1 TB recommended | 100 Mbps recommended |
+| Validating node | 16 GB | SSD, 500 GB minimum, 1 TB recommended | 43 Mbps minimum, 100 Mbps recommended |
+| Miner | 32 GB | SSD, 1 TB recommended | 100 Mbps recommended |
 
 All roles require an x86-64-v3 processor (AVX2). An ARM baseline is planned. These profiles are sized for sustained maximum load.
 

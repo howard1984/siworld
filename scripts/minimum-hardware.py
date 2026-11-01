@@ -12,7 +12,7 @@ SPEC = importlib.util.spec_from_file_location('minimum_measurement', ROOT / 'scr
 M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
 H = M.module('measure-proof-cgroup.py')
-MINIMUM_MEMORY = {'minimum-validator': 16 * 1024**3, 'minimum-miner': 32 * 1024**3}
+MINIMUM_MEMORY = {'minimum-validator': 15 * 1024**3, 'minimum-miner': 30 * 1024**3}
 X86_64_V3_FLAGS = {
     'avx': ('avx',), 'avx2': ('avx2',), 'bmi1': ('bmi1', 'bmi'), 'bmi2': ('bmi2',),
     'f16c': ('f16c',), 'fma': ('fma',), 'lzcnt': ('lzcnt', 'abm'), 'movbe': ('movbe',),

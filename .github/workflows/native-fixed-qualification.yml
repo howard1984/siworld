@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       runner_label:
-        description: Authorized Linux runner with at least 4 vCPUs and 32 GiB for the miner role
+        description: Authorized Linux runner with at least 4 vCPUs and 30 GiB visible RAM for the 32 GB miner profile
         type: string
         default: ubuntu-24.04
   pull_request:
@@ -167,7 +167,7 @@ jobs:
               'source_commit': os.environ['SOURCE_COMMIT'],
               'requested_hardware_profile': os.environ['HARDWARE_PROFILE'],
               'minimum_configuration_requested': True,
-              'minimum_role_memory_bytes': 34359738368 if os.environ['HARDWARE_PROFILE'] == 'minimum-miner' else 17179869184,
+              'minimum_role_memory_bytes': 32212254720 if os.environ['HARDWARE_PROFILE'] == 'minimum-miner' else 16106127360,
               'hardware_qualification_present': (output / 'preflight/hardware-qualification.json').is_file(),
               'measurement_summary_present': (output / 'measurements/summary.json').is_file(),
               'settlement_summary_present': (output / 'settlement/summary.json').is_file(),

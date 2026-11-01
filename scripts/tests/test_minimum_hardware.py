@@ -38,7 +38,7 @@ class MinimumHardwareTests(unittest.TestCase):
                 self.assertTrue(H.qualify_hardware_profile(hardware, profile)['profile_qualified'])
 
     def test_each_role_has_an_exact_memory_floor(self):
-        for role, gib in (('validator', 16), ('miner', 32)):
+        for role, gib in (('validator', 15), ('miner', 30)):
             profile = 'minimum-' + role
             for delta, accepted in ((-1, False), (0, True), (1, True)):
                 with self.subTest(role=role, delta=delta):
@@ -48,6 +48,15 @@ class MinimumHardwareTests(unittest.TestCase):
                     else:
                         with self.assertRaises(ValueError):
                             H.qualify_hardware_profile(value, profile)
+
+    def test_hosted_visible_memory_qualifies_only_the_validator_role(self):
+        hardware = self.hardware(memory=16_760_344_576)
+        self.assertTrue(H.qualify_hardware_profile(hardware, 'minimum-validator')['profile_qualified'])
+        with self.assertRaises(ValueError):
+            H.qualify_hardware_profile(hardware, 'minimum-miner')
+        H.qualify_memory_profile([{'memory.max': '16760344576'}], 'minimum-validator')
+        with self.assertRaises(ValueError):
+            H.qualify_memory_profile([{'memory.max': '16760344576'}], 'minimum-miner')
 
     def test_missing_features_and_reduced_cpu_capacity_fail(self):
         for name in H.X86_64_V3_FLAGS:
@@ -69,7 +78,7 @@ class MinimumHardwareTests(unittest.TestCase):
         self.assertFalse(all(H.v3_features([]).values()))
 
     def test_deployment_memory_limits_do_not_relabel_small_allocations(self):
-        for profile, gib in (('minimum-validator', 16), ('minimum-miner', 32)):
+        for profile, gib in (('minimum-validator', 15), ('minimum-miner', 30)):
             for limit in (str(gib * 1024**3), 'max'):
                 H.qualify_memory_profile([{'memory.max': limit}], profile)
             with self.assertRaises(ValueError):

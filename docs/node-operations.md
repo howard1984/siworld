@@ -14,8 +14,10 @@ services outside consensus.
 
 The minimum CPU configuration is at least four available vCPUs and fixed
 `x86-64-v3` release builds with AVX2 and CPU/OS-state admission checks. The
-Linux collector requires Ubuntu 24.04 and cgroup v2. Minimum RAM is 16 GiB for
-validators and 32 GiB for miners; the actual CPU model and resource allocation
+Linux collector requires Ubuntu 24.04 and cgroup v2. Advertised minimum RAM
+is 16 GB for validators and 32 GB for miners; memory admission requires at
+least 15 GiB / 30 GiB of system-visible memory respectively, including visible
+deployment cgroup limits. The actual CPU model and resource allocation
 must be recorded without a model requirement. These admission floors do not
 establish sustained workload acceptance. The isolated 5-GiB proof cgroup does
 not replace node/miner RAM requirements. macOS/Apple Silicon and Windows require separate
