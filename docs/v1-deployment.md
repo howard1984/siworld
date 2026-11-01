@@ -39,8 +39,9 @@ authority.
 
 ## Platform qualification
 
-The measured Linux reference is Ubuntu 24.04, AMD EPYC 7763, two exposed cores
-and four vCPUs in a Microsoft virtual machine. Host exclusivity is unknown.
+The historical measurement environment is Ubuntu 24.04, AMD EPYC 7763, two
+exposed cores and four vCPUs in a Microsoft virtual machine. Host exclusivity
+is unknown; the CPU model is not a deployment requirement.
 Use the fixed `x86-64-v3` release baseline with AVX2 and its startup check;
 `target-cpu=native` is not a reproducible release configuration. Record actual
 CPU, effective CPU quota, RAM, storage, hypervisor and dependency/source hashes.
@@ -55,18 +56,42 @@ measured storage, network and memory overhead. Do not label either path
 supported by transferring the Linux benchmark. Wallet-only qualification is
 independent of full-node qualification.
 
-## Candidate host profiles
+## Minimum host configuration
 
-These profiles are starting points for integration testing, not measured
-minimums or hardware requirements frozen by the isolated prover experiment.
-The 5-GiB zero-swap cgroup was a measurement boundary, not a miner requirement.
-Freeze supported hardware only after real maximum-load sustained acceptance.
+Require x86-64-v3 CPU and operating-system support, at least four online and
+affinity-available vCPUs, and the role memory below. CPU vendor/model, exact
+physical-core topology and virtualization are recorded without model-based
+admission. The current collection adapter uses Ubuntu 24.04 and cgroup v2.
+These admission floors do not establish maximum-load or sustained integrated
+acceptance. The independent 5-GiB zero-swap proof scope remains a measurement
+budget and does not replace the deployment memory requirement.
 
-| Role | Initial qualification profile |
+| Role | Minimum configuration |
 | --- | --- |
-| Full validator | Four reference-class vCPUs, 16 GiB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
-| Miner/full validator | At least four reference-class vCPUs, 32 GiB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
+| Full validator | At least four vCPUs, 16 GiB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
+| Miner/full validator | At least four vCPUs, 32 GiB RAM, 500 GB usable local SSD minimum; 1 TB recommended |
 | Bootstrap or telemetry collector | Separate host; size after peer/load and retention tests |
+
+Memory qualification uses Linux `MemTotal` in bytes and checks visible
+deployment cgroup limits before creating proof scopes. It does not round a
+smaller visible allocation up to a provider's nominal RAM label. The workflow
+runs both validator and miner roles; an insufficient runner fails before
+optimized proof execution. An explicitly authorized larger or self-hosted
+runner can be selected at dispatch. Standard hosted labels do not guarantee
+the 32-GiB miner minimum.
+
+The hardware suite reproduces the frozen public keys, runs three transaction
+trials at each of one and four workers, and runs three four-worker fixed-576
+settlement trials. It records actual CPU model, exposed core/vCPU counts,
+memory capacity, full ISA evidence, visible quotas, proof bytes and charged
+process-tree peaks. Transaction bodies must fit 655,360 bytes and all three
+four-worker generation times must be at most two seconds. Settlement bodies
+must fit 655,360 bytes and the 589,824-byte measurement threshold. No
+settlement-generation time limit is introduced. Each fresh proof process tree
+must remain within 5 GiB with zero swap and no limit/OOM events.
+The settlement fixture is the existing native-scan Holder witness; the separate
+maximal-priority-fee witness and combined complete-block gate remain required.
+These checks do not change runtime decoder or consensus caps.
 
 SSD capacity means usable capacity after filesystem/array overhead, before
 allocating separate backups. Disk redundancy does not replace backups. Measure
@@ -274,7 +299,7 @@ including observer loss, stale sessions, node restart, peak load and recovery.
 
 Keep 576 positions per block and the 80-bit quantum security requirement.
 Select the smallest measured proof body among profiles whose three
-four-worker generation trials on the EPYC 7763 reference host each complete
+four-worker generation trials on a minimum-qualified host each complete
 within two seconds. Set the body cap at least 10% above the largest observed
 selected-profile proof, rounded up to 64 KiB. The selected economic b7/q41/g20
 profile generated in 1.429902190–1.531155438 seconds across three reference-host

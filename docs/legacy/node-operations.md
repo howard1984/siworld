@@ -39,24 +39,26 @@ start qualification at 16 GiB for a full validator, 32 GiB for a miner and
 500 GB usable SSD minimum and 1 TB recommended, with 100-Mbps uplink
 recommended over the 43-Mbps minimum derived from the frozen proof cap and
 [complete bounded wire budget](../v1-network-budget.md).
-These are candidate profiles, not accepted minimums. Account separately for
+These admission floors do not establish sustained workload acceptance. Account separately for
 prover, node, verifier, OS, caches, maintenance and reserves, then qualify the
 aggregate under sustained maximum load. macOS and Windows require separate
 packaging and resource/recovery qualification. Do not change retained-network
 container or VM limits to accommodate new workers.
 
-Linux D8 acceptance uses the EPYC 7763 Ubuntu 24.04 Microsoft VM profile with
-two exposed cores and four vCPUs as the baseline; EPYC 9V45 is a comparison.
-Record and validate the actual machine before each three-trial series. These
-profiles are measurement references, not a claim of dedicated host cores or
-full-node integration acceptance. See the [qualification procedure](../linux-proof-measurement.md#baseline-and-comparison-hardware)
+Historical Linux D8 measurements used an EPYC 7763 Ubuntu 24.04 Microsoft VM
+exposing two cores and four vCPUs; EPYC 9V45 measurements provided a comparison.
+These describe measurement environments without imposing a CPU-model requirement.
+Current qualification checks x86-64-v3 CPU/OS support, at least four available
+vCPUs and the role memory minimum. Record the actual machine before each
+three-trial series without claiming dedicated host cores or full-node acceptance.
+See the [qualification procedure](../linux-proof-measurement.md#baseline-and-comparison-hardware)
 and [production acceptance plan](../prover-acceptance.md).
 
 ## Native V1 bandwidth target
 
 Capacity stays **576 positions per 300-second target block**. The selected
-transaction profile prioritizes at most two-second generation on a qualified
-EPYC 7763 four-vCPU VM. Its admission cap includes at least 10% over the largest
+transaction profile prioritizes at most two-second generation using four
+workers on minimum-qualified hardware. Its admission cap includes at least 10% over the largest
 measured proof body, rounded up to 64 KiB. The
 [source-bound engineering profile](../../crates/bench-multi-asset/artifacts/v1-transaction-profile.json)
 records the **655,360-byte (640-KiB)** transaction cap; the earlier 512-KiB

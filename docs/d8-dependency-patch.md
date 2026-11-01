@@ -114,8 +114,10 @@ The selected transaction profile is `log_blowup=7`, 41 queries and 20-bit
 query/batch grinding, with zero commitment grinding, binary folding and
 `log_final_poly_len=0`. Its selected quantum Johnson ledger is approximately
 81.692 bits. The scan compares blowup 5–8 with grinding 20/24. Every one of
-three generation trials must complete within two seconds on a qualified EPYC
-7763 four-vCPU VM. Among passing configurations, the smallest maximum observed
+three generation trials must complete within two seconds using four workers
+on a host meeting the [minimum configuration](v1-deployment.md#minimum-host-configuration).
+The recorded EPYC measurements describe their environment, not a CPU-model
+requirement. Among passing configurations, the smallest maximum observed
 proof body wins. Its admission cap is at least 10% above that sample maximum,
 rounded up to 64 KiB: 655,360 bytes (640 KiB) for the selected profile. The
 selected one/four-worker samples reached 588,832 bytes; the cap retains more

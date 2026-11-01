@@ -158,12 +158,14 @@ V2 history-compression upgrade and is not a V1 launch gate.
 
 ## Gate 5: deployment resources and timing
 
-Use [deployment qualification profiles](v1-deployment.md); formal minimum RAM
-and disk requirements remain unqualified until sustained integration trials.
-Linux x86_64 uses x86-64-v3 with AVX2 and OS-state checks. Prefer Ubuntu 24.04
-on the EPYC 7763 two-exposed-core/four-vCPU reference; record actual CPU,
-virtualization, ISA, compiler, dependency and resource-controller identities.
-Other CPU allocations and macOS/Windows adapters require their own results.
+Use the [minimum deployment configuration](v1-deployment.md): x86-64-v3 with
+CPU/OS-state checks, at least four available vCPUs, 16 GiB RAM for validators
+and 32 GiB for miners. The Linux measurement adapter requires Ubuntu 24.04
+and cgroup v2. Record actual CPU model, exposed core/vCPU counts, memory,
+virtualization, ISA, compiler, dependency and resource-controller identities;
+CPU model is not an admission requirement. Existing EPYC 7763 results describe
+their measurement environment. Every deployment still needs its own workload
+results, and macOS/Windows need qualified adapters.
 
 The hosted 5-GiB zero-swap generation scopes are measurement boundaries, not
 a formal miner RAM requirement. Select and enforce separate node, prover,
@@ -181,7 +183,7 @@ settings, process-tree limits, CPU quota/throttling, peak charged memory,
 individual values, medians and maxima. No OOM, restart or silent retry passes.
 
 The selected transaction-generation gate is at most two seconds in all three
-four-worker trials on the qualified reference. The economic b7/q41/g20
+four-worker trials on minimum-qualified hardware. The economic b7/q41/g20
 transaction trials range from 1.429902190 to 1.531155438 seconds, with a
 1.462877730-second median. Their maximum charged process-tree peak is
 525,234,176 bytes. Transaction proof bodies must fit 655,360 bytes;
@@ -191,6 +193,11 @@ maximum across one- and four-worker measurements;
 it is not a deterministic size theorem. Measure independent transaction and
 settlement verification separately. Cold start and readiness are separate timing markers; startup
 memory remains inside the lifetime resource boundary.
+
+Hardware qualification additionally checks fixed-576 settlement bodies against
+655,360 bytes and the stricter 589,824-byte (90-percent) measurement threshold.
+This does not change runtime decoder limits or replace the maximal-fee and
+combined complete-block acceptance gates.
 
 Then run three actual end-to-end trials for each capacity class, including a
 576-position block of distinct, conflict-free valid statements and its bound

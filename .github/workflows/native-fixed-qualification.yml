@@ -1,19 +1,23 @@
-name: Native frozen transaction qualification
+name: Native minimum hardware qualification
 
 on:
   workflow_dispatch:
     inputs:
-      hardware_profile:
-        description: Strict EPYC 7763 baseline, or an explicitly nonqualifying actual-host diagnostic
-        type: choice
-        options: [epyc7763-baseline, diagnostic]
-        default: epyc7763-baseline
+      runner_label:
+        description: Authorized Linux runner with at least 4 vCPUs and 32 GiB for the miner role
+        type: string
+        default: ubuntu-24.04
   pull_request:
     paths:
       - 'crates/native-node/**'
       - 'crates/bench-multi-asset/**'
       - 'crates/bench-d8/**'
       - 'scripts/qualify-native-transaction.py'
+      - 'scripts/qualify-native-settlement.py'
+      - 'scripts/minimum-hardware.py'
+      - 'scripts/prover-launcher.rs'
+      - 'scripts/tests/test_minimum_hardware.py'
+      - 'scripts/tests/test_cgroup_measurement.py'
       - 'scripts/tests/test_native_fixed_qualification.py'
       - '.github/workflows/native-fixed-qualification.yml'
 
@@ -21,17 +25,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: native-fixed-${{ github.ref }}-${{ inputs.hardware_profile || 'epyc7763-baseline' }}
+  group: native-fixed-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   native-fixed:
-    name: Frozen transaction build, keys and six fresh scopes
-    runs-on: ubuntu-24.04
+    name: Minimum ${{ matrix.role }} resources and frozen native proofs
+    runs-on: ${{ inputs.runner_label || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [validator, miner]
     timeout-minutes: 120
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/.local/native-fixed-target
-      HARDWARE_PROFILE: ${{ inputs.hardware_profile || 'epyc7763-baseline' }}
+      HARDWARE_PROFILE: minimum-${{ matrix.role }}
       RAYON_NUM_THREADS: 4
       SIWORLD_COMPOSITION_HIDING_WORKERS: 2
     steps:
@@ -43,16 +51,22 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts/tests -p test_native_fixed_qualification.py -v
           python3 -m unittest discover -s scripts/tests -p test_native_cgroup_measurement.py -v
+          python3 -m unittest discover -s scripts/tests -p test_minimum_hardware.py -v
+          python3 -m unittest discover -s scripts/tests -p test_cgroup_measurement.py -v
           python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json
       - name: Qualify the actual CPU and cgroup boundary before heavy work
         run: |
-          python3 scripts/measure-multi-asset.py --qualify-only \
+          python3 scripts/minimum-hardware.py \
             --hardware-profile "$HARDWARE_PROFILE" \
             --output .local/native-fixed/public/preflight
           test -e /sys/fs/cgroup/cgroup.controllers
           sudo --non-interactive systemctl --version
       - name: Install the repository toolchain
         run: rustup toolchain install
+      - name: Check full x86-64-v3 CPU and AVX operating-system state before optimized code
+        run: |
+          rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/native-fixed-cpu-check
+          /tmp/native-fixed-cpu-check --check-cpu
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: |
@@ -127,6 +141,15 @@ jobs:
             --reproduced .local/native-fixed/public/keys \
             --hardware-profile "$HARDWARE_PROFILE" \
             --output .local/native-fixed/public/measurements
+      - name: Measure three frozen fixed-576 settlement proofs with the 90-percent ceiling
+        run: |
+          python3 scripts/qualify-native-settlement.py \
+            --executable .local/native-fixed/package/bin/v1-transaction-scan \
+            --worker .local/native-fixed/package/libexec/v1-transaction-scan \
+            --screen .local/native-fixed/private/screen.json \
+            --reproduced .local/native-fixed/public/keys \
+            --hardware-profile "$HARDWARE_PROFILE" \
+            --output .local/native-fixed/public/settlement
       - name: Retain an explicit outcome on hardware, build or measurement failure
         if: ${{ always() }}
         env:
@@ -143,10 +166,14 @@ jobs:
               'job_status_before_upload': os.environ['JOB_STATUS'],
               'source_commit': os.environ['SOURCE_COMMIT'],
               'requested_hardware_profile': os.environ['HARDWARE_PROFILE'],
-              'strict_baseline_requested': os.environ['HARDWARE_PROFILE'] == 'epyc7763-baseline',
+              'minimum_configuration_requested': True,
+              'minimum_role_memory_bytes': 34359738368 if os.environ['HARDWARE_PROFILE'] == 'minimum-miner' else 17179869184,
               'hardware_qualification_present': (output / 'preflight/hardware-qualification.json').is_file(),
               'measurement_summary_present': (output / 'measurements/summary.json').is_file(),
+              'settlement_summary_present': (output / 'settlement/summary.json').is_file(),
               'proof_body_limit_bytes': 655360,
+              'settlement_proof_body_limit_bytes': 655360,
+              'settlement_measurement_ceiling_bytes': 589824,
               'four_worker_generation_limit_ns': 2000000000,
               'diagnostic_memory_max_bytes': 5368709120,
               'diagnostic_swap_max_bytes': 0,
@@ -158,7 +185,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: native-fixed-${{ inputs.hardware_profile || 'epyc7763-baseline' }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: native-fixed-minimum-${{ matrix.role }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .local/native-fixed/public/**/*.json
           include-hidden-files: true
           if-no-files-found: error

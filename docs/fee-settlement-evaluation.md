@@ -212,12 +212,13 @@ the revised relation's complete integration and review gates are satisfied,
 these two-output samples remain historical diagnostics. They are not
 production-readiness or activation evidence for the current profile.
 
-No qualified EPYC 7763 Ubuntu 24.04 cgroup result is included in this
+No Ubuntu 24.04 cgroup result from the historical EPYC 7763 measurement environment is included in this
 two-output baseline table. Current-profile measurements are recorded separately
 in the [multi-asset evaluation](v1-multi-asset-evaluation.md). The macOS series above cannot supply Linux kernel charged-memory
 evidence. The hosted native cgroup workflow provides a separate three-trial
 process-tree diagnostic series on Ubuntu 24.04, with kernel `memory.peak`,
 `memory.events`, exact limit readback and actual CPU identity retained in its
-sanitized artifact. A fresh hosted allocation does not establish the EPYC 7763
-reference baseline or isolated verifier-memory bounds. See
+sanitized artifact. A fresh hosted allocation must satisfy the
+[minimum configuration](v1-deployment.md#minimum-host-configuration), without
+a CPU-model requirement, and does not establish isolated verifier-memory bounds. See
 [the measurement procedure](linux-proof-measurement.md#hosted-native-diagnostics).

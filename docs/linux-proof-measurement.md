@@ -7,27 +7,33 @@ integration and independent review remain separate gates.
 
 ## Baseline and comparison hardware
 
-Use the **EPYC 7763 Ubuntu 24.04 Microsoft virtual-machine profile with two
-exposed cores and four vCPUs** as the Linux D8 acceptance baseline. EPYC 9V45 is
-the comparison profile. Record full `lscpu`, exposed core/socket/logical topology,
-affinity, VM detection, CPU model and ISA flags, RAM, OS/kernel and resource
-constraints before each series. Verify the actual baseline model and topology;
-do not treat any four-vCPU runner as equivalent. Preserve the non-secret
-`GITHUB_ACTIONS` marker through the privileged supervisor.
+Use the [minimum deployment configuration](v1-deployment.md#minimum-host-configuration):
+x86-64-v3 CPU/OS support, at least four available vCPUs, and at least 16 GiB RAM
+for validators or 32 GiB for miners. The collection adapter requires Ubuntu
+24.04 and cgroup v2. Record full `lscpu`, exposed core/socket/logical topology,
+affinity, VM detection, actual CPU model and ISA flags, RAM, OS/kernel and
+resource constraints before each series. CPU vendor, model, exact topology and
+virtualization are measurement metadata, not admission requirements. Preserve
+the non-secret `GITHUB_ACTIONS` marker through the privileged supervisor.
+
+Historical EPYC 7763 measurements used an Ubuntu 24.04 Microsoft VM exposing
+two cores and four vCPUs; EPYC 9V45 records are comparison measurements. Frozen
+model-specific collector profiles remain available to reproduce that evidence,
+but do not define current hardware qualification.
 
 The original short-lived runner is no longer available. A replacement requires
 fresh qualification, and its results identify that new allocation. All three
 trials of a configuration must run on one live machine; different jobs or VM
 allocations must not be described as the same machine. VM-visible cores do not
 prove physical host core count, exclusive access or identical contention. A
-missing CI marker means unknown context, not a non-CI host. A comparison host
-does not silently replace the EPYC 7763 acceptance baseline.
+missing CI marker means unknown context, not a non-CI host. A new allocation's
+results must retain its own measurement environment and qualification evidence.
 
 ## Hosted native diagnostics
 
 The native cgroup workflows run on Ubuntu 24.04 and record actual CPU model,
 topology, x86-64-v3/AVX2 features and VM context. Generic runner labels do not
-qualify the EPYC reference allocation. Build release proof tools with pinned
+establish minimum CPU or role memory compliance. Build release proof tools with pinned
 dependencies and fixed x86-64-v3, never `target-cpu=native`. Check the generic
 CPU/OS-state guard and inspect actual proof arithmetic for AVX2 instructions.
 

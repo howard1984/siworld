@@ -81,14 +81,14 @@ budget requires **43 Mbps minimum uplink**, with **100 Mbps recommended**.
 
 | Resource | Qualification profile |
 | --- | --- |
-| Linux proof reference | Ubuntu 24.04, EPYC 7763 class, four vCPUs; requalify each actual allocation |
+| Linux qualification minimum | Ubuntu 24.04 collector, x86-64-v3 CPU/OS support, at least four available vCPUs; record each actual allocation |
 | x86_64 release baseline | Fixed `x86-64-v3`, including AVX2 and CPU/OS-state admission checks; no scalar fallback |
-| Validator / miner RAM | 16 GiB validator profile; separate 32-GiB miner profile; integrated qualification pending |
+| Validator / miner minimum RAM | 16 GiB validator; 32 GiB miner; sustained integrated qualification remains separate |
 | Usable SSD | 500-GB installation floor; 1 TB recommended; lifetime depends on workload |
 | Uplink | Conditional 43-Mbps minimum; 100 Mbps recommended |
 | macOS / Windows | Native packaging, resource and recovery qualification pending |
 
-These are qualification profiles, not accepted minimum hardware guarantees.
+These are admission floors, not guarantees of sustained workload performance.
 The 5-GiB proof experiment is not a miner RAM requirement. Follow
 [deployment qualification](docs/v1-deployment.md) before operating a new native
 network.

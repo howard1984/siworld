@@ -292,7 +292,7 @@ configuration and regenerated artifacts before the three trials.
 
 Only then measure passing profiles under the hard limit. Opening-batch
 grinding is a mandatory pre-checkpoint task. Freeze and measure
-the implemented final configuration on the qualified EPYC 7763 baseline rather
+the implemented final configuration on minimum-qualified hardware rather
 than timing a reduced-difficulty substitute. Apply the joint checkpoint gates:
 at most 135 seconds within the current 10-GiB experimental ceiling permits
 continued experiments; more than 135 and at most 180 seconds under that ceiling

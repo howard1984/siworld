@@ -258,8 +258,9 @@ times, and complete process-tree charged-memory peaks, including resident
 preparation. Distinguish sampled per-phase charged-memory peaks from the
 kernel's lifetime peak: samples are lower bounds, and the lifetime peak governs
 hard-limit compliance. Serialized proof sizes describe retained encodings,
-not allocator footprint. Use the [Linux baseline profile](../linux-proof-measurement.md#baseline-and-comparison-hardware)
-on one live machine for all three trials; EPYC 9V45 remains a comparison.
+not allocator footprint. Apply the [minimum hardware checks](../linux-proof-measurement.md#baseline-and-comparison-hardware)
+on one live machine for all three trials and record its actual model and
+allocation. Retained EPYC 9V45 results describe a comparison measurement environment.
 Start isolated merge timing with eight leaf
 proofs available; include their generation in the N=16 projection. Verify every
 resulting proof. Keep all three observations and report median proving time

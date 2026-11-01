@@ -21,7 +21,7 @@ def parameters():
 
 
 class FixedQualificationTests(unittest.TestCase):
-    def run_collect(self, base, alter=None, hardware=True, profile='epyc7763-baseline'):
+    def run_collect(self, base, alter=None, hardware=True, profile='minimum-miner'):
         for name in ('launcher', 'worker', 'screen.json', 'manifest.json'):
             (base / name).write_text('{}')
         args = SimpleNamespace(output=base / 'results', executable=base / 'launcher',
@@ -44,7 +44,7 @@ class FixedQualificationTests(unittest.TestCase):
                 memory_swap_max_bytes=0, memory_events_before=counters.copy(),
                 memory_events_after=counters.copy(), memory_events_delta=counters.copy(),
                 remaining_descendants_at_exit=0, cpu_max='max 100000',
-                verification_workers=config['workers'], hardware_profile=profile,
+                verification_workers=config['workers'], hardware_profile=config['hardware_profile'],
                 measurement_scope_sha256=hashlib.sha256(config['unit'].encode()).hexdigest(),
                 visible_cpu_limits=[dict(ancestor_level=0, cpu_max='max 100000', quota_cores=None)],
                 measurement=dict(setup_ns=10, generation_ns=1_900_000_000,
@@ -58,8 +58,11 @@ class FixedQualificationTests(unittest.TestCase):
             Path(config['result']).write_text(json.dumps(row))
             return SimpleNamespace(returncode=0, stdout='private transport output')
 
+        hardware_record = dict(profile_qualified=True, hardware=dict(cpu_model='Synthetic CPU',
+            exposed_physical_cores=8, logical_cpus=8, memory_total_bytes=32 * 1024**3)) if hardware else None
         with mock.patch.object(Q, 'bound_profile', return_value=bound), \
              mock.patch.object(Q.M, 'qualify_and_record', return_value={'profile_qualified': True} if hardware else None), \
+             mock.patch.object(Q.H, 'qualify_and_record', return_value=hardware_record), \
              mock.patch.object(Q.M, 'validate_report', side_effect=lambda raw, config: raw['measurement']), \
              mock.patch.object(Q.M, 'security_summary', side_effect=lambda value: value), \
              mock.patch.object(Q.subprocess, 'check_output', return_value='d' * 40), \
@@ -82,6 +85,10 @@ class FixedQualificationTests(unittest.TestCase):
         self.assertIn(str(ROOT / 'scripts/measure-multi-asset.py'), command)
         self.assertTrue(value['baseline_qualified'])
         self.assertTrue(value['engineering_target_pass'])
+        self.assertTrue(value['minimum_configuration_qualified'])
+        self.assertEqual(value['hardware']['hardware']['memory_total_bytes'], 32 * 1024**3)
+        self.assertTrue(all(x['qualification_profile'] == 'minimum-miner' for x in configs))
+        self.assertTrue(all(x['hardware_profile'] == 'diagnostic' for x in configs))
         self.assertFalse(value['verification_only_process'])
         self.assertFalse(value['acceptance'])
 
@@ -101,6 +108,33 @@ class FixedQualificationTests(unittest.TestCase):
                 row['measurement']['proof_bytes'] = 655361
         with tempfile.TemporaryDirectory() as directory:
             code, value, _ = self.run_collect(Path(directory), alter=alter)
+        self.assertEqual(code, 1)
+        self.assertFalse(value['engineering_target_pass'])
+
+    def test_exact_time_and_size_limits_pass_and_extra_time_is_not_allowed(self):
+        def boundary(config, row, raw):
+            row['measurement'].update(generation_ns=2_000_000_000 if config['workers'] == 4
+                                     else 3_000_000_000, proof_bytes=655360)
+        with tempfile.TemporaryDirectory() as directory:
+            code, value, _ = self.run_collect(Path(directory), alter=boundary)
+        self.assertEqual(code, 0)
+        self.assertTrue(value['engineering_target_pass'])
+        self.assertEqual(value['four_worker_generation_limit_ns'], 2_000_000_000)
+
+    def test_legacy_recorder_diagnostic_profile_cannot_bypass_minimum_cpu_quota(self):
+        def reduced(config, row, raw):
+            self.assertEqual(config['hardware_profile'], 'diagnostic')
+            row['visible_cpu_limits'][0].update(cpu_max='300000 100000', quota_cores=3)
+        with tempfile.TemporaryDirectory() as directory:
+            code, value, _ = self.run_collect(Path(directory), alter=reduced)
+        self.assertEqual(code, 1)
+        self.assertFalse(value['engineering_target_pass'])
+
+    def test_whole_process_memory_peak_cannot_exceed_the_unchanged_budget(self):
+        def excessive(config, row, raw):
+            row['memory_peak_bytes'] = Q.M.MEMORY_MAX + 1
+        with tempfile.TemporaryDirectory() as directory:
+            code, value, _ = self.run_collect(Path(directory), alter=excessive)
         self.assertEqual(code, 1)
         self.assertFalse(value['engineering_target_pass'])
 

@@ -119,9 +119,11 @@ within the 10-GiB experimental ceiling permits continued experiments; more than
 more than 180 seconds or more than 10 GiB pauses progression. An OOM or incorrect
 proof also blocks progression. A result under this ceiling does not close
 production resource acceptance; its memory budget remains undecided.
-The EPYC 7763 Ubuntu 24.04 VM profile, exposing two cores and four vCPUs, is the
-Linux baseline; EPYC 9V45 is a comparison profile. The x86_64 release baseline
-is x86-64-v3, with mandatory AVX2 and no scalar fallback. See the
+Historical Linux measurements used an EPYC 7763 Ubuntu 24.04 VM exposing two
+cores and four vCPUs, with EPYC 9V45 as a comparison environment. These models
+are not hardware requirements. Current qualification uses the minimum
+configuration: x86-64-v3 CPU/OS support, at least four available vCPUs and
+16 GiB for validators or 32 GiB for miners, with no scalar fallback. See the
 [hardware qualification requirements](../linux-proof-measurement.md#baseline-and-comparison-hardware).
 
 Retained D4/W16 leaf-B and uniform-q92 setup-excluding timing medians are

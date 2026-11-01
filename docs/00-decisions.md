@@ -130,7 +130,8 @@ encryption-correctness circuits remain future research.
 
 The block target is 300 seconds with 64 through 576 positions in groups of 16.
 Keep the maximum at 576; there is no capacity-reduction fallback. Prioritize
-transaction proving within two seconds on the EPYC 7763 four-vCPU reference.
+transaction proving within two seconds using four workers on a host meeting
+the minimum hardware configuration.
 Select from log blowups 5 through 8 and query/batch grinding 20 or 24, using
 three fresh trials per configuration. All three generation times must pass;
 rank passing configurations by their largest observed serialized proof.
@@ -141,7 +142,8 @@ and opening-batch grinding 20, commitment grinding zero, binary folding and
 247 preprocessing columns and 101 public values. The
 [actual-AIR evaluation](v1-multi-asset-evaluation.md) and source-bound profiles
 record all eight configurations and three trials per configuration on an
-Ubuntu 24.04 EPYC 7763 VM exposing two physical cores and four vCPUs.
+Ubuntu 24.04 EPYC 7763 VM exposing two physical cores and four vCPUs. This is
+the recorded measurement environment, not a CPU-model requirement.
 
 The selected four-worker generation trials are 1.531155438, 1.429902190 and
 1.462877730 seconds. The largest proof across the selected one/four-worker
@@ -266,13 +268,38 @@ The retained seven-node network, history and keys remain unchanged.
 
 The 5-GiB zero-swap generation measurements do not set a formal miner RAM
 requirement. The [qualification profiles](v1-deployment.md) start at four
-reference-class vCPUs/16 GiB for validators and at least four vCPUs/32 GiB for
+vCPUs/16 GiB for validators and at least four vCPUs/32 GiB for
 miners, with 500 GB usable SSD minimum and 1 TB recommended, plus separately
 budgeted backups. These profiles
 are unqualified until sustained integrated measurements pass. Linux x86-64-v3
 is the measured platform; macOS and Windows need their own adapters and
 qualification. Keep the 43-Mbps uplink floor; prefer 100-Mbps links for margin
 and qualify actual full-capacity relay/recovery at both bandwidth classes.
+
+### Hardware qualification decision: 2026-11-01
+
+Hardware qualification changes from a specified CPU model to minimum
+configuration checks. Require x86-64-v3 CPU and operating-system support,
+at least four online and affinity-available vCPUs, and at least 16 GiB of
+visible deployment memory for validators or 32 GiB for miners. Visible
+inherited CPU or memory limits must not reduce that allocation below the
+role minimum. CPU vendor, model, exact core topology and virtualization are
+measurement metadata, not admission requirements. The Linux collection
+adapter currently requires Ubuntu 24.04 and cgroup v2; other operating
+systems need qualified adapters.
+
+Record actual CPU model, core/vCPU counts, memory capacity, ISA features and
+visible allocation limits for every measurement. Retain existing EPYC 7763
+records as measurement environments without changing their recorded values.
+Frozen proof parameters, public keys and source identities remain unchanged.
+All three four-worker transaction generation trials must still complete
+within 2,000,000,000 ns, and every transaction proof body must be at most
+655,360 bytes. The hardware suite also checks three fixed-576 settlement
+proofs against a 655,360-byte ceiling and its 589,824-byte (90-percent)
+measurement threshold. Keep the independent 5-GiB process-tree memory
+boundary, zero swap and failure on resource-limit events. This qualification
+does not change runtime proof decoders or consensus limits, replace maximal
+fee/full-block acceptance, or establish sustained node resource acceptance.
 
 At the target block rate, proofs and sidecars including the nominal depth-24
 finality tail require 336,179,807,232 rolling bytes at the separate caps.

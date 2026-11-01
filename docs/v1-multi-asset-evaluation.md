@@ -49,7 +49,7 @@ Three samples do not bound grinding tails or shared-host contention. The
 different parameters or lower bandwidth requirement needs a new measured,
 source-bound revision.
 
-## Reference execution and measurement scope
+## Measurement environment and scope
 
 [Hosted run 40746559683, attempt 2](https://github.com/siworld-labs/siworld/actions/runs/40746559683/attempts/2)
 measured source commit `7eecc60b9a1b0e7d6b348952daae06cd145abf3a`.
@@ -57,6 +57,9 @@ The runner reported Ubuntu 24.04, AMD EPYC 7763, two exposed physical cores,
 four vCPUs and four affinity CPUs under Microsoft virtualization. AVX2 was
 present; AVX-512 was absent. This is the exposed reference profile, not a
 claim of exclusive access to the physical host or a reserved persistent VM.
+It is retained measurement metadata, not a required CPU model. Current
+qualification uses the [minimum deployment configuration](v1-deployment.md)
+and records each actual allocation without changing these historical samples.
 
 The release uses fixed `x86-64-v3`, pinned dependencies and the CPU admission
 guard. Grid processes use four Rayon workers and two hiding workers; separate

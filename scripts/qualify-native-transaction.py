@@ -4,7 +4,7 @@
 Each of six fresh scopes uses the existing root recorder, a nonroot proof
 process, a 5-GiB memory boundary and no swap. Single-worker verification timing
 comes from a setup/prove/verify process; its peak is not verifier-only memory.
-The optional actual-host diagnostic never certifies the EPYC 7763 baseline.
+The optional actual-host diagnostic never certifies a deployment role.
 """
 import argparse
 import hashlib
@@ -31,6 +31,7 @@ def module(name):
 
 M = module('measure-multi-asset.py')
 F = module('check-native-proof-profiles.py')
+H = module('minimum-hardware.py')
 PARAMETERS = dict(log_blowup=7, num_queries=41, query_pow_bits=20,
     commit_pow_bits=0, batch_pow_bits=20, max_log_arity=1, log_final_poly_len=0)
 MEASUREMENTS = ('setup_ns', 'generation_ns', 'verification_ns', 'proof_bytes',
@@ -96,9 +97,9 @@ def clean_trial(row, raw, config, profile):
             expected = None if numerator == 'max' else int(numerator) / int(period)
             if quota != expected:
                 raise ValueError('CPU quota differs from its kernel limit')
-            if (config['hardware_profile'] == 'epyc7763-baseline'
+            if (config.get('qualification_profile', config['hardware_profile']) != 'diagnostic'
                     and expected is not None and expected < 4):
-                raise ValueError('Visible CPU quota is below the four-vCPU baseline')
+                raise ValueError('Visible CPU quota is below four vCPUs')
         # Inaccessible ancestors remain explicitly unknown, never unlimited.
         limits.append(dict(ancestor_level=index, cpu_max=maximum, quota_cores=quota))
     if not limits:
@@ -116,14 +117,16 @@ def clean_trial(row, raw, config, profile):
         measurement = M.validate_report(raw, config)
         if M.security_summary(raw['security']) != profile['security']:
             raise ValueError('Measured security differs from frozen profile')
-        measured = {name: M.integer(measurement[name], name, positive=True) for name in MEASUREMENTS}
+        names = MEASUREMENTS if config['kind'] == 'transaction' else MEASUREMENTS[:4]
+        measured = {name: M.integer(measurement[name], name, positive=True) for name in names}
         if any(row['measurement'].get(name) != number for name, number in measured.items()):
             raise ValueError('Recorder and actual report measurement differ')
         proof_pass = row.get('proof_report_valid') is True
     except (OSError, ValueError, TypeError, KeyError):
         measured = None
-    result = {'kind': 'transaction', 'workers': config['workers'], 'trial': config['trial'],
-        'parameters': PARAMETERS.copy(), 'hardware_profile': config['hardware_profile'],
+    result = {'kind': config['kind'], 'workers': config['workers'], 'trial': config['trial'],
+        'parameters': config['parameters'].copy(), 'hardware_profile': config['hardware_profile'],
+        'qualification_profile': config.get('qualification_profile', config['hardware_profile']),
         'measurement_scope_sha256': row['measurement_scope_sha256'],
         'resource_control_pass': resource_pass, 'proof_report_valid': proof_pass,
         'exit_code': exit_code, 'timed_out': row['timed_out'],
@@ -144,7 +147,9 @@ def collect(args):
         raise ValueError('Refusing to overwrite qualification evidence')
     args.output.mkdir(parents=True)
     profile = bound_profile(args.manifest, args.reproduced, args.screen)
-    if M.qualify_and_record(args.output, args.hardware_profile) is None:
+    qualify = H.qualify_and_record if args.hardware_profile in H.MINIMUM_MEMORY else M.qualify_and_record
+    hardware = qualify(args.output, args.hardware_profile)
+    if hardware is None:
         return 1
     executable, worker = args.executable.resolve(strict=True), args.worker.resolve(strict=True)
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
@@ -162,7 +167,9 @@ def collect(args):
                 config = dict(uid=os.getuid(), gid=os.getgid(),
                     unit='siworld-native-' + uuid.uuid4().hex + '.scope', kind='transaction',
                     parameters=PARAMETERS.copy(), workers=workers, trial=index, timeout=args.timeout,
-                    executable=str(executable), hardware_profile=args.hardware_profile,
+                    executable=str(executable),
+                    hardware_profile='diagnostic' if args.hardware_profile in H.MINIMUM_MEMORY else args.hardware_profile,
+                    qualification_profile=args.hardware_profile,
                     private_output=str(private / (stem + '-raw.json')),
                     private_log=str(private / (stem + '.log')),
                     result=str(private / (stem + '-result.json')), scan_mode='economics-candidate', **identity)
@@ -192,15 +199,16 @@ def collect(args):
         for group in groups.values() for row in group['trials'])
     time_pass = complete and all(row['measurement']['generation_ns'] <= M.GENERATION_MAX_NS
         for row in groups['4']['trials'])
-    baseline = args.hardware_profile == 'epyc7763-baseline'
+    baseline = args.hardware_profile != 'diagnostic'
     target = bool(baseline and complete and body_pass and time_pass)
-    result = dict(schema=1, status='baseline-qualified' if target else
-        ('baseline-target-not-met' if baseline else 'actual-host-diagnostic-only'),
+    result = dict(schema=1, status='minimum-qualified' if target else
+        ('minimum-target-not-met' if baseline else 'actual-host-diagnostic-only'),
         source_commit=commit, suite=M.SUITE, parameters=PARAMETERS.copy(), **identity,
         launcher_sha256=M.sha(executable), manifest_sha256=M.sha(args.manifest),
         public_verifier_key_sha256=profile['public_verifier_key_sha256'],
         reproduced_public_keys_match=True, actual_security_report=profile['security'],
         hardware_profile=args.hardware_profile, baseline_qualified=target,
+        hardware=hardware, minimum_configuration_qualified=target,
         engineering_target_pass=target, all_measurements_complete=complete,
         proof_body_limit_bytes=M.ECONOMICS_PROOF_MAX, proof_body_limit_pass=bool(body_pass),
         four_worker_generation_limit_ns=M.GENERATION_MAX_NS,
@@ -222,7 +230,8 @@ def main():
     parser.add_argument('--reproduced', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--private-parent', type=Path)
-    parser.add_argument('--hardware-profile', choices=('epyc7763-baseline', 'diagnostic'), default='epyc7763-baseline')
+    parser.add_argument('--hardware-profile', choices=('minimum-validator', 'minimum-miner', 'diagnostic'),
+        default='minimum-miner')
     parser.add_argument('--timeout', type=int, default=120)
     args = parser.parse_args()
     if not 1 <= args.timeout <= 600:
