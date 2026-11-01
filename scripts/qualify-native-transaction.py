@@ -29,7 +29,7 @@ def module(name):
     return result
 
 
-M = module('measure-multi-asset.py')
+M = module('qualification-cgroup.py')
 F = module('check-native-proof-profiles.py')
 H = module('minimum-hardware.py')
 PARAMETERS = dict(log_blowup=7, num_queries=41, query_pow_bits=20,
@@ -113,6 +113,7 @@ def clean_trial(row, raw, config, profile):
         and not any(counters['memory_events_delta'].values()))
     proof_pass = False
     measured = None
+    report_diagnostic = None
     try:
         measurement = M.validate_report(raw, config)
         if M.security_summary(raw['security']) != profile['security']:
@@ -122,8 +123,12 @@ def clean_trial(row, raw, config, profile):
         if any(row['measurement'].get(name) != number for name, number in measured.items()):
             raise ValueError('Recorder and actual report measurement differ')
         proof_pass = row.get('proof_report_valid') is True
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError) as error:
         measured = None
+        report_diagnostic = M.startup_diagnostic(json.dumps(
+            M.failure_diagnostic(error, 'proof-report')))
+    if row.get('proof_report_valid') is not True and isinstance(row.get('report_diagnostic'), dict):
+        report_diagnostic = M.startup_diagnostic(json.dumps(row['report_diagnostic']))
     result = {'kind': config['kind'], 'workers': config['workers'], 'trial': config['trial'],
         'parameters': config['parameters'].copy(), 'hardware_profile': config['hardware_profile'],
         'qualification_profile': config.get('qualification_profile', config['hardware_profile']),
@@ -139,7 +144,52 @@ def clean_trial(row, raw, config, profile):
         'scope_exit_code': 0, 'acceptance': False}
     if measured is not None:
         result['measurement'] = measured
+    if report_diagnostic is not None:
+        result['report_diagnostic'] = report_diagnostic
     return result
+
+
+def collect_trial(config, path, profile):
+    """Preserve bounded diagnostics for both frozen relations, never raw output."""
+    completed = None
+    stage = 'scope-launch'
+    failed = True
+    row = {}
+    try:
+        completed = subprocess.run(M.scope_command(config['unit'], path),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=config['timeout'] + 30, check=False)
+        stage = 'result-read'
+        recorded = json.loads(Path(config['result']).read_text())
+        try:
+            raw = json.loads(Path(config['private_output']).read_text())
+        except (OSError, ValueError):
+            raw = {}
+        stage = 'trial-validation'
+        row = clean_trial(recorded, raw, config, profile)
+        row['scope_exit_code'] = completed.returncode
+        if completed.returncode != 0:
+            row['resource_control_pass'] = False
+        failed = completed.returncode != 0
+        return row
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+        row = dict(kind=config['kind'], workers=config['workers'], trial=config['trial'],
+            parameters=config['parameters'].copy(), resource_control_pass=False,
+            proof_report_valid=False, failure='scope-report-or-profile-validation-failed',
+            collector_diagnostic=M.failure_diagnostic(error, stage), acceptance=False)
+        if completed is not None:
+            row['scope_exit_code'] = completed.returncode
+            if stage == 'result-read':
+                row['startup_diagnostic'] = M.startup_diagnostic(completed.stdout)
+        return row
+    finally:
+        if failed:
+            try:
+                stopped = subprocess.run(['sudo', '--non-interactive', 'systemctl', 'stop', config['unit']],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
+                row['owned_scope_stop_succeeded'] = stopped.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                row['owned_scope_stop_succeeded'] = False
 
 
 def collect(args):
@@ -175,23 +225,7 @@ def collect(args):
                     result=str(private / (stem + '-result.json')), scan_mode='economics-candidate', **identity)
                 path = private / (stem + '-config.json')
                 M.write_json(path, config)
-                try:
-                    completed = subprocess.run(M.scope_command(config['unit'], path),
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                        timeout=args.timeout + 30, check=False)
-                    recorded = json.loads(Path(config['result']).read_text())
-                    try:
-                        raw = json.loads(Path(config['private_output']).read_text())
-                    except (OSError, ValueError):
-                        raw = {}
-                    row = clean_trial(recorded, raw, config, profile)
-                    row['scope_exit_code'] = completed.returncode
-                    if completed.returncode != 0:
-                        row['resource_control_pass'] = False
-                except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
-                    row = dict(kind='transaction', workers=workers, trial=index,
-                        parameters=PARAMETERS.copy(), resource_control_pass=False,
-                        proof_report_valid=False, failure='scope-report-or-profile-validation-failed', acceptance=False)
+                row = collect_trial(config, path, profile)
                 rows.append(row)
             groups[str(workers)] = dict(trials=rows, summary=M.medians(rows))
     complete = all(group['summary'].get('complete') is True for group in groups.values())
@@ -204,6 +238,7 @@ def collect(args):
     result = dict(schema=1, status='minimum-qualified' if target else
         ('minimum-target-not-met' if baseline else 'actual-host-diagnostic-only'),
         source_commit=commit, suite=M.SUITE, parameters=PARAMETERS.copy(), **identity,
+        qualification_adapter_sha256=M.sha(Path(M.__file__)),
         launcher_sha256=M.sha(executable), manifest_sha256=M.sha(args.manifest),
         public_verifier_key_sha256=profile['public_verifier_key_sha256'],
         reproduced_public_keys_match=True, actual_security_report=profile['security'],

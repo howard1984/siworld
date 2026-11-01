@@ -21,6 +21,98 @@ def parameters():
 
 
 class FixedQualificationTests(unittest.TestCase):
+    def failed_trial(self, mode):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            config = dict(kind='transaction', workers=4, trial=1, parameters=parameters(),
+                timeout=5, unit='siworld-native-' + 'a' * 32 + '.scope',
+                result=str(base / 'result.json'), private_output=str(base / 'raw.json'))
+            diagnostic = json.dumps(dict(event='multi-asset-diagnostic-failed',
+                classification='FileNotFoundError', stage='initial-counters',
+                os_error_number=2, kernel_file='cpu.max', private_data='secret'))
+            def run(command, **kwargs):
+                if '--worker-config' not in command:
+                    return SimpleNamespace(returncode=0)
+                if mode == 'timeout':
+                    raise Q.subprocess.TimeoutExpired(command, 35, output='private timeout output')
+                if mode == 'malformed':
+                    Path(config['result']).write_text('private malformed report')
+                return SimpleNamespace(returncode=1, stdout=diagnostic + '\nprivate stderr')
+            with mock.patch.object(Q.subprocess, 'run', side_effect=run) as invoked:
+                row = Q.collect_trial(config, base / 'config.json', {})
+            return row, invoked.call_args_list
+
+    def test_missing_result_retains_recorder_stage_without_private_output(self):
+        row, calls = self.failed_trial('missing')
+        self.assertFalse(row['resource_control_pass'])
+        self.assertEqual(row['scope_exit_code'], 1)
+        self.assertEqual(row['collector_diagnostic']['stage'], 'result-read')
+        self.assertEqual(row['startup_diagnostic']['kernel_file'], 'cpu.max')
+        self.assertEqual(row['startup_diagnostic']['stage'], 'initial-counters')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[-1].args[0][-1], 'siworld-native-' + 'a' * 32 + '.scope')
+        for private in ('secret', 'private stderr', '/private', 'malformed report'):
+            self.assertNotIn(private, json.dumps(row))
+
+    def test_scope_timeout_preserves_class_and_cleans_only_owned_scope(self):
+        row, calls = self.failed_trial('timeout')
+        self.assertEqual(row['collector_diagnostic']['classification'], 'TimeoutExpired')
+        self.assertEqual(row['collector_diagnostic']['stage'], 'scope-launch')
+        self.assertNotIn('scope_exit_code', row)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn('private timeout', json.dumps(row))
+
+    def test_malformed_result_is_distinct_from_missing_result(self):
+        row, _ = self.failed_trial('malformed')
+        self.assertEqual(row['collector_diagnostic']['classification'], 'JSONDecodeError')
+        self.assertEqual(row['collector_diagnostic']['stage'], 'result-read')
+
+    def test_minimum_workflow_probes_scope_before_build(self):
+        workflow = (ROOT / '.github/workflows/native-fixed-qualification.yml').read_text()
+        self.assertIn('--smoke-scope', workflow)
+        self.assertLess(workflow.index('--smoke-scope'), workflow.index('Install the repository toolchain'))
+
+    def test_cpu_controller_requested_without_a_new_quota_or_memory_budget(self):
+        command = Q.M.scope_command('siworld-native-' + 'a' * 32 + '.scope', Path('/synthetic/config.json'))
+        for prop in ('CPUWeight=100', 'CPUAccounting=yes', 'MemoryMax=5G', 'MemorySwapMax=0'):
+            self.assertIn(prop, command)
+        self.assertFalse(any('CPUQuota' in arg for arg in command))
+        self.assertIn(str(Path(Q.M.__file__).resolve()), command)
+
+    def test_two_core_four_thread_7r13_meets_the_miner_preflight(self):
+        hardware = dict(os='Ubuntu 24.04', architecture='x86_64', cpu_model='AMD EPYC 7R13 Processor',
+            exposed_physical_cores=2, logical_cpus=4, online_logical_cpus=4, affinity_cpus=4,
+            memory_total_bytes=32_908_029_952,
+            x86_64_v3_features={name: True for name in Q.H.X86_64_V3_FLAGS})
+        self.assertTrue(Q.H.qualify_hardware_profile(hardware, 'minimum-miner')['profile_qualified'])
+        Q.H.qualify_cpu_profile([{'cpu_limit': {'quota_cores': 4}}], 'minimum-miner')
+        with self.assertRaises(ValueError):
+            Q.H.qualify_cpu_profile([{'cpu_limit': {'quota_cores': 2}}], 'minimum-miner')
+
+    def test_adapter_preserves_missing_cpu_file_stage_and_restores_hooks(self):
+        adapter = Q.M
+        config = dict(uid=1000, gid=1000, unit='siworld-native-' + 'a' * 32 + '.scope')
+        missing = FileNotFoundError(2, 'private exception', '/private/owner/cpu.max')
+        with mock.patch.object(adapter.M.os, 'geteuid', return_value=0), \
+             mock.patch.object(adapter.CG, 'scoped_group', return_value=Path('/synthetic/group')) as group, \
+             mock.patch.object(adapter.CG, 'snapshot', side_effect=missing) as snapshot, \
+             mock.patch.object(Path, 'read_text', return_value='0::/synthetic/group'), \
+             mock.patch.object(Path, 'write_text'):
+            with self.assertRaises(FileNotFoundError) as caught:
+                adapter.record(config)
+            self.assertIs(adapter.CG.scoped_group, group)
+            self.assertIs(adapter.CG.snapshot, snapshot)
+        report = adapter.failure_diagnostic(caught.exception, adapter.CURRENT_STAGE)
+        self.assertEqual(adapter.startup_diagnostic(json.dumps(report)), {
+            'category': 'scope-recorder-failure', 'classification': 'FileNotFoundError',
+            'stage': 'initial-counters', 'os_error_number': 2, 'kernel_file': 'cpu.max'})
+        self.assertNotIn('private', json.dumps(report))
+
+    def test_malformed_diagnostic_values_and_unknown_fields_are_not_exported(self):
+        report = dict(event='multi-asset-diagnostic-failed', classification={'private': 'value'},
+            stage=['private'], kernel_file='/private/cpu.max', os_error_number=True, token='secret')
+        self.assertEqual(Q.M.startup_diagnostic(json.dumps(report)), {'category': 'scope-recorder-failure'})
+
     def run_collect(self, base, alter=None, hardware=True, profile='minimum-miner'):
         for name in ('launcher', 'worker', 'screen.json', 'manifest.json'):
             (base / name).write_text('{}')
@@ -33,6 +125,8 @@ class FixedQualificationTests(unittest.TestCase):
         configs = []
 
         def scope(command, **_):
+            if '--worker-config' not in command:
+                return SimpleNamespace(returncode=0)
             config = json.loads(Path(command[command.index('--worker-config') + 1]).read_text())
             configs.append(config)
             counters = {name: 0 for name in Q.M.CG.EVENTS}
@@ -82,7 +176,7 @@ class FixedQualificationTests(unittest.TestCase):
         command = Q.M.scope_command('siworld-native-' + 'a' * 32 + '.scope', Path('/tmp/config'))
         self.assertIn('MemoryMax=5G', command)
         self.assertIn('MemorySwapMax=0', command)
-        self.assertIn(str(ROOT / 'scripts/measure-multi-asset.py'), command)
+        self.assertIn(str(ROOT / 'scripts/qualification-cgroup.py'), command)
         self.assertTrue(value['baseline_qualified'])
         self.assertTrue(value['engineering_target_pass'])
         self.assertTrue(value['minimum_configuration_qualified'])

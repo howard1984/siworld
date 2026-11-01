@@ -15,6 +15,7 @@ on:
       - 'scripts/qualify-native-transaction.py'
       - 'scripts/qualify-native-settlement.py'
       - 'scripts/minimum-hardware.py'
+      - 'scripts/qualification-cgroup.py'
       - 'scripts/prover-launcher.rs'
       - 'scripts/tests/test_minimum_hardware.py'
       - 'scripts/tests/test_cgroup_measurement.py'
@@ -61,6 +62,8 @@ jobs:
             --output .local/native-fixed/public/preflight
           test -e /sys/fs/cgroup/cgroup.controllers
           sudo --non-interactive systemctl --version
+          python3 scripts/qualification-cgroup.py --smoke-scope --timeout 10 \
+            --output .local/native-fixed/public/scope-preflight
       - name: Install the repository toolchain
         run: rustup toolchain install
       - name: Check full x86-64-v3 CPU and AVX operating-system state before optimized code

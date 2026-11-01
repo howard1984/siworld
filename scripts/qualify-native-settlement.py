@@ -82,27 +82,12 @@ def collect(args):
                 result=str(private / (stem + '-result.json')), scan_mode='economics-candidate', **identity)
             path = private / (stem + '-config.json')
             M.write_json(path, config)
-            try:
-                completed = subprocess.run(M.scope_command(config['unit'], path),
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                    timeout=args.timeout + 30, check=False)
-                recorded = json.loads(Path(config['result']).read_text())
-                try:
-                    raw = json.loads(Path(config['private_output']).read_text())
-                except (OSError, ValueError):
-                    raw = {}
-                row = Q.clean_trial(recorded, raw, config, profile)
-                row['scope_exit_code'] = completed.returncode
-                if completed.returncode != 0:
-                    row['resource_control_pass'] = False
-            except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
-                row = dict(kind='settlement', workers=4, trial=trial,
-                    parameters=PARAMETERS.copy(), resource_control_pass=False,
-                    proof_report_valid=False, failure='scope-report-or-profile-validation-failed', acceptance=False)
+            row = Q.collect_trial(config, path, profile)
             rows.append(row)
     passed = admission(rows)
     M.write_json(args.output / 'summary.json', dict(schema=1, source_commit=commit,
         kind='settlement', parameters=PARAMETERS.copy(), capacity=576, workers=4,
+        qualification_adapter_sha256=M.sha(Path(M.__file__)),
         hardware_profile=args.hardware_profile, hardware=hardware, **identity,
         public_verifier_key_sha256=profile['public_verifier_key_sha256'],
         reproduced_public_keys_match=True, actual_security_report=profile['security'],
