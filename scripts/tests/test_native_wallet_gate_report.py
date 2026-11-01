@@ -28,7 +28,11 @@ class NativeWalletGateTests(unittest.TestCase):
         self.private = Path(self.temporary.name) / 'private'
         self.private.mkdir()
         (self.private / 'runs').mkdir()
-        GATE.prepare(self.private, self.COMMIT)
+        # Keep synthetic freshness away from filesystem timestamp quantization.
+        # Production still rejects stale or future records without a tolerance.
+        started = GATE.time.time_ns() - 1_000_000_000
+        with mock.patch.object(GATE.time, 'time_ns', return_value=started):
+            GATE.prepare(self.private, self.COMMIT)
         self.run = self.private / 'runs' / ('native-wallet-roundtrip-' + 'b' * 32)
         self.run.mkdir()
 
