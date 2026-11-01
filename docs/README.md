@@ -10,6 +10,8 @@ outstanding.
 
 ## Native V1
 
+- [SIWORLD whitepaper](whitepaper.md): protocol design and economic model.
+
 1. [System overview](v1-overview.md): selected design, implementation status and trust boundaries.
 2. [Current decisions](00-decisions.md): authoritative requirements and freeze scope.
 3. [Architecture](architecture.md), [protocol](protocol.md), [cryptography](cryptography.md) and [security model](security-model.md).
