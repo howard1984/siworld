@@ -707,7 +707,8 @@ impl Server {
             && failure
                 .as_str()
                 .is_none_or(|v| v.is_empty() || v.len() > 64))
-            || (matches!(phase, "mining" | "preparing" | "refilling") && !state_available)
+            || (matches!(phase, "mining" | "preparing" | "refilling" | "networking")
+                && !state_available)
         {
             return Err("miner status shape inconsistent".into());
         }
