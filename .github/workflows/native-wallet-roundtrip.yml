@@ -15,8 +15,6 @@ on:
       - 'crates/core/src/v1_economics*'
       - 'crates/bench-multi-asset/**'
       - 'crates/bench-d8/**'
-      - 'scripts/native-wallet-gate-report.py'
-      - 'scripts/tests/test_native_wallet_gate_report.py'
 
 permissions:
   contents: read

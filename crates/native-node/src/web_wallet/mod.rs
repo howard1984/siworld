@@ -663,6 +663,7 @@ impl Server {
                     | "preparing"
                     | "refilling"
                     | "mining"
+                    | "networking"
                     | "committing"
                     | "stopping"
                     | "stopped"

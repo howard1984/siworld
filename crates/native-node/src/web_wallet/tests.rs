@@ -675,6 +675,9 @@ fn miner_projection_requires_immutable_receipt_and_strict_status_shape() {
     assert_eq!(projected["fresh"], true);
     assert_eq!(projected["observation"], "export_only_not_process_liveness");
     assert!(projected.get("fees").is_none());
+    status["phase"] = json!("networking");
+    fs::write(&path, serde_json::to_vec(&status).unwrap()).unwrap();
+    assert_eq!(server.miner_status().unwrap()["phase"], "networking");
     status["updated_unix_ms"] = json!(now + 60000);
     fs::write(&path, serde_json::to_vec(&status).unwrap()).unwrap();
     assert_eq!(server.miner_status().unwrap()["fresh"], false);
