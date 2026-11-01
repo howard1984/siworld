@@ -289,6 +289,8 @@ pub struct Status {
     last_progress_elapsed_ms: u64,
     error_code: Option<&'static str>,
     network_status: Option<Value>,
+    block_timestamp: u64,
+    template_generation_ms: Option<u64>,
 }
 impl Status {
     pub fn new(_identity: &RunIdentity) -> Self {
@@ -307,6 +309,8 @@ impl Status {
             last_progress_elapsed_ms: 0,
             error_code: None,
             network_status: None,
+            block_timestamp: 0,
+            template_generation_ms: None,
         }
     }
     pub fn observation_elapsed_ms(&self, now: Instant) -> u64 {
@@ -318,6 +322,7 @@ impl Status {
     }
     fn state(&mut self, state: &State) {
         self.height = state.height;
+        self.block_timestamp = state.timestamp();
         self.tip = state.tip;
         self.state_fingerprint = state.fingerprint();
         self.cumulative_work = local::hex(&state.cumulative_work.to_big_endian());
@@ -338,9 +343,11 @@ impl Status {
         sequence: u64,
     ) -> Result<Value, String> {
         let observation = self.observation_elapsed_ms(now);
-        Ok(
-            json!({"schema_version":1,"run_id":identity.run_id,"process_id":identity.process_id,"network_id":local::hex(&identity.network),"binary_sha256":identity.binary_sha256,"configuration_sha256":identity.configuration_sha256,"sequence":sequence,"phase":self.phase,"height":self.height,"tip":local::hex(&self.tip),"state_fingerprint":local::hex(&self.state_fingerprint),"cumulative_work":self.cumulative_work,"state_available":self.state_available,"updated_unix_ms":wall_ms()?,"started_unix_ms":identity.started_unix_ms,"elapsed_monotonic_ms":elapsed_ms(self.started,now),"observation_elapsed_ms":observation,"observation_target_ms":OBSERVATION_TARGET_MS,"observation_complete":observation_complete(observation) && self.error_code.is_none(),"pow_attempts":self.pow_attempts,"progress_sequence":self.progress_sequence,"last_progress_elapsed_ms":self.last_progress_elapsed_ms,"error_code":self.error_code,"network":self.network_status,"peer_configuration_sha256":identity.peer_configuration_sha256}),
-        )
+        let mut value = json!({"schema_version":1,"run_id":identity.run_id,"process_id":identity.process_id,"network_id":local::hex(&identity.network),"binary_sha256":identity.binary_sha256,"configuration_sha256":identity.configuration_sha256,"sequence":sequence,"phase":self.phase,"height":self.height,"tip":local::hex(&self.tip),"state_fingerprint":local::hex(&self.state_fingerprint),"cumulative_work":self.cumulative_work,"state_available":self.state_available,"updated_unix_ms":wall_ms()?,"started_unix_ms":identity.started_unix_ms,"elapsed_monotonic_ms":elapsed_ms(self.started,now),"observation_elapsed_ms":observation,"observation_target_ms":OBSERVATION_TARGET_MS,"observation_complete":observation_complete(observation) && self.error_code.is_none(),"pow_attempts":self.pow_attempts,"progress_sequence":self.progress_sequence,"last_progress_elapsed_ms":self.last_progress_elapsed_ms,"error_code":self.error_code,"network":self.network_status,"peer_configuration_sha256":identity.peer_configuration_sha256});
+        value["chain_metrics"] = json!({"last_block_timestamp": self.block_timestamp});
+        value["production_metrics"] = json!({"last_template_generation_ms": self.template_generation_ms,
+            "scope": "block-assembly-including-settlement-proof-excluding-pow"});
+        Ok(value)
     }
 }
 

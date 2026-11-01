@@ -1105,6 +1105,7 @@ enum ProofInput {
     },
 }
 struct BlockProofOutput {
+    generation_ms: u64,
     permit: runtime::ProductionPermit,
     produced: producer::ProducedBlock,
     state: State,
@@ -1190,6 +1191,7 @@ impl ProofTask {
                         timestamp,
                         settings,
                     } => {
+                        let started = Instant::now();
                         let mut produced = producer::assemble(
                             &state,
                             &prover,
@@ -1199,7 +1201,9 @@ impl ProofTask {
                         )?;
                         produced.block.issuances = inputs.issuances;
                         produced.block.validate_shape()?;
+                        let generation_ms = elapsed_ms(started, Instant::now());
                         ProofOutput::Block(Box::new(BlockProofOutput {
+                            generation_ms,
                             permit: inputs.permit,
                             produced,
                             state,
@@ -1356,6 +1360,7 @@ pub(super) fn continuous(
                                 .map_err(|_| "native private queue verification failed")?,
                             ProofOutput::Block(output) => {
                                 let BlockProofOutput {
+                                    generation_ms,
                                     permit,
                                     produced,
                                     state,
@@ -1366,6 +1371,11 @@ pub(super) fn continuous(
                                     // Discard local work before binding/writing.
                                     continue;
                                 }
+                                control
+                                    .status
+                                    .lock()
+                                    .map_err(|_| "service status lock poisoned")?
+                                    .template_generation_ms = Some(generation_ms);
                                 let prepared = node
                                     .bind_produced(permit, produced)
                                     .map_err(|_| "native producer result became stale")?;

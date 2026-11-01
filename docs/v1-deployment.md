@@ -60,6 +60,13 @@ exist. A command exit alone never establishes payment acceptance or receipt.
 Private transaction coverage checks must not publish real/padding counts, fee
 tiers, private balances or note-to-time associations as per-block telemetry.
 
+Private service exports include the accepted public block timestamp and the last
+block-template assembly duration, including settlement proving and excluding
+proof-of-work search. This is a scoped runtime observation, not a separate
+settlement benchmark. Operations monitoring pairs those values with process and
+cgroup memory, disk usage, height, tip and authenticated peer count. It must not
+add per-block real/padding counts or fee-tier telemetry.
+
 Known incomplete work includes Dandelion++, authenticated checkpoint startup,
 three-day proof pruning, production transport qualification, OIDC operations
 roles and miner template pipelining. The engineering transport uses pinned

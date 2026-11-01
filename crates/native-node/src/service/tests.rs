@@ -101,6 +101,26 @@ fn status_exposes_work_progress_without_private_positions() {
     }
 }
 #[test]
+fn private_metrics_expose_public_head_time_and_scoped_template_duration_only() {
+    let identity = RunIdentity::new([6; 32], "a".repeat(64), "b".repeat(64), 100).unwrap();
+    let mut status = Status::new(&identity);
+    status.block_timestamp = 1_800_000_000;
+    status.template_generation_ms = Some(5500);
+    let value = status.to_json(&identity, Instant::now(), 1).unwrap();
+    assert_eq!(
+        value["chain_metrics"],
+        json!({"last_block_timestamp": 1_800_000_000u64})
+    );
+    assert_eq!(
+        value["production_metrics"],
+        json!({"last_template_generation_ms": 5500,
+        "scope": "block-assembly-including-settlement-proof-excluding-pow"})
+    );
+    assert!(!value.to_string().contains("transaction_count"));
+    assert!(!value.to_string().contains("fee_tier"));
+}
+
+#[test]
 fn immutable_receipts_and_run_bound_stop_requests() {
     let directory = Directory::new();
     let identity = RunIdentity::new([5; 32], "a".repeat(64), "b".repeat(64), 100).unwrap();
