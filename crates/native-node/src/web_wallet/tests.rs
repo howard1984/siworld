@@ -12,7 +12,7 @@ impl Directory {
         ));
         fs::create_dir(&p).unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).unwrap();
-        Self(p)
+        Self(p.canonicalize().unwrap())
     }
 }
 impl Drop for Directory {
