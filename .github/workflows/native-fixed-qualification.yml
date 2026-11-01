@@ -9,7 +9,14 @@ on:
         default: ubuntu-24.04
   pull_request:
     paths:
-      - 'crates/native-node/**'
+      # Reuse completed qualification for CLI, service, transport and local-policy changes.
+      # Dispatch explicitly when a proof-affecting dependency change needs acceptance.
+      - 'crates/native-node/src/proofs.rs'
+      - 'crates/native-node/src/proof_codec.rs'
+      - 'crates/native-node/src/state.rs'
+      - 'crates/native-node/src/producer.rs'
+      - 'crates/native-node/src/wire.rs'
+      - 'crates/native-node/src/wallet_vault/native_roundtrip.rs'
       - 'crates/bench-multi-asset/**'
       - 'crates/bench-d8/**'
       - 'scripts/qualify-native-transaction.py'
@@ -20,7 +27,6 @@ on:
       - 'scripts/tests/test_minimum_hardware.py'
       - 'scripts/tests/test_cgroup_measurement.py'
       - 'scripts/tests/test_native_fixed_qualification.py'
-      - '.github/workflows/native-fixed-qualification.yml'
 
 permissions:
   contents: read

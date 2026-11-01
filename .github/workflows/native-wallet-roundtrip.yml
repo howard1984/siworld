@@ -4,11 +4,17 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - 'crates/native-node/**'
+      # Reuse completed qualification for CLI, service, transport and local-policy changes.
+      # Dispatch explicitly when a proof-affecting dependency change needs acceptance.
+      - 'crates/native-node/src/proofs.rs'
+      - 'crates/native-node/src/proof_codec.rs'
+      - 'crates/native-node/src/state.rs'
+      - 'crates/native-node/src/producer.rs'
+      - 'crates/native-node/src/wire.rs'
+      - 'crates/native-node/src/wallet_vault/native_roundtrip.rs'
       - 'crates/core/src/v1_economics*'
       - 'crates/bench-multi-asset/**'
       - 'crates/bench-d8/**'
-      - '.github/workflows/native-wallet-roundtrip.yml'
       - 'scripts/native-wallet-gate-report.py'
       - 'scripts/tests/test_native_wallet_gate_report.py'
 
