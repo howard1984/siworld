@@ -1285,6 +1285,8 @@ pub(super) fn continuous(
     );
     let mut node = Node::new(store, verifier);
     let mut driver = Driver::new(identity, config, node.transport_budget())?;
+    #[cfg(all(feature = "wallet-light-gateway", unix))]
+    let mut wallet_gateway = crate::wallet_gateway::Gateway::from_environment()?;
     // Independent local-job ownership allowance: at most one prover and one
     // PoW task, each retaining a bounded snapshot/result. Sharing these 512 MiB
     // with peers would starve maximum-block locator/synchronization admission.
@@ -1300,6 +1302,10 @@ pub(super) fn continuous(
     let result: Result<(), String> = (|| {
         while !control.stop()? {
             driver.poll()?;
+            #[cfg(all(feature = "wallet-light-gateway", unix))]
+            if let Some(gateway) = &mut wallet_gateway {
+                gateway.poll(&mut node);
+            }
             for _ in 0..COMMAND_SLOTS {
                 match driver.rx.try_recv() {
                     Ok(command) => {

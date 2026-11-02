@@ -36,7 +36,7 @@ export function initVault(walletInfo) {
     worker?.terminate(); ready = false;
     for (const request of requests.values()) request.reject(new Error('Content session closed.'));
     requests.clear(); clear(); dialog.close();
-    $('#lock').disabled = !walletInfo() && !$('#flow').open;
+    $('#lock').disabled = !walletInfo() && !$('#flow')?.open;
     if (healthy && restart) startWorker(); capability();
   }
   function activity() {
@@ -130,13 +130,14 @@ export function initVault(walletInfo) {
   });
   function view() {
     const vault = location.hash === '#vault';
-    $('#wallet-view').hidden = vault; $('#vault-view').hidden = !vault;
+    if($('#wallet-view')) $('#wallet-view').hidden = vault; $('#vault-view').hidden = !vault;
     for (const link of document.querySelectorAll('[data-view]')) {
       if ((link.dataset.view === 'vault') === vault) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
     }
     document.dispatchEvent(new CustomEvent('vault-view-change', { detail: { active: vault } }));
   }
   window.addEventListener('hashchange', view); view();
+  document.addEventListener('vault-collection-changed',()=>render().catch(()=>status('Imported collection could not be read.',true)));
   for (const event of ['keydown', 'pointerdown']) dialog.addEventListener(event, activity, { passive: true });
   document.addEventListener('visibilitychange', () => { if (document.hidden && dialog.open) close(); });
   window.addEventListener('pagehide', () => close(false));

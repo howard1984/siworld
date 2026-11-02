@@ -1,40 +1,46 @@
-import { initVault } from './native-vault.js';
+import { VAULT } from '../sdk/vault-network.js';
 import { backup, bytes, parseBackup, records, save, MAX_BACKUP } from '../sdk/storage.js';
 import { ENGINEERING } from '../sdk/network.js';
+import { ProofProgress } from '../sdk/proof-progress.js';
 
 const $ = selector => document.querySelector(selector);
 const flow = $('#flow');
 let worker, sequence = 0, epoch = 0, ready = false, busy = false, storageHealthy = false;
 let mode = '', stage = '', context, positions, info, encrypted, savedRecords = [], imported;
-let timer;
+let timer, pollTimer, onlineBusy=false, onlineReady=false, preparedId=null;
 const pending = new Map(), contacts = new Map();
+const proofProgress = new ProofProgress({root: $('#send-progress'), label: $('#send-progress-label'), detail: $('#send-progress-detail'), bar: $('#send-progress-bar')});
+const paymentControls = () => { for (const id of ['send-recipient', 'send-amount', 'send-priority', 'send-prepare']) $(`#${id}`).disabled = proofProgress.active; };
 function message(text, error = false) { $('#status').textContent = text; $('#status').classList.toggle('error', error); }
-function capability(value) { for (const id of ['create', 'restore', 'import-backup', 'check', 'import-contact']) $(`#${id}`).disabled = !value; }
+function capability(value) { value=value&&ENGINEERING.name==='siworld-eng-1'&&/^[0-9a-f]{64}$/.test(ENGINEERING.network); for (const id of ['create', 'restore', 'import-backup', 'check', 'import-contact']) $(`#${id}`).disabled = !value; }
 function startWorker() {
   worker = new Worker(new URL('../sdk/worker.js', import.meta.url), { type: 'module' });
   worker.onmessage = ({ data }) => {
-    if (data.ready) { ready = true; capability(storageHealthy); if (storageHealthy) message('Native V1 ready. Keys are processed locally; no chain connection is configured.'); return; }
+    if (data.ready) { ready = true; capability(storageHealthy); if (storageHealthy) message('Native V1 core ready. Only the pinned engineering network can connect.'); return; }
     const request = pending.get(data.id);
     if (!request) return;
+    if (data.progress) { request.onProgress?.(data.progress); return; }
     pending.delete(data.id);
     data.error ? request.reject(new Error(data.error)) : request.resolve(data.result);
   };
-  worker.onerror = () => { for (const request of pending.values()) request.reject(new Error('The local wallet core stopped. Lock and reopen the page.')); pending.clear(); capability(false); message('The local wallet core could not load. No wallet data was sent.', true); };
+  worker.onerror = () => { for (const request of pending.values()) request.reject(new Error('The local wallet core stopped. Lock and reopen the page.')); pending.clear(); capability(false); message('The local wallet core stopped. Preserve pending payments and reopen the encrypted wallet.', true); };
 }
 function call(action, ...args) {
-  return new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject }); worker.postMessage({ id, action, args }); });
+  return new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject, onProgress: action === 'prepare' ? stage => proofProgress.stage(stage) : null }); worker.postMessage({ id, action, args }); });
 }
 function clearSecrets() {
   for (const input of flow.querySelectorAll('input[type=password], #restore-words, #answers input')) input.value = '';
   $('#words').replaceChildren(); $('#answers').replaceChildren(); positions = null;
 }
 function lock(text = 'Wallet locked. Recovery fields and the local worker session were cleared.', restart = true) {
-  ++epoch; clearTimeout(timer); worker?.terminate(); ready = false; capability(false);
+  proofProgress.reset(); paymentControls();
+  ++epoch; clearTimeout(timer); clearTimeout(pollTimer); onlineReady=false; preparedId=null; worker?.terminate(); ready = false; capability(false);
   for (const request of pending.values()) request.reject(new Error('Wallet session was closed.'));
   pending.clear(); clearSecrets(); flow.close();
   info = encrypted = imported = context = null; busy = false; stage = mode = '';
-  $('#next').disabled = false;
+  $('#next').disabled = false; $('#send-open').disabled=true; $('#send-flow').close(); $('#balance-value').textContent='—'; $('#chain-status').textContent='Wallet locked.';
   $('#recipient').value = ''; $('#address-result').textContent = ''; contacts.clear();
+  $('#balance-detail').textContent='Unlock to scan public compact records locally.';$('#asset-balances').replaceChildren();$('#payment-list').replaceChildren();$('#send-recipient').value='';$('#send-amount').value='';$('#send-review').textContent='';$('#send-error').textContent='';
   $('#setup').hidden = false; $('#receiving').hidden = true; $('#full-address').value = ''; $('#short-address').textContent = '';
   $('#account-index').textContent = 'No wallet unlocked'; $('#account-state').textContent = 'LOCKED';
   $('#lock').disabled = $('#copy-address').disabled = true;
@@ -88,7 +94,7 @@ function render(publicInfo, record) {
   $('#full-address').value = info.full_address; $('#short-address').textContent = info.short_address;
   $('#account-state').textContent = 'UNLOCKED'; $('#account-index').textContent = `Account ${info.account} · ${info.network.slice(0, 12)}…`;
   $('#lock').disabled = $('#copy-address').disabled = false;
-  message('Wallet unlocked locally. Receiving keys are ready; balance verification and sending are not connected.'); activity();
+  message('Wallet unlocked locally. Starting compact engineering synchronization.'); activity(); startOnline();
 }
 $('#create').addEventListener('click', () => begin('create'));
 $('#restore').addEventListener('click', () => begin('restore'));
@@ -194,4 +200,21 @@ if (!isSecureContext || window.top !== window || !crypto?.getRandomValues || !na
   startWorker(); reloadSaved().then(() => { storageHealthy = true; capability(ready); }).catch(() => { storageHealthy = false; capability(false); message('Encrypted storage could not be read. Existing data was preserved; saving is paused.', true); });
 }
 
-initVault(() => info);
+if(VAULT.application){const link=document.querySelector('[data-view="vault"]');link.href=VAULT.application;link.rel='noreferrer noopener';}else document.querySelector('[data-view="vault"]').addEventListener('click',event=>{event.preventDefault();message('The independent Vault origin is not configured in this build.',true);});
+function atoms(text){const n=BigInt(text||'0');return `${n/100000000n}.${(n%100000000n).toString().padStart(8,'0')}`;}
+function desktopSend(){return ENGINEERING.desktop_send_measured===true&&!navigator.userAgentData?.mobile&&!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)&&navigator.maxTouchPoints===0;}
+function showBalance(result,stale=false){
+ const sip=result.rows.find(row=>row.asset==='0'.repeat(64));$('#balance-value').textContent=atoms(sip?.available_atoms);
+ $('#balance-detail').textContent=`Mature ${atoms(sip?.mature_atoms)} SIP · locked ${atoms(sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · ${result.payments?.filter(p=>p.phase==='pending'||p.phase==='unknown').length||0} pending or uncertain payments`;
+ $('#chain-status').textContent=`${stale?'Stale · ':''}siworld-eng-1 · height ${result.height} · ${result.tip.slice(0,16)}… · transactions trust full-node consensus`;
+ $('#send-open').disabled=stale||!result.ready||!desktopSend();
+ $('#asset-balances').replaceChildren(...result.rows.filter(r=>r.asset!=='0'.repeat(64)).map(row=>{const p=document.createElement('p');p.textContent=`Asset ${row.asset.slice(0,12)}… · available ${row.available_atoms} atoms · locked ${row.locked_atoms} atoms`;return p;}));
+ $('#payment-list').replaceChildren(...(result.payments||[]).map(payment=>{const row=document.createElement('p');row.textContent=`${atoms(payment.amount_atoms)} SIP · ${payment.phase} `;if(['finalized','pending','unknown'].includes(payment.phase)){const button=document.createElement('button');button.type='button';button.textContent=payment.phase==='finalized'?'Review and submit':'Retry same packet';button.disabled=stale||!result.ready||!desktopSend();button.onclick=()=>{if(proofProgress.active)return;proofProgress.reset();preparedId=payment.id;$('#send-disclosure').checked=false;$('#send-review').textContent=`${atoms(payment.amount_atoms)} SIP · fee ${atoms(payment.fee_atoms)} SIP · recipient ${payment.recipient}`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;$('#send-flow').showModal();};row.append(button);}if(['prepared','finalized'].includes(payment.phase)){const cancel=document.createElement('button');cancel.type='button';cancel.textContent='Cancel unsent payment';cancel.onclick=async()=>{try{showBalance(await call('cancel-payment',payment.id));}catch(error){message(error.message,true);}};row.append(cancel);}return row;}));
+}
+async function startOnline(){const token=epoch;onlineReady=false;try{const result=await call('online-init',ENGINEERING);if(token!==epoch)return;showBalance(result,true);onlineReady=true;await refreshOnline();}catch(error){if(token===epoch)$('#chain-status').textContent=error.message;}}
+async function refreshOnline(){clearTimeout(pollTimer);if(!onlineReady||onlineBusy||!info)return;onlineBusy=true;const token=epoch;try{const result=await call('sync');if(token===epoch)showBalance(result);}catch(error){if(token===epoch){$('#chain-status').textContent=`Synchronization paused: ${error.message} Previous balance is stale.`;$('#send-open').disabled=true;}}finally{onlineBusy=false;if(token===epoch&&info)pollTimer=setTimeout(refreshOnline,5000);}}
+$('#sync-now').onclick=refreshOnline;
+$('#send-open').onclick=()=>{if(proofProgress.active){$('#send-flow').showModal();return;}proofProgress.reset();$('#send-disclosure').checked=false;$('#send-recipient').value=$('#recipient').value;$('#send-prepare').hidden=false;$('#send-ready').hidden=true;$('#send-transmit').hidden=true;$('#send-error').textContent='';$('#send-flow').showModal();};
+$('#send-close').onclick=()=>$('#send-flow').close();
+$('#send-form').onsubmit=async event=>{event.preventDefault();if(onlineBusy)return;onlineBusy=true;clearTimeout(pollTimer);const token=epoch;$('#send-error').textContent='';try{if(!desktopSend())throw new Error('Phone sending remains disabled pending physical-device measurements.');const amount=$('#send-amount').value;if(!/^(0|[1-9][0-9]{0,10})(\.[0-9]{1,8})?$/.test(amount))throw new Error('Enter a positive SIP amount with at most eight decimals.');const [whole,fraction='']=amount.split('.');const value=BigInt(whole)*100000000n+BigInt(fraction.padEnd(8,'0'));if(value<=0n)throw new Error('Amount must be positive.');const address=$('#send-recipient').value.trim();proofProgress.start();paymentControls();const result=await call('prepare',address,contacts.get(address)||'',value.toString(),$('#send-priority').checked);if(token!==epoch)return;proofProgress.finish(result.proving_ms);preparedId=result.prepared_id;showBalance(result);const review=result.payments.find(p=>p.id===preparedId);$('#send-review').textContent=`${atoms(review.amount_atoms)} SIP · fee ${atoms(review.fee_atoms)} SIP · recipient ${review.recipient}`;$('#send-error').textContent=`Proof generated and locally verified in ${(result.proving_ms/1000).toFixed(2)} seconds. Nothing has been transmitted.`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;}catch(error){if(token===epoch){proofProgress.fail();$('#send-error').textContent=error.message;}}finally{onlineBusy=false;paymentControls();if(token===epoch)pollTimer=setTimeout(refreshOnline,5000);}};
+$('#send-transmit').onclick=async()=>{if(!desktopSend()){$('#send-error').textContent='Phone sending remains disabled pending physical-device measurements.';return;}if(onlineBusy||!preparedId||!$('#send-disclosure').checked)return;onlineBusy=true;const token=epoch;try{const result=await call('submit',preparedId);if(token!==epoch)return;showBalance(result);$('#send-error').textContent='Admission acknowledged pending. Inclusion is confirmed only by a later authenticated compact block.';$('#send-transmit').hidden=true;}catch(error){if(token===epoch)$('#send-error').textContent=`Submission is uncertain: ${error.message} Retry the same stored packet; do not create a replacement payment.`;}finally{onlineBusy=false;pollTimer=setTimeout(refreshOnline,5000);}};

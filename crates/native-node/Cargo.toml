@@ -21,6 +21,8 @@ hybrid-tls-candidate = ["dep:rustls", "dep:aws-lc-rs", "dep:aws-lc-sys", "dep:fu
 # Explicit pinned-peer engineering listener; disabled in default builds.
 native-p2p = ["hybrid-tls-candidate"]
 peer-qualification = ["native-p2p"]
+# Explicit private IPC; does not create a public HTTP listener.
+wallet-light-gateway = []
 
 [[bin]]
 name = "siworld-peer-qualification"

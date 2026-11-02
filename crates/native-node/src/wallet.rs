@@ -233,10 +233,64 @@ impl Wallet {
             return Err("wallet network differs from canonical replay".into());
         }
         let (state, report) = replay_chain(config, blocks, verifier)?;
+        let ids = blocks
+            .iter()
+            .map(Block::id)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.scan_light_data(&state, blocks, &ids, false)?;
+        Ok(report)
+    }
+    /// Copy accepted private light receipts only to the same derived identity.
+    pub fn copy_light_receipts(&mut self, source: &Self) -> Result<(), String> {
+        if self.keys.network != source.keys.network || self.address() != source.address() {
+            return Err("Light receipt identity differs.".into());
+        }
+        let staged = source
+            .receipts
+            .iter()
+            .map(|r| OwnedNote {
+                commitment: r.commitment,
+                nullifier: r.nullifier,
+                height: r.height,
+                block_id: r.block_id,
+                output_index: r.output_index,
+                spent: r.spent,
+                eligible_timestamp: r.eligible_timestamp,
+                note: r.note.clone(),
+            })
+            .collect();
+        self.receipts = staged;
+        self.head = source.head;
+        Ok(())
+    }
+    /// Scan authenticated compact public data under explicit full-node-consensus trust.
+    /// This does not verify transaction proofs or establish consensus validity.
+    pub fn scan_light_data(
+        &mut self,
+        state: &State,
+        blocks: &[Block],
+        ids: &[Hash],
+        append: bool,
+    ) -> Result<(), String> {
+        if blocks.len() != ids.len() || state.config.network != self.keys.network {
+            return Err("Light scan network or block identity count differs.".into());
+        }
+        let receipts = self.scan_light_receipts(blocks, ids)?;
+        self.commit_light_receipts(state, receipts, blocks, append);
+        Ok(())
+    }
+    /// Stage decrypted receipts without modifying accepted private state.
+    pub fn scan_light_receipts(
+        &self,
+        blocks: &[Block],
+        ids: &[Hash],
+    ) -> Result<Vec<OwnedNote>, String> {
+        if blocks.len() != ids.len() || blocks.iter().any(|b| b.network != self.keys.network) {
+            return Err("Light receipt context differs.".into());
+        }
         let mut receipts = Vec::new();
         let ec = EncryptionContext::new(self.keys.network);
-        for block in blocks {
-            let block_id = block.id()?;
+        for (block, block_id) in blocks.iter().zip(ids.iter().copied()) {
             for tx in &block.transactions {
                 let public = PublicTransaction::decode(&tx.record.body)
                     .map_err(|_| "wallet replay contains invalid public fields")?;
@@ -331,6 +385,21 @@ impl Wallet {
                 }
             }
         }
+        Ok(receipts)
+    }
+    /// Commit an already staged and authenticated local scan. No fallible work remains.
+    pub fn commit_light_receipts(
+        &mut self,
+        state: &State,
+        mut receipts: Vec<OwnedNote>,
+        blocks: &[Block],
+        append: bool,
+    ) {
+        if append {
+            let mut accepted = std::mem::take(&mut self.receipts);
+            accepted.append(&mut receipts);
+            receipts = accepted;
+        }
         // Keep timestamps only for relevant unlock heights, rather than a
         // second full permanent copy of canonical block headers.
         let mut eligibility = receipts
@@ -344,14 +413,13 @@ impl Wallet {
         }
         for receipt in &mut receipts {
             receipt.spent = state.spent.contains(&receipt.nullifier);
-            receipt.eligible_timestamp = eligibility
+            receipt.eligible_timestamp = receipt.eligible_timestamp.or(eligibility
                 .get(&receipt.height.max(receipt.note.unlock_height))
                 .copied()
-                .flatten();
+                .flatten());
         }
         self.head = Some((state.height, state.tip, state.fingerprint()));
         self.receipts = receipts;
-        Ok(report)
     }
     fn receipt(
         &self,
@@ -667,6 +735,58 @@ impl Wallet {
         payment_randomness: Option<Digest>,
         policy: SpendPolicy,
     ) -> Result<PreparedTransfer, String> {
+        self.prepare_transfer_with_paths_and_randomness(
+            state,
+            selected,
+            recipient,
+            asset,
+            amount,
+            tier,
+            now,
+            payment_randomness,
+            policy,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_light_transfer(
+        &self,
+        state: &State,
+        selected: [Option<DigestBytes>; 2],
+        recipient: &PaymentAddress,
+        asset: AssetId,
+        amount: u64,
+        tier: FeeTier,
+        now: u64,
+        paths: &BTreeMap<DigestBytes, Vec<(Digest, bool)>>,
+    ) -> Result<PreparedTransfer, String> {
+        self.prepare_transfer_with_paths_and_randomness(
+            state,
+            selected,
+            recipient,
+            asset,
+            amount,
+            tier,
+            now,
+            None,
+            SpendPolicy::Manual,
+            Some(paths),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_transfer_with_paths_and_randomness(
+        &self,
+        state: &State,
+        selected: [Option<DigestBytes>; 2],
+        recipient: &PaymentAddress,
+        asset: AssetId,
+        amount: u64,
+        tier: FeeTier,
+        now: u64,
+        payment_randomness: Option<Digest>,
+        policy: SpendPolicy,
+        paths: Option<&BTreeMap<DigestBytes, Vec<(Digest, bool)>>>,
+    ) -> Result<PreparedTransfer, String> {
         self.require_state(state)?;
         if amount == 0 || selected == [None, None] {
             return Err("wallet transfer requires a nonzero payment and an owned input".into());
@@ -709,11 +829,19 @@ impl Wallet {
                     return Err("wallet privacy delay has not elapsed".into());
                 }
             }
-            let index = state
-                .leaves
-                .iter()
-                .position(|value| encode_digest(value) == commitment)
-                .ok_or("wallet input missing from canonical commitment tree")?;
+            let path = if let Some(paths) = paths {
+                paths
+                    .get(&commitment)
+                    .cloned()
+                    .ok_or("Owned light path unavailable.")?
+            } else {
+                let index = state
+                    .leaves
+                    .iter()
+                    .position(|value| encode_digest(value) == commitment)
+                    .ok_or("wallet input missing from canonical commitment tree")?;
+                state.tree.path(&state.leaves, index)?
+            };
             let total = totals.entry(receipt.note.asset_id).or_default();
             *total = total
                 .checked_add(u128::from(receipt.note.value))
@@ -726,7 +854,7 @@ impl Wallet {
                 value: receipt.note.value,
                 unlock_height: receipt.note.unlock_height,
                 dummy: false,
-                path: state.tree.path(&state.leaves, index)?,
+                path,
             })
         };
         let inputs = [make_input(selected[0])?, make_input(selected[1])?];
@@ -993,6 +1121,7 @@ impl WalletPayment {
     }
 }
 
+#[path = "wallet/issuance.rs"]
 pub mod issuance;
 
 #[cfg(test)]

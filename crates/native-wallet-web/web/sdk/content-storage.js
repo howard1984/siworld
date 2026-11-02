@@ -69,3 +69,14 @@ export async function saveContent(data) {
     return id;
   });
 }
+
+export async function mergeContent(backups) {
+  if(!Array.isArray(backups)||backups.length>100)throw new Error('Vault snapshot count limit.');
+  const prepared=await Promise.all(backups.map(async data=>{const backup=parseContentBackup(JSON.stringify(data));return {id:await contentId(backup),backup};}));
+  return navigator.locks.request('siworld-native-v1-content-storage',async()=>{
+    const previous=await contentRecords();const merged=new Map(previous.map(r=>[r.id,r]));
+    for(const row of prepared){const existing=merged.get(row.id);if(existing&&JSON.stringify(existing.backup)!==JSON.stringify(row.backup))throw new Error('Conflicting ciphertext package.');merged.set(row.id,row);}
+    if(merged.size>100)throw new Error('Merging would exceed 100 packages; existing content was preserved.');
+    const db=await database();try{await new Promise((resolve,reject)=>{const tx=db.transaction('packages','readwrite');for(const row of prepared)tx.objectStore('packages').put(row);tx.oncomplete=resolve;tx.onerror=tx.onabort=()=>reject(new Error('Atomic Vault merge failed.'));});}finally{db.close();}
+  });
+}

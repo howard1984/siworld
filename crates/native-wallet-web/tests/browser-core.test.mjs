@@ -10,6 +10,7 @@ const { initSync, BrowserWallet, inspect_address } = await import(new URL('sdk/c
 const { parseBackup, backup, bytes } = await import(new URL('sdk/storage.js',root));
 initSync({ module: readFileSync(new URL('sdk/core/wallet_bg.wasm',root)) });
 const network = '01'.repeat(32);
+// Public synthetic test mnemonic; never use this phrase for real funds.
 const words = [...Array(23).fill('abandon'), 'art'].join(' ');
 const password = 'synthetic-browser-password';
 
@@ -67,9 +68,9 @@ test('backup decoder rejects secrets, oversized input and legacy formats', () =>
   assert.throws(() => parseBackup(JSON.stringify({...fake,words})), /Invalid native/);
   assert.throws(() => parseBackup(JSON.stringify({...fake,account:-1})), /Invalid native/);
 });
-test('UI has no sender network API or secret-bearing logging', () => {
+test('UI delegates bounded network operations to its worker without secret-bearing logging', () => {
   const html = readFileSync(new URL('wallet.html',root),'utf8');
-  assert.match(html, /connect-src 'none'/); assert.match(html, /form-action 'none'/);
+  assert.match(html, /connect-src 'self'/); assert.match(html, /form-action 'none'/);
   for (const path of ['assets/native-wallet.js','sdk/worker.js','sdk/storage.js']) {
     const source = readFileSync(new URL(path,root),'utf8');
     assert.doesNotMatch(source, /console\.|fetch\(|XMLHttpRequest|sendBeacon|WebSocket|localStorage/);

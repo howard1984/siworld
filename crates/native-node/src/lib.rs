@@ -34,3 +34,12 @@ pub mod web_wallet;
 
 #[cfg(test)]
 mod fixtures;
+
+#[cfg(feature = "wallet-light-gateway")]
+#[path = "../../native-wallet-engine/src/compact.rs"]
+pub mod compact;
+#[cfg(feature = "wallet-light-gateway")]
+#[path = "../../native-wallet-engine/src/ranges.rs"]
+pub mod ranges;
+#[cfg(all(feature = "wallet-light-gateway", unix))]
+pub mod wallet_gateway;

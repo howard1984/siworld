@@ -1,6 +1,5 @@
-import { initSync, seal_content, open_content } from './core/wallet.js';
-import { wasmBytes } from './core/bytes.js';
-initSync({ module: wasmBytes });
+import init, { seal_content, open_content } from './core/wallet.js';
+await init({module_or_path:new URL('./core/wallet_bg.wasm',import.meta.url)});
 self.postMessage({ ready: true });
 self.onmessage = ({ data }) => {
   const { id, action, args = [] } = data;

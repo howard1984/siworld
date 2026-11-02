@@ -12,6 +12,8 @@ description = "Portable native V1 wallet identity, receiving addresses and encry
 native-parity = ["dep:reference-native", "dep:reference-math"]
 
 [dependencies]
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize"] }
+sha2 = "=0.10.9"
 reference-native = { package = "siworld-native-node", path = "../native-node", default-features = false, optional = true }
 reference-math = { package = "siworld-multi-asset-experiment", path = "../bench-multi-asset", default-features = false, optional = true }
 blake3 = { version = "1.8.3", features = ["zeroize"] }

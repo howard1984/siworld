@@ -43,9 +43,20 @@ PUBLIC_ARTIFACTS = {
 CRATES = {
     "core", "crypto", "poseidon2", "state", "circuits", "consensus",
     "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset", "fund-keytool",
-    "native-wallet-core", "native-wallet-web",
+    "native-wallet-core", "native-wallet-web", "native-wallet-engine",
 }
 PUBLIC_TEXT_ASSETS = {
+    "crates/native-wallet-web/web/sdk/proof-progress.js",
+    "crates/native-wallet-web/tests/proof-progress.test.mjs",
+    "crates/native-wallet-web/web/vault.html",
+    "crates/native-wallet-web/web/sdk/online-storage.js",
+    "crates/native-wallet-web/web/sdk/light-session.js",
+    "crates/native-wallet-web/web/sdk/cloud-session.js",
+    "crates/native-wallet-web/web/sdk/cloud-worker.js",
+    "crates/native-wallet-web/web/sdk/vault-network.js",
+    "crates/native-wallet-web/web/assets/vault-application.js",
+    "crates/native-wallet-web/web/assets/cloud-vault.js",
+
     "crates/native-wallet-web/web/assets/native-vault.js",
     "crates/native-wallet-web/web/sdk/content-worker.js",
     "crates/native-wallet-web/web/sdk/content-storage.js",

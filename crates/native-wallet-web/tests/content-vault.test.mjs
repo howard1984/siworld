@@ -36,6 +36,7 @@ test('encrypted content backups restore independently of wallet seed backups', a
   assert.equal(await contentId(backup), await contentId(restored));
   assert.notEqual(DB_NAME, 'siworld-native-v1');
   assert.throws(() => parseContentBackup(JSON.stringify({ ...backup, secret: 'plaintext' })), /Invalid/);
+  // Public synthetic test mnemonic; never use this phrase for real funds.
   const words = [...Array(23).fill('abandon'), 'art'].join(' '), wallet = BrowserWallet.restore(network, 7, words);
   try { assert.throws(() => open_content(network, 7, wallet.seal(password, ''), password), /Invalid/); }
   finally { wallet.free(); }
@@ -58,12 +59,12 @@ test('payload limits apply to UTF-8 bytes and invalid EVM keys are rejected', ()
   assert.throws(() => seal_content(network, 7, '1700000000000', 2, 'Synthetic key', '0'.repeat(64), password));
   assert.throws(() => seal_content(network, 7, '1700000000000', 0, 'Synthetic title', 'text', 'short'), /passphrase/);
 });
-test('Wallet and Vault views preserve local-only boundaries and explicit backup separation', () => {
+test('Wallet and Vault preserve independent origins and explicit backup separation', () => {
   const html = readFileSync(new URL('wallet.html', root), 'utf8');
   assert.match(html, /data-view="wallet"/); assert.match(html, /data-view="vault"/);
   assert.match(html, /wallet recovery words do not recover Vault/);
   assert.match(html, /Chain storage and network fees are not connected/);
-  assert.match(html, /connect-src 'none'/);
+  assert.match(html, /connect-src 'self'/);
   for (const path of ['assets/native-vault.js', 'sdk/content-storage.js', 'sdk/content-worker.js']) {
     const source = readFileSync(new URL(path, root), 'utf8');
     assert.doesNotMatch(source, /console\.|fetch\(|XMLHttpRequest|sendBeacon|WebSocket|localStorage|\.innerHTML\s*=/);

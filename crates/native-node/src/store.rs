@@ -257,6 +257,38 @@ impl Store {
         Ok(block)
     }
 
+    #[cfg(feature = "wallet-light-gateway")]
+    pub fn public_block_id(&self, height: u64) -> Result<crate::wire::Hash, String> {
+        self.with_public_block(height, crate::compact::CompactBlock::canonical_id)
+    }
+    #[cfg(feature = "wallet-light-gateway")]
+    pub fn public_compact_block(&self, height: u64) -> Result<Vec<u8>, String> {
+        self.with_public_block(height, crate::compact::CompactBlock::export_canonical)
+    }
+    #[cfg(feature = "wallet-light-gateway")]
+    fn with_public_block<T>(
+        &self,
+        height: u64,
+        read: impl FnOnce(&[u8]) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if height == 0 || height > self.state.height {
+            return Err("Public canonical height unavailable.".into());
+        }
+        let tx = self
+            .database
+            .begin_read()
+            .map_err(|_| "Public history unavailable.")?;
+        let blocks = tx
+            .open_table(BLOCKS)
+            .map_err(|_| "Public history unavailable.")?;
+        let record = blocks
+            .get(height)
+            .map_err(|_| "Public record unavailable.")?
+            .ok_or("Public record missing.")?;
+        let (bytes, _) = split_record(record.value())?;
+        read(bytes)
+    }
+
     /// Retained detached blocks are evidence, never accepted-chain authority.
     pub fn detached_count(&self) -> Result<u64, String> {
         let txn = self
