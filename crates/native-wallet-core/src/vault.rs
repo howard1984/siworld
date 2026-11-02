@@ -142,7 +142,7 @@ fn valid_network(network: [u8; 32]) -> Result<(), String> {
         Ok(())
     }
 }
-fn derive(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+pub(crate) fn derive(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
     if password.is_empty() || password.len() > 1024 {
         return Err("Device password must contain 1 to 1024 UTF-8 bytes.".into());
     }

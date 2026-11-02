@@ -126,3 +126,55 @@ pub fn inspect_address(
     .map_err(js)?;
     Ok(json!({"full_address":address::full(network,&addr).map_err(js)?,"short_address":address::short(network,&addr).map_err(js)?,"address_hex":hex(&addr),"network":hex(&network)}).to_string())
 }
+
+#[wasm_bindgen]
+pub fn seal_content(
+    network_id: &str,
+    account: u32,
+    created_at: &str,
+    kind: u8,
+    title: String,
+    secret: String,
+    passphrase: String,
+) -> Result<Vec<u8>, JsValue> {
+    let password = Zeroizing::new(passphrase);
+    let content = core::content_vault::Content {
+        network: network(network_id).map_err(js)?,
+        account,
+        created_at: created_at
+            .parse()
+            .map_err(|_| js("Invalid content timestamp.".into()))?,
+        kind,
+        title: Zeroizing::new(title),
+        secret: Zeroizing::new(secret),
+    };
+    let bytes = core::content_vault::seal(&content, &password).map_err(js)?;
+    let checked =
+        core::content_vault::open(&bytes, &password, content.network, account).map_err(js)?;
+    if checked.title != content.title
+        || checked.secret != content.secret
+        || checked.kind != kind
+        || checked.created_at != content.created_at
+    {
+        return Err(js("Content encryption verification failed.".into()));
+    }
+    Ok(bytes)
+}
+
+#[wasm_bindgen]
+pub fn open_content(
+    network_id: &str,
+    account: u32,
+    bytes: &[u8],
+    passphrase: String,
+) -> Result<String, JsValue> {
+    let password = Zeroizing::new(passphrase);
+    let content =
+        core::content_vault::open(bytes, &password, network(network_id).map_err(js)?, account)
+            .map_err(js)?;
+    Ok(
+        json!({"title":content.title.as_str(),"secret":content.secret.as_str(),
+        "kind":content.kind,"created_at":content.created_at.to_string()})
+        .to_string(),
+    )
+}

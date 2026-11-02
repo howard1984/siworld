@@ -1,3 +1,4 @@
+import { initVault } from './native-vault.js';
 import { backup, bytes, parseBackup, records, save, MAX_BACKUP } from '../sdk/storage.js';
 import { ENGINEERING } from '../sdk/network.js';
 
@@ -27,8 +28,8 @@ function clearSecrets() {
   for (const input of flow.querySelectorAll('input[type=password], #restore-words, #answers input')) input.value = '';
   $('#words').replaceChildren(); $('#answers').replaceChildren(); positions = null;
 }
-function lock(text = 'Wallet locked. Recovery fields and the local worker session were cleared.') {
-  ++epoch; clearTimeout(timer); worker?.terminate();
+function lock(text = 'Wallet locked. Recovery fields and the local worker session were cleared.', restart = true) {
+  ++epoch; clearTimeout(timer); worker?.terminate(); ready = false; capability(false);
   for (const request of pending.values()) request.reject(new Error('Wallet session was closed.'));
   pending.clear(); clearSecrets(); flow.close();
   info = encrypted = imported = context = null; busy = false; stage = mode = '';
@@ -37,7 +38,7 @@ function lock(text = 'Wallet locked. Recovery fields and the local worker sessio
   $('#setup').hidden = false; $('#receiving').hidden = true; $('#full-address').value = ''; $('#short-address').textContent = '';
   $('#account-index').textContent = 'No wallet unlocked'; $('#account-state').textContent = 'LOCKED';
   $('#lock').disabled = $('#copy-address').disabled = true;
-  startWorker(); message(text);
+  if (restart) startWorker(); message(text);
 }
 function activity() { if (info || flow.open) { clearTimeout(timer); timer = setTimeout(() => lock('Wallet locked after five minutes of inactivity.'), 300000); } }
 function showStage(next) {
@@ -185,9 +186,12 @@ $('#check-address').addEventListener('submit', async event => {
 });
 for (const event of ['pointerdown', 'keydown']) document.addEventListener(event, activity, { passive: true });
 document.addEventListener('visibilitychange', () => { if (document.hidden && (info || flow.open)) lock('Wallet locked when the page left the foreground.'); });
-window.addEventListener('pagehide', () => { worker?.terminate(); clearSecrets(); });
+window.addEventListener('pagehide', () => lock('Wallet locked when leaving this page.', false));
+window.addEventListener('pageshow', event => { if (event.persisted && storageHealthy) startWorker(); });
 if (!isSecureContext || window.top !== window || !crypto?.getRandomValues || !navigator.locks || !window.indexedDB || !window.Worker || !window.WebAssembly) {
   capability(false); message('Open this wallet directly on HTTPS or localhost in a browser with WebAssembly, Web Crypto and Web Locks.', true);
 } else {
   startWorker(); reloadSaved().then(() => { storageHealthy = true; capability(ready); }).catch(() => { storageHealthy = false; capability(false); message('Encrypted storage could not be read. Existing data was preserved; saving is paused.', true); });
 }
+
+initVault(() => info);

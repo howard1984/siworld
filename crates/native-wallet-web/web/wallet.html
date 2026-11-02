@@ -5,16 +5,19 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
-<title>V1 Wallet · siworld</title>
+<title>SIP Wallet · SIP Vault — siworld</title>
 <link rel="stylesheet" href="assets/native-wallet.css">
 <script type="module" src="assets/native-wallet.js"></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to wallet</a>
-<header><a href="wallet.html" class="brand">siworld<span>WALLET</span></a><span class="network-badge"><i></i> V1 · Engineering network</span><button id="lock" type="button" disabled>Lock wallet ↗</button></header>
+<header><a href="wallet.html" class="brand">siworld</a><span class="edition">SIP Wallet / SIP Vault</span><span class="network-badge"><i></i> V1 · Local custody</span><button id="lock" type="button" disabled>Lock this session ↗</button></header>
+<div class="workbench">
+<aside class="rail"><p class="rail-label">YOUR WORKSPACE</p><nav aria-label="Wallet and Vault"><a href="#wallet" data-view="wallet" aria-current="page"><span aria-hidden="true">↗</span> Wallet</a><a href="#vault" data-view="vault"><span aria-hidden="true">▣</span> SIP Vault</a></nav><p class="rail-bottom">Encrypted on this device<br><small>No chain connection</small></p></aside>
 <main id="main" tabindex="-1">
-<div class="heading"><p class="eyebrow">YOUR KEYS. YOUR DEVICE.</p><h1>A wallet that<br>starts with you.</h1><p class="lede">Create or restore a native V1 wallet.<br>Your recovery words stay on this device.</p></div>
 <p id="status" role="status" aria-live="polite">Loading the local wallet core…</p>
+<section id="wallet-view" aria-labelledby="wallet-heading">
+<div class="heading"><h1 id="wallet-heading">Your SIP wallet.</h1><p class="lede">Create or restore a native V1 wallet. Your keys stay on this device.</p></div>
 <div class="layout">
 <section class="account-card" aria-labelledby="account-title">
 <div class="card-top"><span id="account-title">V1 ACCOUNT</span><span id="account-state">LOCKED</span></div>
@@ -32,8 +35,16 @@
 <section class="surface" id="receiving" hidden aria-labelledby="receiving-title"><span class="eyebrow">RECEIVE</span><h2 id="receiving-title">Your V1 receiving address.</h2><p>Use the full address without a directory. Your public recipient file works with the native V1 miner configuration.</p><label for="full-address">Full address</label><textarea id="full-address" rows="3" readonly spellcheck="false"></textarea><div class="actions"><button id="export-recipient" type="button">Download miner recipient file ↓</button><button id="export-backup" type="button">Back up encrypted wallet ↓</button></div><details><summary>Short address and contact record</summary><p>Short addresses require the matching full-address contact record. There is no public V1 directory yet.</p><output id="short-address"></output><button id="export-contact" type="button">Download public contact record ↓</button></details></section>
 </div>
 <section class="surface checker" aria-labelledby="checker-title"><div><span class="eyebrow">ADDRESS CHECK</span><h2 id="checker-title">One field. Both address forms.</h2><p>Validate a full V1 address, or resolve a short address using an imported public contact record. Legacy website addresses are rejected.</p></div><form id="check-address"><label for="recipient">Receiving address</label><textarea id="recipient" rows="2" maxlength="2200" spellcheck="false" required></textarea><div class="actions"><button id="check" type="submit" disabled>Validate address ↗</button><button id="import-contact" type="button" disabled>Import contact record ↑</button></div><input id="contact-file" type="file" accept=".json,.address" hidden><p id="address-result" role="status"></p></form></section>
-<footer><span>Local custody · Native V1</span><span>Engineering assets have no monetary value.</span></footer>
-</main>
+</section>
+<section id="vault-view" hidden aria-labelledby="vault-heading">
+<div class="heading page-heading"><div><h1 id="vault-heading">SIP Vault</h1><p class="lede">Seal a secret. Keep a way back.</p></div><button id="vault-create" class="primary" type="button" disabled>Create vault ＋</button></div>
+<p class="vault-notice">Encrypted content stays on this device. Export a separate backup: wallet recovery words do not recover Vault packages. Chain storage and network fees are not connected.</p>
+<p id="vault-status" role="status" aria-live="polite">Loading encrypted content storage…</p>
+<div class="vault-layout"><section aria-labelledby="collection-heading"><div class="collection-bar"><h2 id="collection-heading">Your packages <span id="vault-count">0</span></h2><span class="eyebrow">LOCAL · ENCRYPTED</span></div><div data-vault-illustration="entry" aria-hidden="true"></div><div id="vault-empty" class="vault-empty"><span class="package-mark" aria-hidden="true">▣</span><h3>A place for a secret.</h3><p>Create a package or restore an encrypted content backup.</p></div><div id="vault-list"></div></section>
+<aside class="recovery-panel"><p class="eyebrow">KEEP YOUR WAY BACK</p><h2>A secret needs<br>a second copy.</h2><p>Each package uses its own passphrase. Titles and content are encrypted; only ciphertext is saved.</p><button id="vault-import" type="button" disabled>Restore content backup ↑</button><input id="vault-backup-file" type="file" accept=".json" hidden><p class="help">Keep the backup and passphrase separately. Older website Vault formats are not imported by this version.</p></aside></div>
+</section>
+<footer><span>SIP Wallet / SIP Vault · Native V1</span><span>Local custody · Chain connection unavailable</span></footer>
+</main></div>
 <dialog id="flow"><form id="flow-form" autocomplete="off"><button id="cancel" class="close" type="button" aria-label="Cancel wallet setup">×</button><p class="eyebrow" id="step-label">NATIVE V1</p><h2 id="flow-title"></h2><p id="flow-description"></p>
 <div id="context-fields"><label for="network">Original native network ID</label><input id="network" required pattern="[0-9a-f]{64}" maxlength="64" spellcheck="false" autocomplete="off"><label for="account">Account index</label><input id="account" type="number" min="0" max="4294967295" step="1" value="0" required><p class="help">A network ID is not a genesis block hash. Keep both fields with your recovery backup.</p></div>
 <div id="restore-fields" hidden><label for="restore-words">24 recovery words</label><textarea id="restore-words" rows="4" maxlength="256" spellcheck="false" autocomplete="off" autocapitalize="none"></textarea></div>
@@ -42,4 +53,9 @@
 <div id="password-fields" hidden><label for="password">Device password</label><input id="password" type="password" autocomplete="new-password" maxlength="1024"><div id="confirm-field"><label for="confirm">Confirm device password</label><input id="confirm" type="password" autocomplete="new-password" maxlength="1024"></div><p class="help">Encrypts this device and backup file. It does not change your receiving address.</p></div>
 <p id="flow-error" role="alert"></p><button id="next" class="primary" type="submit">Continue ↗</button>
 </form></dialog>
+<dialog id="vault-flow" aria-labelledby="vault-flow-title"><form id="vault-form" autocomplete="off"><button id="vault-cancel" class="close" type="button" aria-label="Close Vault">×</button><p class="eyebrow">SIP VAULT · LOCAL CONTENT</p><h2 id="vault-flow-title">Create a package.</h2><p id="vault-description"></p>
+<div id="vault-context"><label for="vault-network">Native V1 network ID</label><input id="vault-network" pattern="[0-9a-f]{64}" maxlength="64" spellcheck="false" autocomplete="off"><label for="vault-account">Account index</label><input id="vault-account" type="number" min="0" max="4294967295" step="1" value="0"></div>
+<div id="vault-fields"><label for="vault-title">Title</label><input id="vault-title" maxlength="80" autocomplete="off"><label for="vault-kind">Content type</label><select id="vault-kind"><option value="0">Private text</option><option value="1">Password</option><option value="2">EVM private key</option></select><label for="vault-secret">Secret content</label><textarea id="vault-secret" rows="5" maxlength="2048" spellcheck="false" autocomplete="off" autocapitalize="none"></textarea><p class="help">Up to 2,048 UTF-8 bytes. The title and content are both encrypted.</p></div>
+<div id="vault-password-fields"><label for="vault-password">Independent Vault passphrase</label><input id="vault-password" type="password" maxlength="1024" autocomplete="new-password"><div id="vault-confirm-field"><label for="vault-confirm">Confirm Vault passphrase</label><input id="vault-confirm" type="password" maxlength="1024" autocomplete="new-password"></div></div>
+<div id="vault-reveal" hidden><label for="vault-open-title">Title</label><input id="vault-open-title" readonly><label for="vault-open-secret">Secret content</label><textarea id="vault-open-secret" rows="6" readonly spellcheck="false"></textarea><p class="help">This view closes after 60 seconds or when the page leaves the foreground.</p></div><div data-vault-illustration="saved" aria-hidden="true" hidden></div><button id="vault-download" type="button" hidden>Download encrypted backup ↓</button><p id="vault-error" role="alert"></p><button id="vault-next" class="primary" type="submit">Encrypt and save ↗</button></form></dialog>
 </body></html>

@@ -91,3 +91,51 @@ transaction counts. Reorganizations require local rollback and replay of wallet
 state, and remote responses remain untrusted until locally verified. A private
 loopback wallet server that owns host wallet files must never be exposed as this
 public service. Deployment and gateway operation require separate review.
+
+## Local content Vault
+
+The reference application has separate Wallet and SIP Vault views. The content
+Vault stores encrypted text, passwords or an EVM private key locally. It is not
+a native chain transaction, a wallet seed vault or a network storage receipt.
+No chain storage, network fee payment or legacy Vault migration is connected.
+Wallet recovery words do not recover content packages. Each package requires
+its independent passphrase and exported encrypted content backup.
+
+The local content envelope uses a distinct `SWNCNT01` magic and authenticated
+domain, with Argon2id v19 (65,536 KiB, three iterations, one lane) and
+XChaCha20-Poly1305. Its 48-byte header contains the magic, random 16-byte salt
+and random 24-byte nonce. The header is authenticated along with the domain.
+The fixed 4,096-byte plaintext contains network ID, account, local creation
+time, content type, UTF-8 title and content lengths, title and content, followed
+by zero padding. A 16-byte tag makes the envelope exactly 4,160 bytes. Titles
+are limited to 80 Unicode scalar values and 320 UTF-8 bytes; content is limited
+to 2,048 UTF-8 bytes. Timestamps are local metadata and have no consensus role.
+
+Content packages use a dedicated WASM worker and a separate IndexedDB database,
+`siworld-native-v1-content`. Only authenticated packages are imported by the UI.
+Writes use Web Locks and IndexedDB `add`, preserving existing packages and
+rejecting conflicting identifiers. Backups contain only the explicit format,
+version, network, account and ciphertext fields. Unsupported fields, oversized
+files, legacy formats, incorrect passphrases and context mismatches are rejected.
+A storage failure after encryption offers the unsaved encrypted backup for
+download and does not claim that the package was persisted.
+
+Decrypted content appears only after an explicit unlock and clears after 60
+seconds, on cancellation, explicit session locking or backgrounding. Page exit
+terminates workers and clears input fields; restoring a page from the browser
+back/forward cache starts new locked workers. No content is sent to a server
+or copied to the clipboard automatically. JavaScript strings and browser/runtime
+copies cannot be guaranteed to be erased from physical memory. The format is a
+local application format, not an adopted V1 consensus encoding.
+
+Optional illustration slots are separate from encrypted content. The UI emits
+`vault-view-change` with an active-view boolean and `vault-content-saved` only
+after successful local persistence. These events contain no package metadata,
+passphrases or content. A failed save never shows the persisted-result slot.
+
+Run content tests against an actual WASM build with:
+
+```sh
+cargo test --locked --release --manifest-path crates/native-wallet-core/Cargo.toml --test content_vault
+WALLET_WEB_OUTPUT="$PWD/build/wallet-v1" node --test crates/native-wallet-web/tests/content-vault.test.mjs
+```

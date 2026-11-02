@@ -1,6 +1,7 @@
 //! Client-side custody and address interfaces. No consensus or proof generation.
 // Reuse the frozen native field/hash implementation without its prover graph.
 pub mod address;
+pub mod content_vault;
 pub mod identity;
 #[allow(dead_code)]
 #[path = "../../bench-multi-asset/src/multi_asset.rs"]
