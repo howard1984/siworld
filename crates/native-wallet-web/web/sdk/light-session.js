@@ -1,6 +1,36 @@
 import {stored,hash,fetchLimited,readJSON} from './online-storage.js';
 const encode=value=>new TextEncoder().encode(JSON.stringify(value));
 const idPattern=/^[0-9a-f]{64}$/;
+// Public address publication is explicit and independent of chain synchronization.
+// No wallet object, recovery material or account identifier enters this adapter.
+export class AddressDirectory {
+  constructor(config, inspect, request=readJSON) { this.config=config;this.inspect=inspect;this.request=request; }
+  endpoint() {
+    if(this.config.name!=='siworld-eng-1'||!idPattern.test(this.config.network)||this.config.address_directory!==true)throw new Error('Short-address directory is unavailable. Use the full address.');
+    const base=new URL(this.config.api);
+    if(base.origin!==globalThis.location.origin||base.username||base.password||base.search||base.hash||base.protocol!=='https:'&&!(base.protocol==='http:'&&base.hostname==='localhost'))throw new Error('Address directory must use the pinned same-origin engineering service.');
+    return base.href.replace(/\/$/,'')+'/v1/addresses';
+  }
+  async resolve(text,network,resolved='') {
+    if(network!==this.config.network)throw new Error('Receiving address network differs.');
+    if(typeof text!=='string'||text.length>2200)throw new Error('Invalid receiving address length.');
+    if(!text.startsWith('sivs1')||resolved)return JSON.parse(this.inspect(text,network,resolved));
+    if(!/^sivs1[a-z2-7]{66}$/.test(text))throw new Error('Invalid short receiving address.');
+    let record;
+    try {record=await this.request(this.endpoint()+'/'+text,{limit:4096,credentials:'omit',redirect:'error',referrerPolicy:'no-referrer',cache:'no-store',signal:AbortSignal.timeout(10000)});}
+    catch {throw new Error('Short address is not registered or its directory is unavailable. Use the full address.');}
+    if(!record||Object.keys(record).sort().join()!=='full_address,network,short_address,version'||record.version!==1||record.network!==network||record.short_address!==text||typeof record.full_address!=='string'||record.full_address.length!==2042)throw new Error('Address directory response rejected.');
+    // The local codec authenticates the full address against the short commitment.
+    return JSON.parse(this.inspect(text,network,record.full_address));
+  }
+  async publish(full) {
+    const info=JSON.parse(this.inspect(full,this.config.network,''));
+    if(info.full_address!==full)throw new Error('Publish a full receiving address only.');
+    const record=await this.request(this.endpoint(),{method:'POST',body:JSON.stringify({full_address:full}),headers:{'Content-Type':'application/json'},limit:4096,credentials:'omit',redirect:'error',referrerPolicy:'no-referrer',cache:'no-store',signal:AbortSignal.timeout(10000)});
+    if(!record||Object.keys(record).sort().join()!=='full_address,network,short_address,version'||record.version!==1||record.network!==this.config.network||record.short_address!==info.short_address||record.full_address!==full)throw new Error('Address registration response rejected.');
+    return this.resolve(info.short_address,this.config.network,record.full_address);
+  }
+}
 export class LightSession {
   constructor(wallet,config) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;}
   async initialize() {

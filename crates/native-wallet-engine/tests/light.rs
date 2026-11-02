@@ -8,6 +8,76 @@ use siworld_native_wallet_engine::{
 };
 use zeroize::Zeroizing;
 #[test]
+fn light_balance_lists_each_holder_unlock_and_matures_at_accepted_height() {
+    use native::{
+        codec::encode_digest,
+        encryption::{EncryptionContext, encrypt_payment},
+        multi_asset::{F, Hasher, Note, SIP_ASSET_ID},
+    };
+    use p3_field::PrimeCharacteristicRing;
+    use siworld_native_wallet_engine::wire::RewardRecord;
+    let (config, mut block) = common::fixture();
+    let wallet = Wallet::from_seed(config.network, Zeroizing::new([42; 32]), 0).unwrap();
+    let heights = [24, 105216, 210408, 315600, 420792];
+    block.rewards = heights
+        .iter()
+        .enumerate()
+        .map(|(i, &height)| {
+            let note = Note {
+                owner: wallet.address().owner(),
+                value: 100,
+                unlock_height: height,
+                rho: [F::from_u32(300000 + i as u32); 12],
+                rseed: [F::from_u32(400000 + i as u32); 12],
+                asset_id: SIP_ASSET_ID,
+            };
+            let p = encrypt_payment(
+                &wallet.address(),
+                &note,
+                &EncryptionContext::new(config.network),
+            )
+            .unwrap();
+            let mut ciphertext = [0; 1313];
+            ciphertext[..1088].copy_from_slice(&p.kem_ciphertext);
+            ciphertext[1088..1296].copy_from_slice(&p.body);
+            ciphertext[1296..1312].copy_from_slice(&p.tag);
+            ciphertext[1312] = p.view_tag;
+            RewardRecord {
+                commitment: encode_digest(&Hasher::new().note_cm(&note)),
+                ciphertext,
+            }
+        })
+        .collect();
+    let compact = CompactBlock::decode(&CompactBlock::export(&block).unwrap()).unwrap();
+    let mut light = LightWallet::new(config, Zeroizing::new([42; 32]), 0).unwrap();
+    light.append(&compact).unwrap();
+    let balance: serde_json::Value = serde_json::from_str(&light.balance_json().unwrap()).unwrap();
+    let tranches = balance["locked_tranches"].as_array().unwrap();
+    assert_eq!(tranches.len(), 5);
+    assert_eq!(
+        tranches
+            .iter()
+            .map(|r| r["unlock_height"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        heights
+    );
+    assert!(
+        tranches
+            .iter()
+            .all(|r| r["estimated_timestamp"].as_u64().is_some() && r["amount_atoms"] == "100")
+    );
+    // Display logic uses accepted height, including during fast ASERT catch-up.
+    light.state.height = 24;
+    light
+        .wallet
+        .scan_light_data(&light.state, &[], &[], true)
+        .unwrap();
+    let balance: serde_json::Value = serde_json::from_str(&light.balance_json().unwrap()).unwrap();
+    assert_eq!(balance["locked_tranches"].as_array().unwrap().len(), 4);
+    assert_eq!(balance["rows"][0]["available_atoms"], "100");
+    assert_eq!(balance["rows"][0]["locked_atoms"], "400");
+}
+#[test]
 fn compact_authenticates_all_positions_and_never_retains_historical_proofs() {
     let (_, b) = common::fixture();
     let bytes = CompactBlock::export(&b).unwrap();

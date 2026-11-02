@@ -19,7 +19,7 @@ No circuit, proof, reward, maturity or consensus parameter is modified.
 
 New entropy comes from browser cryptographic randomness inside a dedicated
 worker. Three distinct randomized word positions must be answered before
-encrypted persistence or receiving-file export. Cancel, lock, page exit and
+encrypted persistence or usable receiving information. Cancel, lock, page exit and
 backgrounding clear recovery fields and terminate the worker. A five-minute
 inactivity timeout also locks the session. Strings copied by the browser or
 JavaScript engine cannot be guaranteed to have been erased; compromised scripts,
@@ -60,14 +60,11 @@ prefix, expected network and payload. The directory commitment uses domain
 Parsers reject noncanonical trailing bits, mixed/uppercase text, wrong networks,
 bad checksums, noncanonical owner fields and invalid encapsulation keys.
 
-A short address cannot reconstruct an ML-KEM public key. It must resolve through
-a matching full-address contact record; the recipient commitment is recomputed
-locally. Unresolved or substituted entries fail explicitly. No registry is
-contacted or published automatically. The current implementation imports bounded
-public contact files locally; it does not provide a public address directory.
-These proposed text forms must not be described as deployed miner interfaces
-until the native tools have adopted the same parser. The existing public JSON
-descriptor is the interoperability route in the meantime.
+The receiving UI provides full text and short text for the same native recipient. Miner setup accepts a single address field; users do not need a JSON descriptor or contact file. Full addresses use the portable wallet codec locally and need no directory. Short addresses authenticate an independently obtained full address through their network-bound commitment; they do not compress an ML-KEM public key.
+
+A short address can be enabled explicitly by publishing only its matching public full address to the engineering directory. No automatic publication occurs. The directory contains no recovery words, private keys, viewing keys, account indices or Vault identifiers. Browser and miner verify the returned full address locally. Missing, malformed, wrong-network or substituted entries fail explicitly. Full addresses remain usable when the directory is unavailable.
+
+The directory has no chain database, transaction admission or node control authority. It is a separate capability from the read-only compact-data API, even when hosted on the same independent wallet server. The operator can transiently observe the public receiving address, lookup and source IP, including correlations across routes on that host. Raw access logs and exported request metadata must be disabled; this does not provide network-level anonymity. Production directory and miner-adapter deployment remain incomplete until separately activated. These text encodings require independent review before mainnet use.
 
 ## Scope and trust model
 
@@ -214,7 +211,7 @@ Poll small head metadata every five seconds while visible, with no duplicate
 requests and backoff while hidden/offline; do not redownload unchanged blocks.
 
 SIP ordinary/priority send uses validated full addresses or locally imported
-short-address contacts, native two-input selection and unlock/fee rules,
+authenticated short-address resolution, native two-input selection and unlock/fee rules,
 durable input reservation, locally self-checked outputs, protected payment
 opening, local WASM proving and local verification of that newly generated
 proof. Persist the exact finalized packet before explicit transmission.
@@ -533,3 +530,9 @@ Optional illustration slots are separate from encrypted content. The UI emits
 `vault-view-change` with an active-view boolean and `vault-content-saved` only
 after successful local persistence. These events contain no package metadata,
 passphrases or content. A failed save never shows the persisted-result slot.
+
+## Read-only engineering balance display
+
+The browser lists each locked amount, its consensus unlock height and an estimated date computed by the existing wallet balance logic. Estimated dates do not change height-based spendability, including during ASERT catch-up. After the 24-block maturity height, the corresponding amount becomes available; the four longer Holder tranches retain their individual unlock schedules. The first read-only engineering deployment disables sending through its pinned configuration.
+
+New wallets cannot expose usable receiving information before the randomized recovery backup challenge succeeds. The UI states that recovery words are the only restoration method and that engineering assets have no monetary value.

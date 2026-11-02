@@ -67,6 +67,14 @@ pub fn short(network: [u8; 32], address: &[u8; 1232]) -> Result<String, String> 
     payload.extend(commitment(&network, address));
     Ok(encode(SHORT, &payload, &network))
 }
+/// Check the network-bound spelling before performing a directory lookup.
+pub fn validate_short(text: &str, network: [u8; 32]) -> Result<(), String> {
+    let payload = decode(SHORT, text, &network, 33)?;
+    if !text.starts_with(SHORT) || payload[0] != 1 {
+        return Err("Unsupported short receiving address.".into());
+    }
+    Ok(())
+}
 /// Resolve either form. `resolved` comes from a bounded local contact record or
 /// future directory response and is always authenticated against the commitment.
 pub fn resolve(
@@ -84,10 +92,8 @@ pub fn resolve(
         return Ok(address);
     }
     if text.starts_with(SHORT) {
+        validate_short(text, expected)?;
         let payload = decode(SHORT, text, &expected, 33)?;
-        if payload[0] != 1 {
-            return Err("Unsupported receiving address version.".into());
-        }
         let full = resolved
             .ok_or("Short address unresolved. Import its full address contact record first.")?;
         if !full.starts_with(FULL) {

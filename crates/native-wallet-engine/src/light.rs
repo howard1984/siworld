@@ -178,7 +178,8 @@ impl LightWallet {
         let mut assets = std::collections::BTreeSet::<&AssetId>::new();
         assets.extend(b.available.keys());
         assets.extend(b.locked.keys());
-        Ok(json!({"trust":"header-and-compact-authenticated-full-node-consensus","height":self.state.height,"tip":crate::local::hex(&self.state.tip),"rows":assets.into_iter().map(|a|json!({"asset":crate::local::hex(&a.0),"available_atoms":b.available.get(a).copied().unwrap_or(0).to_string(),"locked_atoms":b.locked.get(a).copied().unwrap_or(0).to_string()})).collect::<Vec<_>>()}).to_string())
+        Ok(json!({"trust":"header-and-compact-authenticated-full-node-consensus","height":self.state.height,"tip":crate::local::hex(&self.state.tip),"rows":assets.into_iter().map(|a|json!({"asset":crate::local::hex(&a.0),"available_atoms":b.available.get(a).copied().unwrap_or(0).to_string(),"locked_atoms":b.locked.get(a).copied().unwrap_or(0).to_string()})).collect::<Vec<_>>(),
+            "locked_tranches":b.tranches.iter().map(|t|json!({"asset":crate::local::hex(&t.asset.0),"amount_atoms":t.amount.to_string(),"unlock_height":t.unlock_height,"estimated_timestamp":t.estimated_timestamp})).collect::<Vec<_>>()}).to_string())
     }
     pub fn prepare(
         &mut self,

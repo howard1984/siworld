@@ -12,7 +12,7 @@ const pending = new Map(), contacts = new Map();
 const proofProgress = new ProofProgress({root: $('#send-progress'), label: $('#send-progress-label'), detail: $('#send-progress-detail'), bar: $('#send-progress-bar')});
 const paymentControls = () => { for (const id of ['send-recipient', 'send-amount', 'send-priority', 'send-prepare']) $(`#${id}`).disabled = proofProgress.active; };
 function message(text, error = false) { $('#status').textContent = text; $('#status').classList.toggle('error', error); }
-function capability(value) { value=value&&ENGINEERING.name==='siworld-eng-1'&&/^[0-9a-f]{64}$/.test(ENGINEERING.network); for (const id of ['create', 'restore', 'import-backup', 'check', 'import-contact']) $(`#${id}`).disabled = !value; }
+function capability(value) { value=value&&ENGINEERING.name==='siworld-eng-1'&&/^[0-9a-f]{64}$/.test(ENGINEERING.network); for (const id of ['create', 'restore', 'import-backup', 'check']) $(`#${id}`).disabled = !value; }
 function startWorker() {
   worker = new Worker(new URL('../sdk/worker.js', import.meta.url), { type: 'module' });
   worker.onmessage = ({ data }) => {
@@ -40,10 +40,11 @@ function lock(text = 'Wallet locked. Recovery fields and the local worker sessio
   info = encrypted = imported = context = null; busy = false; stage = mode = '';
   $('#next').disabled = false; $('#send-open').disabled=true; $('#send-flow').close(); $('#balance-value').textContent='—'; $('#chain-status').textContent='Wallet locked.';
   $('#recipient').value = ''; $('#address-result').textContent = ''; contacts.clear();
-  $('#balance-detail').textContent='Unlock to scan public compact records locally.';$('#asset-balances').replaceChildren();$('#payment-list').replaceChildren();$('#send-recipient').value='';$('#send-amount').value='';$('#send-review').textContent='';$('#send-error').textContent='';
+  $('#locked-notes').hidden=true;$('#locked-note-list').replaceChildren();$('#balance-detail').textContent='Unlock to scan public compact records locally.';$('#asset-balances').replaceChildren();$('#payment-list').replaceChildren();$('#send-recipient').value='';$('#send-amount').value='';$('#send-review').textContent='';$('#send-error').textContent='';
   $('#setup').hidden = false; $('#receiving').hidden = true; $('#full-address').value = ''; $('#short-address').textContent = '';
   $('#account-index').textContent = 'No wallet unlocked'; $('#account-state').textContent = 'LOCKED';
-  $('#lock').disabled = $('#copy-address').disabled = true;
+  $('#lock').disabled = $('#copy-address').disabled = $('#copy-short-address').disabled = true;
+  $('#short-address-status').textContent = ''; $('#copy-short-address').textContent = 'Enable short address ↙';
   if (restart) startWorker(); message(text);
 }
 function activity() { if (info || flow.open) { clearTimeout(timer); timer = setTimeout(() => lock('Wallet locked after five minutes of inactivity.'), 300000); } }
@@ -63,7 +64,7 @@ function showStage(next) {
     display('words-view', true); $('#next').textContent = 'I wrote down my backup ↗';
   } else if (next === 'seal') {
     $('#flow-title').textContent = mode === 'create' ? 'Verify and protect.' : 'Protect this device.';
-    $('#flow-description').textContent = 'Only an encrypted wallet file is saved in this browser. Keep your recovery words and original network/account separately.';
+    $('#flow-description').textContent = 'Recovery words are the only way to restore this wallet. Confirm your backup before continuing. Engineering assets have no monetary value. The device password only encrypts local storage.';
     display('challenge-fields', mode === 'create'); display('password-fields', true); $('#next').textContent = 'Save encrypted wallet ↗';
     $('#password').autocomplete = 'new-password';
   } else if (next === 'unlock') {
@@ -94,6 +95,10 @@ function render(publicInfo, record) {
   $('#full-address').value = info.full_address; $('#short-address').textContent = info.short_address;
   $('#account-state').textContent = 'UNLOCKED'; $('#account-index').textContent = `Account ${info.account} · ${info.network.slice(0, 12)}…`;
   $('#lock').disabled = $('#copy-address').disabled = false;
+  $('#copy-short-address').disabled = ENGINEERING.address_directory !== true;
+  $('#copy-short-address').textContent = 'Enable short address ↙';
+  $('#short-address-status').textContent = 'Enable the short address to publish only its matching public full address. No recovery words, private keys or viewing keys are sent.';
+  $('#send-open').textContent = ENGINEERING.read_only === true ? 'Read-only · Send unavailable' : 'Send ↗';
   message('Wallet unlocked locally. Starting compact engineering synchronization.'); activity(); startOnline();
 }
 $('#create').addEventListener('click', () => begin('create'));
@@ -165,25 +170,24 @@ function download(name, value, type = 'application/json') {
   const link = document.createElement('a'); link.href = url; link.download = name; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 $('#export-backup').addEventListener('click', () => { if (encrypted) download('siworld-native-v1-encrypted.json', parseBackup(JSON.stringify({format:encrypted.format,version:encrypted.version,network:encrypted.network,account:encrypted.account,vault_hex:encrypted.vault_hex}))); });
-$('#export-recipient').addEventListener('click', () => { if (info) download('siworld-native-v1-recipient.json', info.descriptor); });
-$('#export-contact').addEventListener('click', () => { if (info) download('siworld-native-v1-contact.address', { format: 'siworld-native-v1-contact', version: 1, network: info.network, full_address: info.full_address, short_address: info.short_address }); });
 $('#copy-address').addEventListener('click', async () => {
   if (!info) return;
   try { await navigator.clipboard.writeText(info.full_address); message('Full V1 address copied. This is public receiving data.'); }
   catch { $('#full-address').focus(); $('#full-address').select(); message('Copy the selected public address manually.'); }
 });
-$('#import-contact').addEventListener('click', () => $('#contact-file').click());
-$('#contact-file').addEventListener('change', async event => {
+$('#copy-short-address').addEventListener('click', async () => {
+  if(!info||!ready)return; const token=epoch; const expected=info.short_address;
+  $('#copy-short-address').disabled=true;
   try {
-    const file = event.target.files[0]; if (!file) return; if (file.size > 6000) throw new Error('Contact record is too large.');
-    const data = JSON.parse(await file.text());
-    if (!data || Object.keys(data).sort().join() !== ['format','full_address','network','short_address','version'].join() || data.format !== 'siworld-native-v1-contact' || data.version !== 1) throw new Error('Invalid V1 contact record.');
-    const expected = info?.network || ENGINEERING.network;
-    if (data.network !== expected || typeof data.full_address !== 'string' || data.full_address.length > 2200 || typeof data.short_address !== 'string' || data.short_address.length > 100) throw new Error('Contact record network or address is invalid.');
-    const result = await call('inspect', data.short_address, expected, data.full_address);
-    contacts.set(result.short_address, result.full_address); $('#recipient').value = result.short_address; $('#address-result').textContent = 'Contact imported and verified against its short address.';
-  } catch { $('#address-result').textContent = 'Contact import failed. Use a matching native V1 contact record.'; }
-  finally { event.target.value = ''; }
+    const result=contacts.get(expected)===info.full_address?info:await call('register-address'); if(token!==epoch)return;
+    if(result.short_address!==expected)throw new Error('Address registration mismatch.');
+    contacts.set(result.short_address,result.full_address);
+    $('#short-address-status').textContent='Short address enabled and locally verified. Paste this address directly into the miner setup.';
+    $('#copy-short-address').textContent='Copy short address ↙';
+    try {await navigator.clipboard.writeText(result.short_address); message('Short address copied.');}
+    catch {message('Short address enabled. Copy it from the receiving panel.');}
+  } catch(error){if(token===epoch)$('#short-address-status').textContent=error.message;}
+  finally {if(token===epoch)$('#copy-short-address').disabled=false;}
 });
 $('#check-address').addEventListener('submit', async event => {
   event.preventDefault(); const text = $('#recipient').value.trim();
@@ -202,8 +206,9 @@ if (!isSecureContext || window.top !== window || !crypto?.getRandomValues || !na
 
 if(VAULT.application){const link=document.querySelector('[data-view="vault"]');link.href=VAULT.application;link.rel='noreferrer noopener';}else document.querySelector('[data-view="vault"]').addEventListener('click',event=>{event.preventDefault();message('The independent Vault origin is not configured in this build.',true);});
 function atoms(text){const n=BigInt(text||'0');return `${n/100000000n}.${(n%100000000n).toString().padStart(8,'0')}`;}
-function desktopSend(){return ENGINEERING.desktop_send_measured===true&&!navigator.userAgentData?.mobile&&!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)&&navigator.maxTouchPoints===0;}
+function desktopSend(){return ENGINEERING.read_only!==true&&ENGINEERING.desktop_send_measured===true&&!navigator.userAgentData?.mobile&&!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)&&navigator.maxTouchPoints===0;}
 function showBalance(result,stale=false){
+ const tranches=result.locked_tranches||[];$('#locked-notes').hidden=tranches.length===0;$('#locked-note-list').replaceChildren(...tranches.map(tranche=>{const p=document.createElement('p');const estimated=tranche.estimated_timestamp===null||tranche.estimated_timestamp===undefined?null:new Date(tranche.estimated_timestamp*1000);p.textContent=`${atoms(tranche.amount_atoms)} ${tranche.asset==='0'.repeat(64)?'SIP':'asset '+tranche.asset.slice(0,12)+'…'} · unlock height ${tranche.unlock_height} · ${estimated&&!Number.isNaN(estimated.valueOf())?'estimated '+estimated.toLocaleDateString():'date unavailable'}`;return p;}));
  const sip=result.rows.find(row=>row.asset==='0'.repeat(64));$('#balance-value').textContent=atoms(sip?.available_atoms);
  $('#balance-detail').textContent=`Mature ${atoms(sip?.mature_atoms)} SIP · locked ${atoms(sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · ${result.payments?.filter(p=>p.phase==='pending'||p.phase==='unknown').length||0} pending or uncertain payments`;
  $('#chain-status').textContent=`${stale?'Stale · ':''}siworld-eng-1 · height ${result.height} · ${result.tip.slice(0,16)}… · transactions trust full-node consensus`;
@@ -216,5 +221,5 @@ async function refreshOnline(){clearTimeout(pollTimer);if(!onlineReady||onlineBu
 $('#sync-now').onclick=refreshOnline;
 $('#send-open').onclick=()=>{if(proofProgress.active){$('#send-flow').showModal();return;}proofProgress.reset();$('#send-disclosure').checked=false;$('#send-recipient').value=$('#recipient').value;$('#send-prepare').hidden=false;$('#send-ready').hidden=true;$('#send-transmit').hidden=true;$('#send-error').textContent='';$('#send-flow').showModal();};
 $('#send-close').onclick=()=>$('#send-flow').close();
-$('#send-form').onsubmit=async event=>{event.preventDefault();if(onlineBusy)return;onlineBusy=true;clearTimeout(pollTimer);const token=epoch;$('#send-error').textContent='';try{if(!desktopSend())throw new Error('Phone sending remains disabled pending physical-device measurements.');const amount=$('#send-amount').value;if(!/^(0|[1-9][0-9]{0,10})(\.[0-9]{1,8})?$/.test(amount))throw new Error('Enter a positive SIP amount with at most eight decimals.');const [whole,fraction='']=amount.split('.');const value=BigInt(whole)*100000000n+BigInt(fraction.padEnd(8,'0'));if(value<=0n)throw new Error('Amount must be positive.');const address=$('#send-recipient').value.trim();proofProgress.start();paymentControls();const result=await call('prepare',address,contacts.get(address)||'',value.toString(),$('#send-priority').checked);if(token!==epoch)return;proofProgress.finish(result.proving_ms);preparedId=result.prepared_id;showBalance(result);const review=result.payments.find(p=>p.id===preparedId);$('#send-review').textContent=`${atoms(review.amount_atoms)} SIP · fee ${atoms(review.fee_atoms)} SIP · recipient ${review.recipient}`;$('#send-error').textContent=`Proof generated and locally verified in ${(result.proving_ms/1000).toFixed(2)} seconds. Nothing has been transmitted.`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;}catch(error){if(token===epoch){proofProgress.fail();$('#send-error').textContent=error.message;}}finally{onlineBusy=false;paymentControls();if(token===epoch)pollTimer=setTimeout(refreshOnline,5000);}};
+$('#send-form').onsubmit=async event=>{event.preventDefault();if(onlineBusy)return;onlineBusy=true;clearTimeout(pollTimer);const token=epoch;$('#send-error').textContent='';try{if(!desktopSend())throw new Error('Phone sending remains disabled pending physical-device measurements.');const amount=$('#send-amount').value;if(!/^(0|[1-9][0-9]{0,10})(\.[0-9]{1,8})?$/.test(amount))throw new Error('Enter a positive SIP amount with at most eight decimals.');const [whole,fraction='']=amount.split('.');const value=BigInt(whole)*100000000n+BigInt(fraction.padEnd(8,'0'));if(value<=0n)throw new Error('Amount must be positive.');const address=$('#send-recipient').value.trim();const checked=await call('inspect',address,info.network,contacts.get(address)||'');if(token!==epoch)return;contacts.set(checked.short_address,checked.full_address);proofProgress.start();paymentControls();const result=await call('prepare',address,contacts.get(address)||'',value.toString(),$('#send-priority').checked);if(token!==epoch)return;proofProgress.finish(result.proving_ms);preparedId=result.prepared_id;showBalance(result);const review=result.payments.find(p=>p.id===preparedId);$('#send-review').textContent=`${atoms(review.amount_atoms)} SIP · fee ${atoms(review.fee_atoms)} SIP · recipient ${review.recipient}`;$('#send-error').textContent=`Proof generated and locally verified in ${(result.proving_ms/1000).toFixed(2)} seconds. Nothing has been transmitted.`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;}catch(error){if(token===epoch){proofProgress.fail();$('#send-error').textContent=error.message;}}finally{onlineBusy=false;paymentControls();if(token===epoch)pollTimer=setTimeout(refreshOnline,5000);}};
 $('#send-transmit').onclick=async()=>{if(!desktopSend()){$('#send-error').textContent='Phone sending remains disabled pending physical-device measurements.';return;}if(onlineBusy||!preparedId||!$('#send-disclosure').checked)return;onlineBusy=true;const token=epoch;try{const result=await call('submit',preparedId);if(token!==epoch)return;showBalance(result);$('#send-error').textContent='Admission acknowledged pending. Inclusion is confirmed only by a later authenticated compact block.';$('#send-transmit').hidden=true;}catch(error){if(token===epoch)$('#send-error').textContent=`Submission is uncertain: ${error.message} Retry the same stored packet; do not create a replacement payment.`;}finally{onlineBusy=false;pollTimer=setTimeout(refreshOnline,5000);}};

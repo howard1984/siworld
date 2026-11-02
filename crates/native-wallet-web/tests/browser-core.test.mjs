@@ -8,6 +8,7 @@ if (!site) throw new Error('Set WALLET_WEB_OUTPUT to the built wallet directory.
 const root = pathToFileURL(resolve(site) + sep);
 const { initSync, BrowserWallet, inspect_address } = await import(new URL('sdk/core/wallet.js',root));
 const { parseBackup, backup, bytes } = await import(new URL('sdk/storage.js',root));
+const { AddressDirectory } = await import(new URL('sdk/light-session.js',root));
 initSync({ module: readFileSync(new URL('sdk/core/wallet_bg.wasm',root)) });
 const network = '01'.repeat(32);
 // Public synthetic test mnemonic; never use this phrase for real funds.
@@ -91,4 +92,42 @@ test('browser WASM decrypts an original native wallet vault', () => {
   const wallet=BrowserWallet.unlock(vector.network,Uint8Array.from(vector.vault_hex.match(/../g),b=>parseInt(b,16)),'synthetic-native-password');
   try { assert.equal(JSON.parse(wallet.public_info()).descriptor.address_hex,vector.address_hex); }
   finally { wallet.free(); }
+});
+
+test('short lookup authenticates directory data with the browser codec', async () => {
+  const wallet=BrowserWallet.restore(network,0,words), other=BrowserWallet.restore(network,1,words);
+  const previous=globalThis.location;globalThis.location=new URL('https://wallet.invalid');
+  try {
+    const info=JSON.parse(wallet.public_info()), alternate=JSON.parse(other.public_info());
+    let requests=0, replacement=false;
+    const directory=new AddressDirectory({name:'siworld-eng-1',network,api:'https://wallet.invalid/api',address_directory:true},inspect_address,async(url,options)=>{
+      requests++;
+      assert.equal(url,'https://wallet.invalid/api/v1/addresses/'+info.short_address);
+      assert.equal(options.redirect,'error');assert.equal(options.credentials,'omit');
+      return {version:1,network,short_address:info.short_address,full_address:replacement?alternate.full_address:info.full_address};
+    });
+    assert.equal((await directory.resolve(info.full_address,network)).full_address,info.full_address);
+    assert.equal(requests,0);
+    assert.equal((await directory.resolve(info.short_address,network)).full_address,info.full_address);
+    replacement=true;
+    await assert.rejects(directory.resolve(info.short_address,network),/commitment mismatch/);
+    await assert.rejects(directory.resolve(info.short_address,'02'.repeat(32)),/network differs/);
+  } finally {wallet.free();other.free();globalThis.location=previous;}
+});
+test('short publication sends only an explicitly selected public full address', async () => {
+  const wallet=BrowserWallet.restore(network,0,words);
+  const previous=globalThis.location;globalThis.location=new URL('https://wallet.invalid');
+  try {
+    const info=JSON.parse(wallet.public_info());
+    const directory=new AddressDirectory({name:'siworld-eng-1',network,api:'https://wallet.invalid/api',address_directory:true},inspect_address,async(url,options)=>{
+      assert.equal(url,'https://wallet.invalid/api/v1/addresses');
+      assert.equal(options.method,'POST');
+      assert.deepEqual(JSON.parse(options.body),{full_address:info.full_address});
+      return {version:1,network,short_address:info.short_address,full_address:info.full_address};
+    });
+    assert.equal((await directory.publish(info.full_address)).short_address,info.short_address);
+    const unavailable=new AddressDirectory({name:'siworld-eng-1',network,api:'https://wallet.invalid/api'},inspect_address);
+    await assert.rejects(unavailable.resolve(info.short_address,network),/Use the full address/);
+    assert.equal((await unavailable.resolve(info.full_address,network)).full_address,info.full_address);
+  } finally {wallet.free();globalThis.location=previous;}
 });
