@@ -28,6 +28,7 @@ DOCUMENTS = {
     "v1-protocol-byte-compatibility.md",
     "v1-native-identity.md", "v1-hybrid-handshake.md", "v1-wallet-storage.md",
     "v1-offline-fund-keys.md",
+    "v1-browser-wallet.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
@@ -42,8 +43,16 @@ PUBLIC_ARTIFACTS = {
 CRATES = {
     "core", "crypto", "poseidon2", "state", "circuits", "consensus",
     "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset", "fund-keytool",
+    "native-wallet-core", "native-wallet-web",
 }
 PUBLIC_TEXT_ASSETS = {
+    "crates/native-wallet-web/web/wallet.html",
+    "crates/native-wallet-web/web/assets/native-wallet.css",
+    "crates/native-wallet-web/web/assets/native-wallet.js",
+    "crates/native-wallet-web/web/sdk/network.js",
+    "crates/native-wallet-web/web/sdk/storage.js",
+    "crates/native-wallet-web/web/sdk/worker.js",
+    "crates/native-wallet-web/tests/browser-core.test.mjs",
     "crates/native-node/src/web_wallet/assets/index.html",
     "crates/native-node/src/web_wallet/assets/startup.css",
     "crates/native-node/src/web_wallet/assets/startup.js",

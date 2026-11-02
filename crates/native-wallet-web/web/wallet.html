@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+<title>V1 Wallet · siworld</title>
+<link rel="stylesheet" href="assets/native-wallet.css">
+<script type="module" src="assets/native-wallet.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to wallet</a>
+<header><a href="wallet.html" class="brand">siworld<span>WALLET</span></a><span class="network-badge"><i></i> V1 · Engineering network</span><button id="lock" type="button" disabled>Lock wallet ↗</button></header>
+<main id="main" tabindex="-1">
+<div class="heading"><p class="eyebrow">YOUR KEYS. YOUR DEVICE.</p><h1>A wallet that<br>starts with you.</h1><p class="lede">Create or restore a native V1 wallet.<br>Your recovery words stay on this device.</p></div>
+<p id="status" role="status" aria-live="polite">Loading the local wallet core…</p>
+<div class="layout">
+<section class="account-card" aria-labelledby="account-title">
+<div class="card-top"><span id="account-title">V1 ACCOUNT</span><span id="account-state">LOCKED</span></div>
+<div class="amount">— <span>SIP</span></div><p class="balance-note">Balance unavailable · Chain synchronization is not connected.</p>
+<div class="card-actions"><button disabled type="button" title="Native chain synchronization and local proving are not connected.">Send ↗</button><button id="copy-address" type="button" disabled>Copy full address ↙</button></div>
+<div class="card-bottom"><span id="account-index">No wallet unlocked</span><span>Native V1</span></div>
+</section>
+<section class="setup surface" id="setup" aria-labelledby="setup-title">
+<span class="eyebrow">GET STARTED</span><h2 id="setup-title">Choose your way in.</h2>
+<p>New wallet or existing recovery words. Use the original network and account when restoring.</p>
+<div class="choices"><button id="create" class="choice" type="button" disabled><span>01</span><strong>Create a new wallet</strong><small>Generate and back up 24 recovery words</small><b>↗</b></button><button id="restore" class="choice" type="button" disabled><span>02</span><strong>Restore a wallet</strong><small>Use your original 24 words</small><b>↗</b></button></div>
+<div id="saved" hidden><label for="saved-wallet">Encrypted wallets on this device</label><select id="saved-wallet"></select><button id="open-unlock" type="button">Unlock selected wallet</button></div>
+<button id="import-backup" class="text-button" type="button" disabled>Open an encrypted backup ↑</button><input id="backup-file" type="file" accept=".json" hidden>
+</section>
+<section class="surface" id="receiving" hidden aria-labelledby="receiving-title"><span class="eyebrow">RECEIVE</span><h2 id="receiving-title">Your V1 receiving address.</h2><p>Use the full address without a directory. Your public recipient file works with the native V1 miner configuration.</p><label for="full-address">Full address</label><textarea id="full-address" rows="3" readonly spellcheck="false"></textarea><div class="actions"><button id="export-recipient" type="button">Download miner recipient file ↓</button><button id="export-backup" type="button">Back up encrypted wallet ↓</button></div><details><summary>Short address and contact record</summary><p>Short addresses require the matching full-address contact record. There is no public V1 directory yet.</p><output id="short-address"></output><button id="export-contact" type="button">Download public contact record ↓</button></details></section>
+</div>
+<section class="surface checker" aria-labelledby="checker-title"><div><span class="eyebrow">ADDRESS CHECK</span><h2 id="checker-title">One field. Both address forms.</h2><p>Validate a full V1 address, or resolve a short address using an imported public contact record. Legacy website addresses are rejected.</p></div><form id="check-address"><label for="recipient">Receiving address</label><textarea id="recipient" rows="2" maxlength="2200" spellcheck="false" required></textarea><div class="actions"><button id="check" type="submit" disabled>Validate address ↗</button><button id="import-contact" type="button" disabled>Import contact record ↑</button></div><input id="contact-file" type="file" accept=".json,.address" hidden><p id="address-result" role="status"></p></form></section>
+<footer><span>Local custody · Native V1</span><span>Engineering assets have no monetary value.</span></footer>
+</main>
+<dialog id="flow"><form id="flow-form" autocomplete="off"><button id="cancel" class="close" type="button" aria-label="Cancel wallet setup">×</button><p class="eyebrow" id="step-label">NATIVE V1</p><h2 id="flow-title"></h2><p id="flow-description"></p>
+<div id="context-fields"><label for="network">Original native network ID</label><input id="network" required pattern="[0-9a-f]{64}" maxlength="64" spellcheck="false" autocomplete="off"><label for="account">Account index</label><input id="account" type="number" min="0" max="4294967295" step="1" value="0" required><p class="help">A network ID is not a genesis block hash. Keep both fields with your recovery backup.</p></div>
+<div id="restore-fields" hidden><label for="restore-words">24 recovery words</label><textarea id="restore-words" rows="4" maxlength="256" spellcheck="false" autocomplete="off" autocapitalize="none"></textarea></div>
+<div id="words-view" hidden><ol id="words"></ol><p class="help">Write these words down privately, together with the network ID and account index. The next step asks for three words from your backup.</p></div>
+<div id="challenge-fields" hidden><div id="answers"></div></div>
+<div id="password-fields" hidden><label for="password">Device password</label><input id="password" type="password" autocomplete="new-password" maxlength="1024"><div id="confirm-field"><label for="confirm">Confirm device password</label><input id="confirm" type="password" autocomplete="new-password" maxlength="1024"></div><p class="help">Encrypts this device and backup file. It does not change your receiving address.</p></div>
+<p id="flow-error" role="alert"></p><button id="next" class="primary" type="submit">Continue ↗</button>
+</form></dialog>
+</body></html>

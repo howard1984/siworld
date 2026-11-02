@@ -1,0 +1,34 @@
+[package]
+name = "siworld-native-wallet-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+description = "Portable native V1 wallet identity, receiving addresses and encrypted custody"
+
+[workspace]
+
+[features]
+native-parity = ["dep:reference-native", "dep:reference-math"]
+
+[dependencies]
+reference-native = { package = "siworld-native-node", path = "../native-node", default-features = false, optional = true }
+reference-math = { package = "siworld-multi-asset-experiment", path = "../bench-multi-asset", default-features = false, optional = true }
+blake3 = { version = "1.8.3", features = ["zeroize"] }
+p3-field = "=0.9.0-rc.2"
+p3-koala-bear = "=0.9.0-rc.2"
+p3-symmetric = "=0.9.0-rc.2"
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
+bip39 = { version = "=2.2.2", default-features = false, features = ["std", "zeroize"] }
+getrandom = "0.4"
+zeroize = "1.9.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[lints.rust]
+unsafe_code = "forbid"
