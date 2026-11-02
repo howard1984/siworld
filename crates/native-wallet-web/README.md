@@ -124,3 +124,79 @@ later remaining-time estimates use only the latest three successful durations
 in this page session. An overrun never becomes a fake completion percentage.
 Preparing a proof does not transmit it; explicit review and submission remain
 separate actions.
+
+
+## Read-only public file export
+
+The disabled-by-default `wallet-light-gateway` feature can export accepted public
+chain data when `SIWORLD_WALLET_PUBLIC_EXPORT` names an existing private mode-700
+directory owned by the node process. The node service must run as `siworld`;
+exported files inherit that owner and have mode 600. No environment setting means
+no export. File export creates no socket, listener or request worker, and has no
+submission or administrative capability. The existing owner-only mode-600
+`SIWORLD_WALLET_GATEWAY_SOCKET` is a separate local reference interface; it is
+not enabled by file export. Setting both disables the optional export and logs
+a generic initialization failure without stopping the node.
+
+The public directory contains immutable identity-addressed compact `.bin`
+records and an atomically replaced `chain.json`. Records contain only public
+headers, commitments, ML-KEM ciphertexts, view tags, nullifiers and tree/authentication
+state required by the light client. They exclude full transaction proofs, fee
+openings, peers, mempool contents and local secrets. The index contains only
+version, network, genesis, height, tip and canonical block identities. No index
+is published until every referenced record has been durably installed. A
+reorganization replaces the canonical list while retaining previous fork records.
+Export failures preserve the last complete index and never propagate into node
+validation, state transitions or block admission. Generic diagnostics omit paths
+and underlying error context; retries wait five seconds and runtime error logs
+occur at most once per minute. No database format or consensus rule changes.
+
+The local index is bounded to one million identities and 68,000,512 bytes.
+Publication occurs at most once per five seconds; remote transfer must use pages
+of at most 128 identities. Exporting one record per canonical-owner turn and
+serializing the index adds bounded local I/O; this is not a production-node
+performance qualification. Monitor owner-loop latency before production use.
+
+A separate outbound uploader reads only the public export directory through a
+read-only sandbox mount, using the restricted `siworld` UID to read mode-600
+files. It receives no node database, wallet files, configuration or reference
+IPC. It initiates authenticated HTTPS transfer to an independent archive receiver
+(or an independently authorized private object-storage relay). Receiver activation
+requires authenticated record validation, bound network/genesis, continuity and
+an atomic complete-index switch. The wallet host serves static pages and a
+read-only API over its stored copy; it never connects to a node port and runs no
+node. Transaction broadcast is a separate unimplemented deployment prerequisite;
+this update adds no submission channel or relay. Uploader, receiver, credentials,
+production sandboxing and any service activation are outside this public patch.
+
+`siworld-compact-inspect` accepts at most 8,388,656 bytes on standard input and
+returns authenticated public identity, network, height, parent and SHA-256.
+It verifies the existing compact authentication format. It does not generate
+or replay transaction/settlement proofs, select a chain or replace browser
+header work/continuity validation.
+
+## Static release integrity
+
+`tools/package-release.py` consumes an existing web build and pinned esbuild
+0.25.12. It emits separate wallet and Vault distributions, immutable release
+paths, script/style SHA-384 SRI, a fixed integrity value on WASM fetches, static
+same-origin Workers and a complete activation manifest. The threaded adapter
+uses at most four Workers and requires COOP/COEP. Packaging fails if the pinned
+upstream adapter layout differs; no Blob or dynamic-import fallback is used.
+Private deployment artwork must be included before final integrity generation.
+
+Verify every distribution file with `verify_release` before activation, passing
+an independently approved SHA-256 of the complete manifest as
+`expected_manifest_sha256`, and mount releases read-only at runtime. Without
+that external pin, manifest verification checks self-consistency only. Main-script SRI does not transitively
+verify Worker responses: `new Worker()` has no native SRI parameter. Worker
+integrity therefore depends on the fixed same-origin loader path, HTTPS, strict
+`worker-src 'self'`, immutable paths and trusted preactivation verification.
+Do not describe this as browser-enforced Worker SRI.
+
+The generated response-header manifest requires a CSP with no inline script
+or JavaScript eval, only same-origin resources and `wasm-unsafe-eval` for WASM,
+plus COOP `same-origin`, COEP `require-corp`, CORP `same-origin`, frame denial
+and no-referrer. A deployment must enforce these as HTTP headers on HTML,
+Workers, errors and relevant API responses. The packager does not provision
+TLS, DNS, a public perimeter, source agents or durable Vault storage.

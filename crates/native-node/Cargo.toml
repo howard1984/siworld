@@ -25,6 +25,11 @@ peer-qualification = ["native-p2p"]
 wallet-light-gateway = []
 
 [[bin]]
+name = "siworld-compact-inspect"
+path = "src/bin/siworld-compact-inspect.rs"
+required-features = ["wallet-light-gateway"]
+
+[[bin]]
 name = "siworld-peer-qualification"
 path = "src/bin/siworld-peer-qualification.rs"
 required-features = ["peer-qualification"]

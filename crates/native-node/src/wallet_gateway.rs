@@ -1,4 +1,4 @@
-//! Opt-in private IPC for public compact reads and the unchanged native admission path.
+//! Opt-in public file exports and the existing private reference interface.
 //! No wallet custody, scan, signing, reward configuration or remote prover operation.
 use crate::{
     runtime::Node,
@@ -19,8 +19,11 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
+mod export;
+use export::PublicExport;
+
 const MAX_REQUEST: usize = MAX_ENVELOPE_BYTES + SIDECAR_BYTES;
 const MAX_RESPONSE: usize = crate::ranges::MAX_COMPACT + 48;
 struct Request {
@@ -29,8 +32,10 @@ struct Request {
     reply: SyncSender<Result<Vec<u8>, String>>,
 }
 pub struct Gateway {
-    path: PathBuf,
-    socket_identity: (u64, u64),
+    socket: Option<(PathBuf, (u64, u64))>,
+    export: Option<PublicExport>,
+    retry_at: Instant,
+    log_at: Instant,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     rx: Receiver<Request>,
@@ -41,9 +46,46 @@ pub struct Gateway {
 }
 impl Gateway {
     pub fn from_environment() -> Result<Option<Self>, String> {
-        std::env::var_os("SIWORLD_WALLET_GATEWAY_SOCKET")
-            .map(|p| Self::bind(Path::new(&p)))
-            .transpose()
+        let reference = std::env::var_os("SIWORLD_WALLET_GATEWAY_SOCKET");
+        let public = std::env::var_os("SIWORLD_WALLET_PUBLIC_EXPORT");
+        Self::configured(
+            reference.as_deref().map(Path::new),
+            public.as_deref().map(Path::new),
+        )
+    }
+    fn configured(reference: Option<&Path>, public: Option<&Path>) -> Result<Option<Self>, String> {
+        match (reference, public) {
+            (None, None) => Ok(None),
+            (Some(path), None) => Self::bind(path).map(Some),
+            (reference, Some(path)) => {
+                // Export initialization is optional and must never stop the node.
+                if reference.is_none()
+                    && let Ok(export) = Self::export_only(path)
+                {
+                    return Ok(Some(export));
+                }
+                eprintln!("Public wallet export disabled: initialization unavailable.");
+                Ok(None)
+            }
+        }
+    }
+    /// File-only capability: no socket, listener, request thread or admission path.
+    fn export_only(path: &Path) -> Result<Self, String> {
+        let export = PublicExport::open(path)?;
+        let (_, rx) = mpsc::sync_channel(1);
+        Ok(Self {
+            socket: None,
+            export: Some(export),
+            retry_at: Instant::now(),
+            log_at: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
+            join: None,
+            rx,
+            cache: path.into(),
+            indexed: 0,
+            ids: Vec::new(),
+            packets: std::collections::BTreeMap::new(),
+        })
     }
     pub fn bind(path: &Path) -> Result<Self, String> {
         if path.exists() || path.symlink_metadata().is_ok() {
@@ -121,8 +163,10 @@ impl Gateway {
             }
         });
         Ok(Self {
-            path: path.to_owned(),
-            socket_identity,
+            socket: Some((path.to_owned(), socket_identity)),
+            export: None,
+            retry_at: Instant::now(),
+            log_at: Instant::now(),
             stop,
             join: Some(join),
             rx,
@@ -138,11 +182,29 @@ impl Gateway {
             let response = self.dispatch(node, request.kind, &request.body);
             let _ = request.reply.send(response);
         }
-        // One public block per turn; persist authentication material independently
-        // of any future full-proof pruning. Archive failures never mutate consensus.
-        if self.index(node).is_ok() && self.indexed < self.ids.len() {
-            if self.compact(node, self.indexed).is_ok() {
+        if Instant::now() < self.retry_at {
+            return;
+        }
+        // Read committed history only. One compact record per canonical-owner turn.
+        let result: Result<(), String> = (|| {
+            self.index(node)?;
+            if self.indexed < self.ids.len() {
+                self.compact(node, self.indexed)?;
                 self.indexed += 1;
+            }
+            if self.indexed == self.ids.len()
+                && let Some(export) = &mut self.export
+            {
+                export.publish(&node.state().config, &self.ids)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.retry_at = Instant::now() + Duration::from_secs(5);
+            if self.export.is_some() && Instant::now() >= self.log_at {
+                // No path, node identity, private packet or underlying error is logged.
+                eprintln!("Public wallet export unavailable; node operation continues.");
+                self.log_at = Instant::now() + Duration::from_secs(60);
             }
         }
     }
@@ -187,7 +249,11 @@ impl Gateway {
         let id = self.ids[at];
         let path = self.cache.join(format!("{}.bin", crate::local::hex(&id)));
         if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-            if !metadata.is_file() || metadata.len() > MAX_RESPONSE as u64 {
+            if !metadata.is_file()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o777 != 0o600
+                || metadata.len() > MAX_RESPONSE as u64
+            {
                 return Err("Compact archive record invalid.".into());
             }
             let bytes = std::fs::read(&path).map_err(|_| "Compact archive unreadable.")?;
@@ -210,6 +276,8 @@ impl Gateway {
             .mode(0o600)
             .open(&temp)
             .map_err(|_| "Compact archive write unavailable.")?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| "Compact archive permissions unavailable.")?;
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| "Compact archive write failed.")?;
@@ -225,6 +293,9 @@ impl Gateway {
         kind: u8,
         body: &[u8],
     ) -> Result<Vec<u8>, String> {
+        if self.socket.is_none() {
+            return Err("File export has no request capability.".into());
+        }
         if kind == 3 {
             if body.len() <= SIDECAR_BYTES || body.len() > MAX_REQUEST {
                 return Err("Native packet limit.".into());
@@ -372,13 +443,17 @@ impl Drop for Gateway {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        if std::fs::symlink_metadata(&self.path)
-            .is_ok_and(|m| (m.dev(), m.ino()) == self.socket_identity)
+        if let Some((path, identity)) = &self.socket
+            && std::fs::symlink_metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == *identity)
         {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(path);
         }
     }
 }
+
+#[cfg(test)]
+#[path = "wallet_gateway/tests.rs"]
+mod export_tests;
 
 #[cfg(test)]
 mod tests {
@@ -407,7 +482,7 @@ mod tests {
         let mut node = Node::new(store, TestVerifier);
         let mut gateway = Gateway::bind(&root.join("s")).unwrap();
         assert_eq!(
-            std::fs::metadata(&root.join("s"))
+            std::fs::metadata(root.join("s"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -471,7 +546,7 @@ mod tests {
         client.join().unwrap();
         assert!(
             gateway
-                .dispatch(&mut node, 3, &vec![0; SIDECAR_BYTES + 1])
+                .dispatch(&mut node, 3, &[0; SIDECAR_BYTES + 1])
                 .is_err()
         );
         // Exercise admission and byte-identical retry through the native test verifier.
