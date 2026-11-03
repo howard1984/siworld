@@ -124,6 +124,10 @@ Default binaries enable Plonky3 and reject mock-proof networks. Explicit
 No deployment-qualified native V1 launch command is available before runtime
 integration and acceptance are complete.
 
+## Support
+
+SIWORLD is supported by 22,336 USDC in donations from friends of the project, as of 28 October 2026.
+
 ## License
 
 [GPL-3.0-only](LICENSE). Required third-party attribution, including references
