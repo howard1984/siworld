@@ -1,6 +1,7 @@
 import init, * as core from './core/wallet.js';
 import { LightSession, AddressDirectory } from './light-session.js';
 import { ENGINEERING } from './network.js';
+import { WalletAccounts, accountIndex } from './wallet-accounts.js';
 await init({module_or_path:new URL('./core/wallet_bg.wasm',import.meta.url)});
 if (core.initThreadPool) {
   if (!self.crossOriginIsolated || typeof SharedArrayBuffer === 'undefined') throw new Error('Threaded proving requires cross-origin isolated page headers. Use the standard build otherwise.');
@@ -9,21 +10,40 @@ if (core.initThreadPool) {
 const { BrowserWallet, inspect_address } = core;
 const directory = new AddressDirectory(ENGINEERING,inspect_address);
 self.postMessage({ ready: true });
-let wallet = null, online = null, queue = Promise.resolve();
-const release = () => { wallet?.free(); wallet = null; online = null; };
+let wallet = null, active = null, accounts = null, online = null, queue = Promise.resolve();
+const release = () => { active?.free(); accounts?.free(); wallet?.free(); active = accounts = wallet = online = null; };
+const scoped = new Set(['register-address', 'online-init', 'sync', 'prepare', 'submit', 'cancel-payment', 'journal']);
+function selectAccount(account) {
+  accountIndex(account);
+  const next = accounts.derive(account);
+  active?.free(); active = next; online = null;
+  return JSON.parse(active.public_info());
+}
 self.onmessage = ({ data }) => { queue=queue.then(()=>handle(data)); };
 async function handle(data) {
   const { id, action, args = [] } = data;
   try {
     let result;
+    if (scoped.has(action) && (!active || data.account !== JSON.parse(active.public_info()).account)) throw new Error('The selected wallet changed. Reopen its payment panel.');
     switch (action) {
       case 'create': release(); wallet = BrowserWallet.create(...args); result = { words: wallet.recovery_words(), positions: [...wallet.backup_positions()] }; break;
       case 'restore': release(); wallet = BrowserWallet.restore(...args); result = true; break;
       case 'unlock': release(); wallet = BrowserWallet.unlock(...args); result = JSON.parse(wallet.public_info()); break;
       case 'seal': if (!wallet) throw new Error('Wallet is locked.'); result = { bytes: wallet.seal(...args), info: JSON.parse(wallet.public_info()) }; break;
+      case 'accounts-init':
+        if (!wallet) throw new Error('Wallet is locked.');
+        active?.free(); active = null; accounts?.free(); online = null;
+        accounts = new WalletAccounts(wallet);
+        result = await accounts.initialize(args[0]);
+        selectAccount(JSON.parse(wallet.public_info()).account);
+        break;
+      case 'accounts-add': if (!accounts) throw new Error('Wallet is locked.'); result = await accounts.add(); break;
+      case 'accounts-rename': if (!accounts) throw new Error('Wallet is locked.'); result = await accounts.rename(...args); break;
+      case 'accounts-backup': if (!accounts) throw new Error('Wallet is locked.'); result = await accounts.backup(); break;
+      case 'account-select': if (!accounts) throw new Error('Wallet is locked.'); result = selectAccount(args[0]); break;
       case 'inspect': result = await directory.resolve(...args); break;
-      case 'register-address': if(!wallet)throw new Error('Wallet is locked.'); result=await directory.publish(JSON.parse(wallet.public_info()).full_address); break;
-      case 'online-init': if(!wallet)throw new Error('Wallet is locked.'); online=new LightSession(wallet,args[0]); result=await online.initialize(); break;
+      case 'register-address': if(!wallet)throw new Error('Wallet is locked.'); result=await directory.publish(JSON.parse(active.public_info()).full_address); break;
+      case 'online-init': if(!wallet)throw new Error('Wallet is locked.'); online=new LightSession(active,args[0]); result=await online.initialize(); break;
       case 'sync': result=await online.sync(); break;
       case 'prepare': result=await online.prepare(...args,stage=>self.postMessage({id,progress:stage})); break;
       case 'submit': result=await online.submit(...args); break;

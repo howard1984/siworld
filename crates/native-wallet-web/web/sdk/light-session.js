@@ -32,7 +32,7 @@ export class AddressDirectory {
   }
 }
 export class LightSession {
-  constructor(wallet,config) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;}
+  constructor(wallet,config) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();}
   async initialize() {
     const c=this.config,info=JSON.parse(this.wallet.public_info());
     if(c.name!=='siworld-eng-1'||!c.rules_hex||!idPattern.test(c.genesis)||info.network!==c.network)throw new Error('This build has no pinned siworld-eng-1 light service.');
@@ -53,14 +53,14 @@ export class LightSession {
     const pending=this.journal.payments.filter(p=>p.phase!=='confirmed');
     const reserved=pending.reduce((n,p)=>n+BigInt(p.input_atoms||'0'),0n);
     balance.rows=balance.rows.map(row=>{const amount=row.asset==='0'.repeat(64)?reserved:0n;const mature=BigInt(row.available_atoms);return {...row,mature_atoms:row.available_atoms,reserved_atoms:amount.toString(),available_atoms:(mature>amount?mature-amount:0n).toString()};});
-    return {...balance,ready:this.ready,payments:this.journal.payments.map(p=>({id:p.id,phase:p.phase,amount_atoms:p.amount_atoms,fee_atoms:p.fee_atoms,recipient:p.recipient})),reserved_count:pending.reduce((n,p)=>n+p.inputs.length,0)};
+    return {...balance,received_records:JSON.parse(this.wallet.light_history()).map(note=>({...note,timestamp:this.times.get(note.block_id)??null})),ready:this.ready,payments:this.journal.payments.map(p=>({id:p.id,phase:p.phase,amount_atoms:p.amount_atoms,fee_atoms:p.fee_atoms,recipient:p.recipient,statement_id:p.statement_id,created_at:p.created_at??null,confirmed_height:p.confirmed_height??null,confirmed_timestamp:p.confirmed_timestamp??null})),reserved_count:pending.reduce((n,p)=>n+p.inputs.length,0)};
   }
   async replaySaved() {
     const chain=[];let tip=this.journal.tip;
     for(let height=this.journal.height;height>0;height--){const c=await stored('compact',tip);if(!c||c.height!==height||!idPattern.test(c.parent))throw new Error('Compact cache is incomplete. Restore public history before sending.');chain.push({id:tip,height:c.height,parent:c.parent});tip=c.parent;}
     if(tip!==this.config.genesis)throw new Error('Compact cache has a different genesis.');
     this.wallet.begin_candidate();
-    try{for(const c of chain.reverse()){const record=await stored('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
+    try{for(const c of chain.reverse()){const record=await stored('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
   }
   async sync() {
     if(this.syncing)throw new Error('A compact synchronization is already running.');this.syncing=true;this.ready=false;
@@ -73,7 +73,7 @@ export class LightSession {
       if(this.journal.height>0&&head.height>this.journal.height){const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${this.journal.height}&limit=1`,{signal:AbortSignal.timeout(15000)});extension=Array.isArray(page.ids)&&page.ids.length===1&&page.ids[0]===this.journal.tip;}
       if(extension)this.wallet.begin_extension();else this.wallet.begin_candidate();
       let parent=extension?this.journal.tip:this.config.genesis;let previous=extension?this.journal.height:0;let downloaded=0;
-      const needed=new Set(this.journal.payments.map(p=>p.statement_id));const included=new Set();
+      const needed=new Set(this.journal.payments.map(p=>p.statement_id));const included=new Map();
       for(let from=previous+1;from<=head.height;) {
         const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${from}&limit=128`,{signal:AbortSignal.timeout(15000)});
         if(!Array.isArray(page.ids)||page.ids.length===0||page.ids.length>128||page.ids.length>head.height-from+1)throw new Error('Incomplete compact chain index.');
@@ -81,12 +81,13 @@ export class LightSession {
           if(!bytes){const data=await fetchLimited(`${this.base}/v1/compact/${id}`,{signal:AbortSignal.timeout(30000)});bytes=data.bytes;downloaded+=bytes.length;}
           const state=JSON.parse(this.wallet.append_compact(bytes));
           if(state.tip!==id||state.height!==previous+1)throw new Error('Compact block identity or height differs.');
-          for(const statement of state.observed_statements||[])if(needed.has(statement))included.add(statement);
+          for(const statement of state.observed_statements||[])if(needed.has(statement))included.set(statement,{height:state.height,timestamp:state.block_timestamp});
+          if(state.owned_receipts)this.times.set(id,state.block_timestamp);
           if(!cached)await stored('compact',id,{id,parent,height:state.height,bytes});parent=id;previous=state.height;
         }from+=page.ids.length;
       }
       this.wallet.check_candidate(String(head.height),head.tip);
-      const payments=this.journal.payments.map(p=>({...p,phase:included.has(p.statement_id)?'confirmed':p.phase==='confirmed'&&!extension?(p.ever_submitted?'unknown':'finalized'):p.phase}));
+      const payments=this.journal.payments.map(p=>{const found=included.get(p.statement_id);const orphaned=p.phase==='confirmed'&&!extension&&!found;return {...p,phase:found?'confirmed':orphaned?(p.ever_submitted?'unknown':'finalized'):p.phase,confirmed_height:found?.height??(orphaned?null:p.confirmed_height??null),confirmed_timestamp:found?.timestamp??(orphaned?null:p.confirmed_timestamp??null)};});
       // Persist before replacing the accepted in-memory state. An interrupted candidate is discarded.
       await this.persist({...this.journal,height:head.height,tip:head.tip,payments});
       this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded};
@@ -100,7 +101,7 @@ export class LightSession {
       const reserved=this.journal.payments.filter(p=>p.phase!=='confirmed').flatMap(p=>p.inputs);
       onProgress('preparing');
       const prepared=JSON.parse(this.wallet.prepare_sip(recipient,resolved,amount,priority,JSON.stringify(reserved)));
-      const payment={...prepared,id:crypto.randomUUID(),recipient,ever_submitted:false};
+      const payment={...prepared,id:crypto.randomUUID(),recipient,ever_submitted:false,created_at:Math.floor(Date.now()/1000)};
       onProgress('reserving');
       try{await this.persist({...this.journal,payments:[...this.journal.payments,payment]});}catch(error){this.wallet.cancel_prepared();throw error;}
       // Proving never begins until input reservations and private opening are durably encrypted.

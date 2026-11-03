@@ -1,14 +1,18 @@
 export const FORMAT = 'siworld-native-wallet-backup';
-export const MAX_BACKUP = 2048;
+export const MAX_BACKUP = 70 * 1024;
 export const DB_NAME = 'siworld-native-v1';
 export function parseBackup(text) {
   if (typeof text !== 'string' || new TextEncoder().encode(text).length > MAX_BACKUP) throw new Error('Encrypted backup is too large.');
   let data;
   try { data = JSON.parse(text); } catch { throw new Error('Invalid encrypted backup.'); }
   const keys = ['account', 'format', 'network', 'vault_hex', 'version'];
+  const multiple = data?.version === 2;
+  if (multiple) keys.push('accounts_hex');
+  keys.sort();
   if (!data || typeof data !== 'object' || Object.keys(data).sort().join() !== keys.join() || data.format !== FORMAT ||
-      data.version !== 1 || !/^[0-9a-f]{64}$/.test(data.network) || /^0+$/.test(data.network) ||
+      (!multiple && data.version !== 1) || !/^[0-9a-f]{64}$/.test(data.network) || /^0+$/.test(data.network) ||
       !Number.isInteger(data.account) || data.account < 0 || data.account > 0xffffffff ||
+      (multiple && (typeof data.accounts_hex !== 'string' || data.accounts_hex.length > 65664 || !/^(?:[0-9a-f]{2})+$/.test(data.accounts_hex))) ||
       typeof data.vault_hex !== 'string' || !/^53574e564c543031[0-9a-f]{248}$/.test(data.vault_hex)) {
     throw new Error('Invalid native V1 encrypted backup. Legacy website backups are incompatible.');
   }

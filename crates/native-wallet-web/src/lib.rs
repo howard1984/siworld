@@ -133,6 +133,57 @@ impl BrowserWallet {
             "balance_status":"unavailable", "send_available":false }).to_string())
     }
 
+    /// Derive another account without returning recovery material to JavaScript.
+    pub fn derive_account(&self, account: u32) -> Result<BrowserWallet, JsValue> {
+        if self.challenge.is_some() {
+            return Err(js(
+                "Confirm the recovery backup before adding an account.".into()
+            ));
+        }
+        Ok(Self {
+            material: Material {
+                network: self.material.network,
+                account,
+                entropy: Zeroizing::new(*self.material.entropy),
+            },
+            challenge: None,
+            light: None,
+            candidate: None,
+        })
+    }
+
+    /// Private local display records; never forward these results to a server.
+    pub fn light_history(&self) -> Result<String, JsValue> {
+        let light = self
+            .light
+            .as_ref()
+            .ok_or_else(|| js("Light sync is not initialized.".into()))?;
+        Ok(serde_json::Value::Array(
+            light
+                .wallet
+                .receipts()
+                .iter()
+                .filter(|receipt| {
+                    receipt.note().value > 0
+                        && receipt.output_index != 1
+                        && receipt.output_index != 2
+                })
+                .map(|receipt| {
+                    json!({
+                        "id":hex(&receipt.commitment), "block_id":hex(&receipt.block_id),
+                        "height":receipt.height, "asset":hex(&receipt.note().asset_id.0),
+                        "amount_atoms":receipt.note().value.to_string(),
+                        "unlock_height":receipt.note().unlock_height,
+                        "spent":receipt.spent,
+                        "kind":if receipt.output_index == 0 { "received" }
+                            else if receipt.output_index < 8 { "mining" } else { "allocation" },
+                    })
+                })
+                .collect(),
+        )
+        .to_string())
+    }
+
     pub fn enable_light(&mut self, rules_hex: &str, genesis: &str) -> Result<String, JsValue> {
         if self.challenge.is_some() {
             return Err(js("Confirm your recovery backup first.".into()));
@@ -247,6 +298,16 @@ impl BrowserWallet {
                 .iter()
                 .map(|tx| hex(&tx.record.statement_id(&compact.block.network)))
                 .collect::<Vec<_>>()
+        );
+        summary["block_timestamp"] = json!(compact.block.timestamp);
+        summary["owned_receipts"] = json!(
+            self.candidate
+                .as_ref()
+                .unwrap()
+                .wallet
+                .receipts()
+                .iter()
+                .any(|receipt| receipt.height == compact.block.height && receipt.note().value > 0)
         );
         Ok(summary.to_string())
     }

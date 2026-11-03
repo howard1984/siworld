@@ -29,6 +29,48 @@ Local content packages retain their individual passphrases. Recovery requires
 an independent encrypted recovery file and sync passphrase. Wallet recovery
 words do not recover this Vault account.
 
+## Multiple accounts and local names
+
+An unlocked recovery phrase can derive up to 100 locally managed account
+indexes on the pinned network. **Add wallet** selects the next unused index;
+it does not generate another phrase. Account derivation copies seed entropy
+only inside WASM. A newly created wallet cannot derive accounts until its
+recovery challenge is complete. One management panel is expanded at a time,
+with a separate scanner, balance and encrypted payment journal per account.
+Switching is blocked while the payment panel is open or a proof is running.
+Collapsed balances show their last scanned block rather than implying that
+every account is synchronized in the background. Read-only deployments keep
+all sending controls disabled.
+
+Names are optional display metadata, limited to 48 visible Unicode code
+points and rendered as text. Names and account indexes are encrypted with
+the account-zero local-storage key before being written to IndexedDB. The
+key derives from the recovery material and network inside WASM; it is not
+stored beside the ciphertext. The storage lookup key hashes account zero's
+public address. Decrypted names remain in the page/worker memory only while
+unlocked. They are never included in HTTP requests, address-directory entries,
+transactions, node exports, telemetry or Vault snapshots. IndexedDB is local
+browser storage; it is not an online backup.
+
+A manually downloaded version-2 encrypted wallet backup includes the
+encrypted account registry. The device password protects the seed backup;
+the recovered seed decrypts the registry. Version-1 backups remain readable.
+Restoring words on another device can derive the same indexed addresses,
+but cannot discover names or unused indexes that existed only on the original
+device. Retain the encrypted backup and note which indexes were used. Import
+validates registry authentication and bounds before preserving a backup.
+Existing local names take precedence when importing older registry entries.
+
+The transaction list has All, Received and Sent filters, 20-row pages and
+expandable details. Incoming payments and mining tranches are rebuilt by
+local compact-data scanning; change outputs and zero-value notes are omitted.
+Mining tranches from the same block and asset are grouped, with individual
+unlock heights in the details. Reorganizations rebuild receipts from the
+accepted candidate chain. Sent status, amount, fee and recipient come from
+the encrypted local journal, which is currently bounded to 16 payments per
+account. A phrase-only restore cannot recover outgoing details from another
+browser. No additional server-side account or transaction index is introduced.
+
 ## Build and service configuration
 
 Install the `wasm32-unknown-unknown` Rust target and

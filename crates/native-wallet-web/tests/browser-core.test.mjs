@@ -7,7 +7,7 @@ const site = process.env.WALLET_WEB_OUTPUT;
 if (!site) throw new Error('Set WALLET_WEB_OUTPUT to the built wallet directory.');
 const root = pathToFileURL(resolve(site) + sep);
 const { initSync, BrowserWallet, inspect_address } = await import(new URL('sdk/core/wallet.js',root));
-const { parseBackup, backup, bytes } = await import(new URL('sdk/storage.js',root));
+const { parseBackup, backup, bytes, MAX_BACKUP } = await import(new URL('sdk/storage.js',root));
 const { AddressDirectory } = await import(new URL('sdk/light-session.js',root));
 initSync({ module: readFileSync(new URL('sdk/core/wallet_bg.wasm',root)) });
 const network = '01'.repeat(32);
@@ -62,7 +62,7 @@ test('full addresses and verified short contacts share one parser', () => {
   } finally { wallet.free(); }
 });
 test('backup decoder rejects secrets, oversized input and legacy formats', () => {
-  assert.throws(() => parseBackup('x'.repeat(2049)), /too large/);
+  assert.throws(() => parseBackup('x'.repeat(MAX_BACKUP + 1)), /too large/);
   assert.throws(() => parseBackup(JSON.stringify({ format: 'siworld-wallet-v0', seed: words })), /Invalid native/);
   const fake = {format:'siworld-native-wallet-backup',version:1,network,account:0,vault_hex:'53574e564c543031'+'00'.repeat(124)};
   assert.doesNotThrow(() => parseBackup(JSON.stringify(fake)));
@@ -130,4 +130,26 @@ test('short publication sends only an explicitly selected public full address', 
     await assert.rejects(unavailable.resolve(info.short_address,network),/Use the full address/);
     assert.equal((await unavailable.resolve(info.full_address,network)).full_address,info.full_address);
   } finally {wallet.free();globalThis.location=previous;}
+});
+
+
+test('account derivation preserves recovery context and isolates identities', () => {
+  const root = BrowserWallet.restore(network, 0, words);
+  const first = root.derive_account(1), second = root.derive_account(2);
+  const restored = BrowserWallet.restore(network, 1, words);
+  try {
+    const a = JSON.parse(first.public_info()), b = JSON.parse(second.public_info());
+    assert.deepEqual(a, JSON.parse(restored.public_info()));
+    assert.notEqual(a.full_address, b.full_address);
+    assert.notEqual(a.full_address, JSON.parse(root.public_info()).full_address);
+    assert.equal(a.network, network); assert.equal(a.account, 1);
+    assert.throws(() => first.recovery_words(), /only during/);
+    const data = first.protect_local(new TextEncoder().encode('synthetic account journal'));
+    assert.throws(() => second.open_local(data), /authentication/);
+  } finally {root.free(); first.free(); second.free(); restored.free();}
+});
+test('unconfirmed recovery backup cannot derive an account', () => {
+  const root = BrowserWallet.create(network, 0);
+  try { assert.throws(() => root.derive_account(1), /Confirm/); }
+  finally {root.free();}
 });
