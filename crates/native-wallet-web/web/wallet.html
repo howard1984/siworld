@@ -18,7 +18,7 @@
 <p id="status" role="status" aria-live="polite">Loading the local wallet core…</p>
 <section id="wallet-view" aria-labelledby="wallet-heading">
 <div class="heading"><h1 id="wallet-heading">Your SIP wallet.</h1><p class="lede">Create or restore a native V1 wallet. Your keys stay on this device.</p></div>
-<section id="wallet-collection" hidden aria-labelledby="wallets-title"><div class="collection-bar"><h2 id="wallets-title">Your wallets</h2><button id="add-wallet" type="button" disabled>Add wallet ＋</button></div><p class="help">All addresses in this list use the same recovery phrase. Names stay encrypted on this device and are never uploaded. Keep an encrypted backup to preserve your names and account indexes.</p><div id="wallet-list"></div></section>
+<section id="wallet-collection" hidden aria-labelledby="wallets-title"><div class="collection-bar"><h2 id="wallets-title">Your wallets <span id="wallet-count" aria-label="Wallet count">0 / 10</span></h2><button id="add-wallet" type="button" aria-describedby="wallet-creation-status" disabled>Create new wallet ＋</button></div><p class="help">Manage up to 10 wallets with the same recovery phrase. Expand a wallet to manage its address, balance and transactions. Names stay encrypted on this device and are never uploaded. Keep an encrypted backup to preserve your names and account indexes.</p><p id="wallet-creation-status" class="help" role="status" aria-live="polite"></p><div id="wallet-list"></div></section>
 <div id="wallet-workspace"><div class="layout">
 <section class="account-card" aria-labelledby="account-title">
 <div class="card-top"><span id="account-title">V1 ACCOUNT</span><span id="account-state">LOCKED</span></div>

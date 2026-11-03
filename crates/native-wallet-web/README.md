@@ -31,8 +31,8 @@ words do not recover this Vault account.
 
 ## Multiple accounts and local names
 
-An unlocked recovery phrase can derive up to 100 locally managed account
-indexes on the pinned network. **Add wallet** selects the next unused index;
+An unlocked recovery phrase can derive up to 10 locally managed account
+indexes on the pinned network. **Create new wallet** selects the next unused index;
 it does not generate another phrase. Account derivation copies seed entropy
 only inside WASM. A newly created wallet cannot derive accounts until its
 recovery challenge is complete. One management panel is expanded at a time,
@@ -41,6 +41,12 @@ Switching is blocked while the payment panel is open or a proof is running.
 Collapsed balances show their last scanned block rather than implying that
 every account is synchronized in the background. Read-only deployments keep
 all sending controls disabled.
+
+The wallet collection displays its current count and the ten-wallet limit.
+At capacity the creation button is disabled, while existing expandable
+management panels remain available. The local registry enforces the same
+limit during creation and backup import, including concurrent tabs; invalid
+or oversized imports do not overwrite existing local data.
 
 Names are optional display metadata, limited to 48 visible Unicode code
 points and rendered as text. Names and account indexes are encrypted with

@@ -88,17 +88,67 @@ test('account names and indexes have bounded unambiguous input', () => {
   assert.equal(walletName('  Miner one  '), 'Miner one');
   assert.equal(walletName('<img src=x>'), '<img src=x>');
 });
-test('account capacity and index overflow preserve the encrypted registry', async () => {
+test('ten wallets can be created and the eleventh preserves the encrypted registry', async () => {
   const data = memory(), wallet = BrowserWallet.restore(network, 0, words), book = new WalletAccounts(wallet, data.storage);
   try {
     await book.initialize();
-    await book.write({...book.value, accounts: Array.from({length: 100}, (_, account) => ({account, name: `Wallet ${account + 1}`}))});
+    for (let account = 1; account < 10; account++) {
+      const result = await book.add(); assert.equal(result.account, account);
+    }
+    assert.equal(book.list().length, 10);
+    assert.equal(new Set(book.list().map(row => row.info.full_address)).size, 10);
     let prior = new Uint8Array(data.values.get(book.key));
-    await assert.rejects(book.add(), /100/); assert.deepEqual(data.values.get(book.key), prior);
+    await assert.rejects(book.add(), /10 wallets/); assert.deepEqual(data.values.get(book.key), prior);
+    assert.equal(book.list().length, 10);
+    const reopened = new WalletAccounts(wallet, data.storage);
+    try { assert.equal((await reopened.initialize()).length, 10); }
+    finally { reopened.free(); }
     await book.write({...book.value, accounts: [{account: 0xffffffff, name: 'Last account'}]});
     prior = new Uint8Array(data.values.get(book.key));
     await assert.rejects(book.add(), /index/); assert.deepEqual(data.values.get(book.key), prior);
   } finally {book.free(); wallet.free();}
+});
+test('concurrent creation cannot exceed ten wallets', async () => {
+  const data = memory(), wallet = BrowserWallet.restore(network, 0, words);
+  const first = new WalletAccounts(wallet, data.storage), second = new WalletAccounts(wallet, data.storage);
+  try {
+    await first.initialize(); for (let i = 1; i < 9; i++) await first.add(); await second.initialize();
+    const results = await Promise.allSettled([first.add(), second.add()]);
+    assert.equal(results.filter(row => row.status === 'fulfilled').length, 1);
+    assert.equal(results.filter(row => row.status === 'rejected' && /10 wallets/.test(row.reason.message)).length, 1);
+    assert.deepEqual((await first.read()).accounts.map(row => row.account), Array.from({length: 10}, (_, i) => i));
+  } finally {first.free(); second.free(); wallet.free();}
+});
+test('oversized backup registries fail before overwriting local wallets', async () => {
+  const data = memory(), wallet = BrowserWallet.restore(network, 0, words), book = new WalletAccounts(wallet, data.storage);
+  try {
+    await book.initialize(); await book.rename(0, 'Existing wallet');
+    const prior = new Uint8Array(data.values.get(book.key));
+    const plain = new TextEncoder().encode(JSON.stringify({...book.value,
+      accounts: Array.from({length: 11}, (_, account) => ({account, name: `Wallet ${account + 1}`}))}));
+    const bytes = book.anchor.protect_local(plain); plain.fill(0);
+    const imported = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+    const importing = new WalletAccounts(wallet, data.storage);
+    try { await assert.rejects(importing.initialize(imported), /Invalid encrypted wallet list/); }
+    finally { importing.free(); }
+    assert.deepEqual(data.values.get(book.key), prior); assert.equal(book.list()[0].name, 'Existing wallet');
+  } finally {book.free(); wallet.free();}
+});
+test('merging valid backups cannot exceed ten wallets or overwrite existing names', async () => {
+  const data = memory(), otherData = memory(), wallet = BrowserWallet.restore(network, 0, words);
+  const current = new WalletAccounts(wallet, data.storage), incoming = new WalletAccounts(wallet, otherData.storage);
+  let importer;
+  try {
+    await current.initialize(); await current.rename(0, 'Keep this name');
+    for (let i = 1; i < 10; i++) await current.add();
+    await incoming.initialize();
+    await incoming.write({...incoming.value, accounts: [...incoming.value.accounts, {account: 10, name: 'Other device'}]});
+    const prior = new Uint8Array(data.values.get(current.key));
+    importer = new WalletAccounts(wallet, data.storage);
+    await assert.rejects(importer.initialize(await incoming.backup()), /Invalid encrypted wallet list/);
+    assert.deepEqual(data.values.get(current.key), prior);
+    assert.equal((await current.read()).accounts[0].name, 'Keep this name');
+  } finally {importer?.free(); current.free(); incoming.free(); wallet.free();}
 });
 test('history groups reward tranches and keeps each payment and status distinct', () => {
   const note = {id: 'a'.repeat(96), block_id: 'b'.repeat(64), height: 5, timestamp: 500, asset: sip, amount_atoms: '100', unlock_height: 24, spent: false, kind: 'mining'};

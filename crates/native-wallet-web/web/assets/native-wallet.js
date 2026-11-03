@@ -1,5 +1,6 @@
 import { WalletList } from './wallet-list.js';
 import { WalletHistory } from './wallet-history.js';
+import { MAX_ACCOUNTS } from '../sdk/wallet-accounts.js';
 import { VAULT } from '../sdk/vault-network.js';
 import { backup, bytes, parseBackup, records, save, MAX_BACKUP } from '../sdk/storage.js';
 import { ENGINEERING } from '../sdk/network.js';
@@ -15,6 +16,14 @@ const proofProgress = new ProofProgress({root: $('#send-progress'), label: $('#s
 const history = new WalletHistory($('#wallet-history'));
 const walletList = new WalletList({collection: $('#wallet-collection'), list: $('#wallet-list'), workspace: $('#wallet-workspace'), select: chooseAccount, rename: editWalletName});
 let namingAccount = null;
+function walletCreation() {
+  const count = walletList.rows.size, full = count >= MAX_ACCOUNTS;
+  $('#wallet-count').textContent = `${count} / ${MAX_ACCOUNTS}`;
+  $('#add-wallet').disabled = !info || busy || full;
+  $('#wallet-creation-status').textContent = full
+    ? `Wallet limit reached (${MAX_ACCOUNTS} of ${MAX_ACCOUNTS}). You can still manage all existing wallets.`
+    : 'Create another wallet with the same recovery phrase. No new recovery phrase is needed.';
+}
 const paymentControls = () => { for (const id of ['send-recipient', 'send-amount', 'send-priority', 'send-prepare']) $(`#${id}`).disabled = proofProgress.active; };
 function message(text, error = false) { $('#status').textContent = text; $('#status').classList.toggle('error', error); }
 function capability(value) { value=value&&ENGINEERING.name==='siworld-eng-1'&&/^[0-9a-f]{64}$/.test(ENGINEERING.network); for (const id of ['create', 'restore', 'import-backup']) $(`#${id}`).disabled = !value; }
@@ -39,6 +48,7 @@ function clearSecrets() {
 }
 function lock(text = 'Wallet locked. Recovery fields and the local worker session were cleared.', restart = true) {
   walletList.reset(); history.reset(); history.root.hidden = true; $('#add-wallet').disabled = true;
+  $('#wallet-count').textContent = `0 / ${MAX_ACCOUNTS}`; $('#wallet-creation-status').textContent = '';
   $('#wallet-name-dialog').close(); $('#wallet-name').value = ''; $('#wallet-name-save').disabled = false; namingAccount = null;
   proofProgress.reset(); paymentControls();
   ++epoch; clearTimeout(timer); clearTimeout(pollTimer); onlineReady=false; onlineBusy=false; preparedId=null; worker?.terminate(); ready = false; capability(false);
@@ -114,7 +124,7 @@ async function render(publicInfo, record, selected = false) {
   $('#send-recipient').value = ''; $('#send-amount').value = ''; $('#send-review').textContent = ''; $('#send-error').textContent = '';
   $('#send-source').textContent = `From ${walletList.name(info.account)} · account ${info.account} · ${info.short_address}`;
   $('#account-title').textContent = walletList.name(info.account);
-  $('#add-wallet').disabled = walletList.rows.size >= 100;
+  walletCreation();
   $('#setup').hidden = true; $('#receiving').hidden = false;
   $('#full-address').value = info.full_address; $('#short-address').textContent = info.short_address;
   $('#account-state').textContent = 'UNLOCKED'; $('#account-index').textContent = `Account ${info.account} · ${info.network.slice(0, 12)}…`;
@@ -178,7 +188,7 @@ $('#flow-form').addEventListener('submit', async event => {
       flow.close(); imported = null; await reloadSaved();
     }
   } catch (error) { if (token === epoch) $('#flow-error').textContent = error.message; }
-  finally { if (token === epoch) { busy = false; $('#next').disabled = false; } }
+  finally { if (token === epoch) { busy = false; $('#next').disabled = false; walletCreation(); } }
 });
 $('#open-unlock').addEventListener('click', () => {
   clearSecrets(); ++epoch; imported = null; $('#lock').disabled = false; showStage('unlock'); flow.showModal();
@@ -266,7 +276,7 @@ async function chooseAccount(account) {
     onlineBusy = false;
     await render(selected, encrypted, true);
   } catch (error) { if (token === epoch) lock(error.message); }
-  finally { if (token === epoch) { busy = false; $('#add-wallet').disabled = walletList.rows.size >= 100; } }
+  finally { if (token === epoch) { busy = false; walletCreation(); } }
 }
 $('#add-wallet').onclick = async () => {
   if (!info || busy || proofProgress.active || $('#send-flow').open) return;
@@ -278,7 +288,7 @@ $('#add-wallet').onclick = async () => {
     await chooseAccount(result.account);
     if (token < epoch && info?.account === result.account) message('Wallet added using the same recovery phrase. Save a new encrypted backup to preserve account indexes and local names.');
   } catch (error) { if (token === epoch) message(error.message, true); }
-  finally { if (token === epoch) { busy = false; $('#add-wallet').disabled = !info || walletList.rows.size >= 100; } }
+  finally { if (token === epoch) { busy = false; walletCreation(); } }
 };
 function editWalletName(row) {
   if (!info || busy || proofProgress.active) return;

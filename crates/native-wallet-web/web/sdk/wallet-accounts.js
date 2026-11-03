@@ -1,6 +1,6 @@
 import {stored, hash} from './online-storage.js';
 
-export const MAX_ACCOUNTS = 100;
+export const MAX_ACCOUNTS = 10;
 const MAX_REGISTRY = 32768;
 const encode = value => new TextEncoder().encode(JSON.stringify(value));
 export function accountIndex(value) {
@@ -100,7 +100,7 @@ export class WalletAccounts {
   }
   add() {
     return this.update(value => {
-      if (value.accounts.length >= MAX_ACCOUNTS) throw new Error('At most 100 accounts can be managed on this device.');
+      if (value.accounts.length >= MAX_ACCOUNTS) throw new Error(`At most ${MAX_ACCOUNTS} wallets can be managed with this recovery phrase on this device.`);
       const account = Math.max(...value.accounts.map(row => row.account)) + 1;
       accountIndex(account);
       value.accounts.push({account, name: `Wallet ${value.accounts.length + 1}`});

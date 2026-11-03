@@ -152,12 +152,14 @@ dialog .primary { width: 100%; margin-top: 12px; }
 
 #wallet-collection { margin-bottom: 24px; }
 .wallet-entry { border: 1px solid var(--line); background: var(--surface); margin: 12px 0; padding: 0; }
-.wallet-entry > summary { display: grid; grid-template-columns: minmax(120px,1fr) minmax(180px,2fr); gap: 6px 20px; padding: 20px 24px; }
-.wallet-entry > summary::before { content: '＋'; color: var(--accent-text); grid-row: span 2; display: none; }
+.wallet-entry > summary { display: grid; grid-template-columns: auto minmax(0,1fr) minmax(180px,2fr); gap: 6px 20px; padding: 20px 24px; }
+.wallet-entry > summary::before { content: '＋'; color: var(--accent-text); grid-row: span 2; }
+.wallet-entry[open] > summary::before { content: '−'; }
 .wallet-entry[open] > summary { border-bottom: 1px solid var(--line); }
 .wallet-entry > summary strong { overflow-wrap: anywhere; font-size: 15px; }
 .wallet-address-hint { color: var(--muted); font: 11px/1.8 var(--mono); }
-.wallet-summary-balance { color: var(--muted); font-size: 12px; grid-column: 1/-1; }
+.wallet-summary-balance { color: var(--muted); font-size: 12px; grid-column: 2/-1; }
+#wallet-count { color: var(--muted); font: 11px/1.8 var(--mono); margin-left: 8px; white-space: nowrap; }
 .wallet-entry-body { padding: 0 20px 20px; }
 .wallet-entry-actions { display: flex; justify-content: flex-end; padding: 12px 0; }
 .wallet-entry-actions button { padding: 6px 12px; font-size: 12px; }
@@ -172,7 +174,9 @@ dialog .primary { width: 100%; margin-top: 12px; }
 .transaction-entry p { overflow-wrap: anywhere; font: 11px/1.8 var(--mono); }
 #send-source { overflow-wrap: anywhere; }
 @media (max-width: 640px) {
-  .wallet-entry > summary { padding: 16px; grid-template-columns: minmax(0,1fr); }
+  .wallet-entry > summary { padding: 16px; grid-template-columns: auto minmax(0,1fr); }
+  .wallet-entry > summary::before { grid-row: span 3; }
+  .wallet-address-hint { grid-column: 2; }
   .wallet-entry-body { padding: 0 12px 12px; }
   .transaction-entry summary { grid-template-columns: minmax(0,1fr); }
 }
