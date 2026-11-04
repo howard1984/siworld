@@ -28,7 +28,18 @@ export class CommitmentSession {
       : this.Tree.create(c.rules_hex, c.genesis);
     return JSON.parse(this.tree.summary());
   }
-  async sync(head, signal, onProgress = () => {}) {
+  async atHeight(head, height, signal, onProgress = () => {}) {
+    if (!Number.isSafeInteger(height) || height < 0 || height > head.height || head.network !== this.config.network ||
+        head.genesis !== this.config.genesis || !identity(head.tip)) throw new Error('Invalid historical scan boundary.');
+    let tip = height === 0 ? this.config.genesis : head.tip;
+    if (height > 0 && height < head.height) {
+      const page = await this.json(`${this.base}/v1/chain?tip=${head.tip}&from=${height}&limit=1`, {signal:requestSignal(signal), limit:20000});
+      if (!Array.isArray(page.ids) || page.ids.length !== 1 || !identity(page.ids[0])) throw new Error('Missing historical scan boundary.');
+      tip = page.ids[0];
+    }
+    return this.sync({...head, height, tip}, signal, onProgress, true);
+  }
+  async sync(head, signal, onProgress = () => {}, view = false) {
     const c = this.config;
     if (!this.tree || head.network !== c.network || head.genesis !== c.genesis ||
         !identity(head.tip) || !Number.isSafeInteger(head.height) || head.height < 0 || head.height > 1000000) throw new Error('History head differs from the pinned network.');
@@ -41,12 +52,17 @@ export class CommitmentSession {
       }
       const accepted = JSON.parse(this.tree.summary());
       let extension = accepted.height === 0;
-      if (accepted.tip === head.tip && accepted.height === head.height) return {...accepted, downloaded_bytes: 0, authentication_ciphertext_bytes: 0};
+      if (accepted.tip === head.tip && accepted.height === head.height) return {...accepted, downloaded_bytes: 0, authentication_ciphertext_bytes: 0,
+        ...(view ? {tree:this.tree, release:() => {}} : {})};
       if (accepted.height && head.height > accepted.height) {
         const page = await this.json(`${this.base}/v1/chain?tip=${head.tip}&from=${accepted.height}&limit=1`, {signal:requestSignal(signal), limit:20000});
         extension = Array.isArray(page.ids) && page.ids.length === 1 && page.ids[0] === accepted.tip;
       }
       const trial = extension ? this.tree.fork() : this.Tree.create(c.rules_hex, c.genesis);
+      // An older birthday or another prefix is a temporary view. Never replace
+      // a later accepted local frontier with this historical reconstruction.
+      const transient = view && !extension;
+      const baseline = transient ? this.Tree.create(c.rules_hex, c.genesis) : this.tree;
       let previous = extension ? accepted.height : 0, downloaded = 0, incidental = 0;
       try {
         while (previous < head.height) {
@@ -68,13 +84,16 @@ export class CommitmentSession {
           }
         }
         signal?.throwIfAborted();
-        trial.check_head(String(head.height), head.tip, this.tree);
+        trial.check_head(String(head.height), head.tip, baseline);
+        if (transient) return {...JSON.parse(trial.summary()), downloaded_bytes:downloaded,
+          authentication_ciphertext_bytes:incidental, tree:trial, release:() => trial.free()};
         // Once persistence begins, finish the in-memory replacement as well.
         await this.storage('private', this.key, trial.sealed_cache(this.anchor));
         this.tree.free(); this.tree = trial;
         return {...JSON.parse(trial.summary()), downloaded_bytes: downloaded,
-          authentication_ciphertext_bytes: incidental};
+          authentication_ciphertext_bytes: incidental, ...(view ? {tree:this.tree, release:() => {}} : {})};
       } catch (error) { trial.free(); throw error; }
+      finally { if (transient) baseline.free(); }
     });
   }
   free() { this.tree?.free(); this.tree = this.anchor = null; }

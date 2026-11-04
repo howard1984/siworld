@@ -103,3 +103,31 @@ test('cache authentication and account-zero binding fail closed', async () => {
   const other = {public_info:() => JSON.stringify({network:config.network, account:1})};
   await assert.rejects(new CommitmentSession(other, config, Tree, f.io).initialize(), /account-zero/);
 });
+
+test('birthday view reuses an authenticated tree without repeating projection downloads', async () => {
+  const f=fixture(),session=new CommitmentSession(anchor,config,Tree,f.io);
+  await session.initialize();
+  let view=await session.atHeight(head(4),3);
+  assert.equal(view.height,3);assert.equal(view.downloaded_bytes,12);view.release();
+  const before=f.records.length;
+  view=await session.atHeight(head(4),3);
+  assert.equal(view.downloaded_bytes,0);assert.equal(view.authentication_ciphertext_bytes,0);
+  assert.equal(f.records.length,before);assert.equal(view.tree,session.tree);view.release();
+});
+test('older birthday reconstruction preserves the later encrypted frontier', async () => {
+  const f=fixture(),session=new CommitmentSession(anchor,config,Tree,f.io);
+  await session.initialize();await session.sync(head(4));
+  const saved=[...f.saved.values()][0].slice(),writes=f.writes.length;
+  const view=await session.atHeight(head(4),2);
+  assert.equal(view.height,2);assert.equal(view.downloaded_bytes,8);assert.notEqual(view.tree,session.tree);
+  assert.equal(JSON.parse(session.tree.summary()).height,4);assert.equal(f.writes.length,writes);
+  assert.deepEqual([...f.saved.values()][0],saved);view.release();
+  assert.ok(f.records.every(bytes=>bytes.every(value=>value===0)));
+});
+test('malformed birthday indexes fail before downloading history or replacing a frontier', async () => {
+  const f=fixture(),session=new CommitmentSession(anchor,config,Tree,{...f.io,json:async()=>({ids:['bad']})});
+  await session.initialize();
+  await assert.rejects(session.atHeight(head(4),2),/Missing historical/);
+  await assert.rejects(session.atHeight(head(4),5),/Invalid historical/);
+  assert.equal(f.records.length,0);assert.equal(f.writes.length,0);
+});

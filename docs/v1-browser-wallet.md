@@ -181,17 +181,21 @@ while building this history, checks the announced head and greater verified work
 and persists only the encrypted frontier. It erases each raw authentication
 record after use, including on validation failure or cancellation. A fresh
 scanner can adopt the verified tree and begin trial decryption at its birthday.
-Production route activation and birthday/account integration are separate from
-these tree and SDK interfaces; their presence alone does not accelerate the
-currently deployed wallet.
+The account worker shares this frontier across derived accounts. Without an
+accepted private scan cache, it builds a commitment-only prefix through the
+account's starting height, then requests full compact records only after that
+boundary. Earlier ciphertext is never trial-decrypted or saved. A historical
+view older than the cached frontier is reconstructed temporarily without
+replacing the later local cache. Production route and page activation remain
+separate; the source implementation alone does not change a deployed wallet.
 
 An isolated desktop Chrome 156 measurement on an Apple M1 Max with 32 GiB RAM
-authenticated 886 public engineering blocks using the SIMD, single-thread WASM
-tree adapter. The projection payload was 100,375,606 bytes, including 33,169,495
-incidental ciphertext bytes (33.05%). Authentication and tree construction took
-12.24 seconds; the total with staged loopback transfer was 13.89 seconds.
-The encrypted frontier was 175,764 bytes, reopened in 13.4 ms; a fresh account
-adopted it in 29.7 ms. Observed WASM linear-memory capacity was 5,439,488 bytes;
+authenticated 891 public engineering blocks using the SIMD, single-thread WASM
+tree adapter. The projection payload was 100,932,417 bytes, including 33,352,103
+incidental ciphertext bytes (33.04%). Authentication and tree construction took
+26.53 seconds; the total with staged loopback transfer was 28.37 seconds.
+The encrypted frontier was 176,729 bytes, reopened in 32.6 ms; a fresh account
+adopted it in 65.2 ms. Observed WASM linear-memory capacity was 5,439,488 bytes;
 this is not total browser memory or an instrumented memory peak. No secret user
 wallet or historical decryption was used in this measurement.
 
@@ -204,9 +208,9 @@ deployed, so these are not measured end-to-end synchronization times.
 
 | History | Blocks | Projection payload | Estimated tree CPU | Estimated transfer plus CPU |
 | --- | ---: | ---: | ---: | ---: |
-| Measured sample | 886 | 100.38 MB | 12.24 s measured | 28.30 s |
-| 30 days | 8,640 | 978.83 MB | 119.33 s | 275.95 s |
-| 365 days | 105,120 | 11.91 GB | 1,451.90 s | 3,357.36 s |
+| Measured sample | 891 | 100.93 MB | 26.53 s measured | 42.68 s |
+| 30 days | 8,640 | 978.74 MB | 257.27 s | 413.87 s |
+| 365 days | 105,120 | 11.91 GB | 3,130.16 s | 5,035.44 s |
 
 This is not a header-verified snapshot: the first build still authenticates all
 historical commitments. A cumulative commitment-tree root in consensus-committed
@@ -247,8 +251,9 @@ resource controls before activation.
 Historical transaction proofs and their three-day pruning window are no
 longer browser synchronization inputs. Missing historical proofs do not
 require a wallet checkpoint and do not block readiness. The remaining
-requirements are all public historical ciphertexts/nullifiers/commitments and
-valid header/range-authentication material. If an implementation prunes full
+requirements are authenticated public commitments through the starting height,
+full compact ciphertext/nullifier data after that height, and valid header/range
+authentication material. If an implementation prunes full
 block bytes without retaining the required BLAKE3 outboard authentication
 nodes, it cannot reconstruct those nodes from compact bytes alone. This is
 a compact-service indexing/retention dependency, not a need to restore or
@@ -303,7 +308,7 @@ without replaying compact history, then checks the live head before enabling
 spending. Version-1 journals migrate after their existing authenticated replay;
 an unavailable or mismatched version-2 cache fails closed without deleting the
 journal. Deep reorganizations still build a new candidate. Public compact-cache
-pruning and birthday/shared-account scanning remain separate work.
+pruning and shared multi-key scanning remain separate work.
 
 The version-2 encrypted account registry also records each account's creation
 date and starting height, plus the highest allocated account index. Creation
@@ -312,8 +317,8 @@ height zero. Existing registries migrate with an unknown date and height zero,
 and merging backups preserves the earliest boundary and local display name.
 These fields remain inside the encrypted account backup and are never sent to
 the API. The account panel and recovery-word step display the creation context.
-This metadata alone does not change the active scan algorithm: historical-tree
-integration, date-based recovery and five-empty-account discovery remain pending.
+The scan adapter uses the stored starting height for its authenticated prefix.
+Date-based recovery and five-empty-account discovery remain pending.
 
 Poll small head metadata every five seconds while visible, with no duplicate
 requests and backoff while hidden/offline; do not redownload unchanged blocks.
@@ -653,5 +658,5 @@ public heights and duration estimates and stays between the worker and page.
 Address creation and copying do not wait for scanning. Until the candidate is
 verified and durably recorded, the interface marks the balance as potentially
 incomplete and keeps sending disabled. Changing or locking the wallet discards
-stale progress messages. This display does not implement birthday selection,
-account discovery, shared scanning or durable receipt-cache pruning.
+stale progress messages. Approximate-date recovery, account discovery, shared
+multi-key scanning and public compact-cache pruning remain pending.

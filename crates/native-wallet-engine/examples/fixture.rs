@@ -6,6 +6,7 @@ use native::{
 };
 use p3_field::PrimeCharacteristicRing;
 use siworld_native_wallet_engine::{
+    commitment::CommitmentBlock,
     compact::CompactBlock,
     state::{Config, State},
     wallet::Wallet,
@@ -104,7 +105,43 @@ fn main() {
                 .all(|t| t.proof.is_empty())
         );
         std::fs::write(out.join(format!("block-{slots}.bin")), &compact).unwrap();
-        rows.push(serde_json::json!({"slots":slots,"compact_bytes":compact.len(),"full_block_bytes":block.encoded_len().unwrap(),"block_id":siworld_native_wallet_engine::local::hex(&decoded.id)}));
+        std::fs::write(
+            out.join(format!("commitments-{slots}.bin")),
+            CommitmentBlock::project(&compact).unwrap(),
+        )
+        .unwrap();
+        // Header-valid synthetic extension for birthday scanning; proofs are fixtures.
+        let mut next = block.clone();
+        next.height = 2;
+        next.parent = decoded.id;
+        next.timestamp = 601;
+        let next_note = Note {
+            rho: [F::from_u32(900003); 12],
+            rseed: [F::from_u32(900004); 12],
+            ..note.clone()
+        };
+        let payment = encrypt_payment(
+            &wallet.address(),
+            &next_note,
+            &EncryptionContext::new(config.network),
+        )
+        .unwrap();
+        let mut next_ciphertext = [0; REWARD_CIPHERTEXT_BYTES];
+        next_ciphertext[..1088].copy_from_slice(&payment.kem_ciphertext);
+        next_ciphertext[1088..1296].copy_from_slice(&payment.body);
+        next_ciphertext[1296..1312].copy_from_slice(&payment.tag);
+        next_ciphertext[1312] = payment.view_tag;
+        next.rewards[0] = RewardRecord {
+            commitment: encode_digest(&Hasher::new().note_cm(&next_note)),
+            ciphertext: next_ciphertext,
+        };
+        for (i, reward) in next.rewards.iter_mut().enumerate().skip(1) {
+            reward.commitment = digest(300000 + i as u32);
+        }
+        let next_compact = CompactBlock::export(&next).unwrap();
+        let next_id = CompactBlock::decode(&next_compact).unwrap().id;
+        std::fs::write(out.join(format!("next-{slots}.bin")), next_compact).unwrap();
+        rows.push(serde_json::json!({"slots":slots,"compact_bytes":compact.len(),"full_block_bytes":block.encoded_len().unwrap(),"block_id":siworld_native_wallet_engine::local::hex(&decoded.id),"next_block_id":siworld_native_wallet_engine::local::hex(&next_id)}));
     }
     let metadata = serde_json::json!({"scope":"synthetic-codec-and-local-browser-fixture-not-live-chain-or-consensus-qualification","words":bip39::Mnemonic::from_entropy(&[42;32]).unwrap().to_string(),"network":siworld_native_wallet_engine::local::hex(&config.network),"rules_hex":siworld_native_wallet_engine::local::hex(&config.encode_rules()),"genesis":siworld_native_wallet_engine::local::hex(&config.genesis_id()),"rows":rows});
     std::fs::write(

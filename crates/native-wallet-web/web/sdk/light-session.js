@@ -37,13 +37,14 @@ export class AddressDirectory {
   }
 }
 export class LightSession {
-  constructor(wallet,config,io={}) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();this.storage=io.storage||stored;this.batch=io.batch||storePrivatePair;}
+  constructor(wallet,config,io={}) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();this.storage=io.storage||stored;this.batch=io.batch||storePrivatePair;this.history=io.history;this.birthHeight=io.birthday?.birth_height??0;}
   decodeJournal(bytes) {
     const plain=this.wallet.open_local(bytes);
     try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(plain));}finally{plain.fill(0);}
   }
   async initialize(onProgress=()=>{}) {
     const c=this.config,info=JSON.parse(this.wallet.public_info());
+    if(!Number.isSafeInteger(this.birthHeight)||this.birthHeight<0||this.birthHeight>1000000)throw new Error('Invalid wallet scan boundary.');
     if(c.name!=='siworld-eng-1'||!c.rules_hex||!idPattern.test(c.genesis)||info.network!==c.network)throw new Error('This build has no pinned siworld-eng-1 light service.');
     const origin=new URL(c.api);if(origin.username||origin.password||origin.search||origin.hash||!(origin.protocol==='https:'||(origin.protocol==='http:'&&origin.hostname==='localhost')))throw new Error('Use the pinned HTTPS engineering service.');
     this.base=origin.href.replace(/\/$/,'');this.key=await hash(new TextEncoder().encode(info.full_address));
@@ -106,9 +107,17 @@ export class LightSession {
       if(head.tip===this.journal.tip&&head.height===this.journal.height){this.ready=true;return this.summary();}
       let extension=false;
       if(this.journal.height>0&&head.height>this.journal.height){const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${this.journal.height}&limit=1`,{signal:signal(15000)});extension=Array.isArray(page.ids)&&page.ids.length===1&&page.ids[0]===this.journal.tip;}
-      if(extension)this.wallet.begin_extension();else this.wallet.begin_candidate();
-      let parent=extension?this.journal.tip:this.config.genesis;let previous=extension?this.journal.height:0;let downloaded=0;
-      const start=performance.now(), fromHeight=previous;
+      let parent=extension?this.journal.tip:this.config.genesis;let previous=extension?this.journal.height:0;let downloaded=0,incidental=0;
+      const start=performance.now();
+      if(extension)this.wallet.begin_extension();
+      else if(this.history&&this.birthHeight>0){
+        if(!this.history.tree)await this.history.initialize();
+        const view=await this.history.atHeight(head,Math.min(this.birthHeight,head.height),controller.signal,
+          row=>onProgress(scanProgress('history',start,0,row.height,head.height)));
+        try{controller.signal.throwIfAborted();this.wallet.begin_after_history(view.tree);parent=view.tip;previous=view.height;downloaded=view.downloaded_bytes;incidental=view.authentication_ciphertext_bytes;}
+        finally{view.release();}
+      }else this.wallet.begin_candidate();
+      const fromHeight=previous;
       onProgress(scanProgress('scan',start,fromHeight,previous,head.height));
       const needed=new Set(this.journal.payments.map(p=>p.statement_id));const included=new Map();
       for(let from=previous+1;from<=head.height;) {
@@ -131,7 +140,7 @@ export class LightSession {
       // Persist before replacing the accepted in-memory state. Cancellation
       // after this point must finish both steps so disk and memory agree.
       await this.persistScan({...this.journal,height:head.height,tip:head.tip,payments});
-      this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded};
+      this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded,authentication_ciphertext_bytes:incidental};
     });}catch(error){this.wallet.abort_candidate();throw error;}finally{this.syncing=false;this.syncController=null;}
   }
   async prepare(recipient,resolved,amount,priority,onProgress=()=>{}) {

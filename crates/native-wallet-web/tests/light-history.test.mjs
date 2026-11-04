@@ -5,7 +5,7 @@ import {resolve, sep} from 'node:path';
 import {pathToFileURL} from 'node:url';
 const root = pathToFileURL(resolve(process.env.WALLET_WEB_OUTPUT) + sep);
 const fixture = pathToFileURL(resolve(process.env.WALLET_FIXTURE_DIR) + sep);
-const {initSync, BrowserWallet} = await import(new URL('sdk/core/wallet.js', root));
+const {initSync, BrowserWallet, BrowserCommitmentTree} = await import(new URL('sdk/core/wallet.js', root));
 initSync({module: readFileSync(new URL('sdk/core/wallet_bg.wasm', root))});
 // Public synthetic chain and mnemonic; this build must never be deployed.
 const config = JSON.parse(readFileSync(new URL('fixture.json', fixture)));
@@ -35,6 +35,7 @@ test('private history scans real fixture receipts and isolates derived accounts'
 });
 
 const {LightSession} = await import(new URL('sdk/light-session.js', root));
+const {CommitmentSession} = await import(new URL('sdk/commitment-session.js', root));
 function deferred() {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
@@ -234,5 +235,46 @@ test('scan state and journal persist atomically and reopen without public downlo
   } finally {
     wallet.free(); reopened.free(); globalThis.fetch = savedFetch;
     if (savedNavigator) Object.defineProperty(globalThis, 'navigator', savedNavigator); else delete globalThis.navigator;
+  }
+});
+
+test('birthday sync authenticates the prefix, scans later notes and reuses the tree for another account', async () => {
+  const savedFetch=globalThis.fetch,savedNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  const privateValues=new Map(),publicValues=new Map(),requests=[];
+  const io={storage:async(store,key,value)=>{
+    const values=store==='private'?privateValues:publicValues;
+    if(value!==undefined)values.set(key,structuredClone(value));
+    return values.has(key)?structuredClone(values.get(key)):undefined;
+  },batch:async(a,av,b,bv)=>{privateValues.set(a,new Uint8Array(av));privateValues.set(b,new Uint8Array(bv));}};
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{locks:{request:(_key,options,action)=>(action||options)()}}});
+  const pinned={...config,name:'siworld-eng-1',api:'https://wallet.invalid/api'};
+  const wallet=BrowserWallet.restore(config.network,0,config.words),anchor=wallet.derive_account(0),other=wallet.derive_account(1);
+  const history=new CommitmentSession(anchor,pinned,BrowserCommitmentTree,io);
+  const first=config.rows[0].block_id,next=config.rows[0].next_block_id;
+  const nextBytes=readFileSync(new URL('next-64.bin',fixture)),prefix=readFileSync(new URL('commitments-64.bin',fixture));
+  globalThis.fetch=async url=>{
+    requests.push(url);
+    if(url.endsWith('/head'))return Response.json({network:config.network,genesis:config.genesis,height:2,tip:next});
+    if(url.includes('/chain?')){const from=Number(new URL(url).searchParams.get('from'));return Response.json({ids:[from===1?first:next]});}
+    if(url.endsWith('/commitments/'+first))return new Response(prefix);
+    assert.ok(url.endsWith('/compact/'+next),'Pre-birthday compact ciphertext must never be requested.');
+    return new Response(nextBytes);
+  };
+  try {
+    const session=new LightSession(wallet,pinned,{...io,history,birthday:{birth_height:1}}),progress=[];
+    await session.initialize();const result=await session.sync(row=>progress.push(row));
+    assert.equal(result.height,2);assert.equal(result.ready,true);assert.equal(result.received_records.length,1);
+    assert.equal(result.received_records[0].height,2);
+    assert.equal(result.downloaded_bytes,prefix.length+nextBytes.length);assert.ok(result.authentication_ciphertext_bytes>0);
+    assert.ok(progress.some(row=>row.phase==='history'));
+    const downloads=requests.filter(url=>url.includes('/compact/')||url.includes('/commitments/')).length;
+    const second=new LightSession(other,pinned,{...io,history,birthday:{birth_height:1}});
+    await second.initialize();const otherResult=await second.sync();
+    assert.equal(otherResult.height,2);assert.deepEqual(otherResult.received_records,[]);
+    assert.equal(otherResult.downloaded_bytes,0);
+    assert.equal(requests.filter(url=>url.includes('/compact/')||url.includes('/commitments/')).length,downloads);
+  }finally{
+    history.free();other.free();anchor.free();wallet.free();globalThis.fetch=savedFetch;
+    if(savedNavigator)Object.defineProperty(globalThis,'navigator',savedNavigator);else delete globalThis.navigator;
   }
 });

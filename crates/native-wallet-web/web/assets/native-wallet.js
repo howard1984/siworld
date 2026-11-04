@@ -46,7 +46,8 @@ function call(action, ...args) {
   return new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject, onProgress: action === 'prepare' ? stage => proofProgress.stage(stage) : ['sync','online-init'].includes(action) ? progress => {
     if(token!==epoch||progress.kind!=='synchronization')return;
     const eta=Number.isSafeInteger(progress.eta_seconds)?` · about ${progress.eta_seconds} s remaining`:' · estimating remaining time';
-    $('#chain-status').textContent=`${progress.phase==='cache'?'Reopening verified local cache':'Scanning public compact data'} · block ${progress.height} of ${progress.target_height}${eta} · Balance may be incomplete.`;
+    const phase=progress.phase==='cache'?'Reopening verified local cache':progress.phase==='history'?'Verifying historical output commitments':'Scanning public compact data';
+    $('#chain-status').textContent=`${phase} · block ${progress.height} of ${progress.target_height}${eta} · Balance may be incomplete.`;
     $('#send-open').disabled=true;
   } : null }); worker.postMessage({ id, action, args, account: info?.account }); });
 }
