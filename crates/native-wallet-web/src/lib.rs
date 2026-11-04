@@ -29,6 +29,102 @@ fn js(error: String) -> JsValue {
     JsValue::from_str(&error)
 }
 
+fn history_config(rules_hex: &str, genesis: &str) -> Result<engine::state::Config, JsValue> {
+    let rules =
+        wallet_core::hex_array::<{ engine::state::CONFIG_RULE_BYTES }>(rules_hex).map_err(js)?;
+    let config = engine::state::Config::decode_rules(&rules).map_err(js)?;
+    if hex(&config.genesis_id()) != genesis || config.fixture && !cfg!(feature = "browser-fixtures")
+    {
+        return Err(js(
+            "Pinned engineering history configuration differs.".into()
+        ));
+    }
+    Ok(config)
+}
+
+/// Public tree context only. Adjacent authentication bytes are dropped after append.
+#[wasm_bindgen]
+pub struct BrowserCommitmentTree {
+    history: engine::history::CommitmentHistory,
+}
+
+#[wasm_bindgen]
+impl BrowserCommitmentTree {
+    pub fn create(rules_hex: &str, genesis: &str) -> Result<Self, JsValue> {
+        Ok(Self {
+            history: engine::history::CommitmentHistory::new(history_config(rules_hex, genesis)?)
+                .map_err(js)?,
+        })
+    }
+
+    pub fn restore(
+        rules_hex: &str,
+        genesis: &str,
+        anchor: &BrowserWallet,
+        encrypted: &[u8],
+    ) -> Result<Self, JsValue> {
+        let config = history_config(rules_hex, genesis)?;
+        if anchor.challenge.is_some() || anchor.material.network != config.network {
+            return Err(js(
+                "Confirm the recovery backup on the same network first.".into()
+            ));
+        }
+        let plain = Zeroizing::new(anchor.open_local(encrypted)?);
+        Ok(Self {
+            history: engine::history::CommitmentHistory::open_local(config, &plain).map_err(js)?,
+        })
+    }
+
+    pub fn fork(&self) -> Self {
+        Self {
+            history: engine::history::CommitmentHistory {
+                state: self.history.state.clone(),
+            },
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        let s = &self.history.state;
+        json!({"height":s.height,"tip":hex(&s.tip),"output_count":s.tree.count}).to_string()
+    }
+
+    pub fn append(&mut self, bytes: &[u8]) -> Result<String, JsValue> {
+        let block = engine::commitment::CommitmentBlock::decode(bytes).map_err(js)?;
+        self.history.append(&block).map_err(js)?;
+        Ok(json!({"height":block.height,"tip":hex(&block.id),
+            "output_count":self.history.state.tree.count,
+            "authentication_ciphertext_bytes":block.authentication_ciphertext_bytes})
+        .to_string())
+    }
+
+    pub fn check_head(&self, height: &str, tip: &str, previous: &Self) -> Result<(), JsValue> {
+        let s = &self.history.state;
+        let prior = &previous.history.state;
+        if s.config != prior.config
+            || s.height.to_string() != height
+            || hex(&s.tip) != tip
+            || s.tip != prior.tip && s.cumulative_work <= prior.cumulative_work
+        {
+            return Err(js(
+                "Historical candidate lacks the announced head or greater work.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn sealed_cache(&self, anchor: &BrowserWallet) -> Result<Vec<u8>, JsValue> {
+        if anchor.challenge.is_some()
+            || anchor.material.network != self.history.state.config.network
+        {
+            return Err(js(
+                "Confirm the recovery backup on the same network first.".into()
+            ));
+        }
+        let plain = Zeroizing::new(self.history.cache().map_err(js)?);
+        anchor.protect_local(&plain)
+    }
+}
+
 #[wasm_bindgen]
 pub struct BrowserWallet {
     material: Material,
@@ -241,6 +337,20 @@ impl BrowserWallet {
                 .map_err(js)?,
         );
         Ok(())
+    }
+    /// Begin scanning after a locally verified birthday tree, without older decryption.
+    pub fn begin_after_history(&mut self, tree: &BrowserCommitmentTree) -> Result<(), JsValue> {
+        self.begin_candidate()?;
+        let result = self
+            .candidate
+            .as_mut()
+            .unwrap()
+            .adopt_history(&tree.history)
+            .map_err(js);
+        if result.is_err() {
+            self.candidate = None;
+        }
+        result
     }
     pub fn candidate_balance(&self) -> Result<String, JsValue> {
         self.candidate

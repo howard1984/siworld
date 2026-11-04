@@ -147,6 +147,63 @@ ciphertext and nullifier records, plus authenticated tree-state witnesses,
 or a reviewed standardized outboard proof format for the existing hash.
 This task implements neither a consensus-format change nor a mainnet launch.
 
+### Commitment-only history and local tree reuse
+
+The historical `SWLT0001` application response is a projection of an existing
+authenticated compact record. It discloses header/count/length framing and all
+output commitments in native tree order: transaction outputs, issuance outputs,
+rewards and fund outputs. It does not parse historical ciphertext or nullifiers.
+The existing 1,024-byte authentication chunks can contain adjacent ciphertext
+bytes. These unavoidable bytes are downloaded for authentication only, never
+trial-decrypted or included in the local tree cache. Download measurements must
+report this incidental ciphertext separately from total response bytes.
+
+`CommitmentHistory` verifies range authentication, header continuity, target,
+median time past and work before atomically advancing a public frontier.
+The frontier, output count, tip, cumulative work, median-time window and bounded
+recent roots can be cached locally. `BrowserCommitmentTree` seals this cache
+with the wallet's existing authenticated local-storage encryption. Account zero
+is the shared encryption anchor so account changes can reuse one tree. Plain
+network snapshots are not accepted by the local-cache entry point. The cache
+contains no historical ciphertext, viewing keys, owned notes or account labels.
+
+The worker-side `CommitmentSession` adapter requests only commitment projections
+while building this history, checks the announced head and greater verified work,
+and persists only the encrypted frontier. It erases each raw authentication
+record after use, including on validation failure or cancellation. A fresh
+scanner can adopt the verified tree and begin trial decryption at its birthday.
+Production route activation and birthday/account integration are separate from
+these tree and SDK interfaces; their presence alone does not accelerate the
+currently deployed wallet.
+
+An isolated desktop Chrome 156 measurement on an Apple M1 Max with 32 GiB RAM
+authenticated 886 public engineering blocks using the SIMD, single-thread WASM
+tree adapter. The projection payload was 100,375,606 bytes, including 33,169,495
+incidental ciphertext bytes (33.05%). Authentication and tree construction took
+12.24 seconds; the total with staged loopback transfer was 13.89 seconds.
+The encrypted frontier was 175,764 bytes, reopened in 13.4 ms; a fresh account
+adopted it in 29.7 ms. Observed WASM linear-memory capacity was 5,439,488 bytes;
+this is not total browser memory or an instrumented memory peak. No secret user
+wallet or historical decryption was used in this measurement.
+
+The following estimates assume the measured block mix and 288 blocks per day.
+They use decimal byte units. CPU estimates scale the measured authentication
+time linearly; download estimates use sustained 50 Mbit/s and add that CPU time.
+They exclude HTTP framing, per-request latency, server projection, throttling,
+reorganizations and post-birthday ciphertext scanning. The endpoint is not yet
+deployed, so these are not measured end-to-end synchronization times.
+
+| History | Blocks | Projection payload | Estimated tree CPU | Estimated transfer plus CPU |
+| --- | ---: | ---: | ---: | ---: |
+| Measured sample | 886 | 100.38 MB | 12.24 s measured | 28.30 s |
+| 30 days | 8,640 | 978.83 MB | 119.33 s | 275.95 s |
+| 365 days | 105,120 | 11.91 GB | 1,451.90 s | 3,357.36 s |
+
+This is not a header-verified snapshot: the first build still authenticates all
+historical commitments. A cumulative commitment-tree root in consensus-committed
+data remains a mainnet prerequisite for directly authenticated snapshots without
+historical reconstruction. That change requires a separate consensus proposal.
+
 ## Synchronization and spending state
 
 The opt-in native gateway serves immutable compact binary blocks and bounded

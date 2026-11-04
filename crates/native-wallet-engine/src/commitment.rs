@@ -86,6 +86,9 @@ impl CommitmentBlock {
         let mut outputs = Vec::with_capacity(3 * slots + 5);
         for _ in 0..slots {
             let size = r.u32()?;
+            if !(TX_PREFIX_BYTES + 1..=TX_PREFIX_BYTES + MAX_TX_PROOF).contains(&size) {
+                return Err("Historical transaction framing limit.".into());
+            }
             let prefix = r.take(65)?;
             if &prefix[..4] != b"SWTX"
                 || prefix[4..6] != FORMAT_VERSION.to_le_bytes()
@@ -99,12 +102,10 @@ impl CommitmentBlock {
                 r.commitment(&mut outputs)?;
             }
             r.ciphertext(PUBLIC_BYTES - 240)?;
-            r.skip(48)?; // Confidential fee commitment.
-            let proof = r.u32()?;
-            if proof == 0 || proof > MAX_TX_PROOF || size != TX_PREFIX_BYTES + proof {
-                return Err("Historical transaction framing mismatch.".into());
-            }
-            r.skip(proof)?;
+            // The authenticated outer record length suffices to find the next
+            // output. Do not disclose a redundant proof-length boundary chunk.
+            // Full nodes, rather than this tree adapter, check proof validity.
+            r.skip(48 + 4 + size - TX_PREFIX_BYTES)?;
         }
         // Native tree order places issuance commitments before reward/fund outputs.
         let mut rewards = Vec::new();
@@ -139,19 +140,18 @@ impl CommitmentBlock {
                 r.skip(32)?;
                 r.ciphertext(crate::issuance::CIPHERTEXT_BYTES)?;
             }
-            r.skip(crate::fund_spend::SIGNATURE_BYTES + 96)?;
-            let proof = r.u32()?;
-            if proof == 0
-                || proof > crate::issuance::MAX_PROOF_BYTES
-                || size != r.at - start + proof
-            {
+            let trailer = crate::fund_spend::SIGNATURE_BYTES + 96 + 4;
+            let remaining = size
+                .checked_sub(r.at - start)
+                .ok_or("Historical issuance length.")?;
+            if remaining <= trailer || remaining - trailer > crate::issuance::MAX_PROOF_BYTES {
                 return Err("Historical issuance framing mismatch.".into());
             }
-            r.skip(proof)?;
+            r.skip(remaining)?;
         }
         outputs.extend(rewards);
-        let settlement = r.u32()?;
-        if settlement == 0 || settlement > MAX_SETTLEMENT_PROOF {
+        let settlement = sparse.length - r.at;
+        if !(5..=4 + MAX_SETTLEMENT_PROOF).contains(&settlement) {
             return Err("Historical settlement limit.".into());
         }
         r.skip(settlement)?;
@@ -178,7 +178,10 @@ impl CommitmentBlock {
     }
     /// Archive-side projection from authenticated compact data, without full proofs.
     pub fn project(compact: &[u8]) -> Result<Vec<u8>, String> {
-        if compact.len() < 65 || compact.len() > MAX_COMPACT + 48 || &compact[..8] != b"SWLC0001" {
+        if compact.len() < 65
+            || compact.len() > MAX_COMPACT + 48
+            || !matches!(&compact[..8], b"SWLC0001" | b"SWLT0001")
+        {
             return Err("Compact tree source unavailable.".into());
         }
         let nonce = u64::from_le_bytes(compact[8..16].try_into().unwrap());

@@ -46,6 +46,8 @@ CRATES = {
     "native-wallet-core", "native-wallet-web", "native-wallet-engine",
 }
 PUBLIC_TEXT_ASSETS = {
+    "crates/native-wallet-web/web/sdk/commitment-session.js",
+    "crates/native-wallet-web/tests/commitment-session.test.mjs",
     "crates/native-wallet-web/web/sdk/wallet-accounts.js",
     "crates/native-wallet-web/web/assets/wallet-list.js",
     "crates/native-wallet-web/web/assets/wallet-history.js",
