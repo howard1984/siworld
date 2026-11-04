@@ -380,9 +380,9 @@ jobs:
       - name: Native runtime format and lints
         run: |
           cargo fmt --manifest-path crates/native-node/Cargo.toml --check
-          cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway --all-targets -- -D warnings
       - name: Native protocol, transition, persistence and audit rejection tests
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway
       - name: Actual fixed-profile transaction and settlement mutation rejection
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib proofs::tests::fixed_profiles_roundtrip_rejects_context_and_body_mutation -- --ignored --exact
       - name: Actual wallet transfer proof, admission and receiver authentication
