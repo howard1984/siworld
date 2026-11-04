@@ -1,4 +1,4 @@
-import {stored,hash,fetchLimited,readJSON} from './online-storage.js';
+import {stored,storePrivatePair,hash,fetchLimited,readJSON} from './online-storage.js';
 const encode=value=>new TextEncoder().encode(JSON.stringify(value));
 const idPattern=/^[0-9a-f]{64}$/;
 function scanProgress(phase, start, from, height, target) {
@@ -37,22 +37,46 @@ export class AddressDirectory {
   }
 }
 export class LightSession {
-  constructor(wallet,config) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();}
+  constructor(wallet,config,io={}) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();this.storage=io.storage||stored;this.batch=io.batch||storePrivatePair;}
+  decodeJournal(bytes) {
+    const plain=this.wallet.open_local(bytes);
+    try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(plain));}finally{plain.fill(0);}
+  }
   async initialize(onProgress=()=>{}) {
     const c=this.config,info=JSON.parse(this.wallet.public_info());
     if(c.name!=='siworld-eng-1'||!c.rules_hex||!idPattern.test(c.genesis)||info.network!==c.network)throw new Error('This build has no pinned siworld-eng-1 light service.');
     const origin=new URL(c.api);if(origin.username||origin.password||origin.search||origin.hash||!(origin.protocol==='https:'||(origin.protocol==='http:'&&origin.hostname==='localhost')))throw new Error('Use the pinned HTTPS engineering service.');
     this.base=origin.href.replace(/\/$/,'');this.key=await hash(new TextEncoder().encode(info.full_address));
     this.wallet.enable_light(c.rules_hex,c.genesis);
-    const saved=await stored('private',this.key);
-    this.journal=saved?JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(this.wallet.open_local(saved))):{version:1,network:c.network,tip:c.genesis,height:0,payments:[]};
-    const j=this.journal;
-    if(j.version!==1||j.network!==c.network||!idPattern.test(j.tip)||!Number.isSafeInteger(j.height)||j.height<0||!Array.isArray(j.payments)||j.payments.length>16)throw new Error('Invalid local journal; sending remains paused.');
-    if(j.height)await this.replaySaved(onProgress);
-    return this.summary();
+    return navigator.locks.request(`siworld-light-${this.key}`,async()=>{
+      const saved=await this.storage('private',this.key);
+      this.journal=saved?this.decodeJournal(saved):{version:1,network:c.network,tip:c.genesis,height:0,payments:[]};
+      const j=this.journal;
+      if(![1,2].includes(j.version)||j.network!==c.network||!idPattern.test(j.tip)||!Number.isSafeInteger(j.height)||j.height<0||j.height>1000000||!Array.isArray(j.payments)||j.payments.length>16)throw new Error('Invalid local journal; sending remains paused.');
+      if(j.version===2){
+        if(!Array.isArray(j.receipt_times)||j.receipt_times.length>100000||j.receipt_times.some(row=>!Array.isArray(row)||row.length!==2||!idPattern.test(row[0])||!Number.isSafeInteger(row[1])||row[1]<0))throw new Error('Invalid private receipt dates.');
+        const cache=await this.storage('private',`scan:${this.key}`);
+        if(!(cache instanceof Uint8Array)||cache.length<48||cache.length>64*1024*1024+48)throw new Error('Private scan cache is missing or invalid. Preserve the payment journal before recovery.');
+        const state=JSON.parse(this.wallet.restore_light_cache(c.rules_hex,c.genesis,cache));
+        if(state.tip!==j.tip||state.height!==j.height)throw new Error('Private scan state and journal disagree; sending remains paused.');
+        this.times=new Map(j.receipt_times);
+        onProgress({kind:'synchronization',phase:'cache',height:j.height,target_height:j.height,eta_seconds:0});
+      }else if(j.height){
+        await this.replaySaved(onProgress);
+        await this.persistScan(this.journal,false);
+      }
+      return this.summary();
+    });
   }
-  async fresh() {const raw=await stored('private',this.key);if(raw){const current=JSON.parse(new TextDecoder().decode(this.wallet.open_local(raw)));if(JSON.stringify(current)!==JSON.stringify(this.journal))throw new Error('Another tab changed this wallet. Lock and reopen before continuing.');}}
-  async persist(next=this.journal) {await stored('private',this.key,this.wallet.protect_local(encode(next)));this.journal=next;}
+  async fresh() {const raw=await this.storage('private',this.key);if(raw){const current=this.decodeJournal(raw);if(JSON.stringify(current)!==JSON.stringify(this.journal))throw new Error('Another tab changed this wallet. Lock and reopen before continuing.');}}
+  async persist(next=this.journal) {const plain=encode(next);try{await this.storage('private',this.key,this.wallet.protect_local(plain));}finally{plain.fill(0);}this.journal=next;}
+  async persistScan(next,candidate=true) {
+    const value={...next,version:2,receipt_times:[...this.times]};
+    const plain=encode(value);
+    try{await this.batch(this.key,this.wallet.protect_local(plain),`scan:${this.key}`,this.wallet.light_cache(candidate));}
+    finally{plain.fill(0);}
+    this.journal=value;
+  }
   summary() {
     const balance=JSON.parse(this.wallet.light_balance());
     const pending=this.journal.payments.filter(p=>p.phase!=='confirmed');
@@ -64,10 +88,10 @@ export class LightSession {
     const start=performance.now();
     onProgress(scanProgress('cache',start,0,0,this.journal.height));
     const chain=[];let tip=this.journal.tip;
-    for(let height=this.journal.height;height>0;height--){const c=await stored('compact',tip);if(!c||c.height!==height||!idPattern.test(c.parent))throw new Error('Compact cache is incomplete. Restore public history before sending.');chain.push({id:tip,height:c.height,parent:c.parent});tip=c.parent;}
+    for(let height=this.journal.height;height>0;height--){const c=await this.storage('compact',tip);if(!c||c.height!==height||!idPattern.test(c.parent))throw new Error('Compact cache is incomplete. Restore public history before sending.');chain.push({id:tip,height:c.height,parent:c.parent});tip=c.parent;}
     if(tip!==this.config.genesis)throw new Error('Compact cache has a different genesis.');
     this.wallet.begin_candidate();
-    try{for(const c of chain.reverse()){const record=await stored('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);onProgress(scanProgress('cache',start,0,state.height,this.journal.height));}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
+    try{for(const c of chain.reverse()){const record=await this.storage('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);onProgress(scanProgress('cache',start,0,state.height,this.journal.height));}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
   }
   cancelSync() { this.syncController?.abort(new DOMException('Balance synchronization paused for a wallet change.', 'AbortError')); }
   async sync(onProgress=()=>{}) {
@@ -90,14 +114,14 @@ export class LightSession {
       for(let from=previous+1;from<=head.height;) {
         const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${from}&limit=128`,{signal:signal(15000)});
         if(!Array.isArray(page.ids)||page.ids.length===0||page.ids.length>128||page.ids.length>head.height-from+1)throw new Error('Incomplete compact chain index.');
-        for(const id of page.ids){if(!idPattern.test(id))throw new Error('Invalid compact chain identity.');let cached=await stored('compact',id);let bytes=cached?.bytes;
+        for(const id of page.ids){if(!idPattern.test(id))throw new Error('Invalid compact chain identity.');let cached=await this.storage('compact',id);let bytes=cached?.bytes;
           if(!bytes){const data=await fetchLimited(`${this.base}/v1/compact/${id}`,{signal:signal(30000)});bytes=data.bytes;downloaded+=bytes.length;}
           controller.signal.throwIfAborted();
           const state=JSON.parse(this.wallet.append_compact(bytes));
           if(state.tip!==id||state.height!==previous+1)throw new Error('Compact block identity or height differs.');
           for(const statement of state.observed_statements||[])if(needed.has(statement))included.set(statement,{height:state.height,timestamp:state.block_timestamp});
           if(state.owned_receipts)this.times.set(id,state.block_timestamp);
-          if(!cached)await stored('compact',id,{id,parent,height:state.height,bytes});parent=id;previous=state.height;
+          if(!cached)await this.storage('compact',id,{id,parent,height:state.height,bytes});parent=id;previous=state.height;
           onProgress(scanProgress('scan',start,fromHeight,previous,head.height));
         }from+=page.ids.length;
       }
@@ -106,14 +130,14 @@ export class LightSession {
       const payments=this.journal.payments.map(p=>{const found=included.get(p.statement_id);const orphaned=p.phase==='confirmed'&&!extension&&!found;return {...p,phase:found?'confirmed':orphaned?(p.ever_submitted?'unknown':'finalized'):p.phase,confirmed_height:found?.height??(orphaned?null:p.confirmed_height??null),confirmed_timestamp:found?.timestamp??(orphaned?null:p.confirmed_timestamp??null)};});
       // Persist before replacing the accepted in-memory state. Cancellation
       // after this point must finish both steps so disk and memory agree.
-      await this.persist({...this.journal,height:head.height,tip:head.tip,payments});
+      await this.persistScan({...this.journal,height:head.height,tip:head.tip,payments});
       this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded};
     });}catch(error){this.wallet.abort_candidate();throw error;}finally{this.syncing=false;this.syncController=null;}
   }
   async prepare(recipient,resolved,amount,priority,onProgress=()=>{}) {
     if(!this.ready||this.syncing)throw new Error('Finish current compact synchronization before sending.');
     return navigator.locks.request(`siworld-light-${this.key}`,async()=>{
-      const persisted=await stored('private',this.key);if(persisted){const j=JSON.parse(new TextDecoder().decode(this.wallet.open_local(persisted)));if(JSON.stringify(j)!==JSON.stringify(this.journal))throw new Error('Another tab changed this wallet. Lock and reopen before sending.');}
+      await this.fresh();
       if(this.journal.payments.length>=16)throw new Error('The bounded payment journal is full. Export and resolve pending payments.');
       const reserved=this.journal.payments.filter(p=>p.phase!=='confirmed').flatMap(p=>p.inputs);
       onProgress('preparing');
@@ -125,7 +149,7 @@ export class LightSession {
       onProgress('proving');
       const start=performance.now();const packet=this.wallet.prove_sip();const proving_ms=performance.now()-start;
       onProgress('saving');
-      await stored('private',`${this.key}:${payment.id}`,this.wallet.protect_local(packet));packet.fill(0);
+      try{await this.storage('private',`${this.key}:${payment.id}`,this.wallet.protect_local(packet));}finally{packet.fill(0);}
       await this.persist({...this.journal,payments:this.journal.payments.map(p=>p.id===payment.id?{...p,phase:'finalized'}:p)});
       this.wallet.cancel_prepared();return {...this.summary(),prepared_id:payment.id,proving_ms};
     });
@@ -136,11 +160,11 @@ export class LightSession {
       await this.fresh();
       const payment=this.journal.payments.find(p=>p.id===id);
       if(!payment||!['finalized','unknown','pending'].includes(payment.phase))throw new Error('Select a finalized or unknown payment.');
-      const encrypted=await stored('private',`${this.key}:${id}`);if(!encrypted)throw new Error('Finalized packet is missing. Do not create a replacement payment.');
+      const encrypted=await this.storage('private',`${this.key}:${id}`);if(!encrypted)throw new Error('Finalized packet is missing. Do not create a replacement payment.');
       const packet=this.wallet.open_local(encrypted);
       // Mark uncertain before the first byte can leave this worker. Retries use exactly this packet.
-      await this.persist({...this.journal,payments:this.journal.payments.map(p=>p.id===id?{...p,phase:'unknown',ever_submitted:true}:p)});
       try {
+        await this.persist({...this.journal,payments:this.journal.payments.map(p=>p.id===id?{...p,phase:'unknown',ever_submitted:true}:p)});
         const ack=await readJSON(`${this.base}/v1/transactions`,{method:'POST',body:packet,headers:{'Content-Type':'application/octet-stream'},signal:AbortSignal.timeout(30000)});
         if(ack.status!=='pending'||ack.statement_id!==payment.statement_id)throw new Error('Admission acknowledgment is uncertain. Retry only the same finalized packet.');
         await this.persist({...this.journal,payments:this.journal.payments.map(p=>p.id===id?{...p,phase:'pending'}:p)});

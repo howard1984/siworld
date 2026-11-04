@@ -5,7 +5,9 @@
 //! durable payment integration and relay transport require separate acceptance.
 //! Rescans authenticate ciphertext and reconstruct commitments after independent
 //! canonical replay. Wallet keys, receipts and payment bundles have no Debug or
-//! serialization implementation. Their private contents must never be sent to
+//! general-purpose serialization implementation. The explicit private receipt
+//! cache must be authenticated and encrypted before local persistence.
+//! Their private contents must never be sent to
 //! public telemetry, including through lower-level note or sidecar types.
 use crate::audit::{AuditReport, replay_chain};
 use crate::proofs::NativeProver;
@@ -25,6 +27,9 @@ use native::multi_asset::{
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use std::collections::BTreeMap;
 use zeroize::{Zeroize, Zeroizing};
+
+#[path = "wallet_cache.rs"]
+mod local_cache;
 
 /// Independent domains separate spend, ML-KEM and sender-change key material.
 /// The network ID and little-endian account index are included in each domain.

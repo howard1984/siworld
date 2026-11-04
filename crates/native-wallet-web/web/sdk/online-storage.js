@@ -5,6 +5,17 @@ export async function stored(store,key,value) {
   const db=await database();
   try {return await new Promise((resolve,reject)=>{const tx=db.transaction(store,value===undefined?'readonly':'readwrite');const r=value===undefined?tx.objectStore(store).get(key):tx.objectStore(store).put(value,key);let result;r.onsuccess=()=>{result=r.result;};tx.oncomplete=()=>resolve(result);tx.onabort=tx.onerror=()=>reject(new Error('Durable wallet storage failed; sending is paused.'));});}finally{db.close();}
 }
+// Scan state and its payment journal must advance in the same durable transaction.
+export async function storePrivatePair(firstKey, first, secondKey, second) {
+  const db=await database();
+  try {await new Promise((resolve,reject)=>{
+    const tx=db.transaction('private','readwrite'), store=tx.objectStore('private');
+    tx.oncomplete=resolve;
+    tx.onabort=tx.onerror=()=>reject(new Error('Durable scan state failed; the previous wallet was preserved.'));
+    try{store.put(first,firstKey); store.put(second,secondKey);}
+    catch{tx.abort();reject(new Error('Durable scan state failed; the previous wallet was preserved.'));}
+  });}finally{db.close();}
+}
 export const hex=bytes=>Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
 export const unhex=text=>{if(typeof text!=='string'||text.length%2||!/^[0-9a-f]*$/.test(text))throw new Error('Invalid binary encoding.');return Uint8Array.from(text.match(/../g)||[],p=>parseInt(p,16));};
 export const hash=async bytes=>hex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)));

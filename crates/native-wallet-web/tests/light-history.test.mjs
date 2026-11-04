@@ -144,7 +144,7 @@ test('authenticated scan progress keeps sending paused until candidate persisten
   Object.assign(session, {base: 'https://wallet.invalid/api', key: 'synthetic-progress',
     journal: {version: 1, network: config.network, tip: config.genesis, height: 0, payments: []}});
   session.fresh = async () => {};
-  session.persist = async next => {
+  session.persistScan = async next => {
     assert.equal(session.ready, false);
     assert.equal(JSON.parse(wallet.light_balance()).height, 0);
     session.journal = next;
@@ -166,5 +166,73 @@ test('authenticated scan progress keeps sending paused until candidate persisten
     wallet.free(); globalThis.fetch = savedFetch; globalThis.indexedDB = savedDB;
     if (savedNavigator) Object.defineProperty(globalThis, 'navigator', savedNavigator);
     else delete globalThis.navigator;
+  }
+});
+
+test('sealed scan cache restores private receipts and rejects another account or damaged bytes', () => {
+  const wallet = BrowserWallet.restore(config.network, 0, config.words);
+  const reopened = BrowserWallet.restore(config.network, 0, config.words);
+  const foreign = wallet.derive_account(1);
+  try {
+    wallet.enable_light(config.rules_hex, config.genesis); wallet.begin_candidate();
+    const state = JSON.parse(wallet.append_compact(bytes));
+    const pending = wallet.light_cache(true);
+    assert.equal(new TextDecoder().decode(pending.slice(0, 8)), 'SWNSCN01');
+    assert.throws(() => wallet.open_local(pending), /Invalid local encrypted/);
+    wallet.commit_candidate(String(state.height), state.tip);
+    assert.throws(() => foreign.restore_light_cache(config.rules_hex, config.genesis, pending), /authentication/);
+    const corrupt = new Uint8Array(pending); corrupt[corrupt.length - 1] ^= 1;
+    assert.throws(() => reopened.restore_light_cache(config.rules_hex, config.genesis, corrupt), /authentication/);
+    reopened.restore_light_cache(config.rules_hex, config.genesis, pending);
+    assert.equal(reopened.light_balance(), wallet.light_balance());
+    assert.equal(reopened.light_history(), wallet.light_history());
+    assert.throws(() => reopened.restore_light_cache(config.rules_hex, config.genesis, pending), /fresh confirmed/);
+  } finally {wallet.free(); reopened.free(); foreign.free();}
+});
+
+test('scan state and journal persist atomically and reopen without public downloads', async () => {
+  const savedFetch = globalThis.fetch, savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const values = new Map(), publicValues = new Map(); let failWrite = true, downloaded = 0;
+  const io = {
+    storage: async (store, key, value) => {
+      const target = store === 'private' ? values : publicValues;
+      if (value !== undefined) target.set(key, structuredClone(value));
+      return target.has(key) ? structuredClone(target.get(key)) : undefined;
+    },
+    batch: async (a, av, b, bv) => {
+      if (failWrite) throw new Error('Synthetic atomic storage failure.');
+      values.set(a, new Uint8Array(av)); values.set(b, new Uint8Array(bv));
+    },
+  };
+  Object.defineProperty(globalThis, 'navigator', {configurable: true, value: {locks: {
+    request(_name, options, action) {return (action || options)();}
+  }}});
+  const pinned = {...config, name:'siworld-eng-1', api:'https://wallet.invalid/api'};
+  const wallet = BrowserWallet.restore(config.network, 0, config.words);
+  const reopened = BrowserWallet.restore(config.network, 0, config.words);
+  const session = new LightSession(wallet, pinned, io);
+  try {
+    await session.initialize();
+    globalThis.fetch = async url => {
+      if (url.endsWith('/head')) return Response.json({network:config.network, genesis:config.genesis, height:1, tip:config.rows[0].block_id});
+      if (url.includes('/chain?')) return Response.json({ids:[config.rows[0].block_id]});
+      assert.ok(url.endsWith('/compact/'+config.rows[0].block_id)); downloaded++; return new Response(bytes);
+    };
+    await assert.rejects(session.sync(), /atomic storage failure/);
+    assert.equal(values.size, 0); assert.equal(session.ready, false);
+    assert.equal(JSON.parse(wallet.light_balance()).height, 0); assert.equal(session.journal.height, 0);
+    failWrite = false; await session.sync();
+    assert.equal(session.journal.version, 2); assert.equal(values.size, 2);
+    const before = session.summary(), fetched = downloaded;
+    globalThis.fetch = () => {throw new Error('Reopening a private scan cache must not download history.');};
+    const opened = new LightSession(reopened, pinned, io), progress = [];
+    const after = await opened.initialize(row => progress.push(row));
+    assert.equal(after.height, before.height); assert.deepEqual(after.rows, before.rows);
+    assert.deepEqual(after.received_records, before.received_records);
+    assert.equal(after.ready, false); assert.equal(downloaded, fetched);
+    assert.deepEqual(progress, [{kind:'synchronization',phase:'cache',height:1,target_height:1,eta_seconds:0}]);
+  } finally {
+    wallet.free(); reopened.free(); globalThis.fetch = savedFetch;
+    if (savedNavigator) Object.defineProperty(globalThis, 'navigator', savedNavigator); else delete globalThis.navigator;
   }
 });

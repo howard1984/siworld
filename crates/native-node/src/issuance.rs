@@ -419,6 +419,50 @@ impl AssetRegistry {
             visit(fee);
         }
     }
+    /// Decode an already authenticated local wallet cache, never a peer checkpoint.
+    pub fn from_local_encoding(bytes: &[u8], height: u64) -> Result<Self, String> {
+        let mut reader = Reader { bytes, position: 0 };
+        let count = usize::try_from(u64::from_le_bytes(reader.array()?))
+            .map_err(|_| "Local asset cache count exceeds capacity.")?;
+        if count > 10000 || bytes.len() != 8 + count * (80 + ISSUER_KEY_BYTES + 8 + 48) {
+            return Err("Local asset cache size differs.".into());
+        }
+        let mut result = Self::default();
+        for _ in 0..count {
+            let id = reader.array()?;
+            let asset = PublicAsset {
+                height: u64::from_le_bytes(reader.array()?),
+                public_supply: u64::from_le_bytes(reader.array()?),
+                declaration: reader.array()?,
+            };
+            if asset.height == 0
+                || asset.height > height
+                || result.assets.insert(id, asset).is_some()
+            {
+                return Err("Local asset cache entry differs.".into());
+            }
+        }
+        for _ in 0..count {
+            let key = reader.array()?;
+            let sequence = u64::from_le_bytes(reader.array()?);
+            if !result.sequences.insert((key, sequence)) {
+                return Err("Local issuer sequence reused.".into());
+            }
+        }
+        for _ in 0..count {
+            let fee = reader.array()?;
+            let _ = decode_digest(&fee).map_err(|_| "Invalid cached issuance field.")?;
+            if !result.fees.insert(fee) {
+                return Err("Local issuance fee reused.".into());
+            }
+        }
+        let mut canonical = Vec::with_capacity(bytes.len());
+        result.visit_encoding(&mut |part| canonical.extend_from_slice(part));
+        if canonical != bytes {
+            return Err("Local asset cache is not canonical.".into());
+        }
+        Ok(result)
+    }
 }
 
 pub(crate) fn params() -> FriParams {

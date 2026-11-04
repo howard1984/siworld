@@ -76,6 +76,64 @@ impl OwnedPaths {
             .map(|(cm, (_, p))| (*cm, p.clone()))
             .collect()
     }
+    /// Private membership metadata; persist only inside a local encrypted envelope.
+    pub fn cache_owned(&self) -> Vec<u8> {
+        let mut bytes = (self.owned.len() as u32).to_le_bytes().to_vec();
+        for (cm, (index, path)) in &self.owned {
+            bytes.extend_from_slice(cm);
+            bytes.extend_from_slice(&index.to_le_bytes());
+            for (digest, right) in path {
+                bytes.extend_from_slice(&encode_digest(digest));
+                bytes.push(u8::from(*right));
+            }
+        }
+        bytes
+    }
+    pub fn open_local_owned(&mut self, mut bytes: &[u8]) -> Result<(), String> {
+        let take = |input: &mut &[u8], n| -> Result<Vec<u8>, String> {
+            let (part, rest) = input
+                .split_at_checked(n)
+                .ok_or("Truncated local path cache.")?;
+            *input = rest;
+            Ok(part.to_vec())
+        };
+        let count = u32::from_le_bytes(take(&mut bytes, 4)?.try_into().unwrap()) as usize;
+        if count > 5000 || bytes.len() != count * (56 + TREE_DEPTH * 49) {
+            return Err("Local path cache size differs.".into());
+        }
+        let h = Hasher::new();
+        let mut owned = BTreeMap::new();
+        for _ in 0..count {
+            let cm: [u8; 48] = take(&mut bytes, 48)?.try_into().unwrap();
+            let index = u64::from_le_bytes(take(&mut bytes, 8)?.try_into().unwrap());
+            if index >= self.count {
+                return Err("Cached leaf index exceeds the local tree.".into());
+            }
+            let mut node =
+                native::codec::decode_digest(&cm).map_err(|_| "Invalid cached leaf field.")?;
+            let mut path = Vec::with_capacity(TREE_DEPTH);
+            for level in 0..TREE_DEPTH {
+                let sibling =
+                    native::codec::decode_digest(&take(&mut bytes, 48)?.try_into().unwrap())
+                        .map_err(|_| "Invalid cached path field.")?;
+                let right = take(&mut bytes, 1)?[0];
+                if right > 1 || u64::from(right) != (index >> level) & 1 {
+                    return Err("Cached path direction differs.".into());
+                }
+                node = if right == 1 {
+                    h.compress(&sibling, &node)
+                } else {
+                    h.compress(&node, &sibling)
+                };
+                path.push((sibling, right == 1));
+            }
+            if node != self.root || owned.insert(cm, (index, path)).is_some() {
+                return Err("Cached private path root or identity differs.".into());
+            }
+        }
+        self.owned = owned;
+        Ok(())
+    }
     pub fn remove(&mut self, commitment: &[u8; 48]) {
         self.owned.remove(commitment);
     }

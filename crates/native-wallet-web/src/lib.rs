@@ -512,16 +512,104 @@ impl BrowserWallet {
 
     /// Domain-separated local journal encryption; the key never crosses the worker.
     pub fn protect_local(&self, data: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.seal_private(
+            data,
+            b"SWNLOC01",
+            "siworld browser local journal key v1",
+            2_000_000,
+        )
+    }
+    pub fn open_local(&self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        Ok(self
+            .open_private(
+                bytes,
+                b"SWNLOC01",
+                "siworld browser local journal key v1",
+                2_000_000,
+            )?
+            .to_vec())
+    }
+    /// Only ciphertext crosses the WASM boundary; decrypted notes remain in Rust.
+    pub fn light_cache(&self, candidate: bool) -> Result<Vec<u8>, JsValue> {
+        let state = if candidate {
+            &self.candidate
+        } else {
+            &self.light
+        };
+        let plain = state
+            .as_ref()
+            .ok_or_else(|| js("Light scan state unavailable.".into()))?
+            .local_cache()
+            .map_err(js)?;
+        self.seal_private(
+            &plain,
+            b"SWNSCN01",
+            "siworld browser local scan cache key v1",
+            64 * 1024 * 1024,
+        )
+    }
+    pub fn restore_light_cache(
+        &mut self,
+        rules_hex: &str,
+        genesis: &str,
+        bytes: &[u8],
+    ) -> Result<String, JsValue> {
+        let config = history_config(rules_hex, genesis)?;
+        if self.challenge.is_some()
+            || config.network != self.material.network
+            || self.candidate.is_some()
+            || self
+                .light
+                .as_ref()
+                .is_some_and(|s| s.state.height != 0 || !s.wallet.receipts().is_empty())
+        {
+            return Err(js(
+                "A fresh confirmed wallet session is required for local scan restoration.".into(),
+            ));
+        }
+        let plain = self.open_private(
+            bytes,
+            b"SWNSCN01",
+            "siworld browser local scan cache key v1",
+            64 * 1024 * 1024,
+        )?;
+        let restored = engine::light::LightWallet::open_local(
+            config,
+            Zeroizing::new(*self.material.entropy),
+            self.material.account,
+            &plain,
+        )
+        .map_err(js)?;
+        self.light = Some(restored);
+        self.light_balance()
+    }
+}
+
+impl BrowserWallet {
+    fn private_key(&self, domain: &'static str) -> Zeroizing<[u8; 32]> {
+        let mut h = blake3::Hasher::new_derive_key(domain);
+        h.update(self.material.entropy.as_ref());
+        h.update(&self.material.network);
+        h.update(&self.material.account.to_le_bytes());
+        Zeroizing::new(*h.finalize().as_bytes())
+    }
+    fn seal_private(
+        &self,
+        data: &[u8],
+        magic: &[u8; 8],
+        domain: &'static str,
+        limit: usize,
+    ) -> Result<Vec<u8>, JsValue> {
         use chacha20poly1305::{
             Key, XChaCha20Poly1305, XNonce,
             aead::{AeadInOut, KeyInit},
         };
-        if data.len() > 2_000_000 {
-            return Err(js("Local journal byte limit.".into()));
+        if data.len() > limit {
+            return Err(js("Local encrypted data byte limit.".into()));
         }
-        let key = self.local_key();
+        let key = self.private_key(domain);
         let cipher = XChaCha20Poly1305::new(<&Key>::try_from(key.as_ref()).unwrap());
-        let mut out = b"SWNLOC01".to_vec();
+        let mut out = magic.to_vec();
         let mut nonce = [0; 24];
         getrandom::fill(&mut nonce).map_err(|_| js("Secure randomness unavailable.".into()))?;
         out.extend_from_slice(&nonce);
@@ -532,20 +620,26 @@ impl BrowserWallet {
                 &self.material.network,
                 plain.as_mut_slice().into(),
             )
-            .map_err(|_| js("Journal encryption failed.".into()))?;
+            .map_err(|_| js("Local encryption failed.".into()))?;
         out.extend_from_slice(&plain);
         out.extend_from_slice(&tag);
         Ok(out)
     }
-    pub fn open_local(&self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+    fn open_private(
+        &self,
+        bytes: &[u8],
+        magic: &[u8; 8],
+        domain: &'static str,
+        limit: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, JsValue> {
         use chacha20poly1305::{
             Key, Tag, XChaCha20Poly1305, XNonce,
             aead::{AeadInOut, KeyInit},
         };
-        if bytes.len() < 48 || bytes.len() > 2_000_048 || &bytes[..8] != b"SWNLOC01" {
-            return Err(js("Invalid local encrypted journal.".into()));
+        if bytes.len() < 48 || bytes.len() > limit + 48 || &bytes[..8] != magic {
+            return Err(js("Invalid local encrypted data.".into()));
         }
-        let key = self.local_key();
+        let key = self.private_key(domain);
         let cipher = XChaCha20Poly1305::new(<&Key>::try_from(key.as_ref()).unwrap());
         let end = bytes.len() - 16;
         let mut plain = Zeroizing::new(bytes[32..end].to_vec());
@@ -556,18 +650,8 @@ impl BrowserWallet {
                 plain.as_mut_slice().into(),
                 <&Tag>::try_from(&bytes[end..]).unwrap(),
             )
-            .map_err(|_| js("Journal authentication failed.".into()))?;
-        Ok(plain.to_vec())
-    }
-}
-
-impl BrowserWallet {
-    fn local_key(&self) -> Zeroizing<[u8; 32]> {
-        let mut h = blake3::Hasher::new_derive_key("siworld browser local journal key v1");
-        h.update(self.material.entropy.as_ref());
-        h.update(&self.material.network);
-        h.update(&self.material.account.to_le_bytes());
-        Zeroizing::new(*h.finalize().as_bytes())
+            .map_err(|_| js("Local authentication failed.".into()))?;
+        Ok(plain)
     }
 }
 

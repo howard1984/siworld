@@ -18,6 +18,9 @@ use serde_json::json;
 use siworld_core::pow;
 use zeroize::Zeroizing;
 
+#[path = "cache.rs"]
+mod local_cache;
+
 pub struct LightWallet {
     pub state: State,
     pub wallet: Wallet,

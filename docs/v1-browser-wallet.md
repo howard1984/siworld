@@ -286,6 +286,25 @@ network and account; it is not a Vault credential. Local lookup keys derived
 from public addresses never leave local storage. This engineering journal has
 a 16-payment tracking bound and a 5,000-owned-path bound; limits fail closed. Public compact caches may be persisted separately. Storage
 quota or malformed/incomplete history prevents spending until resolved.
+
+Accepted scan state is sealed inside WASM with XChaCha20-Poly1305 and a separate
+`siworld browser local scan cache key v1` derivation from entropy, network and
+account. Only ciphertext crosses into JavaScript and IndexedDB. The bounded
+64 MiB envelope retains private receipts, eligibility timestamps, owned paths,
+the verified frontier/header context and public asset registry; it contains no
+transaction proofs, raw compact records, recovery words or private keys.
+Restoration checks identity, note commitments, nullifiers, path roots and state
+bounds. It trusts the authenticated local envelope, not a remote snapshot.
+
+An IndexedDB transaction atomically replaces the scan ciphertext and version-2
+encrypted journal, including relevant receipt dates. A failed write preserves
+the previous accepted wallet and its reservations. Reopening restores receipts
+without replaying compact history, then checks the live head before enabling
+spending. Version-1 journals migrate after their existing authenticated replay;
+an unavailable or mismatched version-2 cache fails closed without deleting the
+journal. Deep reorganizations still build a new candidate. Public compact-cache
+pruning and birthday/shared-account scanning remain separate work.
+
 Poll small head metadata every five seconds while visible, with no duplicate
 requests and backoff while hidden/offline; do not redownload unchanged blocks.
 
