@@ -28,22 +28,32 @@ fn private_file(path: &Path) {
 
 #[test]
 fn export_defaults_off_and_invalid_configuration_does_not_stop_node() {
-    assert!(Gateway::configured(None, None).unwrap().is_none());
+    assert!(Gateway::configured(None, None, None).unwrap().is_none());
     let root = root();
     let public = directory(&root, "public", 0o750);
-    assert!(Gateway::configured(None, Some(&public)).unwrap().is_none());
+    assert!(
+        Gateway::configured(None, None, Some(&public))
+            .unwrap()
+            .is_none()
+    );
     std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o700)).unwrap();
     let link = root.join("link");
     std::os::unix::fs::symlink(&public, &link).unwrap();
-    assert!(Gateway::configured(None, Some(&link)).unwrap().is_none());
+    assert!(
+        Gateway::configured(None, None, Some(&link))
+            .unwrap()
+            .is_none()
+    );
     let socket = root.join("s");
     assert!(
-        Gateway::configured(Some(&socket), Some(&public))
+        Gateway::configured(Some(&socket), None, Some(&public))
             .unwrap()
             .is_none()
     );
     assert!(!socket.exists());
-    let export = Gateway::configured(None, Some(&public)).unwrap().unwrap();
+    let export = Gateway::configured(None, None, Some(&public))
+        .unwrap()
+        .unwrap();
     assert!(export.socket.is_none());
     assert!(export.join.is_none());
     assert!(export.rx.try_recv().is_err());
@@ -222,5 +232,99 @@ fn atomic_export_replaces_reorganized_index_without_deleting_fork_objects() {
     );
     std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o770)).unwrap();
     assert!(PublicExport::open(&public).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn submission_capability_coexists_with_export_without_read_or_admin_operations() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([23; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    let mut gateway = Gateway::configured(None, Some(&root.join("submit")), Some(&public))
+        .unwrap()
+        .unwrap();
+    for kind in [0, 1, 2, 4, 255] {
+        assert!(
+            gateway
+                .dispatch(&mut node, kind, b"")
+                .unwrap_err()
+                .contains("Submission-only")
+        );
+    }
+    gateway.poll(&mut node);
+    assert!(public.join("chain.json").is_file());
+    assert_eq!(
+        std::fs::metadata(root.join("submit"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(!root.join("compact-public").exists());
+    drop(gateway);
+    assert!(!root.join("submit").exists());
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn submission_uses_original_admission_and_exact_packet_retry() {
+    use native::{
+        codec::encode_digest,
+        multi_asset::{F, Hasher},
+    };
+    use p3_field::PrimeCharacteristicRing;
+    let root = root();
+    let config = Config::development([24; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    let before = node.state().tip;
+    let mut gateway = Gateway::configured(None, Some(&root.join("submit")), None)
+        .unwrap()
+        .unwrap();
+    let mut tx = candidate(node.state(), 300).transactions.remove(0);
+    tx.record.fee_commit = encode_digest(&Hasher::new().fee_commit(100, &[F::from_u32(22); 8]));
+    let sidecar = crate::wire::Sidecar {
+        transaction_id: tx.record.statement_id(&node.state().config.network),
+        fee: 100,
+        blind: [22; 8],
+    };
+    let mut packet = tx.encode_envelope(&node.state().config.network).unwrap();
+    packet.extend(sidecar.encode().unwrap());
+    let ack = gateway.dispatch(&mut node, 3, &packet).unwrap();
+    assert_eq!(gateway.dispatch(&mut node, 3, &packet).unwrap(), ack);
+    let value: Value = serde_json::from_slice(&ack).unwrap();
+    assert_eq!(
+        value,
+        json!({"status":"pending", "statement_id": crate::local::hex(&sidecar.transaction_id)})
+    );
+    *packet.last_mut().unwrap() ^= 1;
+    assert!(gateway.dispatch(&mut node, 3, &packet).is_err());
+    assert!(gateway.dispatch(&mut node, 3, b"invalid").is_err());
+    gateway.poll(&mut node);
+    assert_eq!(node.state().tip, before);
+    assert_eq!(gateway.indexed, 0);
+    assert!(!root.join("compact-public").exists());
+    drop(gateway);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn submission_conflicts_fail_closed_and_export_failure_preserves_submission() {
+    let root = root();
+    let public = directory(&root, "public", 0o750);
+    let socket = root.join("submit");
+    assert!(Gateway::configured(Some(&root.join("reference")), Some(&socket), None).is_err());
+    assert!(!socket.exists());
+    let gateway = Gateway::configured(None, Some(&socket), Some(&public))
+        .unwrap()
+        .unwrap();
+    assert!(gateway.socket.is_some());
+    assert!(gateway.export.is_none());
+    drop(gateway);
     std::fs::remove_dir_all(root).unwrap();
 }

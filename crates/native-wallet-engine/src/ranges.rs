@@ -24,7 +24,7 @@ impl Sparse {
                 }
             }
         }
-        if !self.chunks.keys().copied().eq(expected.into_iter()) {
+        if !self.chunks.keys().copied().eq(expected) {
             return Err("Noncanonical compact disclosure includes extra historical data.".into());
         }
         Ok(())

@@ -34,6 +34,7 @@ struct Request {
 pub struct Gateway {
     socket: Option<(PathBuf, (u64, u64))>,
     export: Option<PublicExport>,
+    submit_only: bool,
     retry_at: Instant,
     log_at: Instant,
     stop: Arc<AtomicBool>,
@@ -47,13 +48,37 @@ pub struct Gateway {
 impl Gateway {
     pub fn from_environment() -> Result<Option<Self>, String> {
         let reference = std::env::var_os("SIWORLD_WALLET_GATEWAY_SOCKET");
+        let submit = std::env::var_os("SIWORLD_WALLET_SUBMIT_SOCKET");
         let public = std::env::var_os("SIWORLD_WALLET_PUBLIC_EXPORT");
         Self::configured(
             reference.as_deref().map(Path::new),
+            submit.as_deref().map(Path::new),
             public.as_deref().map(Path::new),
         )
     }
-    fn configured(reference: Option<&Path>, public: Option<&Path>) -> Result<Option<Self>, String> {
+    fn configured(
+        reference: Option<&Path>,
+        submit: Option<&Path>,
+        public: Option<&Path>,
+    ) -> Result<Option<Self>, String> {
+        if let Some(path) = submit {
+            if reference.is_some() {
+                return Err("Choose exactly one private wallet IPC capability.".into());
+            }
+            let mut gateway = Self::bind_with_access(path, true)?;
+            if let Some(path) = public {
+                match PublicExport::open(path) {
+                    Ok(export) => {
+                        gateway.export = Some(export);
+                        gateway.cache = path.into();
+                    }
+                    Err(_) => {
+                        eprintln!("Public wallet export disabled: initialization unavailable.")
+                    }
+                }
+            }
+            return Ok(Some(gateway));
+        }
         match (reference, public) {
             (None, None) => Ok(None),
             (Some(path), None) => Self::bind(path).map(Some),
@@ -76,6 +101,7 @@ impl Gateway {
         Ok(Self {
             socket: None,
             export: Some(export),
+            submit_only: false,
             retry_at: Instant::now(),
             log_at: Instant::now(),
             stop: Arc::new(AtomicBool::new(false)),
@@ -88,6 +114,9 @@ impl Gateway {
         })
     }
     pub fn bind(path: &Path) -> Result<Self, String> {
+        Self::bind_with_access(path, false)
+    }
+    fn bind_with_access(path: &Path, submit_only: bool) -> Result<Self, String> {
         if path.exists() || path.symlink_metadata().is_ok() {
             return Err("Wallet gateway path already exists; no replacement performed.".into());
         }
@@ -111,19 +140,21 @@ impl Gateway {
             .set_nonblocking(true)
             .map_err(|_| "Private wallet gateway mode unavailable.")?;
         let cache = parent.join("compact-public");
-        match std::fs::create_dir(&cache) {
-            Ok(()) => std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| "Compact archive permissions unavailable.")?,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err("Compact archive unavailable.".into()),
-        }
-        let metadata =
-            std::fs::symlink_metadata(&cache).map_err(|_| "Compact archive unavailable.")?;
-        if !metadata.is_dir()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err("Compact archive must remain a private directory.".into());
+        if !submit_only {
+            match std::fs::create_dir(&cache) {
+                Ok(()) => std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "Compact archive permissions unavailable.")?,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(_) => return Err("Compact archive unavailable.".into()),
+            }
+            let metadata =
+                std::fs::symlink_metadata(&cache).map_err(|_| "Compact archive unavailable.")?;
+            if !metadata.is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err("Compact archive must remain a private directory.".into());
+            }
         }
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = Arc::new(AtomicBool::new(false));
@@ -165,6 +196,7 @@ impl Gateway {
         Ok(Self {
             socket: Some((path.to_owned(), socket_identity)),
             export: None,
+            submit_only,
             retry_at: Instant::now(),
             log_at: Instant::now(),
             stop,
@@ -182,7 +214,7 @@ impl Gateway {
             let response = self.dispatch(node, request.kind, &request.body);
             let _ = request.reply.send(response);
         }
-        if Instant::now() < self.retry_at {
+        if (self.submit_only && self.export.is_none()) || Instant::now() < self.retry_at {
             return;
         }
         // Read committed history only. One compact record per canonical-owner turn.
@@ -295,6 +327,9 @@ impl Gateway {
     ) -> Result<Vec<u8>, String> {
         if self.socket.is_none() {
             return Err("File export has no request capability.".into());
+        }
+        if self.submit_only && kind != 3 {
+            return Err("Submission-only IPC rejects data and administrative operations.".into());
         }
         if kind == 3 {
             if body.len() <= SIDECAR_BYTES || body.len() > MAX_REQUEST {

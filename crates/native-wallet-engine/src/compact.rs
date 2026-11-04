@@ -57,7 +57,7 @@ fn parse(
     let network = h[33..65].try_into().unwrap();
     let slots = u16::from_le_bytes(h[145..147].try_into().unwrap()) as usize;
     if !(MIN_SLOTS..=MAX_SLOTS).contains(&slots)
-        || slots % GROUP != 0
+        || !slots.is_multiple_of(GROUP)
         || h[148] as usize > MAX_FUND_SPENDS
         || h[149] as usize > crate::issuance::RECORDS_CODEC_LIMIT
     {

@@ -165,6 +165,19 @@ bodies. A node export/outboard index may be prepared while full blocks are
 available; persist compact data and its authentication paths independently
 when required for historical service.
 
+A production submission capability is separately opt-in through
+`SIWORLD_WALLET_SUBMIT_SOCKET`. It accepts only operation 3 (an original native
+transaction envelope followed by its private fee sidecar); read and control
+operations are rejected. It retains the mode-700 parent, mode-600 socket,
+four-connection/request bounds and original admission checks. Do not configure
+the reference `SIWORLD_WALLET_GATEWAY_SOCKET` simultaneously. Optional
+`SIWORLD_WALLET_PUBLIC_EXPORT` may run alongside submission in an independent
+export directory. Export initialization or write failures do not grant read
+capabilities or disable submission. Submission alone does not index history.
+No TCP listener is created and this configuration does not enable a remote
+HTTP service. An outbound relay requires independent authentication and
+resource controls before activation.
+
 Historical transaction proofs and their three-day pruning window are no
 longer browser synchronization inputs. Missing historical proofs do not
 require a wallet checkpoint and do not block readiness. The remaining
