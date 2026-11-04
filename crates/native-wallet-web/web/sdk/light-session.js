@@ -62,23 +62,28 @@ export class LightSession {
     this.wallet.begin_candidate();
     try{for(const c of chain.reverse()){const record=await stored('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
   }
+  cancelSync() { this.syncController?.abort(new DOMException('Balance synchronization paused for a wallet change.', 'AbortError')); }
   async sync() {
     if(this.syncing)throw new Error('A compact synchronization is already running.');this.syncing=true;this.ready=false;
-    try {return await navigator.locks.request(`siworld-light-${this.key}`,async()=>{
+    const controller = this.syncController = new AbortController();
+    const signal = timeout => AbortSignal.any([controller.signal, AbortSignal.timeout(timeout)]);
+    try {return await navigator.locks.request(`siworld-light-${this.key}`,{signal:controller.signal},async()=>{
       await this.fresh();
-      const head=await readJSON(`${this.base}/v1/head`,{signal:AbortSignal.timeout(15000)});
+      controller.signal.throwIfAborted();
+      const head=await readJSON(`${this.base}/v1/head`,{signal:signal(15000)});
       if(head.network!==this.config.network||head.genesis!==this.config.genesis||!idPattern.test(head.tip)||!Number.isSafeInteger(head.height)||head.height<0||head.height>1000000)throw new Error('Engineering head does not match the pinned network.');
       if(head.tip===this.journal.tip&&head.height===this.journal.height){this.ready=true;return this.summary();}
       let extension=false;
-      if(this.journal.height>0&&head.height>this.journal.height){const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${this.journal.height}&limit=1`,{signal:AbortSignal.timeout(15000)});extension=Array.isArray(page.ids)&&page.ids.length===1&&page.ids[0]===this.journal.tip;}
+      if(this.journal.height>0&&head.height>this.journal.height){const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${this.journal.height}&limit=1`,{signal:signal(15000)});extension=Array.isArray(page.ids)&&page.ids.length===1&&page.ids[0]===this.journal.tip;}
       if(extension)this.wallet.begin_extension();else this.wallet.begin_candidate();
       let parent=extension?this.journal.tip:this.config.genesis;let previous=extension?this.journal.height:0;let downloaded=0;
       const needed=new Set(this.journal.payments.map(p=>p.statement_id));const included=new Map();
       for(let from=previous+1;from<=head.height;) {
-        const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${from}&limit=128`,{signal:AbortSignal.timeout(15000)});
+        const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${from}&limit=128`,{signal:signal(15000)});
         if(!Array.isArray(page.ids)||page.ids.length===0||page.ids.length>128||page.ids.length>head.height-from+1)throw new Error('Incomplete compact chain index.');
         for(const id of page.ids){if(!idPattern.test(id))throw new Error('Invalid compact chain identity.');let cached=await stored('compact',id);let bytes=cached?.bytes;
-          if(!bytes){const data=await fetchLimited(`${this.base}/v1/compact/${id}`,{signal:AbortSignal.timeout(30000)});bytes=data.bytes;downloaded+=bytes.length;}
+          if(!bytes){const data=await fetchLimited(`${this.base}/v1/compact/${id}`,{signal:signal(30000)});bytes=data.bytes;downloaded+=bytes.length;}
+          controller.signal.throwIfAborted();
           const state=JSON.parse(this.wallet.append_compact(bytes));
           if(state.tip!==id||state.height!==previous+1)throw new Error('Compact block identity or height differs.');
           for(const statement of state.observed_statements||[])if(needed.has(statement))included.set(statement,{height:state.height,timestamp:state.block_timestamp});
@@ -86,12 +91,14 @@ export class LightSession {
           if(!cached)await stored('compact',id,{id,parent,height:state.height,bytes});parent=id;previous=state.height;
         }from+=page.ids.length;
       }
+      controller.signal.throwIfAborted();
       this.wallet.check_candidate(String(head.height),head.tip);
       const payments=this.journal.payments.map(p=>{const found=included.get(p.statement_id);const orphaned=p.phase==='confirmed'&&!extension&&!found;return {...p,phase:found?'confirmed':orphaned?(p.ever_submitted?'unknown':'finalized'):p.phase,confirmed_height:found?.height??(orphaned?null:p.confirmed_height??null),confirmed_timestamp:found?.timestamp??(orphaned?null:p.confirmed_timestamp??null)};});
-      // Persist before replacing the accepted in-memory state. An interrupted candidate is discarded.
+      // Persist before replacing the accepted in-memory state. Cancellation
+      // after this point must finish both steps so disk and memory agree.
       await this.persist({...this.journal,height:head.height,tip:head.tip,payments});
       this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded};
-    });}catch(error){this.wallet.abort_candidate();throw error;}finally{this.syncing=false;}
+    });}catch(error){this.wallet.abort_candidate();throw error;}finally{this.syncing=false;this.syncController=null;}
   }
   async prepare(recipient,resolved,amount,priority,onProgress=()=>{}) {
     if(!this.ready||this.syncing)throw new Error('Finish current compact synchronization before sending.');

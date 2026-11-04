@@ -19,7 +19,12 @@ function selectAccount(account) {
   active?.free(); active = next; online = null;
   return JSON.parse(active.public_info());
 }
-self.onmessage = ({ data }) => { queue=queue.then(()=>handle(data)); };
+self.onmessage = ({ data }) => {
+  // Interrupt network waits before queuing a wallet change. WASM operations
+  // remain serialized until the abandoned candidate has been discarded.
+  if (data.action === 'accounts-add' || data.action === 'account-select') online?.cancelSync();
+  queue=queue.then(()=>handle(data));
+};
 async function handle(data) {
   const { id, action, args = [] } = data;
   try {

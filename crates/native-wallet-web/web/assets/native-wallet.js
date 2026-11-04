@@ -16,13 +16,15 @@ const proofProgress = new ProofProgress({root: $('#send-progress'), label: $('#s
 const history = new WalletHistory($('#wallet-history'));
 const walletList = new WalletList({collection: $('#wallet-collection'), list: $('#wallet-list'), workspace: $('#wallet-workspace'), select: chooseAccount, rename: editWalletName});
 let namingAccount = null;
-function walletCreation() {
+function walletCreation(status = '') {
   const count = walletList.rows.size, full = count >= MAX_ACCOUNTS;
   $('#wallet-count').textContent = `${count} / ${MAX_ACCOUNTS}`;
   $('#add-wallet').disabled = !info || busy || full;
-  $('#wallet-creation-status').textContent = full
+  $('#add-wallet').textContent = busy ? 'Please wait…' : 'Create new wallet ＋';
+  $('#add-wallet').setAttribute('aria-busy', String(busy));
+  $('#wallet-creation-status').textContent = status || (full
     ? `Wallet limit reached (${MAX_ACCOUNTS} of ${MAX_ACCOUNTS}). You can still manage all existing wallets.`
-    : 'Create another wallet with the same recovery phrase. No new recovery phrase is needed.';
+    : 'Create another wallet with the same recovery phrase. No new recovery phrase is needed.');
 }
 const paymentControls = () => { for (const id of ['send-recipient', 'send-amount', 'send-priority', 'send-prepare']) $(`#${id}`).disabled = proofProgress.active; };
 function message(text, error = false) { $('#status').textContent = text; $('#status').classList.toggle('error', error); }
@@ -268,8 +270,8 @@ async function chooseAccount(account) {
   if (!info || busy || proofProgress.active || $('#send-flow').open) { message('Close the payment panel and finish the current operation before switching wallets.', true); return; }
   if (info.account === account) { walletList.activate(account); return; }
   busy = true; const token = ++epoch; clearTimeout(pollTimer); onlineReady = false;
-  $('#add-wallet').disabled = true; $('#send-open').disabled = true;
-  message('Opening the selected wallet. Waiting for the current local operation to finish.');
+  walletCreation('Opening the selected wallet. Its balance will synchronize separately.'); $('#send-open').disabled = true;
+  message('Opening the selected wallet. Pausing the previous balance synchronization.');
   try {
     const selected = await call('account-select', account);
     if (token !== epoch) return;
@@ -280,15 +282,17 @@ async function chooseAccount(account) {
 }
 $('#add-wallet').onclick = async () => {
   if (!info || busy || proofProgress.active || $('#send-flow').open) return;
-  busy = true; const token = epoch; $('#add-wallet').disabled = true;
+  busy = true; const token = epoch; let failure = '';
+  walletCreation('Creating a wallet locally. Pausing the current balance synchronization.');
+  message('Creating a wallet with the same recovery phrase. No new recovery phrase is needed.');
   try {
     const result = await call('accounts-add');
     if (token !== epoch) return;
     walletList.load(result.accounts, info.account); busy = false;
     await chooseAccount(result.account);
     if (token < epoch && info?.account === result.account) message('Wallet added using the same recovery phrase. Save a new encrypted backup to preserve account indexes and local names.');
-  } catch (error) { if (token === epoch) message(error.message, true); }
-  finally { if (token === epoch) { busy = false; walletCreation(); } }
+  } catch (error) { if (token === epoch) { failure = `Wallet creation failed: ${error.message}`; message(failure, true); } }
+  finally { if (token === epoch) { busy = false; walletCreation(failure); } }
 };
 function editWalletName(row) {
   if (!info || busy || proofProgress.active) return;
