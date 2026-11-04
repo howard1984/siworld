@@ -66,9 +66,7 @@ impl Material {
         )
     }
     pub fn seal(&self, password: &str) -> Result<Vec<u8>, String> {
-        if !(12..=1024).contains(&password.len()) {
-            return Err("Use a device password of 12 to 1024 UTF-8 bytes.".into());
-        }
+        validate_new_password(password)?;
         let mut out = vec![0u8; VAULT_LEN];
         out[..8].copy_from_slice(b"SWNVLT01");
         getrandom::fill(&mut out[8..HEADER])
@@ -117,6 +115,76 @@ impl Material {
             entropy: Zeroizing::new(data[36..].try_into().expect("entropy width")),
         })
     }
+}
+/// Applies only when sealing new device backups. Existing files remain readable.
+pub fn validate_new_password(password: &str) -> Result<(), String> {
+    if password.len() > 1024 || password.chars().count() < 8 {
+        return Err("Use at least 8 characters and at most 1024 UTF-8 bytes.".into());
+    }
+    let lower = Zeroizing::new(password.trim().to_ascii_lowercase());
+    let candidate = lower.trim_matches(|c: char| !c.is_alphanumeric());
+    let characters = Zeroizing::new(candidate.chars().map(u32::from).collect::<Vec<_>>());
+    let repeated = characters.len() < 8
+        || (1..=4).any(|period| {
+            characters
+                .iter()
+                .enumerate()
+                .all(|(i, value)| *value == characters[i % period])
+        });
+    let letters = Zeroizing::new(
+        lower
+            .bytes()
+            .filter(u8::is_ascii_alphabetic)
+            .map(char::from)
+            .collect::<String>(),
+    );
+    let common = [
+        "password",
+        "passwords",
+        "passwrd",
+        "passw0rd",
+        "qwerty",
+        "qwertyuiop",
+        "letmein",
+        "welcome",
+        "iloveyou",
+        "admin",
+        "administrator",
+        "changeme",
+        "default",
+        "siworld",
+        "blockchain",
+        "testnet",
+        "abcdefgh",
+        "abcd",
+        "abc",
+        "psswrd",
+        "pssword",
+        "qazwsx",
+        "asdfgh",
+        "monkey",
+        "dragon",
+        "football",
+        "baseball",
+        "sunshine",
+        "princess",
+        "trustnoone",
+    ];
+    let sequential = [
+        "01234567890123456789",
+        "98765432109876543210",
+        "abcdefghijklmnopqrstuvwxyz",
+        "zyxwvutsrqponmlkjihgfedcba",
+        "qwertyuiopasdfghjklzxcvbnm",
+    ]
+    .iter()
+    .any(|sequence| sequence.contains(candidate));
+    if repeated || sequential || common.contains(&letters.as_str()) {
+        return Err(
+            "This password is too common or repetitive. Choose a unique passphrase.".into(),
+        );
+    }
+    Ok(())
 }
 pub fn challenge() -> Result<[usize; 3], String> {
     let mut out = [0; 3];

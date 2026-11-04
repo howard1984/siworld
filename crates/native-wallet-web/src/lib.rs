@@ -29,6 +29,22 @@ fn js(error: String) -> JsValue {
     JsValue::from_str(&error)
 }
 
+#[wasm_bindgen]
+pub fn device_password_status(password: String) -> String {
+    let password = Zeroizing::new(password);
+    match vault::validate_new_password(&password) {
+        Err(message) => json!({"valid":false,"label":message}).to_string(),
+        Ok(()) => {
+            let label = if password.chars().count() >= 16 {
+                "Password strength: longer passphrase. Keep it unique to this wallet."
+            } else {
+                "Password strength: minimum requirements met. A unique passphrase of 16 or more characters is recommended."
+            };
+            json!({"valid":true,"label":label}).to_string()
+        }
+    }
+}
+
 fn history_config(rules_hex: &str, genesis: &str) -> Result<engine::state::Config, JsValue> {
     let rules =
         wallet_core::hex_array::<{ engine::state::CONFIG_RULE_BYTES }>(rules_hex).map_err(js)?;

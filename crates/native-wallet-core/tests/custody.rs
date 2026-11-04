@@ -72,7 +72,47 @@ fn vault_authentication_password_and_context() {
         assert!(Material::open(&bad, p, m.network).is_err());
     }
     assert!(Material::open(&encrypted[..131], p, m.network).is_err());
-    assert!(m.seal("too-short").is_err());
+    assert!(m.seal("short").is_err());
+}
+#[test]
+fn device_password_policy_counts_characters_and_rejects_common_patterns() {
+    for value in [
+        "short",
+        "12345678",
+        "Password123!",
+        "WELCOME123!",
+        "qwertyuiop",
+        "aaaaaaaa",
+        "abcdabcd",
+        "letmein!!",
+        "SIWORLD2026",
+        "aB1!aB1!",
+        "abc12345",
+        "P@ssw0rd!",
+        "12345678!",
+        "\u{00e9}\u{00e9}\u{00e9}\u{00e9}",
+        "        ",
+    ] {
+        assert!(vault::validate_new_password(value).is_err());
+    }
+    assert!(vault::validate_new_password(&"x".repeat(1025)).is_err());
+    for value in [
+        "F7!k2@Qz",
+        "a unique synthetic passphrase",
+        "M\u{00e9}lange7!",
+    ] {
+        vault::validate_new_password(value).unwrap();
+    }
+    // Public synthetic test password; never use it for real funds.
+    let password = "F7!k2@Qz";
+    let m = material(1, 0);
+    let encrypted = m.seal(password).unwrap();
+    assert_eq!(
+        Material::open(&encrypted, password, m.network)
+            .unwrap()
+            .account,
+        0
+    );
 }
 #[test]
 fn password_rotation_keeps_identity() {

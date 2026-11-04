@@ -6,7 +6,7 @@ import { resolve, sep } from 'node:path';
 const site = process.env.WALLET_WEB_OUTPUT;
 if (!site) throw new Error('Set WALLET_WEB_OUTPUT to the built wallet directory.');
 const root = pathToFileURL(resolve(site) + sep);
-const { initSync, BrowserWallet, inspect_address } = await import(new URL('sdk/core/wallet.js',root));
+const { initSync, BrowserWallet, inspect_address, device_password_status } = await import(new URL('sdk/core/wallet.js',root));
 const { parseBackup, backup, bytes, MAX_BACKUP } = await import(new URL('sdk/storage.js',root));
 const { AddressDirectory } = await import(new URL('sdk/light-session.js',root));
 initSync({ module: readFileSync(new URL('sdk/core/wallet_bg.wasm',root)) });
@@ -14,6 +14,23 @@ const network = '01'.repeat(32);
 // Public synthetic test mnemonic; never use this phrase for real funds.
 const words = [...Array(23).fill('abandon'), 'art'].join(' ');
 const password = 'synthetic-browser-password';
+
+test('new device passwords reject common patterns without changing recovery identity', () => {
+  const wallet = BrowserWallet.restore(network, 0, words);
+  try {
+    const prior = wallet.public_info();
+    for (const value of ['short', 'Password123!', '12345678', 'abcdabcd']) {
+      assert.equal(JSON.parse(device_password_status(value)).valid, false);
+      assert.throws(() => wallet.seal(value, ''), /characters|common/);
+    }
+    // Public synthetic test password; never use it for real funds.
+    const value = 'F7!k2@Qz';
+    assert.equal(JSON.parse(device_password_status(value)).valid, true);
+    const reopened = BrowserWallet.unlock(network, wallet.seal(value, ''), value);
+    try { assert.equal(reopened.public_info(), prior); }
+    finally { reopened.free(); }
+  } finally { wallet.free(); }
+});
 
 test('native mnemonic restores without the legacy PBKDF2 derivation', () => {
   const wallet = BrowserWallet.restore(network, 42, words);

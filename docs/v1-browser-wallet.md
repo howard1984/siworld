@@ -32,6 +32,15 @@ network (32), little-endian account (4), and entropy (32). Argon2id v19 uses
 native domain string and the entire header. The device password does not affect
 the receiving identity. Native and portable vaults authenticate each other.
 
+New device passwords require at least eight Unicode scalar values and at most
+1,024 UTF-8 bytes. Common passwords, short repeated patterns and simple sequences
+are rejected by the portable custody core before encryption. The page displays
+the same worker-owned policy result and recommends a unique passphrase of at
+least sixteen characters; its length hint is not an entropy estimate. Existing
+backup passwords remain accepted when opening their authenticated files. The
+Argon2id profile, vault format and recovery derivation are unchanged. Recovery
+words remain the only recovery method if both local storage and backups are lost.
+
 IndexedDB stores ciphertext and public recovery context in a separate native V1
 namespace. Adds are atomic and never replace an existing wallet. Backup parsing
 is bounded, validates an exact schema and rejects legacy formats. The browser

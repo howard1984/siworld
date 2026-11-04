@@ -31,6 +31,7 @@ async function handle(data) {
     let result;
     if (scoped.has(action) && (!active || data.account !== JSON.parse(active.public_info()).account)) throw new Error('The selected wallet changed. Reopen its payment panel.');
     switch (action) {
+      case 'password-check': result = JSON.parse(core.device_password_status(...args)); break;
       case 'create': release(); wallet = BrowserWallet.create(...args); result = { words: wallet.recovery_words(), positions: [...wallet.backup_positions()] }; break;
       case 'restore': release(); wallet = BrowserWallet.restore(...args); result = true; break;
       case 'unlock': release(); wallet = BrowserWallet.unlock(...args); result = JSON.parse(wallet.public_info()); break;

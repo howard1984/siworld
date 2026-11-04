@@ -47,6 +47,7 @@ function call(action, ...args) {
 function clearSecrets() {
   for (const input of flow.querySelectorAll('input[type=password], #restore-words, #answers input')) input.value = '';
   $('#words').replaceChildren(); $('#answers').replaceChildren(); positions = null;
+  $('#password-strength').textContent = '';
 }
 function lock(text = 'Wallet locked. Recovery fields and the local worker session were cleared.', restart = true) {
   walletList.reset(); history.reset(); history.root.hidden = true; $('#add-wallet').disabled = true;
@@ -93,6 +94,7 @@ function showStage(next) {
     display('password-fields', true); $('#confirm-field').hidden = true; $('#password').autocomplete = 'current-password';
     $('#next').textContent = imported ? 'Unlock and import ↗' : 'Unlock wallet ↗';
   }
+  $('#password-strength').hidden = next !== 'seal';
   for (const input of flow.querySelectorAll('input,textarea')) input.required = !input.closest('[hidden]');
   activity(); requestAnimationFrame(() => flow.querySelector('div:not([hidden]) input, div:not([hidden]) textarea')?.focus());
 }
@@ -170,7 +172,9 @@ $('#flow-form').addEventListener('submit', async event => {
     } else if (stage === 'seal') {
       let password = $('#password').value;
       if (password !== $('#confirm').value) throw new Error('Device passwords do not match.');
-      if (new TextEncoder().encode(password).length < 12) throw new Error('Use a device password of at least 12 UTF-8 bytes.');
+      const assessment = await call('password-check', password);
+      if (token !== epoch) return;
+      if (!assessment.valid) throw new Error(assessment.label);
       let answers = [...document.querySelectorAll('#answers input')].map(input => input.value).join(' ');
       for (const input of flow.querySelectorAll('input[type=password]')) input.value = '';
       const resultPromise = call('seal', password, answers); password = answers = '';
@@ -191,6 +195,15 @@ $('#flow-form').addEventListener('submit', async event => {
     }
   } catch (error) { if (token === epoch) $('#flow-error').textContent = error.message; }
   finally { if (token === epoch) { busy = false; $('#next').disabled = false; walletCreation(); } }
+});
+let passwordRevision = 0;
+$('#password').addEventListener('input', async () => {
+  if (stage !== 'seal' || !ready) return;
+  const revision = ++passwordRevision, token = epoch;
+  try {
+    const assessment = await call('password-check', $('#password').value);
+    if (token === epoch && revision === passwordRevision && stage === 'seal') $('#password-strength').textContent = assessment.label;
+  } catch { /* Sealing still enforces the same policy inside WASM. */ }
 });
 $('#open-unlock').addEventListener('click', () => {
   clearSecrets(); ++epoch; imported = null; $('#lock').disabled = false; showStage('unlock'); flow.showModal();
