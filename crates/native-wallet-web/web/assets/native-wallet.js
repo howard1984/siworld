@@ -69,6 +69,7 @@ function lock(text = 'Wallet locked. Recovery fields and the local worker sessio
   $('#locked-notes').hidden=true;$('#locked-note-list').replaceChildren();$('#balance-detail').textContent='Unlock to scan public compact records locally.';$('#asset-balances').replaceChildren();$('#payment-list').replaceChildren();$('#send-recipient').value='';$('#send-amount').value='';$('#send-review').textContent='';$('#send-error').textContent='';
   $('#setup').hidden = false; $('#receiving').hidden = true; $('#full-address').value = ''; $('#short-address').textContent = '';
   $('#account-title').textContent = 'V1 ACCOUNT'; $('#send-source').textContent = '';
+  $('#wallet-birthday').textContent = '';
   $('#account-index').textContent = 'No wallet unlocked'; $('#account-state').textContent = 'LOCKED';
   $('#lock').disabled = $('#copy-address').disabled = $('#copy-short-address').disabled = true;
   $('#short-address-status').textContent = ''; $('#copy-short-address').textContent = 'Enable short address ↙';
@@ -87,7 +88,7 @@ function showStage(next) {
     $('#next').textContent = mode === 'create' ? 'Generate recovery words ↗' : 'Continue ↗';
   } else if (next === 'words') {
     $('#flow-title').textContent = 'Keep your way back.';
-    $('#flow-description').textContent = `Write down the 24 words privately. Network: ${context.network} · Account: ${context.account}.`;
+    $('#flow-description').textContent = `Write down the 24 words privately. Network: ${context.network} · Account: ${context.account}. Created ${context.birthday.created_on} · starting block ${context.birthday.birth_height}. Keep this date and height with your recovery words.`;
     display('words-view', true); $('#next').textContent = 'I wrote down my backup ↗';
   } else if (next === 'seal') {
     $('#flow-title').textContent = mode === 'create' ? 'Verify and protect.' : 'Protect this device.';
@@ -134,6 +135,10 @@ async function render(publicInfo, record, selected = false) {
   $('#send-recipient').value = ''; $('#send-amount').value = ''; $('#send-review').textContent = ''; $('#send-error').textContent = '';
   $('#send-source').textContent = `From ${walletList.name(info.account)} · account ${info.account} · ${info.short_address}`;
   $('#account-title').textContent = walletList.name(info.account);
+  const birthday = walletList.rows.get(info.account);
+  $('#wallet-birthday').textContent = birthday.created_on
+    ? `Created ${birthday.created_on} · starting block ${birthday.birth_height}. Record this date with your recovery words. Your encrypted backup also preserves account indexes.`
+    : 'Creation date is unknown. Recovery uses a conservative history boundary. Keep your account indexes with your recovery words.';
   walletCreation();
   $('#setup').hidden = true; $('#receiving').hidden = false;
   $('#full-address').value = info.full_address; $('#short-address').textContent = info.short_address;
@@ -160,6 +165,7 @@ $('#flow-form').addEventListener('submit', async event => {
       if (mode === 'create') {
         const result = await call('create', context.network, context.account); if (token !== epoch) return;
         positions = result.positions;
+        context.birthday = result.birthday;
         $('#words').replaceChildren(...result.words.split(' ').map(word => { const item = document.createElement('li'); item.textContent = word; return item; }));
         result.words = ''; showStage('words');
       } else {

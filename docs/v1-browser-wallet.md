@@ -305,6 +305,16 @@ an unavailable or mismatched version-2 cache fails closed without deleting the
 journal. Deep reorganizations still build a new candidate. Public compact-cache
 pruning and birthday/shared-account scanning remain separate work.
 
+The version-2 encrypted account registry also records each account's creation
+date and starting height, plus the highest allocated account index. Creation
+reads only pinned public head metadata; unavailable or invalid metadata uses
+height zero. Existing registries migrate with an unknown date and height zero,
+and merging backups preserves the earliest boundary and local display name.
+These fields remain inside the encrypted account backup and are never sent to
+the API. The account panel and recovery-word step display the creation context.
+This metadata alone does not change the active scan algorithm: historical-tree
+integration, date-based recovery and five-empty-account discovery remain pending.
+
 Poll small head metadata every five seconds while visible, with no duplicate
 requests and backoff while hidden/offline; do not redownload unchanged blocks.
 

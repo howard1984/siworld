@@ -5,7 +5,7 @@ import {pathToFileURL} from 'node:url';
 import {resolve, sep} from 'node:path';
 const root = pathToFileURL(resolve(process.env.WALLET_WEB_OUTPUT) + sep);
 const {initSync, BrowserWallet} = await import(new URL('sdk/core/wallet.js', root));
-const {WalletAccounts, accountIndex, walletName} = await import(new URL('sdk/wallet-accounts.js', root));
+const {WalletAccounts, accountIndex, walletName, walletBirthday, captureBirthday} = await import(new URL('sdk/wallet-accounts.js', root));
 const {transactionRows} = await import(new URL('assets/wallet-history.js', root));
 const {parseBackup, backup, bytes} = await import(new URL('sdk/storage.js', root));
 initSync({module: readFileSync(new URL('sdk/core/wallet_bg.wasm', root))});
@@ -103,7 +103,7 @@ test('ten wallets can be created and the eleventh preserves the encrypted regist
     const reopened = new WalletAccounts(wallet, data.storage);
     try { assert.equal((await reopened.initialize()).length, 10); }
     finally { reopened.free(); }
-    await book.write({...book.value, accounts: [{account: 0xffffffff, name: 'Last account'}]});
+    await book.write({...book.value, highest_account:0xffffffff, accounts: [{account: 0xffffffff, name: 'Last account', birth_height:0, created_on:null}]});
     prior = new Uint8Array(data.values.get(book.key));
     await assert.rejects(book.add(), /index/); assert.deepEqual(data.values.get(book.key), prior);
   } finally {book.free(); wallet.free();}
@@ -142,13 +142,84 @@ test('merging valid backups cannot exceed ten wallets or overwrite existing name
     await current.initialize(); await current.rename(0, 'Keep this name');
     for (let i = 1; i < 10; i++) await current.add();
     await incoming.initialize();
-    await incoming.write({...incoming.value, accounts: [...incoming.value.accounts, {account: 10, name: 'Other device'}]});
+    await incoming.write({...incoming.value, highest_account:10, accounts: [...incoming.value.accounts, {account: 10, name: 'Other device', birth_height:0, created_on:null}]});
     const prior = new Uint8Array(data.values.get(current.key));
     importer = new WalletAccounts(wallet, data.storage);
     await assert.rejects(importer.initialize(await incoming.backup()), /Invalid encrypted wallet list/);
     assert.deepEqual(data.values.get(current.key), prior);
     assert.equal((await current.read()).accounts[0].name, 'Keep this name');
   } finally {importer?.free(); current.free(); incoming.free(); wallet.free();}
+});
+
+test('birthdays and highest account index survive an encrypted backup without plaintext metadata', async () => {
+  const firstData=memory(), restoredData=memory(), wallet=BrowserWallet.restore(network,0,words);
+  const book=new WalletAccounts(wallet,firstData.storage), restored=new WalletAccounts(wallet,restoredData.storage);
+  try {
+    await book.initialize('',{birth_height:100,created_on:'2000-01-02'});
+    await book.add({birth_height:150,created_on:'2000-01-03'});
+    const rows=await restored.initialize(await book.backup());
+    assert.deepEqual(rows.map(row=>[row.account,row.birth_height,row.created_on]),[[0,100,'2000-01-02'],[1,150,'2000-01-03']]);
+    assert.equal(restored.value.highest_account,1);
+    for(const value of firstData.values.values())for(const text of ['birth_height','2000-01-02','highest_account'])assert.ok(!new TextDecoder().decode(value).includes(text));
+  }finally{book.free();restored.free();wallet.free();}
+});
+test('new wallet birthday queries only pinned public head metadata', async () => {
+  const config={name:'siworld-eng-1',network,genesis:'03'.repeat(32),api:'https://wallet.invalid/api'};
+  const queries=[];
+  const result=await captureBirthday(config,network,{date:'2000-01-02',json:async(url,options)=>{
+    queries.push(url);assert.equal(options.limit,20000);assert.ok(options.signal instanceof AbortSignal);
+    return {network,genesis:config.genesis,tip:'04'.repeat(32),height:123};
+  }});
+  assert.deepEqual(queries,['https://wallet.invalid/api/v1/head']);
+  assert.deepEqual(result,{birth_height:123,created_on:'2000-01-02'});
+});
+test('unavailable or mismatched birthday metadata falls back to genesis', async () => {
+  const config={name:'siworld-eng-1',network,genesis:'03'.repeat(32),api:'https://wallet.invalid/api'};
+  const head={network,genesis:config.genesis,tip:'04'.repeat(32),height:123};
+  for(const row of [{...head,network:'02'.repeat(32)},{...head,genesis:'05'.repeat(32)},{...head,height:1000001},{...head,height:-1},{...head,tip:'bad'}]){
+    assert.deepEqual(await captureBirthday(config,network,{date:'2000-01-02',json:async()=>row}),{birth_height:0,created_on:'2000-01-02'});
+  }
+  assert.equal((await captureBirthday(config,network,{json:async()=>{throw new Error('Synthetic offline state');}})).birth_height,0);
+  let queried=false;
+  assert.equal((await captureBirthday({...config,api:'https://user:password@wallet.invalid/api'},network,{json:async()=>{queried=true;}})).birth_height,0);
+  assert.equal(queried,false);
+});
+test('legacy lists migrate with unknown birthdays instead of skipping historical receipts', async () => {
+  const data=memory(), wallet=BrowserWallet.restore(network,0,words), book=new WalletAccounts(wallet,data.storage);
+  try {
+    await book.initialize();
+    const legacy={version:1,type:'wallet-accounts',network,accounts:[{account:0,name:'Existing wallet'},{account:3,name:'Existing miner'}]};
+    data.values.set(book.key,book.anchor.protect_local(new TextEncoder().encode(JSON.stringify(legacy))));
+    const rows=await book.initialize('',{birth_height:200,created_on:'2000-01-02'});
+    assert.deepEqual(rows.map(row=>[row.birth_height,row.created_on]),[[0,null],[0,null]]);
+    assert.equal(book.value.version,2);assert.equal(book.value.highest_account,3);
+    assert.equal((await book.add()).account,4);
+  }finally{book.free();wallet.free();}
+});
+test('backup merge keeps the earliest scan boundary and local name', async () => {
+  const data=memory(), importedData=memory(), wallet=BrowserWallet.restore(network,0,words);
+  const current=new WalletAccounts(wallet,data.storage), incoming=new WalletAccounts(wallet,importedData.storage);
+  try {
+    await current.initialize('',{birth_height:200,created_on:'2000-02-02'});await current.rename(0,'Keep local name');
+    await incoming.initialize('',{birth_height:100,created_on:'2000-01-02'});
+    const rows=await current.initialize(await incoming.backup());
+    assert.equal(rows[0].name,'Keep local name');assert.equal(rows[0].birth_height,100);assert.equal(rows[0].created_on,'2000-01-02');
+    await current.write({...current.value,highest_account:7});
+    assert.equal((await current.add({birth_height:250,created_on:'2000-02-03'})).account,8);
+    assert.equal(current.value.highest_account,8);
+  }finally{current.free();incoming.free();wallet.free();}
+});
+test('invalid birthday and highest-index metadata preserve the encrypted registry', async () => {
+  const data=memory(),wallet=BrowserWallet.restore(network,0,words),book=new WalletAccounts(wallet,data.storage);
+  try {
+    await book.initialize();const prior=new Uint8Array(data.values.get(book.key));
+    for(const birth_height of [-1,1.5,1000001,NaN,'1'])assert.throws(()=>walletBirthday({birth_height,created_on:null}),/birthday/);
+    for(const created_on of ['2000-02-30','2000-13-01','00-01-01','2000-01-01T00:00:00Z',17])assert.throws(()=>walletBirthday({birth_height:1,created_on}),/birthday/);
+    assert.throws(()=>walletBirthday({birth_height:1,created_on:null,extra:0}),/birthday/);
+    await assert.rejects(book.write({...book.value,highest_account:-1}),/index/);
+    assert.throws(()=>book.add({birth_height:-1,created_on:null}),/birthday/);
+    assert.deepEqual(data.values.get(book.key),prior);
+  }finally{book.free();wallet.free();}
 });
 test('history groups reward tranches and keeps each payment and status distinct', () => {
   const note = {id: 'a'.repeat(96), block_id: 'b'.repeat(64), height: 5, timestamp: 500, asset: sip, amount_atoms: '100', unlock_height: 24, spent: false, kind: 'mining'};
