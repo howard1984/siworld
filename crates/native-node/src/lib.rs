@@ -36,6 +36,9 @@ pub mod web_wallet;
 mod fixtures;
 
 #[cfg(feature = "wallet-light-gateway")]
+#[path = "../../native-wallet-engine/src/commitment.rs"]
+pub mod commitment;
+#[cfg(feature = "wallet-light-gateway")]
 #[path = "../../native-wallet-engine/src/compact.rs"]
 pub mod compact;
 #[cfg(feature = "wallet-light-gateway")]

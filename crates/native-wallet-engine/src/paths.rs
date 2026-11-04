@@ -34,6 +34,24 @@ impl OwnedPaths {
             owned: BTreeMap::new(),
         }
     }
+    /// Start an empty-owned-note view from an independently authenticated local tree cache.
+    pub fn from_tree_cache(
+        count: u64,
+        frontier: &[crate::wire::DigestBytes],
+        root: crate::wire::DigestBytes,
+    ) -> Result<Self, String> {
+        let tree = crate::state::CommitmentTree::from_local_cache(count, frontier, root)?;
+        let mut paths = Self::new();
+        paths.count = count;
+        paths.root = tree.root();
+        paths.frontier = frontier
+            .iter()
+            .map(|v| {
+                native::codec::decode_digest(v).map_err(|_| "Invalid cached frontier.".to_owned())
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(paths)
+    }
     pub fn count(&self) -> u64 {
         self.count
     }

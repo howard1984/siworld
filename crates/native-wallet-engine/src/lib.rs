@@ -24,7 +24,9 @@ pub mod local {
         b.iter().map(|v| format!("{v:02x}")).collect()
     }
 }
+pub mod commitment;
 pub mod compact;
+pub mod history;
 pub mod light;
 pub mod ranges;
 

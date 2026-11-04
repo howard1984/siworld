@@ -14,6 +14,21 @@ pub struct Sparse {
     chunks: BTreeMap<usize, Vec<u8>>,
 }
 impl Sparse {
+    pub fn disclosed_overlap(&self, ranges: &[(usize, usize)]) -> usize {
+        ranges
+            .iter()
+            .map(|&(at, len)| {
+                self.chunks
+                    .iter()
+                    .map(|(&index, bytes)| {
+                        (at + len)
+                            .min(index * 1024 + bytes.len())
+                            .saturating_sub(at.max(index * 1024))
+                    })
+                    .sum::<usize>()
+            })
+            .sum()
+    }
     pub fn require_exact_ranges(&self, ranges: &[(usize, usize)]) -> Result<(), String> {
         let mut expected = std::collections::BTreeSet::new();
         for &(at, len) in ranges {
@@ -100,6 +115,91 @@ impl RangeProof {
         }
         Ok(out)
     }
+    /// Prune an authenticated disclosure without access to hidden source bytes.
+    pub fn project(
+        encoded: &[u8],
+        root: [u8; 32],
+        ranges: &[(usize, usize)],
+    ) -> Result<Vec<u8>, String> {
+        let sparse = Self::verify(encoded, root)?;
+        for &(at, len) in ranges {
+            sparse.read(at, len)?;
+        }
+        let mut position = 16;
+        fn walk(
+            encoded: &[u8],
+            at: &mut usize,
+            offset: usize,
+            length: usize,
+            ranges: &[(usize, usize)],
+            out: &mut Vec<u8>,
+        ) -> [u8; 32] {
+            let tag = encoded[*at];
+            *at += 1;
+            let selected = ranges
+                .iter()
+                .any(|(start, len)| *len > 0 && *start < offset + length && start + len > offset);
+            let mut child = Vec::new();
+            let cv = match tag {
+                0 => {
+                    let cv = encoded[*at..*at + 32].try_into().unwrap();
+                    *at += 32;
+                    cv
+                }
+                1 => {
+                    let bytes = &encoded[*at..*at + length];
+                    *at += length;
+                    if selected {
+                        child.push(1);
+                        child.extend(bytes);
+                    }
+                    hash_nonroot(bytes, offset)
+                }
+                2 => {
+                    let left = left_subtree_len(length as u64) as usize;
+                    child.push(2);
+                    let a = walk(encoded, at, offset, left, ranges, &mut child);
+                    let b = walk(
+                        encoded,
+                        at,
+                        offset + left,
+                        length - left,
+                        ranges,
+                        &mut child,
+                    );
+                    merge_subtrees_non_root(
+                        &a,
+                        &b,
+                        Mode::DeriveKeyMaterial(&hash_derive_key_context(DOMAIN)),
+                    )
+                }
+                _ => unreachable!("verified tree tag"),
+            };
+            if selected
+                || offset == 0
+                    && length == u64::from_le_bytes(encoded[8..16].try_into().unwrap()) as usize
+            {
+                out.extend(child);
+            } else {
+                out.push(0);
+                out.extend(cv);
+            }
+            cv
+        }
+        let mut projected = encoded[..16].to_vec();
+        walk(
+            encoded,
+            &mut position,
+            0,
+            sparse.length,
+            ranges,
+            &mut projected,
+        );
+        let result = Self::verify(&projected, root)?;
+        result.require_exact_ranges(ranges)?;
+        Ok(projected)
+    }
+
     pub fn verify(encoded: &[u8], root: [u8; 32]) -> Result<Sparse, String> {
         if encoded.len() < 17 || encoded.len() > MAX_COMPACT || &encoded[..8] != b"SWLR0001" {
             return Err("Invalid compact range envelope.".into());

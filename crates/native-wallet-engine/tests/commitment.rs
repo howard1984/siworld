@@ -1,0 +1,116 @@
+mod common;
+use native::codec::{PublicTransaction, encode_digest};
+use siworld_native_wallet_engine::{commitment::CommitmentBlock, compact::CompactBlock};
+#[test]
+fn historical_projection_binds_all_outputs_in_native_order_without_ciphertext_fields() {
+    for slots in [64, 576] {
+        let (_, block) = common::fixture_slots(slots);
+        let compact = CompactBlock::export(&block).unwrap();
+        let projected = CommitmentBlock::project(&compact).unwrap();
+        let decoded = CommitmentBlock::decode(&projected).unwrap();
+        let expected = block
+            .transactions
+            .iter()
+            .flat_map(|t| {
+                PublicTransaction::decode(&t.record.body)
+                    .unwrap()
+                    .cm
+                    .map(|cm| encode_digest(&cm))
+            })
+            .chain(block.rewards.iter().map(|r| r.commitment))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded.outputs, expected);
+        assert_eq!(decoded.id, block.id().unwrap());
+        assert_eq!(decoded.network, block.network);
+        assert_eq!(decoded.timestamp, block.timestamp);
+        assert!(projected.len() < compact.len());
+        assert!(decoded.authentication_ciphertext_bytes > 0);
+        assert!(decoded.authentication_ciphertext_bytes < slots * (2027 - 240) + 5 * 1313);
+        for offset in [0, 16, 64, 512, projected.len() - 1] {
+            let mut corrupt = projected.clone();
+            corrupt[offset] ^= 1;
+            assert!(CommitmentBlock::decode(&corrupt).is_err());
+        }
+        assert!(CommitmentBlock::decode(&compact).is_err());
+        assert!(CompactBlock::decode(&projected).is_err());
+    }
+}
+#[test]
+fn extra_disclosure_and_missing_commitments_are_rejected() {
+    use siworld_native_wallet_engine::ranges::{DOMAIN, RangeProof};
+    let (_, block) = common::fixture();
+    let mut raw = block.encode().unwrap();
+    raw.drain(145..153);
+    for ranges in [vec![(0, 150)], vec![(0, raw.len())]] {
+        let seed = *blake3::Hasher::new_derive_key(DOMAIN)
+            .update(&raw)
+            .finalize()
+            .as_bytes();
+        let mut bytes = b"SWLT0001".to_vec();
+        bytes.extend(block.nonce.to_le_bytes());
+        bytes.extend(seed);
+        bytes.extend(RangeProof::create(&raw, &ranges).unwrap());
+        assert!(CommitmentBlock::decode(&bytes).is_err());
+    }
+}
+
+#[test]
+fn local_tree_cache_reuses_frontier_and_skips_all_historical_decryption() {
+    use siworld_native_wallet_engine::{history::CommitmentHistory, light::LightWallet};
+    use zeroize::Zeroizing;
+    let (config, first) = common::fixture();
+    let projected = CommitmentBlock::project(&CompactBlock::export(&first).unwrap()).unwrap();
+    let mut history = CommitmentHistory::new(config.clone()).unwrap();
+    history
+        .append(&CommitmentBlock::decode(&projected).unwrap())
+        .unwrap();
+    let saved = history.cache().unwrap();
+    let mut restored = CommitmentHistory::open_local(config.clone(), &saved).unwrap();
+    assert_eq!(restored.cache().unwrap(), saved);
+    let mut born = LightWallet::new(config.clone(), Zeroizing::new([42; 32]), 0).unwrap();
+    born.adopt_history(&restored).unwrap();
+    assert!(
+        born.wallet.receipts().is_empty(),
+        "older owned reward must not be trial-decrypted"
+    );
+    assert!(born.adopt_history(&restored).is_err());
+    let mut second = first.clone();
+    second.height = 2;
+    second.parent = restored.state.tip;
+    second.timestamp = 601;
+    second.rewards[0].commitment = common::digest(800001);
+    second.rewards[0].ciphertext = [0; 1313];
+    let compact = CompactBlock::decode(&CompactBlock::export(&second).unwrap()).unwrap();
+    born.append(&compact).unwrap();
+    restored
+        .append(
+            &CommitmentBlock::decode(
+                &CommitmentBlock::project(&CompactBlock::export(&second).unwrap()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(born.state.tree.root(), restored.state.tree.root());
+    assert_eq!(born.state.tree.count, restored.state.tree.count);
+    assert_eq!(born.state.tip, restored.state.tip);
+    let prior = restored.cache().unwrap();
+    assert!(
+        restored
+            .append(&CommitmentBlock::decode(&projected).unwrap())
+            .is_err()
+    );
+    assert_eq!(
+        restored.cache().unwrap(),
+        prior,
+        "failed header append is atomic"
+    );
+    let mut wrong: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    wrong["root"] = serde_json::json!("00".repeat(48));
+    assert!(
+        CommitmentHistory::open_local(config.clone(), &serde_json::to_vec(&wrong).unwrap())
+            .is_err()
+    );
+    let mut other = config;
+    other.network = [9; 32];
+    assert!(CommitmentHistory::open_local(other, &saved).is_err());
+}

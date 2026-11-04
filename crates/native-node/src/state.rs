@@ -446,6 +446,40 @@ impl CommitmentTree {
         self.root = node;
         Ok(())
     }
+    /// Local cache serialization only; never authenticate a peer-supplied snapshot.
+    pub fn cache_frontier(&self) -> Vec<DigestBytes> {
+        self.frontier.iter().map(encode_digest).collect()
+    }
+    /// The caller must authenticate the cached state independently of these shape checks.
+    pub fn from_local_cache(
+        count: u64,
+        frontier: &[DigestBytes],
+        expected: DigestBytes,
+    ) -> Result<Self, String> {
+        if count >= (1u64 << TREE_DEPTH) || frontier.len() != TREE_DEPTH {
+            return Err("Local tree cache shape limit.".into());
+        }
+        let mut tree = Self::new();
+        tree.frontier = frontier
+            .iter()
+            .map(|v| decode_digest(v).map_err(|_| "Invalid local frontier field.".to_owned()))
+            .collect::<Result<_, _>>()?;
+        let h = Hasher::new();
+        let mut root = tree.zeros[0];
+        for level in 0..TREE_DEPTH {
+            root = if count >> level & 1 == 1 {
+                h.compress(&tree.frontier[level], &root)
+            } else {
+                h.compress(&root, &tree.zeros[level])
+            };
+        }
+        if encode_digest(&root) != expected {
+            return Err("Local frontier root mismatch.".into());
+        }
+        tree.count = count;
+        tree.root = root;
+        Ok(tree)
+    }
     /// Local wallet witness construction; all public commitments must be supplied.
     pub fn path(&self, leaves: &[Digest], index: usize) -> Result<Vec<(Digest, bool)>, String> {
         if leaves.len() as u64 != self.count || index >= leaves.len() {

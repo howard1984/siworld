@@ -45,6 +45,28 @@ impl LightWallet {
         fork.paths = self.paths.clone();
         Ok(fork)
     }
+    /// Adopt a tree built from authenticated history without scanning older ciphertext.
+    pub fn adopt_history(
+        &mut self,
+        history: &crate::history::CommitmentHistory,
+    ) -> Result<(), String> {
+        if self.state.height != 0
+            || !self.wallet.receipts().is_empty()
+            || self.state.config != history.state.config
+        {
+            return Err("Historical tree requires a fresh wallet on the same network.".into());
+        }
+        let state = history.scanner_state()?;
+        let paths = crate::paths::OwnedPaths::from_tree_cache(
+            state.tree.count,
+            &state.tree.cache_frontier(),
+            encode_digest(&state.tree.root()),
+        )?;
+        self.wallet.scan_light_data(&state, &[], &[], false)?;
+        self.state = state;
+        self.paths = paths;
+        Ok(())
+    }
     pub fn retain_prover(&mut self, previous: &mut Self) {
         self.prover = previous.prover.take();
     }
