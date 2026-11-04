@@ -160,3 +160,17 @@ test('history groups reward tranches and keeps each payment and status distinct'
   assert.equal(rows.filter(row => row.direction === 'sent').length, 2);
   assert.equal(rows.find(row => row.title === 'Payment received').amount_atoms, '100');
 });
+
+test('history distinguishes coinbase maturity from scheduled Holder locks', () => {
+  const note = {id: 'a'.repeat(96), block_id: 'b'.repeat(64), height: 1, timestamp: 500, asset: sip,
+    amount_atoms: '100', unlock_height: 25, spent: false, kind: 'mining', awaiting_maturity: true};
+  let rows = transactionRows({height: 24, received_records: [note]});
+  assert.equal(rows[0].status, 'Awaiting maturity');
+  rows = transactionRows({height: 25, received_records: [{...note, awaiting_maturity: false}]});
+  assert.equal(rows[0].status, 'Confirmed');
+  for (const records of [
+    [note, {...note, id: 'c'.repeat(96), unlock_height: 100, awaiting_maturity: false}],
+    [{...note, id: 'c'.repeat(96), unlock_height: 100, awaiting_maturity: false}, note],
+  ]) assert.equal(transactionRows({height: 24, received_records: records})[0].status, 'Locked');
+  assert.equal(transactionRows({height: 24, received_records: [{...note, spent: true}]})[0].status, 'Confirmed');
+});

@@ -13,7 +13,10 @@ export function transactionRows(result) {
     }
     row.amount_atoms = (BigInt(row.amount_atoms) + BigInt(note.amount_atoms)).toString();
     row.notes.push(note);
-    if (!note.spent && note.unlock_height > result.height) row.status = 'Locked';
+    if (!note.spent && note.unlock_height > result.height) {
+      if (!note.awaiting_maturity) row.status = 'Locked';
+      else if (row.status !== 'Locked') row.status = 'Awaiting maturity';
+    }
   }
   const rows = [...grouped.values()];
   for (const payment of result.payments || []) rows.push({

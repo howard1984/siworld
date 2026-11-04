@@ -612,6 +612,17 @@ passphrases or content. A failed save never shows the persisted-result slot.
 
 ## Read-only engineering balance display
 
-The browser lists each locked amount, its consensus unlock height and an estimated date computed by the existing wallet balance logic. Estimated dates do not change height-based spendability, including during ASERT catch-up. After the 24-block maturity height, the corresponding amount becomes available; the four longer Holder tranches retain their individual unlock schedules. The first read-only engineering deployment disables sending through its pinned configuration.
+The browser separates spendable amounts, the first miner reward note awaiting 24-block maturity, and scheduled timelocks. The four longer Holder notes retain separate unlock entries. Only the first miner reward position with the configured maturity offset is classified as awaiting maturity; another output with the same unlock height remains a scheduled lock. Total locked amounts remain available in the local balance response for compatibility. The browser lists each nonspendable amount, its consensus unlock height and an estimated date computed from the accepted header timestamp and target interval. Estimated dates do not change height-based spendability, including during ASERT catch-up. After the 24-block maturity height, the corresponding amount becomes available; the four longer Holder tranches retain their individual unlock schedules. The first read-only engineering deployment disables sending through its pinned configuration.
 
 New wallets cannot expose usable receiving information before the randomized recovery backup challenge succeeds. The UI states that recovery words are the only restoration method and that engineering assets have no monetary value.
+
+During local cache replay and compact scanning, the selected account displays
+the processed height, target height and an estimated remaining duration after
+at least two processed blocks. Estimates use observed processing time and do
+not predict network availability or later chain growth. Progress contains only
+public heights and duration estimates and stays between the worker and page.
+Address creation and copying do not wait for scanning. Until the candidate is
+verified and durably recorded, the interface marks the balance as potentially
+incomplete and keeps sending disabled. Changing or locking the wallet discards
+stale progress messages. This display does not implement birthday selection,
+account discovery, shared scanning or durable receipt-cache pruning.

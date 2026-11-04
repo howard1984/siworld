@@ -197,11 +197,68 @@ impl LightWallet {
     }
     pub fn balance_json(&self) -> Result<String, String> {
         let b = self.wallet.balance_details(&self.state)?;
+        let mut pending = std::collections::BTreeMap::<AssetId, u128>::new();
+        let mut batches = std::collections::BTreeMap::<(u64, AssetId, bool), u128>::new();
+        for receipt in self.wallet.receipts() {
+            let note = receipt.note();
+            if receipt.spent || note.value == 0 || note.unlock_height <= self.state.height {
+                continue;
+            }
+            // Only the first miner reward note uses coinbase maturity. Other
+            // timelocks remain scheduled locks even when their dates coincide.
+            let maturing = receipt.output_index == 3
+                && receipt
+                    .height
+                    .checked_add(self.state.config.economics.maturity)
+                    == Some(note.unlock_height);
+            if maturing {
+                let total = pending.entry(note.asset_id).or_default();
+                *total = total
+                    .checked_add(u128::from(note.value))
+                    .ok_or("Maturing balance overflow.")?;
+            }
+            let total = batches
+                .entry((note.unlock_height, note.asset_id, maturing))
+                .or_default();
+            *total = total
+                .checked_add(u128::from(note.value))
+                .ok_or("Unlock batch overflow.")?;
+        }
         let mut assets = std::collections::BTreeSet::<&AssetId>::new();
         assets.extend(b.available.keys());
         assets.extend(b.locked.keys());
-        Ok(json!({"trust":"header-and-compact-authenticated-full-node-consensus","height":self.state.height,"tip":crate::local::hex(&self.state.tip),"rows":assets.into_iter().map(|a|json!({"asset":crate::local::hex(&a.0),"available_atoms":b.available.get(a).copied().unwrap_or(0).to_string(),"locked_atoms":b.locked.get(a).copied().unwrap_or(0).to_string()})).collect::<Vec<_>>(),
-            "locked_tranches":b.tranches.iter().map(|t|json!({"asset":crate::local::hex(&t.asset.0),"amount_atoms":t.amount.to_string(),"unlock_height":t.unlock_height,"estimated_timestamp":t.estimated_timestamp})).collect::<Vec<_>>()}).to_string())
+        let rows = assets
+            .into_iter()
+            .map(|asset| {
+                let locked = b.locked.get(asset).copied().unwrap_or(0);
+                let maturing = pending.get(asset).copied().unwrap_or(0);
+                let scheduled = locked
+                    .checked_sub(maturing)
+                    .ok_or("Maturing balance exceeds total locks.")?;
+                Ok(json!({"asset":crate::local::hex(&asset.0),
+                "available_atoms":b.available.get(asset).copied().unwrap_or(0).to_string(),
+                "locked_atoms":locked.to_string(), "pending_maturity_atoms":maturing.to_string(),
+                "time_locked_atoms":scheduled.to_string()}))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let tranches = batches
+            .into_iter()
+            .map(|((height, asset, maturing), amount)| {
+                let estimated = height
+                    .checked_sub(self.state.height)
+                    .and_then(|blocks| blocks.checked_mul(self.state.config.target_interval))
+                    .and_then(|seconds| self.state.timestamp().checked_add(seconds));
+                json!({"asset":crate::local::hex(&asset.0), "amount_atoms":amount.to_string(),
+                "unlock_height":height,"estimated_timestamp":estimated,
+                "kind":if maturing {"maturing"} else {"locked"}})
+            })
+            .collect::<Vec<_>>();
+        Ok(
+            json!({"trust":"header-and-compact-authenticated-full-node-consensus",
+            "height":self.state.height,"tip":crate::local::hex(&self.state.tip),
+            "rows":rows, "locked_tranches":tranches})
+            .to_string(),
+        )
     }
     pub fn prepare(
         &mut self,

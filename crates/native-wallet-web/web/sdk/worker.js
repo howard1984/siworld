@@ -49,8 +49,8 @@ async function handle(data) {
       case 'account-select': if (!accounts) throw new Error('Wallet is locked.'); result = selectAccount(args[0]); break;
       case 'inspect': result = await directory.resolve(...args); break;
       case 'register-address': if(!wallet)throw new Error('Wallet is locked.'); result=await directory.publish(JSON.parse(active.public_info()).full_address); break;
-      case 'online-init': if(!wallet)throw new Error('Wallet is locked.'); online=new LightSession(active,args[0]); result=await online.initialize(); break;
-      case 'sync': result=await online.sync(); break;
+      case 'online-init': if(!wallet)throw new Error('Wallet is locked.'); online=new LightSession(active,args[0]); result=await online.initialize(progress=>self.postMessage({id,progress})); break;
+      case 'sync': result=await online.sync(progress=>self.postMessage({id,progress})); break;
       case 'prepare': result=await online.prepare(...args,stage=>self.postMessage({id,progress:stage})); break;
       case 'submit': result=await online.submit(...args); break;
       case 'cancel-payment': result=await online.cancel(...args); break;

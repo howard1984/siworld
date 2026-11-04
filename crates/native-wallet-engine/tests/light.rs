@@ -18,7 +18,7 @@ fn light_balance_lists_each_holder_unlock_and_matures_at_accepted_height() {
     use siworld_native_wallet_engine::wire::RewardRecord;
     let (config, mut block) = common::fixture();
     let wallet = Wallet::from_seed(config.network, Zeroizing::new([42; 32]), 0).unwrap();
-    let heights = [24, 105216, 210408, 315600, 420792];
+    let heights = [25, 105216, 210408, 315600, 420792];
     block.rewards = heights
         .iter()
         .enumerate()
@@ -66,8 +66,21 @@ fn light_balance_lists_each_holder_unlock_and_matures_at_accepted_height() {
             .iter()
             .all(|r| r["estimated_timestamp"].as_u64().is_some() && r["amount_atoms"] == "100")
     );
+    assert_eq!(balance["rows"][0]["available_atoms"], "0");
+    assert_eq!(balance["rows"][0]["pending_maturity_atoms"], "100");
+    assert_eq!(balance["rows"][0]["time_locked_atoms"], "400");
+    assert_eq!(tranches[0]["kind"], "maturing");
+    assert!(tranches[1..].iter().all(|row| row["kind"] == "locked"));
     // Display logic uses accepted height, including during fast ASERT catch-up.
     light.state.height = 24;
+    light
+        .wallet
+        .scan_light_data(&light.state, &[], &[], true)
+        .unwrap();
+    let balance: serde_json::Value = serde_json::from_str(&light.balance_json().unwrap()).unwrap();
+    assert_eq!(balance["rows"][0]["available_atoms"], "0");
+    assert_eq!(balance["rows"][0]["pending_maturity_atoms"], "100");
+    light.state.height = 25;
     light
         .wallet
         .scan_light_data(&light.state, &[], &[], true)
@@ -76,6 +89,21 @@ fn light_balance_lists_each_holder_unlock_and_matures_at_accepted_height() {
     assert_eq!(balance["locked_tranches"].as_array().unwrap().len(), 4);
     assert_eq!(balance["rows"][0]["available_atoms"], "100");
     assert_eq!(balance["rows"][0]["locked_atoms"], "400");
+    assert_eq!(balance["rows"][0]["pending_maturity_atoms"], "0");
+    assert_eq!(balance["rows"][0]["time_locked_atoms"], "400");
+    // A spent maturity note must disappear from all displayed balance buckets.
+    light
+        .state
+        .spent
+        .insert(light.wallet.receipts()[0].nullifier);
+    light
+        .wallet
+        .scan_light_data(&light.state, &[], &[], true)
+        .unwrap();
+    let balance: serde_json::Value = serde_json::from_str(&light.balance_json().unwrap()).unwrap();
+    assert_eq!(balance["rows"][0]["available_atoms"], "0");
+    assert_eq!(balance["rows"][0]["pending_maturity_atoms"], "0");
+    assert_eq!(balance["rows"][0]["time_locked_atoms"], "400");
 }
 #[test]
 fn compact_authenticates_all_positions_and_never_retains_historical_proofs() {

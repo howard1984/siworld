@@ -1,6 +1,11 @@
 import {stored,hash,fetchLimited,readJSON} from './online-storage.js';
 const encode=value=>new TextEncoder().encode(JSON.stringify(value));
 const idPattern=/^[0-9a-f]{64}$/;
+function scanProgress(phase, start, from, height, target) {
+  const completed=height-from, elapsed=performance.now()-start;
+  return {kind:'synchronization', phase, height, target_height:target,
+    eta_seconds:completed>=2?Math.ceil(Math.max(0,target-height)*elapsed/completed/1000):null};
+}
 // Public address publication is explicit and independent of chain synchronization.
 // No wallet object, recovery material or account identifier enters this adapter.
 export class AddressDirectory {
@@ -33,7 +38,7 @@ export class AddressDirectory {
 }
 export class LightSession {
   constructor(wallet,config) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();}
-  async initialize() {
+  async initialize(onProgress=()=>{}) {
     const c=this.config,info=JSON.parse(this.wallet.public_info());
     if(c.name!=='siworld-eng-1'||!c.rules_hex||!idPattern.test(c.genesis)||info.network!==c.network)throw new Error('This build has no pinned siworld-eng-1 light service.');
     const origin=new URL(c.api);if(origin.username||origin.password||origin.search||origin.hash||!(origin.protocol==='https:'||(origin.protocol==='http:'&&origin.hostname==='localhost')))throw new Error('Use the pinned HTTPS engineering service.');
@@ -43,7 +48,7 @@ export class LightSession {
     this.journal=saved?JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(this.wallet.open_local(saved))):{version:1,network:c.network,tip:c.genesis,height:0,payments:[]};
     const j=this.journal;
     if(j.version!==1||j.network!==c.network||!idPattern.test(j.tip)||!Number.isSafeInteger(j.height)||j.height<0||!Array.isArray(j.payments)||j.payments.length>16)throw new Error('Invalid local journal; sending remains paused.');
-    if(j.height)await this.replaySaved();
+    if(j.height)await this.replaySaved(onProgress);
     return this.summary();
   }
   async fresh() {const raw=await stored('private',this.key);if(raw){const current=JSON.parse(new TextDecoder().decode(this.wallet.open_local(raw)));if(JSON.stringify(current)!==JSON.stringify(this.journal))throw new Error('Another tab changed this wallet. Lock and reopen before continuing.');}}
@@ -55,15 +60,17 @@ export class LightSession {
     balance.rows=balance.rows.map(row=>{const amount=row.asset==='0'.repeat(64)?reserved:0n;const mature=BigInt(row.available_atoms);return {...row,mature_atoms:row.available_atoms,reserved_atoms:amount.toString(),available_atoms:(mature>amount?mature-amount:0n).toString()};});
     return {...balance,received_records:JSON.parse(this.wallet.light_history()).map(note=>({...note,timestamp:this.times.get(note.block_id)??null})),ready:this.ready,payments:this.journal.payments.map(p=>({id:p.id,phase:p.phase,amount_atoms:p.amount_atoms,fee_atoms:p.fee_atoms,recipient:p.recipient,statement_id:p.statement_id,created_at:p.created_at??null,confirmed_height:p.confirmed_height??null,confirmed_timestamp:p.confirmed_timestamp??null})),reserved_count:pending.reduce((n,p)=>n+p.inputs.length,0)};
   }
-  async replaySaved() {
+  async replaySaved(onProgress=()=>{}) {
+    const start=performance.now();
+    onProgress(scanProgress('cache',start,0,0,this.journal.height));
     const chain=[];let tip=this.journal.tip;
     for(let height=this.journal.height;height>0;height--){const c=await stored('compact',tip);if(!c||c.height!==height||!idPattern.test(c.parent))throw new Error('Compact cache is incomplete. Restore public history before sending.');chain.push({id:tip,height:c.height,parent:c.parent});tip=c.parent;}
     if(tip!==this.config.genesis)throw new Error('Compact cache has a different genesis.');
     this.wallet.begin_candidate();
-    try{for(const c of chain.reverse()){const record=await stored('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
+    try{for(const c of chain.reverse()){const record=await stored('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);onProgress(scanProgress('cache',start,0,state.height,this.journal.height));}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
   }
   cancelSync() { this.syncController?.abort(new DOMException('Balance synchronization paused for a wallet change.', 'AbortError')); }
-  async sync() {
+  async sync(onProgress=()=>{}) {
     if(this.syncing)throw new Error('A compact synchronization is already running.');this.syncing=true;this.ready=false;
     const controller = this.syncController = new AbortController();
     const signal = timeout => AbortSignal.any([controller.signal, AbortSignal.timeout(timeout)]);
@@ -77,6 +84,8 @@ export class LightSession {
       if(this.journal.height>0&&head.height>this.journal.height){const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${this.journal.height}&limit=1`,{signal:signal(15000)});extension=Array.isArray(page.ids)&&page.ids.length===1&&page.ids[0]===this.journal.tip;}
       if(extension)this.wallet.begin_extension();else this.wallet.begin_candidate();
       let parent=extension?this.journal.tip:this.config.genesis;let previous=extension?this.journal.height:0;let downloaded=0;
+      const start=performance.now(), fromHeight=previous;
+      onProgress(scanProgress('scan',start,fromHeight,previous,head.height));
       const needed=new Set(this.journal.payments.map(p=>p.statement_id));const included=new Map();
       for(let from=previous+1;from<=head.height;) {
         const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${from}&limit=128`,{signal:signal(15000)});
@@ -89,6 +98,7 @@ export class LightSession {
           for(const statement of state.observed_statements||[])if(needed.has(statement))included.set(statement,{height:state.height,timestamp:state.block_timestamp});
           if(state.owned_receipts)this.times.set(id,state.block_timestamp);
           if(!cached)await stored('compact',id,{id,parent,height:state.height,bytes});parent=id;previous=state.height;
+          onProgress(scanProgress('scan',start,fromHeight,previous,head.height));
         }from+=page.ids.length;
       }
       controller.signal.throwIfAborted();

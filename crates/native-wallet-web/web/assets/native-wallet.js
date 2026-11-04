@@ -42,7 +42,13 @@ function startWorker() {
   worker.onerror = () => { for (const request of pending.values()) request.reject(new Error('The local wallet core stopped. Lock and reopen the page.')); pending.clear(); capability(false); message('The local wallet core stopped. Preserve pending payments and reopen the encrypted wallet.', true); };
 }
 function call(action, ...args) {
-  return new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject, onProgress: action === 'prepare' ? stage => proofProgress.stage(stage) : null }); worker.postMessage({ id, action, args, account: info?.account }); });
+  const token=epoch;
+  return new Promise((resolve, reject) => { const id = ++sequence; pending.set(id, { resolve, reject, onProgress: action === 'prepare' ? stage => proofProgress.stage(stage) : ['sync','online-init'].includes(action) ? progress => {
+    if(token!==epoch||progress.kind!=='synchronization')return;
+    const eta=Number.isSafeInteger(progress.eta_seconds)?` · about ${progress.eta_seconds} s remaining`:' · estimating remaining time';
+    $('#chain-status').textContent=`${progress.phase==='cache'?'Reopening verified local cache':'Scanning public compact data'} · block ${progress.height} of ${progress.target_height}${eta} · Balance may be incomplete.`;
+    $('#send-open').disabled=true;
+  } : null }); worker.postMessage({ id, action, args, account: info?.account }); });
 }
 function clearSecrets() {
   for (const input of flow.querySelectorAll('input[type=password], #restore-words, #answers input')) input.value = '';
@@ -262,9 +268,9 @@ function atoms(text){const n=BigInt(text||'0');return `${n/100000000n}.${(n%1000
 function desktopSend(){return ENGINEERING.read_only!==true&&ENGINEERING.desktop_send_measured===true&&!navigator.userAgentData?.mobile&&!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)&&navigator.maxTouchPoints===0;}
 function showBalance(result,stale=false){
  walletList.balance(info.account,result); history.set(result);
- const tranches=result.locked_tranches||[];$('#locked-notes').hidden=tranches.length===0;$('#locked-note-list').replaceChildren(...tranches.map(tranche=>{const p=document.createElement('p');const estimated=tranche.estimated_timestamp===null||tranche.estimated_timestamp===undefined?null:new Date(tranche.estimated_timestamp*1000);p.textContent=`${atoms(tranche.amount_atoms)} ${tranche.asset==='0'.repeat(64)?'SIP':'asset '+tranche.asset.slice(0,12)+'…'} · unlock height ${tranche.unlock_height} · ${estimated&&!Number.isNaN(estimated.valueOf())?'estimated '+estimated.toLocaleDateString():'date unavailable'}`;return p;}));
+ const tranches=result.locked_tranches||[];$('#locked-notes').hidden=tranches.length===0;$('#locked-note-list').replaceChildren(...tranches.map(tranche=>{const p=document.createElement('p');const estimated=tranche.estimated_timestamp===null||tranche.estimated_timestamp===undefined?null:new Date(tranche.estimated_timestamp*1000);p.textContent=`${tranche.kind==='maturing'?'Awaiting 24-block maturity':'Scheduled lock'} · ${atoms(tranche.amount_atoms)} ${tranche.asset==='0'.repeat(64)?'SIP':'asset '+tranche.asset.slice(0,12)+'…'} · unlock height ${tranche.unlock_height} · ${estimated&&!Number.isNaN(estimated.valueOf())?'estimated '+estimated.toLocaleDateString():'date unavailable'}`;return p;}));
  const sip=result.rows.find(row=>row.asset==='0'.repeat(64));$('#balance-value').textContent=atoms(sip?.available_atoms);
- $('#balance-detail').textContent=`Mature ${atoms(sip?.mature_atoms)} SIP · locked ${atoms(sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · ${result.payments?.filter(p=>p.phase==='pending'||p.phase==='unknown').length||0} pending or uncertain payments`;
+ $('#balance-detail').textContent=`Available before reservations ${atoms(sip?.mature_atoms)} SIP · awaiting maturity ${atoms(sip?.pending_maturity_atoms)} SIP · locked ${atoms(sip?.time_locked_atoms??sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · ${result.payments?.filter(p=>p.phase==='pending'||p.phase==='unknown').length||0} pending or uncertain payments`;
  $('#chain-status').textContent=`${stale?'Stale · ':''}siworld-eng-1 · height ${result.height} · ${result.tip.slice(0,16)}… · transactions trust full-node consensus`;
  $('#send-open').disabled=stale||!result.ready||!desktopSend();
  $('#asset-balances').replaceChildren(...result.rows.filter(r=>r.asset!=='0'.repeat(64)).map(row=>{const p=document.createElement('p');p.textContent=`Asset ${row.asset.slice(0,12)}… · available ${row.available_atoms} atoms · locked ${row.locked_atoms} atoms`;return p;}));

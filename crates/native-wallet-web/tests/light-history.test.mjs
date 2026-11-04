@@ -25,7 +25,8 @@ test('private history scans real fixture receipts and isolates derived accounts'
     assert.ok(history.length > 0);
     assert.ok(history.every(row => row.amount_atoms !== '0' && Number.isSafeInteger(row.height)));
     assert.ok(history.some(row => row.kind === 'mining'));
-    for (const row of history) assert.deepEqual(Object.keys(row).sort(), ['amount_atoms', 'asset', 'block_id', 'height', 'id', 'kind', 'spent', 'unlock_height']);
+    assert.ok(history.every(row => typeof row.awaiting_maturity === 'boolean'));
+    for (const row of history) assert.deepEqual(Object.keys(row).sort(), ['amount_atoms', 'asset', 'awaiting_maturity', 'block_id', 'height', 'id', 'kind', 'spent', 'unlock_height']);
     assert.deepEqual(JSON.parse(other.light_history()), []);
     const before = wallet.light_history();
     wallet.begin_extension(); assert.throws(() => wallet.append_compact(bytes), /continuity/); wallet.abort_candidate();
@@ -50,6 +51,7 @@ async function interruptedSync(stage, accepted = false) {
   const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
   const started = deferred();
   let requestSignal, persisted = 0;
+  const progress = [];
   const wallet = BrowserWallet.restore(config.network, 0, config.words);
   const session = new LightSession(wallet, config);
   wallet.enable_light(config.rules_hex, config.genesis);
@@ -75,7 +77,7 @@ async function interruptedSync(stage, accepted = false) {
     return waitingResponse(requestSignal);
   };
   try {
-    const syncing = session.sync();
+    const syncing = session.sync(update => progress.push(update));
     const rejected = assert.rejects(syncing, error => error.name === 'AbortError');
     await started.promise;
     session.cancelSync();
@@ -86,6 +88,9 @@ async function interruptedSync(stage, accepted = false) {
     assert.equal(session.syncController, null);
     assert.equal(session.journal, journal);
     assert.equal(persisted, 0);
+    assert.equal(progress.length, stage === 'chain' ? 1 : 0);
+    if (progress.length) assert.deepEqual(progress[0], {kind: 'synchronization', phase: 'scan',
+      height: 0, target_height: 1, eta_seconds: null});
     assert.equal(JSON.parse(wallet.light_balance()).height, journal.height);
     assert.equal(wallet.light_history(), previousHistory);
     // The aborted candidate must not prevent the accepted chain from syncing again.
@@ -108,4 +113,58 @@ test('wallet changes discard a candidate waiting for the chain index and allow r
 });
 test('interrupting a later synchronization preserves accepted reward receipts', async () => {
   await interruptedSync('head', true);
+});
+
+test('authenticated scan progress keeps sending paused until candidate persistence', async () => {
+  const savedFetch = globalThis.fetch, savedDB = globalThis.indexedDB;
+  const savedNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const values = new Map(), progress = [];
+  const database = {close() {}, transaction() {
+    const tx = {objectStore() {return {
+      get(key) {return operation(values.get(key));},
+      put(value, key) {values.set(key, value); return operation(key);},
+    };}};
+    function operation(value) {
+      const request = {};
+      queueMicrotask(() => {request.result = value; request.onsuccess(); tx.oncomplete();});
+      return request;
+    }
+    return tx;
+  }};
+  globalThis.indexedDB = {open() {
+    const request = {}; queueMicrotask(() => {request.result = database; request.onsuccess();});
+    return request;
+  }};
+  Object.defineProperty(globalThis, 'navigator', {configurable: true, value: {locks: {
+    request(_name, options, action) {options.signal.throwIfAborted(); return action();}
+  }}});
+  const wallet = BrowserWallet.restore(config.network, 0, config.words);
+  wallet.enable_light(config.rules_hex, config.genesis);
+  const session = new LightSession(wallet, config);
+  Object.assign(session, {base: 'https://wallet.invalid/api', key: 'synthetic-progress',
+    journal: {version: 1, network: config.network, tip: config.genesis, height: 0, payments: []}});
+  session.fresh = async () => {};
+  session.persist = async next => {
+    assert.equal(session.ready, false);
+    assert.equal(JSON.parse(wallet.light_balance()).height, 0);
+    session.journal = next;
+  };
+  globalThis.fetch = async url => {
+    if (url.endsWith('/head')) return Response.json({network: config.network, genesis: config.genesis,
+      height: 1, tip: config.rows[0].block_id});
+    if (url.includes('/chain?')) return Response.json({ids: [config.rows[0].block_id]});
+    assert.ok(url.endsWith('/compact/' + config.rows[0].block_id));
+    return new Response(bytes);
+  };
+  try {
+    const result = await session.sync(update => {assert.equal(session.ready, false); progress.push(update);});
+    assert.equal(result.ready, true); assert.equal(result.height, 1);
+    assert.deepEqual(progress.map(update => [update.height, update.target_height]), [[0, 1], [1, 1]]);
+    assert.ok(progress.every(update => update.eta_seconds === null));
+    assert.ok(progress.every(update => Object.keys(update).sort().join() === 'eta_seconds,height,kind,phase,target_height'));
+  } finally {
+    wallet.free(); globalThis.fetch = savedFetch; globalThis.indexedDB = savedDB;
+    if (savedNavigator) Object.defineProperty(globalThis, 'navigator', savedNavigator);
+    else delete globalThis.navigator;
+  }
 });

@@ -286,6 +286,11 @@ impl BrowserWallet {
                         "height":receipt.height, "asset":hex(&receipt.note().asset_id.0),
                         "amount_atoms":receipt.note().value.to_string(),
                         "unlock_height":receipt.note().unlock_height,
+                        "awaiting_maturity":!receipt.spent
+                            && receipt.output_index == 3
+                            && receipt.note().unlock_height > light.state.height
+                            && receipt.height.checked_add(light.state.config.economics.maturity)
+                                == Some(receipt.note().unlock_height),
                         "spent":receipt.spent,
                         "kind":if receipt.output_index == 0 { "received" }
                             else if receipt.output_index < 8 { "mining" } else { "allocation" },
