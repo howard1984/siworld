@@ -345,6 +345,31 @@ fn synthetic_fund_keys() -> Vec<[u8; crate::fund_spend::VERIFYING_KEY_BYTES]> {
     .clone()
 }
 
+/// Borrowed proof input assembled from an independently checked snapshot.
+pub struct TransactionProof<'a> {
+    public: PublicTransaction,
+    context: ProofContext,
+    fee: Digest,
+    root: Digest,
+    proof: &'a [u8],
+}
+
+fn verify_bounded<T: Sync>(
+    values: &[T],
+    verify: impl Fn(&T) -> Result<(), String> + Sync,
+) -> Result<(), String> {
+    use rayon::prelude::*;
+    // Bound simultaneous proof decoders independently of the pool size. Keep
+    // errors in canonical input order and stop before starting another batch.
+    for batch in values.chunks(4) {
+        let results: Vec<_> = batch.par_iter().map(&verify).collect();
+        for result in results {
+            result?;
+        }
+    }
+    Ok(())
+}
+
 pub trait BlockVerifier {
     /// Proof validity only; State independently checks the signed declaration,
     /// destination-bound fee output, uniqueness and commitment insertion.
@@ -359,6 +384,18 @@ pub trait BlockVerifier {
         root: &Digest,
         proof: &[u8],
     ) -> Result<(), String>;
+    fn transactions(&self, proofs: &[TransactionProof<'_>]) -> Result<(), String> {
+        for proof in proofs {
+            self.transaction(
+                &proof.public,
+                &proof.context,
+                &proof.fee,
+                &proof.root,
+                proof.proof,
+            )?;
+        }
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn settlement(
         &self,
@@ -371,6 +408,17 @@ pub trait BlockVerifier {
     ) -> Result<(), String>;
 }
 impl BlockVerifier for NativeVerifier {
+    fn transactions(&self, proofs: &[TransactionProof<'_>]) -> Result<(), String> {
+        verify_bounded(proofs, |proof| {
+            self.verify_transaction(
+                &proof.public,
+                &proof.context,
+                &proof.fee,
+                &proof.root,
+                proof.proof,
+            )
+        })
+    }
     fn issuance(&self, record: &crate::issuance::IssuanceRecord) -> Result<(), String> {
         self.verify_issuance(record)
     }
@@ -655,6 +703,7 @@ impl State {
         let mut leaves = Vec::new();
         let mut fees = Vec::with_capacity(MAX_SLOTS);
         let mut trial_tree = self.tree.clone();
+        let mut transaction_proofs = Vec::with_capacity(block.transactions.len());
         for tx in &block.transactions {
             let snapshot = self.snapshot(tx.record.snapshot)?;
             let root =
@@ -682,9 +731,16 @@ impl State {
                 tx.record.snapshot.height,
                 tx.record.snapshot.block_id,
             );
-            verifier.transaction(&public, &context, &fee, &root, &tx.proof)?;
+            transaction_proofs.push(TransactionProof {
+                public,
+                context,
+                fee,
+                root,
+                proof: &tx.proof,
+            });
             fees.push(fee);
         }
+        verifier.transactions(&transaction_proofs)?;
         let mut trial_assets = self.assets.clone();
         if let Some(policy) = &self.config.issuance {
             if block.issuances.len() > usize::from(policy.max_per_block) {

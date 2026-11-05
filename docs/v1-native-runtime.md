@@ -98,6 +98,13 @@ configured, backed-up recipient wallet; receipts do not replace its seed
 backup. The separate wallet API does not establish protected durable wallet
 recovery merely by accepting a recipient address.
 
+Native transaction proof verification uses batches of at most four concurrent
+decoders. Replay still validates every stored proof through the same transition
+used for production. Snapshot lookup, input/output reuse checks, commitment-tree
+updates, economic state and settlement verification remain sequential. Batch
+errors are reported in canonical transaction order. This does not introduce a
+checkpoint startup path or replace validation with a stored fingerprint.
+
 ## Fixed-profile measurement evidence
 
 The following measurements use source revision

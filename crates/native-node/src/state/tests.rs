@@ -97,6 +97,100 @@ fn producer_and_validator_apply_the_same_transition() {
         u128::from(siworld_core::v1_economics::INITIAL_REWARD)
     );
 }
+
+#[test]
+fn every_transaction_position_rejects_invalid_proofs_without_state_changes() {
+    let initial = State::new(Config::development([91; 32], 0).unwrap()).unwrap();
+    let valid = candidate(&initial, 910000);
+    for index in 0..valid.transactions.len() {
+        let mut block = valid.clone();
+        block.transactions[index].proof = vec![0];
+        let mut state = initial.clone();
+        let before = state.fingerprint();
+        assert!(
+            state.apply(&block, &TestVerifier).is_err(),
+            "position {index}"
+        );
+        assert_eq!(state.fingerprint(), before);
+        assert_eq!(state.height, 0);
+    }
+}
+
+#[test]
+fn bounded_verification_preserves_error_order_and_worker_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let active = AtomicUsize::new(0);
+    let maximum = AtomicUsize::new(0);
+    let visited = AtomicUsize::new(0);
+    let values: Vec<_> = (0..17).collect();
+    let result = verify_bounded(&values, |value| {
+        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(count, Ordering::SeqCst);
+        visited.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        active.fetch_sub(1, Ordering::SeqCst);
+        match value {
+            1 => Err("first rejection".into()),
+            3 => Err("later rejection".into()),
+            _ => Ok(()),
+        }
+    });
+    assert_eq!(result, Err("first rejection".into()));
+    assert_eq!(visited.load(Ordering::SeqCst), 4);
+    assert!((1..=4).contains(&maximum.load(Ordering::SeqCst)));
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(verify_bounded(&values, |_| Ok(())).is_ok());
+}
+
+#[test]
+#[ignore = "explicit real-proof batch compatibility and timing check"]
+fn real_proof_batch_matches_serial_and_rejects_changed_context() {
+    let witness = native::multi_asset::sample_empty_witness(602);
+    let fields = witness.slot.public_inputs(&Hasher::new());
+    let mut body = [0; native::codec::PUBLIC_TRANSACTION_BYTES];
+    for (index, value) in fields.nf.iter().chain(&fields.cm_out).enumerate() {
+        body[index * 48..(index + 1) * 48].copy_from_slice(&encode_digest(value));
+    }
+    let public = PublicTransaction::decode(&body).unwrap();
+    let context = ProofContext::for_snapshot([6; 32], 600, [7; 32]);
+    let fee = Hasher::new().fee_commit(0, &witness.slot.fee_blind);
+    let root = witness.anchors_root(&Hasher::new());
+    let prover = crate::proofs::NativeProver::new().unwrap();
+    let proof = prover.transaction(&witness, &public, &context).unwrap();
+    let verifier = NativeVerifier::new().unwrap();
+    let mut proofs: Vec<_> = (0..8)
+        .map(|_| TransactionProof {
+            public: public.clone(),
+            context: ProofContext::for_snapshot([6; 32], 600, [7; 32]),
+            fee,
+            root,
+            proof: &proof,
+        })
+        .collect();
+    let start = std::time::Instant::now();
+    for item in &proofs {
+        verifier
+            .transaction(
+                &item.public,
+                &item.context,
+                &item.fee,
+                &item.root,
+                item.proof,
+            )
+            .unwrap();
+    }
+    let serial = start.elapsed();
+    let start = std::time::Instant::now();
+    verifier.transactions(&proofs).unwrap();
+    let parallel = start.elapsed();
+    eprintln!(
+        "verified_batch=8 serial_ms={} parallel_ms={}",
+        serial.as_millis(),
+        parallel.as_millis()
+    );
+    proofs[7].context = ProofContext::for_snapshot([6; 32], 600, [8; 32]);
+    assert!(verifier.transactions(&proofs).is_err());
+}
 #[test]
 fn every_public_mutation_failure_is_atomic() {
     let initial = State::new(Config::development([2; 32], 0).unwrap()).unwrap();

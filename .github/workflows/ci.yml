@@ -385,6 +385,8 @@ jobs:
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway
       - name: Actual fixed-profile transaction and settlement mutation rejection
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib proofs::tests::fixed_profiles_roundtrip_rejects_context_and_body_mutation -- --ignored --exact
+      - name: Bounded parallel verification with real proof and context rejection
+        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib state::tests::real_proof_batch_matches_serial_and_rejects_changed_context -- --ignored --exact --nocapture
       - name: Actual wallet transfer proof, admission and receiver authentication
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib wallet::tests::actual_native_wallet_proof_passes_admission_and_recipient_authentication -- --ignored --exact
       - name: Actual issuance block, durable registry and seed-wallet rescan
