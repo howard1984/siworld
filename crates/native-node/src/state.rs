@@ -358,11 +358,10 @@ fn verify_bounded<T: Sync>(
     values: &[T],
     verify: impl Fn(&T) -> Result<(), String> + Sync,
 ) -> Result<(), String> {
-    use rayon::prelude::*;
     // Bound simultaneous proof decoders independently of the pool size. Keep
     // errors in canonical input order and stop before starting another batch.
     for batch in values.chunks(4) {
-        let results: Vec<_> = batch.par_iter().map(&verify).collect();
+        let results = crate::transaction_proof_results(batch, &verify);
         for result in results {
             result?;
         }

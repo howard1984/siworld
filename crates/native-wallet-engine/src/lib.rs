@@ -1,4 +1,13 @@
 //! Browser adapter reusing native formats and frozen proof code.
+
+// The portable adapter shares state validation without requiring a native pool.
+pub(crate) fn transaction_proof_results<T: Sync>(
+    values: &[T],
+    verify: &(impl Fn(&T) -> Result<(), String> + Sync),
+) -> Vec<Result<(), String>> {
+    values.iter().map(verify).collect()
+}
+
 #[path = "../../native-node/src/audit.rs"]
 pub mod audit;
 #[path = "../../native-node/src/fund_spend.rs"]

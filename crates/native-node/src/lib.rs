@@ -16,6 +16,14 @@ pub mod state;
 pub mod store;
 pub mod wire;
 
+pub(crate) fn transaction_proof_results<T: Sync>(
+    values: &[T],
+    verify: &(impl Fn(&T) -> Result<(), String> + Sync),
+) -> Vec<Result<(), String>> {
+    use rayon::prelude::*;
+    values.par_iter().map(verify).collect()
+}
+
 pub mod admission;
 pub mod audit;
 pub mod chain;
