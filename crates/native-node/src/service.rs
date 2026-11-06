@@ -11,7 +11,9 @@ use crate::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -69,6 +71,10 @@ fn private(metadata: &fs::Metadata) -> bool {
     }
 }
 fn check_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        siworld_miner_platform::Directory::open(path)?.check()?;
+    }
     let meta = fs::symlink_metadata(path).map_err(|_| "service directory unavailable")?;
     if !meta.is_dir() || meta.file_type().is_symlink() || !private(&meta) {
         return Err("service directory must be real and private".into());
@@ -76,65 +82,108 @@ fn check_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 fn create_directory(path: &Path) -> Result<(), String> {
-    let mut options = fs::DirBuilder::new();
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::DirBuilderExt;
-        options.mode(0o700);
+        if path
+            .try_exists()
+            .map_err(|_| "service directory unavailable")?
+        {
+            return check_directory(path);
+        }
+        return siworld_miner_platform::Directory::create(path)?.check();
     }
-    match options.create(path) {
-        Ok(()) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-        Err(_) => return Err("private service directory creation failed".into()),
+    #[cfg(not(windows))]
+    {
+        let mut options = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            options.mode(0o700);
+        }
+        match options.create(path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(_) => return Err("private service directory creation failed".into()),
+        }
+        check_directory(path)
     }
-    check_directory(path)
 }
 fn new_file(path: &Path) -> Result<File, String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        return siworld_miner_platform::create_private(path);
     }
-    options
-        .open(path)
-        .map_err(|_| "refusing to overwrite service evidence".into())
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .map_err(|_| "refusing to overwrite service evidence".into())
+    }
 }
 fn checked_file(path: &Path, write: bool, max: u64) -> Result<File, String> {
-    let before = fs::symlink_metadata(path).map_err(|_| "private service file unavailable")?;
-    if !before.is_file()
-        || before.file_type().is_symlink()
-        || !private(&before)
-        || before.len() > max
+    #[cfg(windows)]
     {
-        return Err("invalid private service file".into());
+        let file = siworld_miner_platform::read_private(path, write)?;
+        if file
+            .metadata()
+            .map_err(|_| "private metadata unavailable")?
+            .len()
+            > max
+        {
+            return Err("private file size limit".into());
+        }
+        return Ok(file);
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(write)
-        .open(path)
-        .map_err(|_| "private service file open failed")?;
-    let opened = file
-        .metadata()
-        .map_err(|_| "private service file metadata unavailable")?;
-    let after =
-        fs::symlink_metadata(path).map_err(|_| "private service file changed while opening")?;
-    if !same_file(&before, &opened)
-        || !same_file(&opened, &after)
-        || !after.is_file()
-        || after.file_type().is_symlink()
-        || !private(&opened)
-        || opened.len() > max
+    #[cfg(not(windows))]
     {
-        return Err("private service file changed while opening".into());
+        let before = fs::symlink_metadata(path).map_err(|_| "private service file unavailable")?;
+        if !before.is_file()
+            || before.file_type().is_symlink()
+            || !private(&before)
+            || before.len() > max
+        {
+            return Err("invalid private service file".into());
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(write)
+            .open(path)
+            .map_err(|_| "private service file open failed")?;
+        let opened = file
+            .metadata()
+            .map_err(|_| "private service file metadata unavailable")?;
+        let after =
+            fs::symlink_metadata(path).map_err(|_| "private service file changed while opening")?;
+        if !same_file(&before, &opened)
+            || !same_file(&opened, &after)
+            || !after.is_file()
+            || after.file_type().is_symlink()
+            || !private(&opened)
+            || opened.len() > max
+        {
+            return Err("private service file changed while opening".into());
+        }
+        Ok(file)
     }
-    Ok(file)
 }
 fn sync_directory(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|_| "service directory durability failed".into())
+    #[cfg(windows)]
+    {
+        return check_directory(path);
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+            .and_then(|f| f.sync_all())
+            .map_err(|_| "service directory durability failed".into())
+    }
 }
 fn json_bytes(value: &Value) -> Result<Vec<u8>, String> {
     let mut bytes = serde_json::to_vec(value).map_err(|_| "service JSON encoding failed")?;
@@ -351,6 +400,7 @@ impl Status {
     }
 }
 
+#[cfg(not(windows))]
 fn remove_owned_temporary(path: &Path, identity: &fs::Metadata) {
     if let Ok(current) = fs::symlink_metadata(path)
         && current.is_file()
@@ -364,54 +414,66 @@ fn remove_owned_temporary(path: &Path, identity: &fs::Metadata) {
 /// Replace only a private regular destination, using a unique owned temporary.
 /// Failure removes that temporary only and preserves pre-existing evidence.
 pub fn atomic_json(destination: &Path, value: &Value) -> Result<(), String> {
-    let parent = destination
-        .parent()
-        .ok_or("service export requires a parent directory")?;
-    check_directory(parent)?;
-    let previous = match fs::symlink_metadata(destination) {
-        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() && private(&meta) => {
-            Some(meta)
-        }
-        Ok(_) => return Err("invalid existing service export".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Err("service export metadata unavailable".into()),
-    };
-    let bytes = json_bytes(value)?;
-    let mut entropy = [0; 16];
-    getrandom::fill(&mut entropy).map_err(|_| "OS entropy unavailable for atomic export")?;
-    let temporary = parent.join(format!(".native-status-{}.tmp", local::hex(&entropy)));
-    let mut file = new_file(&temporary)?;
-    let temporary_identity = file
-        .metadata()
-        .map_err(|_| "atomic export temporary metadata failed")?;
-    let result = (|| {
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "atomic service export durability failed")?;
-        match (previous.as_ref(), fs::symlink_metadata(destination)) {
-            (Some(before), Ok(after))
-                if same_file(before, &after)
-                    && after.is_file()
-                    && !after.file_type().is_symlink() => {}
-            (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (),
-            _ => return Err("service export destination changed".into()),
-        }
-        let current =
-            fs::symlink_metadata(&temporary).map_err(|_| "atomic export temporary changed")?;
-        if !current.is_file()
-            || current.file_type().is_symlink()
-            || !same_file(&temporary_identity, &current)
-        {
-            return Err("atomic export temporary changed".into());
-        }
-        fs::rename(&temporary, destination)
-            .map_err(|_| "atomic service export replacement failed")?;
-        sync_directory(parent)
-    })();
-    if result.is_err() {
-        remove_owned_temporary(&temporary, &temporary_identity);
+    #[cfg(windows)]
+    {
+        let parent = destination.parent().ok_or("export parent required")?;
+        let name = destination
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or("export filename required")?;
+        return siworld_miner_platform::Directory::open(parent)?.replace(name, &json_bytes(value)?);
     }
-    result
+    #[cfg(not(windows))]
+    {
+        let parent = destination
+            .parent()
+            .ok_or("service export requires a parent directory")?;
+        check_directory(parent)?;
+        let previous = match fs::symlink_metadata(destination) {
+            Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() && private(&meta) => {
+                Some(meta)
+            }
+            Ok(_) => return Err("invalid existing service export".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("service export metadata unavailable".into()),
+        };
+        let bytes = json_bytes(value)?;
+        let mut entropy = [0; 16];
+        getrandom::fill(&mut entropy).map_err(|_| "OS entropy unavailable for atomic export")?;
+        let temporary = parent.join(format!(".native-status-{}.tmp", local::hex(&entropy)));
+        let mut file = new_file(&temporary)?;
+        let temporary_identity = file
+            .metadata()
+            .map_err(|_| "atomic export temporary metadata failed")?;
+        let result = (|| {
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "atomic service export durability failed")?;
+            match (previous.as_ref(), fs::symlink_metadata(destination)) {
+                (Some(before), Ok(after))
+                    if same_file(before, &after)
+                        && after.is_file()
+                        && !after.file_type().is_symlink() => {}
+                (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => (),
+                _ => return Err("service export destination changed".into()),
+            }
+            let current =
+                fs::symlink_metadata(&temporary).map_err(|_| "atomic export temporary changed")?;
+            if !current.is_file()
+                || current.file_type().is_symlink()
+                || !same_file(&temporary_identity, &current)
+            {
+                return Err("atomic export temporary changed".into());
+            }
+            fs::rename(&temporary, destination)
+                .map_err(|_| "atomic service export replacement failed")?;
+            sync_directory(parent)
+        })();
+        if result.is_err() {
+            remove_owned_temporary(&temporary, &temporary_identity);
+        }
+        result
+    }
 }
 pub fn write_run_receipt(directory: &Path, identity: &RunIdentity) -> Result<(), String> {
     check_directory(directory)?;
@@ -540,6 +602,8 @@ struct Control {
     sequence: AtomicU64,
     failed: AtomicBool,
     shutdown: AtomicBool,
+    #[cfg_attr(not(feature = "native-p2p"), allow(dead_code))]
+    private_miner_view: bool,
 }
 impl Control {
     fn sequence(&self) -> Result<u64, String> {
@@ -916,7 +980,7 @@ pub fn run(directory: &Path) -> Result<(), String> {
     let rayon = std::env::var("RAYON_NUM_THREADS").ok();
     let hiding = std::env::var("SIWORLD_COMPOSITION_HIDING_WORKERS").ok();
     check_workers(rayon.as_deref(), hiding.as_deref())?;
-    run_controlled(directory, &config, None, |control| {
+    run_controlled(directory, &config, None, false, |control| {
         continuous(directory, control)
     })
 }
@@ -925,6 +989,20 @@ pub fn run(directory: &Path) -> Result<(), String> {
 /// public-network activation remain unavailable.
 #[cfg(feature = "native-p2p")]
 pub fn run_network(directory: &Path, peer_file: &Path) -> Result<(), String> {
+    run_network_mode(directory, peer_file, false)
+}
+
+/// Local CLI presentation is isolated from the ordinary monitoring export.
+#[cfg(feature = "native-p2p")]
+pub fn run_cli_miner(directory: &Path, peer_file: &Path) -> Result<(), String> {
+    run_network_mode(directory, peer_file, true)
+}
+#[cfg(feature = "native-p2p")]
+fn run_network_mode(
+    directory: &Path,
+    peer_file: &Path,
+    private_miner_view: bool,
+) -> Result<(), String> {
     let _lease = Lease::acquire(directory)?;
     let config = local::load(directory)?;
     let binding = crate::p2p::Binding::new(&config);
@@ -935,6 +1013,9 @@ pub fn run_network(directory: &Path, peer_file: &Path) -> Result<(), String> {
         .map_err(|_| "local descriptor unavailable")?
         .fingerprint();
     let peers = network::Configuration::load(directory, peer_file, binding, local_id)?;
+    if private_miner_view && (!peers.mining_enabled() || peers.listening_enabled()) {
+        return Err("CLI miner requires outbound-only mining configuration".into());
+    }
     if peers.mining_enabled() {
         if config.fund_allocation.is_none() || config.fixture {
             return Err(
@@ -950,15 +1031,20 @@ pub fn run_network(directory: &Path, peer_file: &Path) -> Result<(), String> {
         )?;
     }
     let digest = peers.digest().to_owned();
-    run_controlled(directory, &config, Some(digest), |control| {
-        network::continuous(directory, control, peers)
-    })
+    run_controlled(
+        directory,
+        &config,
+        Some(digest),
+        private_miner_view,
+        |control| network::continuous(directory, control, peers),
+    )
 }
 
 fn run_controlled(
     directory: &Path,
     config: &crate::state::Config,
     peer_digest: Option<String>,
+    private_miner_view: bool,
     action: impl FnOnce(&Arc<Control>) -> Result<(), String> + Send,
 ) -> Result<(), String> {
     let binary = std::env::current_exe().map_err(|_| "running binary identity unavailable")?;
@@ -979,6 +1065,7 @@ fn run_controlled(
         sequence: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
+        private_miner_view,
     });
     let export_control = Arc::clone(&control);
     let export_thread = std::thread::spawn(move || exporter(export_control));

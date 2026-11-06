@@ -28,7 +28,7 @@ DOCUMENTS = {
     "v1-protocol-byte-compatibility.md",
     "v1-native-identity.md", "v1-hybrid-handshake.md", "v1-wallet-storage.md",
     "v1-offline-fund-keys.md",
-    "v1-browser-wallet.md",
+    "v1-browser-wallet.md", "windows-native-miner.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
@@ -44,8 +44,10 @@ CRATES = {
     "core", "crypto", "poseidon2", "state", "circuits", "consensus",
     "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset", "fund-keytool",
     "native-wallet-core", "native-wallet-web", "native-wallet-engine",
+    "miner-cli", "miner-launcher", "miner-platform",
 }
 PUBLIC_TEXT_ASSETS = {
+    "crates/miner-cli/help.txt",
     "crates/native-wallet-web/web/sdk/commitment-session.js",
     "crates/native-wallet-web/tests/commitment-session.test.mjs",
     "crates/native-wallet-web/tests/shared-history.browser.mjs",

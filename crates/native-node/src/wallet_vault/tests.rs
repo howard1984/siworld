@@ -14,7 +14,10 @@ impl Temporary {
             std::process::id(),
             NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
         ));
+        #[cfg(not(windows))]
         std::fs::create_dir(&path).unwrap();
+        #[cfg(windows)]
+        siworld_miner_platform::Directory::create(&path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -466,6 +469,7 @@ fn missing_corrupt_or_different_account_journal_never_resets_to_empty() {
     assert!(WalletVault::open(&other, NETWORK, PASSWORD).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn deleted_live_lock_is_not_recreated_and_owner_cannot_continue() {
     let directory = Temporary::new();
@@ -782,4 +786,17 @@ fn idempotent_reservation_rechecks_durable_file_and_poisoning_cannot_be_cleared_
     assert!(wallet.reserve_payment(record).is_err());
     std::fs::write(&path, original).unwrap();
     assert!(wallet.reserve_payment(record).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn live_windows_wallet_lock_cannot_be_deleted_or_replaced() {
+    let directory = Temporary::new();
+    let wallet =
+        WalletVault::restore(&directory.wallet(), NETWORK, 0, zero_words(), PASSWORD).unwrap();
+    let lock = directory.wallet().join(".wallet.lock");
+    assert!(std::fs::remove_file(&lock).is_err());
+    assert!(std::fs::rename(&lock, directory.wallet().join("renamed.lock")).is_err());
+    assert!(wallet.keys().is_ok());
+    assert!(WalletVault::open(&directory.wallet(), NETWORK, PASSWORD).is_err());
 }

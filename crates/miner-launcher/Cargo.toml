@@ -1,0 +1,22 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "siworld-miner-launcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+description = "Baseline CPU admission for the Windows native miner"
+
+[[bin]]
+name = "siworld-miner"
+path = "src/main.rs"
+
+[dependencies]
+siworld-miner-platform = { path = "../miner-platform" }
+sha2 = "=0.10.9"
+
+[lints.rust]
+unsafe_code = "forbid"

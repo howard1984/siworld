@@ -1,7 +1,9 @@
 //! Write-once local configuration and protected engineering reward receipts.
 use crate::state::Config;
 use crate::wire::Hash;
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -13,6 +15,10 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn check_directory(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        siworld_miner_platform::Directory::open(path)?.check()?;
+    }
     let meta = fs::symlink_metadata(path).map_err(|_| "engineering directory unavailable")?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         return Err("expected a real engineering directory".into());
@@ -38,6 +44,18 @@ fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     }
 }
 pub(crate) fn regular_read(path: &Path, private: bool, max: usize) -> Result<File, String> {
+    #[cfg(windows)]
+    if private {
+        let file = siworld_miner_platform::read_private(path, false)?;
+        let length = file
+            .metadata()
+            .map_err(|_| "private file metadata unavailable")?
+            .len();
+        if length == 0 || length > max as u64 {
+            return Err("invalid private file length".into());
+        }
+        return Ok(file);
+    }
     let before = fs::symlink_metadata(path).map_err(|_| "local file unavailable")?;
     if !before.is_file()
         || before.file_type().is_symlink()
@@ -71,21 +89,35 @@ pub(crate) fn regular_read(path: &Path, private: bool, max: usize) -> Result<Fil
     Ok(file)
 }
 fn private_new(path: &Path) -> Result<File, String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        return siworld_miner_platform::create_private(path);
     }
-    options
-        .open(path)
-        .map_err(|_| "refusing to overwrite or open private material".into())
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(path)
+            .map_err(|_| "refusing to overwrite or open private material".into())
+    }
 }
 fn sync_directory(path: &Path) -> Result<(), String> {
-    File::open(path)
-        .and_then(|f| f.sync_all())
-        .map_err(|_| "directory durability failed".into())
+    #[cfg(windows)]
+    {
+        return siworld_miner_platform::Directory::open(path)?.check();
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+            .and_then(|f| f.sync_all())
+            .map_err(|_| "directory durability failed".into())
+    }
 }
 pub fn initialize(path: &Path, work_bits: u8) -> Result<Config, String> {
     let mut network = [0; 32];
@@ -108,21 +140,26 @@ pub fn initialize_asert(
 }
 pub fn initialize_config(path: &Path, config: Config) -> Result<Config, String> {
     config.validate()?;
+    #[cfg(not(windows))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
+    #[cfg(not(windows))]
     builder
         .create(path)
         .map_err(|_| "initialization requires a new directory with an existing parent")?;
+    #[cfg(windows)]
+    siworld_miner_platform::Directory::create(path)?;
     let mut file = private_new(&path.join(CONFIG_FILE))?;
     file.write_all(MAGIC)
         .and_then(|_| file.write_all(&config.encode_rules()))
         .and_then(|_| file.sync_all())
         .map_err(|_| "configuration durability failed")?;
     sync_directory(path)?;
+    #[cfg(not(windows))]
     sync_directory(
         path.parent()
             .filter(|p| !p.as_os_str().is_empty())

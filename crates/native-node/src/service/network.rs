@@ -33,10 +33,11 @@ const ROUTE_MAGIC: &[u8; 4] = b"SWP2";
 #[derive(Clone)]
 struct Peer {
     endpoint: SocketAddr,
+    dial: bool,
     expected: ExpectedPeer,
 }
 pub(super) struct Configuration {
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
     mining: bool,
     peers: Arc<BTreeMap<Hash, Peer>>,
     digest: String,
@@ -95,6 +96,9 @@ pub fn pin_peer(directory: &Path, descriptor_file: &Path, fingerprint: &str) -> 
         .map_err(|_| "public pin persistence rejected".to_owned())
 }
 impl Configuration {
+    pub(super) fn listening_enabled(&self) -> bool {
+        self.listen.is_some()
+    }
     pub(super) fn mining_enabled(&self) -> bool {
         self.mining
     }
@@ -119,11 +123,20 @@ impl Configuration {
         if object.len() != 5 || value["version"] != 1 || value["engineering"] != true {
             return Err("explicit engineering peer configuration required".into());
         }
-        let listen = value["listen"]
-            .as_str()
-            .ok_or("missing listen endpoint")?
-            .parse()
-            .map_err(|_| "invalid listen endpoint")?;
+        let listen_value = value
+            .get("listen")
+            .ok_or("Explicit listen selection is required")?;
+        let listen = if listen_value.is_null() {
+            None
+        } else {
+            Some(
+                listen_value
+                    .as_str()
+                    .ok_or("invalid listen selection")?
+                    .parse()
+                    .map_err(|_| "invalid listen endpoint")?,
+            )
+        };
         let mining = value["mining"]
             .as_bool()
             .ok_or("explicit mining selection required")?;
@@ -137,9 +150,13 @@ impl Configuration {
         let mut endpoints = BTreeSet::new();
         for value in values {
             let entry = value.as_object().ok_or("invalid peer entry")?;
-            if entry.len() != 3 {
+            if entry.len() != 3 && !(entry.len() == 4 && entry.contains_key("dial")) {
                 return Err("unexpected peer entry field".into());
             }
+            let dial = match value.get("dial") {
+                None => true,
+                Some(v) => v.as_bool().ok_or("invalid peer dial selection")?,
+            };
             let endpoint: SocketAddr = value["endpoint"]
                 .as_str()
                 .ok_or("missing peer endpoint")?
@@ -176,7 +193,14 @@ impl Configuration {
                 .map_err(|_| "configured peer mismatch")?;
             if fingerprint == local_id
                 || peers
-                    .insert(fingerprint, Peer { endpoint, expected })
+                    .insert(
+                        fingerprint,
+                        Peer {
+                            endpoint,
+                            dial,
+                            expected,
+                        },
+                    )
                     .is_some()
             {
                 return Err("duplicate or local configured identity".into());
@@ -287,6 +311,9 @@ struct Worker {
     join: JoinHandle<Failure>,
     sync: SyncAttempt,
     acknowledged: BTreeSet<Hash>,
+    sync_goal: Option<u64>,
+    sync_more: bool,
+    sync_complete: bool,
     _reservation: Reservation,
 }
 struct PendingAuthentication {
@@ -300,7 +327,7 @@ enum Admission {
     Waiting,
 }
 struct Driver {
-    listener: TcpListener,
+    listener: Option<TcpListener>,
     identity: Arc<NativeIdentity>,
     local: Hash,
     peers: Arc<BTreeMap<Hash, Peer>>,
@@ -334,11 +361,17 @@ impl Driver {
             0,
         )
         .map_err(|_| "peer scheduling rejected")?;
-        let listener =
-            TcpListener::bind(config.listen).map_err(|_| "native listener unavailable")?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| "native listener mode unavailable")?;
+        let listener = config
+            .listen
+            .map(|address| {
+                let listener =
+                    TcpListener::bind(address).map_err(|_| "native listener unavailable")?;
+                listener
+                    .set_nonblocking(true)
+                    .map_err(|_| "native listener mode unavailable")?;
+                Ok::<_, String>(listener)
+            })
+            .transpose()?;
         let configuration = budget
             .reserve(MAX_CONFIG_BYTES)
             .map_err(|_| "peer configuration budget unavailable")?;
@@ -365,6 +398,18 @@ impl Driver {
             failures: 0,
             _configuration: configuration,
         })
+    }
+    fn has_synced_peer(&self) -> bool {
+        self.workers.values().any(|w| {
+            w.token.is_some() && w.peer.is_some() && !w.cancel.is_cancelled() && w.sync_complete
+        })
+    }
+    fn sync_goal(&self) -> Option<u64> {
+        self.workers
+            .values()
+            .filter(|w| !w.cancel.is_cancelled())
+            .filter_map(|w| w.sync_goal)
+            .max()
     }
     fn status(&self, mining: bool) -> Value {
         let status = self.scheduler.status();
@@ -451,6 +496,9 @@ impl Driver {
                 join,
                 sync: SyncAttempt::default(),
                 acknowledged: BTreeSet::new(),
+                sync_goal: None,
+                sync_more: true,
+                sync_complete: false,
                 _reservation: reservation,
             },
         );
@@ -482,7 +530,10 @@ impl Driver {
         self.poll_authentication();
         // Bound accepts per owner turn, including sockets rejected at capacity.
         for _ in 0..4 {
-            match self.listener.accept() {
+            let Some(listener) = &self.listener else {
+                break;
+            };
+            match listener.accept() {
                 Ok((socket, _)) if self.workers.len() < MAX_WORKERS => {
                     self.spawn(Some(socket), None, None)?;
                 }
@@ -504,7 +555,12 @@ impl Driver {
         // A single initiator avoids that race; the accepted connection still
         // synchronizes both directions in every paired cycle.
         let local = self.local;
-        for peer in ready.into_iter().filter(|peer| local < *peer) {
+        let outbound_only = self.listener.is_none();
+        let ready: Vec<_> = ready
+            .into_iter()
+            .filter(|peer| self.peers[peer].dial && (outbound_only || local < *peer))
+            .collect();
+        for peer in ready {
             if self.workers.len() >= MAX_WORKERS {
                 break;
             }
@@ -682,7 +738,11 @@ impl Driver {
                         w.peer.expect("authenticated peer"),
                         &mut w.sync,
                         &meta,
-                    )
+                    )?;
+                    w.sync_goal = Some(meta.after.height);
+                    w.sync_more = meta.more;
+                    w.sync_complete = meta.count == 0 && !meta.more;
+                    Ok(())
                 });
                 let _ = reply.send(result);
             }
@@ -693,12 +753,14 @@ impl Driver {
                 reply,
             } => {
                 let result = self.active_mut(id).and_then(|w| {
-                    node.resident_accept_batch(
+                    let changed = node.resident_accept_batch(
                         w.peer.expect("authenticated peer"),
                         &mut w.sync,
                         batch,
                         guards,
-                    )
+                    )?;
+                    w.sync_complete = !w.sync_more;
+                    Ok(changed)
                 });
                 let _ = reply.send(result);
             }
@@ -1297,6 +1359,9 @@ pub(super) fn continuous(
     let mut prover: Option<NativeProver> = None;
     let mut proof: Option<ProofTask> = None;
     let mut work: Option<Mining> = None;
+    let mut last_private_view = Instant::now();
+    let mut reward_fingerprint = None;
+    let mut reward_view = Value::Null;
     control.state(node.state())?;
     control.phase("networking")?;
     let result: Result<(), String> = (|| {
@@ -1316,13 +1381,16 @@ pub(super) fn continuous(
                     Err(_) => return Err("resident owner command channel closed".into()),
                 }
             }
+            let mining_ready = !control.private_miner_view || driver.has_synced_peer();
             if let Some(current) = &work {
-                if current.fingerprint != node.state().fingerprint() {
+                if !mining_ready || current.fingerprint != node.state().fingerprint() {
                     current.cancel.store(true, Ordering::SeqCst);
                 }
                 if current.join.is_finished() {
                     let completed = work.take().expect("selected work");
-                    let stale = completed.fingerprint != node.state().fingerprint();
+                    let stale = !mining_ready
+                        || completed.cancel.load(Ordering::SeqCst)
+                        || completed.fingerprint != node.state().fingerprint();
                     let candidate = completed
                         .join
                         .join()
@@ -1347,7 +1415,7 @@ pub(super) fn continuous(
                 status.progress()?;
             }
             if let Some(current) = &proof {
-                if current.fingerprint != node.state().fingerprint() {
+                if !mining_ready || current.fingerprint != node.state().fingerprint() {
                     current.cancel.store(true, Ordering::SeqCst);
                 }
                 if current.join.is_finished() {
@@ -1396,7 +1464,7 @@ pub(super) fn continuous(
                     }
                 }
             }
-            if mining && proof.is_none() {
+            if mining && mining_ready && proof.is_none() {
                 let block = work.is_none() && node.resident_padding_ready();
                 if block || node.resident_padding_can_grow() {
                     // Local-job pressure is backpressure. It must
@@ -1417,6 +1485,35 @@ pub(super) fn continuous(
                         Err(_) => return Err("producer ownership budget unavailable".into()),
                     }
                 }
+            }
+            if control.private_miner_view && last_private_view.elapsed() >= Duration::from_secs(1) {
+                let fingerprint = node.state().fingerprint();
+                if reward_fingerprint != Some(fingerprint) {
+                    reward_view = node.store().miner_reward_view()?;
+                    reward_fingerprint = Some(fingerprint);
+                }
+                let connected = driver.scheduler.status().established;
+                let phase = if connected == 0 {
+                    "waiting_for_authenticated_peers"
+                } else if !driver.has_synced_peer() {
+                    "synchronizing"
+                } else if work.is_some() {
+                    "pow_search"
+                } else {
+                    "template_preparation"
+                };
+                let status = control
+                    .status
+                    .lock()
+                    .map_err(|_| "private miner status unavailable")?;
+                let view = json!({"schema":1,"run_id":control.identity.run_id,"updated_unix_ms":wall_ms()?,
+                    "height":node.state().height,"batch_goal_unverified":driver.sync_goal(),
+                    "phase":phase,"authenticated_peers":connected,"inbound_listener":driver.listener.is_some(),
+                    "pow_attempts":status.pow_attempts,"elapsed_monotonic_ms":elapsed_ms(status.started,Instant::now()),
+                    "rewards":reward_view});
+                drop(status);
+                atomic_json(&directory.join("miner-private-status.json"), &view)?;
+                last_private_view = Instant::now();
             }
             std::thread::sleep(POLL);
         }
@@ -1476,6 +1573,18 @@ pub(super) fn continuous(
         return Err("resident final replay changed accepted state".into());
     }
     control.state(replayed.state())?;
+    if control.private_miner_view {
+        let status = control
+            .status
+            .lock()
+            .map_err(|_| "private final miner status unavailable")?;
+        let view = json!({"schema":1,"run_id":control.identity.run_id,"updated_unix_ms":wall_ms()?,
+            "height":replayed.state().height,"batch_goal_unverified":null,"phase":"stopped",
+            "authenticated_peers":0,"inbound_listener":false,"pow_attempts":status.pow_attempts,
+            "elapsed_monotonic_ms":elapsed_ms(status.started,Instant::now()),"rewards":replayed.miner_reward_view()?});
+        drop(status);
+        atomic_json(&directory.join("miner-private-status.json"), &view)?;
+    }
     control.phase("stopped")?;
     control.event("service_stopped")
 }

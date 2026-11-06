@@ -56,7 +56,7 @@ impl Endpoint {
             NativeIdentity::initialize(&directory.0, p2p::Binding::new(&configuration())).unwrap(),
         );
         let config = Configuration {
-            listen: (Ipv4Addr::LOCALHOST, 0).into(),
+            listen: Some((Ipv4Addr::LOCALHOST, 0).into()),
             mining: false,
             peers: Arc::new(BTreeMap::new()),
             digest: "0".repeat(64),
@@ -69,7 +69,7 @@ impl Endpoint {
         }
     }
     fn address(&self) -> SocketAddr {
-        self.driver.listener.local_addr().unwrap()
+        self.driver.listener.as_ref().unwrap().local_addr().unwrap()
     }
     fn follow(&mut self, other: &Self) {
         let peer = expected(&other.driver.identity);
@@ -77,6 +77,7 @@ impl Endpoint {
             peer.fingerprint(),
             Peer {
                 endpoint: other.address(),
+                dial: true,
                 expected: peer,
             },
         )]));
@@ -240,6 +241,9 @@ fn waiting_worker(
     endpoint.driver.workers.insert(
         id,
         Worker {
+            sync_goal: None,
+            sync_more: true,
+            sync_complete: false,
             peer,
             token,
             cancel,
@@ -794,6 +798,9 @@ fn cancelled_queued_apply_cannot_import_after_the_caller_has_left() {
     owner.driver.workers.insert(
         id,
         Worker {
+            sync_goal: None,
+            sync_more: true,
+            sync_complete: false,
             peer: Some(peer_id),
             token: Some(token),
             cancel: cancel.clone(),
@@ -1052,4 +1059,29 @@ fn pending_transaction_reaches_peer_before_block_inclusion_and_survives_reconnec
     });
     assert!(a.node.as_ref().unwrap().mempool().is_empty());
     assert!(b.node.as_ref().unwrap().mempool().is_empty());
+}
+
+#[test]
+fn outbound_only_miner_with_larger_identity_syncs_without_a_listener() {
+    let mut miner = Endpoint::new();
+    let mut source = Endpoint::new();
+    if miner.driver.local < source.driver.local {
+        std::mem::swap(&mut miner, &mut source);
+    }
+    source.append(710_000);
+    miner.follow(&source);
+    source.follow(&miner);
+    // The source knows this identity is an outbound-only client.
+    let mut peers = (*source.driver.peers).clone();
+    peers.get_mut(&miner.driver.local).unwrap().dial = false;
+    source.driver.peers = Arc::new(peers);
+    miner.driver.listener = None;
+    until(&mut miner, &mut source, |miner, source| {
+        miner.driver.scheduler.status().established == 1
+            && source.driver.scheduler.status().established == 1
+            && miner.state().tip == source.state().tip
+            && miner.driver.has_synced_peer()
+    });
+    assert!(miner.driver.listener.is_none());
+    assert_eq!(miner.state().height, 1);
 }

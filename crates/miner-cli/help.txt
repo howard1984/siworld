@@ -1,0 +1,12 @@
+SIWORLD native Windows miner (engineering network)
+
+siworld-miner.exe [--network-bundle FILE]
+siworld-miner.exe --check-cpu
+siworld-miner.exe --check-hardware
+siworld-miner.exe --status
+
+Requires Windows 10/11 x86_64 with x86-64-v3, 4 logical CPUs and 30 GiB OS-visible RAM.
+Data: %LOCALAPPDATA%\SIWORLD. No inbound listener or firewall rule is created.
+Choose Holder/Voyager, new/existing receiving address, BACKEDUP, then START.
+Use Ctrl+C and wait for a verified clean stop. No Windows service is installed.
+The unsigned engineering package is not a qualified public-network release.

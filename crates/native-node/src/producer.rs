@@ -34,7 +34,7 @@ pub struct ProducedBlock {
 }
 
 /// Synthetic proof fixture with real reward encryption and receipt binding.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn production_fixture(state: &State, seed: u32) -> ProducedBlock {
     let keys =
         crate::wallet::WalletKeys::from_seed(state.config.network, Zeroizing::new([42; 32]), 0)
@@ -378,6 +378,38 @@ pub fn validate_reward_secret(block: &Block, secret: &[u8]) -> Result<(), String
     Ok(())
 }
 
+/// Private presentation only. Authenticate the complete existing receipt before
+/// extracting earned amounts; this does not define or change reward rules.
+pub(crate) fn reward_note_amounts(block: &Block, secret: &[u8]) -> Result<Vec<(u64, u64)>, String> {
+    validate_reward_secret(block, secret)?;
+    block
+        .rewards
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let entry =
+                &secret[48 + index * REWARD_ENTRY_BYTES..48 + (index + 1) * REWARD_ENTRY_BYTES];
+            let owner = decode_digest(entry[48..96].try_into().expect("validated owner"))
+                .map_err(|_| "invalid reward owner")?;
+            let address =
+                PaymentAddress::new(owner, entry[144..1328].try_into().expect("validated key"))
+                    .map_err(|_| "invalid reward address")?;
+            let opening = PaymentEncryptionOpening::from_encapsulation_coins(
+                entry[1328..1360].try_into().expect("validated coins"),
+            );
+            let note = opening
+                .verify_payment(
+                    &address,
+                    &decode_digest(&record.commitment).map_err(|_| "invalid reward commitment")?,
+                    &decode_payment(&record.ciphertext),
+                    &EncryptionContext::new(block.network),
+                )
+                .map_err(|_| "reward display authentication failed")?;
+            Ok((note.value, note.unlock_height))
+        })
+        .collect()
+}
+
 /// Generate one complete native proof with fresh OS entropy and real output
 /// encryption. The caller must independently verify it before queue admission.
 pub fn prepare_padding(state: &State, prover: &NativeProver) -> Result<Padding, String> {
@@ -681,6 +713,14 @@ mod tests {
                 settlement_proof: Vec::new(),
             };
             validate_reward_secret(&block, &rewards.secret).unwrap();
+            assert_eq!(
+                reward_note_amounts(&block, &rewards.secret).unwrap(),
+                rewards
+                    .notes
+                    .iter()
+                    .map(|note| (note.value, note.unlock_height))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(
                 block.rewards.len(),
                 if mode == RewardMode::Holder { 5 } else { 1 }

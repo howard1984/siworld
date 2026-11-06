@@ -76,9 +76,80 @@ impl Owner {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(super) struct Owner {
+    directory: siworld_miner_platform::Directory,
+    database_name: std::ffi::OsString,
+    identity: (u32, u64),
+}
+#[cfg(windows)]
+impl Owner {
+    pub(super) fn bind(path: &Path, database: &File) -> Result<Self, String> {
+        let owner = Self {
+            directory: siworld_miner_platform::Directory::open(
+                path.parent().ok_or("database parent unavailable")?,
+            )?,
+            database_name: path
+                .file_name()
+                .ok_or("database filename unavailable")?
+                .to_owned(),
+            identity: siworld_miner_platform::file_identity(database)?,
+        };
+        owner.check()?;
+        Ok(owner)
+    }
+    fn check(&self) -> Result<(), String> {
+        self.directory.check()?;
+        let database = self.directory.open_file(&self.database_name, false)?;
+        if siworld_miner_platform::file_identity(&database)? != self.identity {
+            return Err("native receipt database identity changed".into());
+        }
+        Ok(())
+    }
+    pub(super) fn save(&self, id: &Hash, secret: &[u8]) -> Result<(), String> {
+        self.check()?;
+        if secret.is_empty() || secret.len() > crate::producer::MAX_REWARD_SECRET_BYTES {
+            return Err("invalid reward receipt size".into());
+        }
+        let name = format!("reward-{}.secret", crate::local::hex(id));
+        match self.directory.write_once(&name, secret) {
+            Ok(()) => (),
+            Err(_) => {
+                let existing = zeroize::Zeroizing::new(
+                    self.directory
+                        .read(&name, crate::producer::MAX_REWARD_SECRET_BYTES)?,
+                );
+                if existing.len() != secret.len()
+                    || existing
+                        .iter()
+                        .zip(secret)
+                        .fold(0u8, |d, (a, b)| d | (a ^ b))
+                        != 0
+                {
+                    return Err("existing reward evidence differs; preserved".into());
+                }
+                self.directory
+                    .open_file(std::ffi::OsStr::new(&name), true)?
+                    .sync_all()
+                    .map_err(|_| "reward durability failed")?;
+            }
+        }
+        self.check()
+    }
+    pub(super) fn read(&self, id: &Hash) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+        self.check()?;
+        let bytes = zeroize::Zeroizing::new(self.directory.read(
+            &format!("reward-{}.secret", crate::local::hex(id)),
+            crate::producer::MAX_REWARD_SECRET_BYTES,
+        )?);
+        self.check()?;
+        Ok(bytes)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(super) struct Owner;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Owner {
     pub(super) fn bind(_: &Path, _: &File) -> Result<Self, String> {
         Ok(Self)

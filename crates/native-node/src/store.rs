@@ -27,6 +27,7 @@ const LOCAL_REWARDS_MARKER: &str = "local-production-receipts";
 const LOCAL_REWARDS_VERSION: &[u8] = b"\x01\0\0\0\0\0\0\0\0";
 const HEAD_BYTES: usize = 72;
 const FINGERPRINT_BYTES: usize = 32;
+mod miner_view;
 mod receipts;
 
 pub struct Store {
@@ -1030,9 +1031,16 @@ fn open_regular_file(path: &Path, create_allowed: bool) -> Result<(File, bool), 
             options.mode(0o600);
         }
     }
+    #[cfg(not(windows))]
     let file = options
         .open(path)
         .map_err(|_| "native database file unavailable")?;
+    #[cfg(windows)]
+    let file = if existing.is_none() {
+        siworld_miner_platform::create_private(path)?
+    } else {
+        siworld_miner_platform::read_private(path, true)?
+    };
     let opened = file
         .metadata()
         .map_err(|_| "native database file metadata unavailable")?;
@@ -1077,5 +1085,5 @@ fn sync_parent(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod local_reward_tests;

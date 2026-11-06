@@ -430,9 +430,30 @@ mod storage {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+struct Storage(siworld_miner_platform::Directory);
+#[cfg(windows)]
+impl Storage {
+    fn open(path: &Path) -> Result<Self, Error> {
+        siworld_miner_platform::Directory::open(path)
+            .map(Self)
+            .map_err(|_| Error::Storage)
+    }
+    fn read_exact(&self, name: &str, size: usize) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let bytes = Zeroizing::new(self.0.read(name, size).map_err(|_| Error::Storage)?);
+        if bytes.len() != size {
+            return Err(Error::Storage);
+        }
+        Ok(bytes)
+    }
+    fn write_once(&self, name: &str, bytes: &[u8]) -> Result<(), Error> {
+        self.0.write_once(name, bytes).map_err(|_| Error::Storage)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 struct Storage;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Storage {
     fn open(_: &Path) -> Result<Self, Error> {
         Err(Error::UnsupportedPlatform)

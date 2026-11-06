@@ -323,9 +323,84 @@ mod unix {
 #[cfg(unix)]
 pub use unix::Directory;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub use windows::Directory;
+#[cfg(windows)]
+mod windows {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::fs::File;
+    pub struct Directory {
+        directory: siworld_miner_platform::Directory,
+        lock: File,
+    }
+    impl Directory {
+        pub fn create(path: &Path) -> Result<Self, String> {
+            let directory = siworld_miner_platform::Directory::create(path)?;
+            let lock = directory.create_file(OsStr::new(".wallet.lock"))?;
+            Self::lock(directory, lock)
+        }
+        pub fn open(path: &Path) -> Result<Self, String> {
+            let directory = siworld_miner_platform::Directory::open(path)?;
+            let lock = directory.open_file(OsStr::new(".wallet.lock"), true)?;
+            Self::lock(directory, lock)
+        }
+        fn lock(directory: siworld_miner_platform::Directory, lock: File) -> Result<Self, String> {
+            lock.try_lock()
+                .map_err(|_| "wallet directory is already in use")?;
+            let owner = Self { directory, lock };
+            owner.check_owner()?;
+            Ok(owner)
+        }
+        pub fn check_owner(&self) -> Result<(), String> {
+            self.directory.check()?;
+            siworld_miner_platform::check_private(&self.lock, false)?;
+            let current = self.directory.open_file(OsStr::new(".wallet.lock"), true)?;
+            if siworld_miner_platform::file_identity(&current)?
+                != siworld_miner_platform::file_identity(&self.lock)?
+            {
+                return Err("wallet ownership lock changed".into());
+            }
+            Ok(())
+        }
+        pub fn read_vault(&self) -> Result<Vec<u8>, String> {
+            self.check_owner()?;
+            let bytes = self.directory.read(VAULT_FILENAME, VAULT_LEN)?;
+            if bytes.len() != VAULT_LEN {
+                return Err("invalid native wallet vault length".into());
+            }
+            Ok(bytes)
+        }
+        pub fn read_journal(&self) -> Result<Vec<u8>, String> {
+            self.check_owner()?;
+            self.directory
+                .read("payments.journal", super::super::journal::MAX_FILE)
+        }
+        pub fn create_journal(&self, bytes: &[u8]) -> Result<(), String> {
+            self.check_owner()?;
+            self.directory.write_once("payments.journal", bytes)
+        }
+        pub fn replace_journal(&self, bytes: &[u8]) -> Result<(), String> {
+            let _ = self.read_journal()?;
+            self.directory.replace("payments.journal", bytes)
+        }
+        pub fn publish_with(
+            &self,
+            bytes: &[u8],
+            before_publish: impl FnOnce() -> Result<(), String>,
+        ) -> Result<(), String> {
+            self.check_owner()?;
+            self.directory.publish(VAULT_FILENAME, bytes, || {
+                before_publish()?;
+                self.check_owner()
+            })
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub struct Directory;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Directory {
     pub fn check_owner(&self) -> Result<(), String> {
         Err("native wallet protected storage is supported only on Unix".into())

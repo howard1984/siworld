@@ -10,16 +10,20 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
+        #[cfg(unix)]
         use std::os::unix::fs::DirBuilderExt;
         let path = std::env::temp_dir().join(format!(
             "siworld-local-index-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        #[cfg(unix)]
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
             .unwrap();
+        #[cfg(windows)]
+        siworld_miner_platform::Directory::create(&path).unwrap();
         Self(path)
     }
     fn database(&self) -> PathBuf {
@@ -93,9 +97,38 @@ fn local_ownership_and_receipts_remain_verifiable_after_reorganization() {
         owned
     );
     assert_eq!(node.store().verify_local_rewards().unwrap(), 1);
+    let view = node.store().miner_reward_view().unwrap();
+    assert_eq!(view["accepted_blocks"], 0);
+    assert_eq!(view["detached_blocks"], 1);
+    assert_eq!(view["mature_earned_atoms"], "0");
+    assert_eq!(view["pending_atoms"], "0");
     drop(node);
     let store = Store::open_existing(directory.database(), config(), &TestVerifier).unwrap();
     assert_eq!(store.verify_local_rewards().unwrap(), 1);
+}
+
+#[test]
+fn miner_reward_display_authenticates_receipts_and_matures_by_verified_height() {
+    let directory = Directory::new();
+    let mut node = open(&directory);
+    let id = produce(&mut node, 720_000);
+    let before = node.store().miner_reward_view().unwrap();
+    assert_eq!(before["accepted_blocks"], 1);
+    assert_ne!(before["pending_atoms"], "0");
+    assert_eq!(before["mature_earned_atoms"], "0");
+    for seed in (730_000..970_000).step_by(10_000) {
+        let block = candidate(node.state(), seed);
+        node.import_branch(node.state().height, &[block], CandidatePolicy::default())
+            .unwrap();
+    }
+    let after = node.store().miner_reward_view().unwrap();
+    assert_eq!(after["pending_atoms"], "0");
+    assert_eq!(after["mature_earned_atoms"], before["pending_atoms"]);
+    let receipt = directory.receipt(&id);
+    let mut data = std::fs::read(&receipt).unwrap();
+    data[50] ^= 1;
+    std::fs::write(receipt, data).unwrap();
+    assert!(node.store().miner_reward_view().is_err());
 }
 
 #[test]

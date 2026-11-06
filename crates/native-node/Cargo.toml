@@ -12,6 +12,8 @@ repository = "https://github.com/siworld-labs/siworld"
 description = "Native V1 engineering chain and network interfaces"
 
 [features]
+# Equivalent Rust-only BLAKE3 implementation for cross-target type checks.
+portable-hash = ["blake3/pure"]
 default = ["parallel"]
 parallel = ["native/parallel"]
 # Inactive transport qualification. This feature does not enable a listener or
@@ -35,6 +37,7 @@ path = "src/bin/siworld-peer-qualification.rs"
 required-features = ["peer-qualification"]
 
 [dependencies]
+siworld-miner-platform = { path = "../miner-platform" }
 native = { package = "siworld-multi-asset-experiment", path = "../bench-multi-asset", default-features = false }
 siworld-core = { path = "../core" }
 p3-air = "=0.9.0-rc.2"
