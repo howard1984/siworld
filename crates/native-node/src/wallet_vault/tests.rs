@@ -724,50 +724,63 @@ fn genuine_prepared_transfer_opening_is_durable_and_typed_verified_after_reopen(
 }
 
 #[test]
-fn relay_callback_never_runs_after_live_journal_deletion_tampering_or_lock_loss() {
-    for alteration in 0..3 {
-        let directory = Temporary::new();
-        let mut wallet =
-            WalletVault::restore(&directory.wallet(), NETWORK, 0, zero_words(), PASSWORD).unwrap();
-        let (_, block, sidecar) = payment_fixture(250_000 + alteration * 20_000);
-        let tx = block
-            .transactions
-            .iter()
-            .find(|tx| tx.record.statement_id(&NETWORK) == sidecar.transaction_id)
-            .unwrap();
-        let ticket = wallet.reserve_payment(&tx.record).unwrap();
-        wallet
-            .store_prepared_payment(
-                &ticket,
-                tx,
-                &sidecar,
-                Zeroizing::new(vec![1]),
-                |_, _| Ok(()),
-            )
-            .unwrap();
-        let path = directory.wallet().join("payments.journal");
-        match alteration {
-            0 => std::fs::remove_file(&path).unwrap(),
-            1 => {
+fn relay_callback_never_runs_after_live_journal_deletion_or_tampering() {
+    for alteration in 0..2 {
+        assert_relay_rejected_after(|directory| {
+            let path = directory.join("payments.journal");
+            if alteration == 0 {
+                std::fs::remove_file(&path).unwrap();
+            } else {
                 let mut changed = std::fs::read(&path).unwrap();
                 *changed.last_mut().unwrap() ^= 1;
                 std::fs::write(&path, changed).unwrap();
             }
-            _ => std::fs::remove_file(directory.wallet().join(".wallet.lock")).unwrap(),
-        }
-        let mut called = false;
-        assert!(
-            wallet
-                .submit_payment(ticket.id(), |_| {
-                    called = true;
-                    Ok(())
-                })
-                .is_err()
-        );
-        assert!(!called);
-        assert!(wallet.payment_packet(ticket.id()).is_err());
-        assert!(wallet.reserve_payment(&tx.record).is_err());
+        });
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn relay_callback_never_runs_after_live_lock_loss() {
+    // Unix permits unlinking an open lock; Windows rejects that operation.
+    assert_relay_rejected_after(|directory| {
+        std::fs::remove_file(directory.join(".wallet.lock")).unwrap();
+    });
+}
+
+fn assert_relay_rejected_after(alter: impl FnOnce(&std::path::Path)) {
+    let directory = Temporary::new();
+    let mut wallet =
+        WalletVault::restore(&directory.wallet(), NETWORK, 0, zero_words(), PASSWORD).unwrap();
+    let (_, block, sidecar) = payment_fixture(250_000);
+    let tx = block
+        .transactions
+        .iter()
+        .find(|tx| tx.record.statement_id(&NETWORK) == sidecar.transaction_id)
+        .unwrap();
+    let ticket = wallet.reserve_payment(&tx.record).unwrap();
+    wallet
+        .store_prepared_payment(
+            &ticket,
+            tx,
+            &sidecar,
+            Zeroizing::new(vec![1]),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+    alter(&directory.wallet());
+    let mut called = false;
+    assert!(
+        wallet
+            .submit_payment(ticket.id(), |_| {
+                called = true;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(!called);
+    assert!(wallet.payment_packet(ticket.id()).is_err());
+    assert!(wallet.reserve_payment(&tx.record).is_err());
 }
 
 #[test]
