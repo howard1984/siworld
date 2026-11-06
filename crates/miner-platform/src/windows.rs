@@ -216,7 +216,9 @@ fn open_raw(path: &Path, directory: bool, write: bool, create: bool) -> Result<F
     let security = Security::new(directory)?;
     let attrs = security.attributes();
     let access = if directory {
-        FILE_READ_ATTRIBUTES | READ_CONTROL
+        // Attribute-only handles do not participate in all namespace sharing
+        // checks. List access makes the no-delete-sharing anchor effective.
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL
     } else if write {
         GENERIC_READ | GENERIC_WRITE | READ_CONTROL
     } else {
@@ -416,12 +418,14 @@ impl Directory {
             }
             // SAFETY: immediately reads this thread's last native API error.
             let error = unsafe { GetLastError() };
-            if !matches!(error, ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
-                || std::time::Instant::now() >= deadline
+            if !matches!(
+                error,
+                ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION | ERROR_ACCESS_DENIED
+            ) || std::time::Instant::now() >= deadline
             {
-                return Err(
-                    "Windows atomic replacement failed; temporary evidence retained".into(),
-                );
+                return Err(format!(
+                    "Windows atomic replacement failed (error {error}); temporary evidence retained"
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
