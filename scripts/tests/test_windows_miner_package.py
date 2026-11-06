@@ -68,6 +68,7 @@ class PeTests(unittest.TestCase):
 
     def test_accepts_windows_core_api_set(self):
         self.audit_data(executable('api-ms-win-core-synch-l1-2-0.dll'))
+        self.audit_data(executable('bcryptprimitives.dll'))
 
     def test_rejects_truncated_and_wrong_machine(self):
         for size in [0, 0x40, 0x90, 0x210, 0x799]:

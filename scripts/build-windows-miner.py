@@ -95,7 +95,8 @@ def package(output):
     if output.exists():
         raise SystemExit('Output must be a new directory; existing artifacts are preserved')
     output.mkdir(parents=True)
-    worker_target = output / 'worker-target'
+    # Reuse source-bound release dependencies from the same CI job's tests.
+    worker_target = Path(os.environ.get('CARGO_TARGET_DIR', output / 'worker-target')).resolve()
     launcher_target = output / 'launcher-target'
     build('crates/miner-cli/Cargo.toml', worker_target,
           WORKER_FLAGS)

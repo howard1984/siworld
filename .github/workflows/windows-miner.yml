@@ -98,7 +98,7 @@ jobs:
         run: |
           cargo test --locked --manifest-path crates/miner-platform/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --manifest-path crates/miner-cli/Cargo.toml
+          cargo test --release --locked --target x86_64-pc-windows-msvc --manifest-path crates/miner-cli/Cargo.toml
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:RUSTFLAGS = '-C target-cpu=x86-64 -C target-feature=+crt-static'
           cargo test --locked --manifest-path crates/miner-launcher/Cargo.toml
@@ -106,7 +106,7 @@ jobs:
       - name: Synthetic native transport, custody and reward regressions
         run: |
           foreach ($filter in @('service::network::tests', 'store::local_reward_tests', 'wallet_vault::tests', 'producer::tests::every_reward_is_seed_recoverable_with_unique_indexed_nullifiers')) {
-            cargo test --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib $filter
+            cargo test --release --locked --target x86_64-pc-windows-msvc --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib $filter
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Build unsigned native package and SHA-256
@@ -136,3 +136,7 @@ jobs:
             .local/windows-miner-build/provenance.json
           if-no-files-found: error
           retention-days: 14
+      - name: Record native archive sizes on failure
+        if: ${{ failure() }}
+        run: |
+          Get-ChildItem -Path '.local/windows-tests-target' -Recurse -Filter '*p3_recursion*.rlib' -ErrorAction SilentlyContinue | Select-Object Name, Length

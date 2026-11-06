@@ -4,7 +4,8 @@ import struct
 
 
 SYSTEM_DLLS = frozenset({
-    'advapi32.dll', 'bcrypt.dll', 'crypt32.dll', 'dbghelp.dll',
+    # getrandom uses ProcessPrng from this inbox Windows 10/11 system library.
+    'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'crypt32.dll', 'dbghelp.dll',
     'iphlpapi.dll', 'kernel32.dll', 'ncrypt.dll', 'normaliz.dll',
     'ntdll.dll', 'ole32.dll', 'oleaut32.dll', 'powrprof.dll',
     'psapi.dll', 'rpcrt4.dll', 'secur32.dll', 'shell32.dll',
