@@ -13,6 +13,12 @@ export class CommitmentSession {
     this.json = io.json || readJSON;
     this.binary = io.binary || fetchLimited;
     this.tree = null; this.projections = true;
+    this.birthdays = new Set();
+    this.rememberBirthdays(io.birthdays ?? []);
+  }
+  rememberBirthdays(heights) {
+    if (!Array.isArray(heights) || heights.some(height => !Number.isSafeInteger(height) || height < 0 || height > 1000000)) throw new Error('Invalid historical scan boundary.');
+    this.birthdays = new Set([...this.birthdays, ...heights].filter(height => height > 0));
   }
   async initialize() {
     const c = this.config, info = JSON.parse(this.anchor.public_info());
@@ -31,6 +37,7 @@ export class CommitmentSession {
   async atHeight(head, height, signal, onProgress = () => {}) {
     if (!Number.isSafeInteger(height) || height < 0 || height > head.height || head.network !== this.config.network ||
         head.genesis !== this.config.genesis || !identity(head.tip)) throw new Error('Invalid historical scan boundary.');
+    this.rememberBirthdays([height]);
     let tip = height === 0 ? this.config.genesis : head.tip;
     if (height > 0 && height < head.height) {
       const page = await this.json(`${this.base}/v1/chain?tip=${head.tip}&from=${height}&limit=1`, {signal:requestSignal(signal), limit:20000});
@@ -81,6 +88,11 @@ export class CommitmentSession {
       const baseline = transient ? this.Tree.create(c.rules_hex, c.genesis) : this.tree;
       let previous = extension ? accepted.height : 0, downloaded = 0, incidental = 0;
       let currentTip = extension ? accepted.tip : c.genesis;
+      // Preserve every local account's boundary as the shared scan crosses it,
+      // including an earlier account whose own scan never reached that point.
+      const retained = new Map(await Promise.all([...this.birthdays]
+        .filter(height => height > previous && height < head.height)
+        .map(async height => [height, 'commitment-boundary:' + await hash(new TextEncoder().encode(`${this.key}:${height}`))])));
       const checkpoint = async () => {
         if (transient || !extension || previous === JSON.parse(this.tree.summary()).height) return;
         trial.check_head(String(previous), currentTip, this.tree);
@@ -118,6 +130,10 @@ export class CommitmentSession {
               if (state.tip !== id || state.height !== previous + 1) throw new Error('Historical record identity or height differs.');
               incidental += state.authentication_ciphertext_bytes;
               previous = state.height; currentTip = state.tip;
+              if (retained.has(previous)) {
+                trial.check_head(String(previous), currentTip, transient ? baseline : this.tree);
+                await this.storage('private', retained.get(previous), trial.sealed_cache(this.anchor));
+              }
               if (previous % 16 === 0) await checkpoint();
               onProgress({height: previous, target_height: head.height, downloaded_bytes: downloaded,
                 authentication_ciphertext_bytes: incidental});

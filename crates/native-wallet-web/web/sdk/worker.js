@@ -44,11 +44,16 @@ async function handle(data, revision) {
         active?.free(); active = null; history?.free(); history = null; accounts?.free(); online = null;
         accounts = new WalletAccounts(wallet);
         result = await accounts.initialize(args[0], creationBirthday || undefined);
-        history = new CommitmentSession(accounts.anchor, ENGINEERING, core.BrowserCommitmentTree);
+        history = new CommitmentSession(accounts.anchor, ENGINEERING, core.BrowserCommitmentTree,
+          {birthdays:accounts.value.accounts.map(row => row.birth_height)});
         creationBirthday = null;
         selectAccount(JSON.parse(wallet.public_info()).account);
         break;
-      case 'accounts-add': if (!accounts) throw new Error('Wallet is locked.'); result = await accounts.add(await captureBirthday(ENGINEERING,accounts.network)); break;
+      case 'accounts-add':
+        if (!accounts) throw new Error('Wallet is locked.');
+        result = await accounts.add(await captureBirthday(ENGINEERING,accounts.network));
+        history.rememberBirthdays(accounts.value.accounts.map(row => row.birth_height));
+        break;
       case 'accounts-rename': if (!accounts) throw new Error('Wallet is locked.'); result = await accounts.rename(...args); break;
       case 'accounts-backup': if (!accounts) throw new Error('Wallet is locked.'); result = await accounts.backup(); break;
       case 'account-select': if (!accounts) throw new Error('Wallet is locked.'); result = selectAccount(args[0]); break;

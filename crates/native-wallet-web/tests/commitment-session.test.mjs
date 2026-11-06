@@ -28,10 +28,11 @@ class Tree {
   }
   append_compact(bytes) { return this.append(bytes); }
   check_head(height, tip, previous) {
+    if (previous.freed) throw new Error('Previous frontier was freed.');
     if (String(this.height) !== height || id(this.height) !== tip || this.height < previous.height) throw new Error('Insufficient work.');
   }
   sealed_cache() { return encoder.encode('sealed:' + this.height); }
-  free() {}
+  free() { this.freed=true; }
 }
 function fixture() {
   const saved = new Map(), records = [], requested = [], writes = [];
@@ -185,11 +186,53 @@ test('a cancelled birthday remains reusable after a later account catches up', a
   await assert.rejects(session.atHeight(head(4),2,controller.signal,()=>controller.abort()),{name:'AbortError'});
   // Cancellation happened at the first block, before the original boundary.
   assert.equal(JSON.parse(session.tree.summary()).height,1);
-  let view=await session.atHeight(head(4),2);view.release();
-  view=await session.atHeight(head(4),4);view.release();
+  let view=await session.atHeight(head(4),4);view.release();
   const before=f.records.length;
   view=await session.atHeight(head(4),2);view.release();
   assert.equal(f.records.length,before);
+});
+
+test('registered birthdays survive an interrupted scan and a new worker session', async () => {
+  const f=fixture(), first=new CommitmentSession(anchor,config,Tree,f.io), controller=new AbortController();
+  await first.initialize();
+  await assert.rejects(first.atHeight(head(4),2,controller.signal,()=>controller.abort()),{name:'AbortError'});
+  first.free();
+  const later=new CommitmentSession(anchor,config,Tree,{...f.io,birthdays:[2,4]});
+  await later.initialize();(await later.atHeight(head(4),4)).release();
+  const restored=new CommitmentSession(anchor,config,Tree,f.io);
+  await restored.initialize();const before=f.records.length;
+  const view=await restored.atHeight(head(4),2);
+  assert.equal(view.height,2);assert.equal(view.downloaded_bytes,0);view.release();
+  assert.equal(f.records.length,before);
+  assert.equal(JSON.parse(restored.tree.summary()).height,4);
+});
+
+test('retained birthday snapshots fail closed when their historical prefix is invalid', async () => {
+  const f=fixture(),session=new CommitmentSession(anchor,config,Tree,{...f.io,birthdays:[2,4]});
+  await session.initialize();f.fail(2);
+  await assert.rejects(session.atHeight(head(4),4),/continuity/);
+  assert.equal(f.writes.length,0);
+  assert.equal(JSON.parse(session.tree.summary()).height,0);
+  assert.ok(f.records.every(bytes=>bytes.every(value=>value===0)));
+});
+
+test('historical boundary registration rejects invalid heights and deduplicates accounts', () => {
+  const f=fixture();
+  for(const birthdays of [[-1],[1.5],[1000001],['2'],[null],false]) {
+    assert.throws(()=>new CommitmentSession(anchor,config,Tree,{...f.io,birthdays}),/boundar/);
+  }
+  const session=new CommitmentSession(anchor,config,Tree,{...f.io,birthdays:[0,2,2]});
+  session.rememberBirthdays([2,4]);
+  assert.deepEqual([...session.birthdays],[2,4]);
+});
+
+test('birthday snapshots use the current frontier after periodic checkpoints replace it', async () => {
+  const f=fixture(),session=new CommitmentSession(anchor,config,Tree,{...f.io,birthdays:[18,20]});
+  await session.initialize();(await session.atHeight(head(20),20)).release();
+  const before=f.records.length,view=await session.atHeight(head(20),18);
+  assert.equal(view.height,18);assert.equal(view.downloaded_bytes,0);view.release();
+  assert.equal(f.records.length,before);
+  assert.equal(JSON.parse(session.tree.summary()).height,20);
 });
 
 test('long shared history persists checked prefixes before the requested head', async () => {

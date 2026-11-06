@@ -9,6 +9,8 @@ const ids=[config.rows[0].block_id,config.rows[0].next_block_id];
 const blocks=await Promise.all(['block-64.bin','next-64.bin'].map(name=>readFile(resolve(fixtures,name))));
 const {chromium}=await import(process.env.WALLET_PLAYWRIGHT||'playwright');
 const errors=[],downloads=[0,0];let origin,held=false,stall=true,projections=0;
+const staggered=process.env.WALLET_TEST_STAGGERED_BIRTHDAYS==='1';
+let heads=0;
 let notifyBlocked;
 const blocked=new Promise(done=>{notifyBlocked=done;});
 const server=http.createServer(async(request,response)=>{
@@ -22,7 +24,10 @@ const server=http.createServer(async(request,response)=>{
     response.setHeader('Content-Type','text/javascript');
     return response.end('export const ENGINEERING = '+JSON.stringify({...config,name:'siworld-eng-1',api:origin+'/api',read_only:true})+';');
   }
-  if(url.pathname==='/api/v1/head')return response.end(JSON.stringify({network:config.network,genesis:config.genesis,height:2,tip:ids[1]}));
+  if(url.pathname==='/api/v1/head'){
+    const height=staggered&&heads++===0?1:2;
+    return response.end(JSON.stringify({network:config.network,genesis:config.genesis,height,tip:ids[height-1]}));
+  }
   if(url.pathname==='/api/v1/chain'){
     const tip=url.searchParams.get('tip'),from=Number(url.searchParams.get('from')),limit=Number(url.searchParams.get('limit'));
     assert.ok(ids.includes(tip));assert.ok(from>=1&&limit>=1&&limit<=128);
@@ -31,7 +36,7 @@ const server=http.createServer(async(request,response)=>{
   if(url.pathname.startsWith('/api/v1/commitments/')){projections++;response.writeHead(400);return response.end('{"error":"Public data unavailable."}');}
   if(url.pathname.startsWith('/api/v1/compact/')){
     const at=ids.indexOf(url.pathname.split('/').at(-1));assert.ok(at>=0);
-    if(at===1&&stall){held=true;notifyBlocked();await new Promise(done=>response.once('close',done));return;}
+    if(at===(staggered?0:1)&&stall){held=true;notifyBlocked();await new Promise(done=>response.once('close',done));return;}
     downloads[at]++;return response.end(blocks[at]);
   }
   try{
@@ -67,7 +72,7 @@ try{
     await rpc('accounts-init');await rpc('online-init',[ENGINEERING]);
     window.firstScan=rpc('sync').then(()=>({completed:true}),error=>({error:error.message}));
   });
-  await page.waitForFunction(()=>window.progress.some(row=>row.phase==='history'&&row.height===1));
+  if(!staggered)await page.waitForFunction(()=>window.progress.some(row=>row.phase==='history'&&row.height===1));
   await blocked;
   assert.ok(held,'The first account must be interrupted during the next network request.');
   stall=false;
@@ -83,10 +88,11 @@ try{
   });
   assert.equal(result.interrupted,true);
   for(const account of [result.first,result.second])assert.deepEqual(account,{ready:true,height:2,receipts:0});
-  assert.deepEqual(downloads,[1,1],'Verified history must be downloaded once across both accounts.');
+  assert.deepEqual(downloads,staggered?[1,2]:[1,1],
+    'Verified pre-birthday history must be downloaded once; the earlier account also scans its later block for receipts.');
   assert.equal(projections,1,'Probe the unavailable projection service once per shared session.');
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({result:'passed',cancelled_prefix_reused:true,both_accounts_ready:true,
-    compact_downloads:downloads,projection_probes:projections,javascript_errors:0,transactions_sent:0}));
+    staggered_birthdays:staggered,compact_downloads:downloads,projection_probes:projections,javascript_errors:0,transactions_sent:0}));
   await context.close();
 }finally{await browser.close();server.closeAllConnections();await new Promise(done=>server.close(done));}

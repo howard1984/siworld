@@ -171,16 +171,22 @@ node crates/native-wallet-web/tests/wallet-lifecycle.browser.mjs
 Install Playwright in the test environment, or set `WALLET_PLAYWRIGHT` to its
 module entry point. `WALLET_BROWSER` optionally selects a Chromium executable.
 
-The shared-history regression requires a `--browser-fixtures` build and the
-synthetic two-block fixture directory in `WALLET_FIXTURE_DIR`. It returns HTTP
-400 for projections, interrupts one account during synchronization, and checks
-that another account resumes the verified prefix without downloading it again:
+The shared-history regression accepts a two-block fixture directory in
+`WALLET_FIXTURE_DIR` with protocol parameters supported by the wallet build.
+Synthetic parameters require `--browser-fixtures`; public engineering blocks
+work with the standard engineering build. The test returns HTTP 400 for
+projections, interrupts one account during synchronization, and checks that
+another account resumes verified history without downloading it again:
 
 ```sh
 WALLET_WEB_OUTPUT="$PWD/build/wallet-fixtures" \
 WALLET_FIXTURE_DIR="$PWD/build/wallet-fixtures-data" \
 node crates/native-wallet-web/tests/shared-history.browser.mjs
 ```
+
+Set `WALLET_TEST_STAGGERED_BIRTHDAYS=1` to create accounts at different block
+heights. This case verifies that returning to the interrupted earlier account
+reuses its encrypted boundary; only its later blocks need a receipt scan.
 
 Parity data uses only disposable synthetic phrases, never a real wallet.
 These tests exercise application compatibility and hostile-data boundaries;
