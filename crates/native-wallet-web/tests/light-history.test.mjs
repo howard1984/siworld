@@ -36,6 +36,19 @@ test('private history scans real fixture receipts and isolates derived accounts'
 
 const {LightSession} = await import(new URL('sdk/light-session.js', root));
 const {CommitmentSession} = await import(new URL('sdk/commitment-session.js', root));
+
+test('compact fallback builds the same authenticated frontier as the projected record', () => {
+  const projected=BrowserCommitmentTree.create(config.rules_hex,config.genesis);
+  const compact=BrowserCommitmentTree.create(config.rules_hex,config.genesis);
+  try {
+    projected.append(readFileSync(new URL('commitments-64.bin',fixture)));
+    compact.append_compact(bytes);
+    assert.equal(compact.summary(),projected.summary());
+    const before=compact.summary(),corrupt=new Uint8Array(bytes);corrupt[32]^=1;
+    assert.throws(()=>compact.append_compact(corrupt));
+    assert.equal(compact.summary(),before);
+  }finally{projected.free();compact.free();}
+});
 function deferred() {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
@@ -273,6 +286,53 @@ test('birthday sync authenticates the prefix, scans later notes and reuses the t
     assert.equal(otherResult.height,2);assert.deepEqual(otherResult.received_records,[]);
     assert.equal(otherResult.downloaded_bytes,0);
     assert.equal(requests.filter(url=>url.includes('/compact/')||url.includes('/commitments/')).length,downloads);
+  }finally{
+    history.free();other.free();anchor.free();wallet.free();globalThis.fetch=savedFetch;
+    if(savedNavigator)Object.defineProperty(globalThis,'navigator',savedNavigator);else delete globalThis.navigator;
+  }
+});
+
+test('HTTP 400 projection fallback shares history while retaining account-specific receipts', async () => {
+  const savedFetch=globalThis.fetch,savedNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  const privateValues=new Map(),publicValues=new Map(),requests=[];
+  const io={storage:async(store,key,value)=>{
+    const values=store==='private'?privateValues:publicValues;
+    if(value!==undefined)values.set(key,structuredClone(value));
+    return values.has(key)?structuredClone(values.get(key)):undefined;
+  },batch:async(a,av,b,bv)=>{privateValues.set(a,new Uint8Array(av));privateValues.set(b,new Uint8Array(bv));}};
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{locks:{request:(_key,options,action)=>(action||options)()}}});
+  const pinned={...config,name:'siworld-eng-1',api:'https://wallet.invalid/api'};
+  const wallet=BrowserWallet.restore(config.network,0,config.words),anchor=wallet.derive_account(0),other=wallet.derive_account(1);
+  const history=new CommitmentSession(anchor,pinned,BrowserCommitmentTree,io);
+  const first=config.rows[0].block_id,next=config.rows[0].next_block_id;
+  const nextBytes=readFileSync(new URL('next-64.bin',fixture));
+  globalThis.fetch=async url=>{
+    requests.push(url);
+    if(url.endsWith('/head'))return Response.json({network:config.network,genesis:config.genesis,height:2,tip:next});
+    if(url.includes('/chain?')){
+      const p=new URL(url).searchParams,from=Number(p.get('from')),end=p.get('tip')===first?1:2;
+      return Response.json({ids:[first,next].slice(from-1,Math.min(end,from-1+Number(p.get('limit'))))});
+    }
+    if(url.includes('/commitments/'))return new Response(null,{status:400});
+    if(url.endsWith('/compact/'+first))return new Response(bytes);
+    assert.ok(url.endsWith('/compact/'+next));return new Response(nextBytes);
+  };
+  try{
+    const session=new LightSession(wallet,pinned,{...io,history,birthday:{birth_height:1}});
+    await session.initialize();
+    await assert.rejects(session.sync(row=>{if(row.phase==='history'&&row.height===1)session.cancelSync();}),{name:'AbortError'});
+    assert.equal(session.ready,false);assert.equal(session.journal.height,0);
+    assert.equal(JSON.parse(wallet.light_balance()).height,0);
+    assert.equal(JSON.parse(history.tree.summary()).height,1);
+    const second=new LightSession(other,pinned,{...io,history,birthday:{birth_height:2}});
+    await second.initialize();const b=await second.sync();
+    assert.equal(b.ready,true);assert.equal(b.height,2);assert.deepEqual(b.received_records,[]);
+    const a=await session.sync();
+    assert.equal(a.ready,true);assert.equal(a.height,2);assert.equal(a.received_records.length,1);
+    assert.equal(a.received_records[0].height,2);
+    assert.equal(requests.filter(url=>url.includes('/commitments/')).length,1);
+    assert.equal(requests.filter(url=>url.endsWith('/compact/'+first)).length,1);
+    assert.equal(publicValues.has(first),false,'Do not retain pre-birthday ciphertext used only for authentication.');
   }finally{
     history.free();other.free();anchor.free();wallet.free();globalThis.fetch=savedFetch;
     if(savedNavigator)Object.defineProperty(globalThis,'navigator',savedNavigator);else delete globalThis.navigator;

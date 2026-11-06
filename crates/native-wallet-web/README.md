@@ -36,7 +36,16 @@ indexes on the pinned network. **Create new wallet** selects the next unused ind
 it does not generate another phrase. Account derivation copies seed entropy
 only inside WASM. A newly created wallet cannot derive accounts until its
 recovery challenge is complete. One management panel is expanded at a time,
-with a separate scanner, balance and encrypted payment journal per account.
+with a separate private balance scanner and encrypted payment journal per account.
+Accounts share a locally authenticated public-history frontier. Checked history
+prefixes are encrypted every 16 blocks and on an interrupted extension, so a
+new account continues the existing history work. Exact birthday frontiers are
+also encrypted for reuse when switching back to an earlier account. Account
+balances become current only after their own scan and journal commit together.
+If the optional commitment-projection service is unavailable, the worker
+authenticates the same frontier from public compact records. It erases those
+historical input bytes after use and does not persist pre-birthday ciphertext
+downloaded only for tree authentication. Invalid authentication fails closed.
 Switching is blocked while the payment panel is open or a proof is running.
 Collapsed balances show their last scanned block rather than implying that
 every account is synchronized in the background. Read-only deployments keep
@@ -57,6 +66,14 @@ public address. Decrypted names remain in the page/worker memory only while
 unlocked. They are never included in HTTP requests, address-directory entries,
 transactions, node exports, telemetry or Vault snapshots. IndexedDB is local
 browser storage; it is not an online backup.
+
+The locked-device selector identifies encrypted seed records by stable local
+record IDs. It remembers the last selected record across lock and reload;
+names become available only after decryption. Indexed accounts created from
+the same recovery phrase share that seed record and its device password.
+Renaming an account or exporting its registry interrupts pending balance
+downloads before entering the serialized worker queue. Synchronization then
+resumes without discarding accepted scan state or the payment journal.
 
 A manually downloaded version-2 encrypted wallet backup includes the
 encrypted account registry. The device password protects the seed backup;
@@ -137,6 +154,32 @@ WALLET_PARITY_VAULT=/tmp/wallet-native-vault.json \
 node --test crates/native-wallet-web/tests/browser-core.test.mjs \
   crates/native-wallet-web/tests/content-vault.test.mjs
 python3 crates/native-wallet-web/tests/services-test.py
+node --test crates/native-wallet-web/tests/storage-selection.test.mjs
+```
+
+The optional browser lifecycle regression uses Playwright and an unpacked
+engineering build with supported pinned protocol parameters. It serves an
+empty localhost chain, creates disposable wallets, stalls synchronization,
+and verifies rename, backup, selection persistence and password retry. It
+blocks external requests and never submits payments:
+
+```sh
+WALLET_WEB_OUTPUT="$PWD/build/wallet-v1" \
+node crates/native-wallet-web/tests/wallet-lifecycle.browser.mjs
+```
+
+Install Playwright in the test environment, or set `WALLET_PLAYWRIGHT` to its
+module entry point. `WALLET_BROWSER` optionally selects a Chromium executable.
+
+The shared-history regression requires a `--browser-fixtures` build and the
+synthetic two-block fixture directory in `WALLET_FIXTURE_DIR`. It returns HTTP
+400 for projections, interrupts one account during synchronization, and checks
+that another account resumes the verified prefix without downloading it again:
+
+```sh
+WALLET_WEB_OUTPUT="$PWD/build/wallet-fixtures" \
+WALLET_FIXTURE_DIR="$PWD/build/wallet-fixtures-data" \
+node crates/native-wallet-web/tests/shared-history.browser.mjs
 ```
 
 Parity data uses only disposable synthetic phrases, never a real wallet.

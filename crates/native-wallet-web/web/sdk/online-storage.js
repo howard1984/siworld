@@ -21,7 +21,7 @@ export const unhex=text=>{if(typeof text!=='string'||text.length%2||!/^[0-9a-f]*
 export const hash=async bytes=>hex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)));
 export async function fetchLimited(url,{limit=8388656,method='GET',body,headers={},signal}={}) {
   const response=await fetch(url,{method,body,headers,signal,credentials:'omit',referrerPolicy:'no-referrer',redirect:'error',cache:'no-store'});
-  if(!response.ok)throw new Error(`Engineering service returned HTTP ${response.status}.`);
+  if(!response.ok)throw Object.assign(new Error(`Engineering service returned HTTP ${response.status}.`),{status:response.status});
   const declared=Number(response.headers.get('content-length'));if(declared>limit)throw new Error('Response exceeds its byte limit.');
   const reader=response.body.getReader();const parts=[];let size=0;
   try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit)throw new Error('Response exceeds its byte limit.');parts.push(value);}}catch(error){await reader.cancel();throw error;}

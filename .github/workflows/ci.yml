@@ -103,6 +103,10 @@ jobs:
           python3 scripts/check-repository.py
           python3 scripts/check-native-envelope-policy.py
           python3 scripts/check-fee-settlement-evaluation.py --schema >/tmp/fee-settlement-schema.json
+      - name: Wallet record selection regressions
+        run: node --test crates/native-wallet-web/tests/storage-selection.test.mjs
+      - name: Shared wallet history regressions
+        run: node --test crates/native-wallet-web/tests/commitment-session.test.mjs
       - name: Audit evidence and memory declarations
         run: |
           python3 scripts/check-audit-registry.py

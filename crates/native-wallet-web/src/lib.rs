@@ -113,6 +113,13 @@ impl BrowserCommitmentTree {
         .to_string())
     }
 
+    /// Authenticate the same history from compact data when projections are unavailable.
+    pub fn append_compact(&mut self, bytes: &[u8]) -> Result<String, JsValue> {
+        let projected =
+            Zeroizing::new(engine::commitment::CommitmentBlock::project(bytes).map_err(js)?);
+        self.append(&projected)
+    }
+
     pub fn check_head(&self, height: &str, tip: &str, previous: &Self) -> Result<(), JsValue> {
         let s = &self.history.state;
         let prior = &previous.history.state;

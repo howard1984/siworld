@@ -48,10 +48,13 @@ CRATES = {
 PUBLIC_TEXT_ASSETS = {
     "crates/native-wallet-web/web/sdk/commitment-session.js",
     "crates/native-wallet-web/tests/commitment-session.test.mjs",
+    "crates/native-wallet-web/tests/shared-history.browser.mjs",
     "crates/native-wallet-web/web/sdk/wallet-accounts.js",
     "crates/native-wallet-web/web/assets/wallet-list.js",
     "crates/native-wallet-web/web/assets/wallet-history.js",
     "crates/native-wallet-web/tests/wallet-accounts.test.mjs",
+    "crates/native-wallet-web/tests/storage-selection.test.mjs",
+    "crates/native-wallet-web/tests/wallet-lifecycle.browser.mjs",
     "crates/native-wallet-web/tests/light-history.test.mjs",
     "crates/native-wallet-web/web/sdk/proof-progress.js",
     "crates/native-wallet-web/tests/proof-progress.test.mjs",

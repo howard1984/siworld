@@ -11,7 +11,7 @@ if (core.initThreadPool) {
 const { BrowserWallet, inspect_address } = core;
 const directory = new AddressDirectory(ENGINEERING,inspect_address);
 self.postMessage({ ready: true });
-let wallet = null, active = null, accounts = null, online = null, history = null, creationBirthday = null, queue = Promise.resolve();
+let wallet = null, active = null, accounts = null, online = null, history = null, creationBirthday = null, queue = Promise.resolve(), syncRevision = 0;
 const release = () => { history?.free(); active?.free(); accounts?.free(); wallet?.free(); active = accounts = wallet = online = history = creationBirthday = null; };
 const scoped = new Set(['register-address', 'online-init', 'sync', 'prepare', 'submit', 'cancel-payment', 'journal']);
 function selectAccount(account) {
@@ -23,13 +23,15 @@ function selectAccount(account) {
 self.onmessage = ({ data }) => {
   // Interrupt network waits before queuing a wallet change. WASM operations
   // remain serialized until the abandoned candidate has been discarded.
-  if (data.action === 'accounts-add' || data.action === 'account-select') online?.cancelSync();
-  queue=queue.then(()=>handle(data));
+  if (['accounts-add', 'account-select', 'accounts-rename', 'accounts-backup'].includes(data.action)) { ++syncRevision; online?.cancelSync(); }
+  const revision = syncRevision;
+  queue=queue.then(()=>handle(data, revision));
 };
-async function handle(data) {
+async function handle(data, revision) {
   const { id, action, args = [] } = data;
   try {
     let result;
+    if (action === 'sync' && revision !== syncRevision) throw new Error('Balance synchronization paused for a wallet change.');
     if (scoped.has(action) && (!active || data.account !== JSON.parse(active.public_info()).account)) throw new Error('The selected wallet changed. Reopen its payment panel.');
     switch (action) {
       case 'password-check': result = JSON.parse(core.device_password_status(...args)); break;

@@ -2,14 +2,14 @@ import { WalletList } from './wallet-list.js';
 import { WalletHistory } from './wallet-history.js';
 import { MAX_ACCOUNTS } from '../sdk/wallet-accounts.js';
 import { VAULT } from '../sdk/vault-network.js';
-import { backup, bytes, parseBackup, records, save, MAX_BACKUP } from '../sdk/storage.js';
+import { backup, bytes, parseBackup, records, save, selectedWallet, savedWalletLabel, MAX_BACKUP } from '../sdk/storage.js';
 import { ENGINEERING } from '../sdk/network.js';
 import { ProofProgress } from '../sdk/proof-progress.js';
 
 const $ = selector => document.querySelector(selector);
 const flow = $('#flow');
 let worker, sequence = 0, epoch = 0, ready = false, busy = false, storageHealthy = false;
-let mode = '', stage = '', context, positions, info, encrypted, savedRecords = [], imported;
+let mode = '', stage = '', context, positions, info, encrypted, savedRecords = [], imported, unlockingRecord;
 let timer, pollTimer, onlineBusy=false, onlineReady=false, preparedId=null;
 const pending = new Map(), contacts = new Map();
 const proofProgress = new ProofProgress({root: $('#send-progress'), label: $('#send-progress-label'), detail: $('#send-progress-detail'), bar: $('#send-progress-bar')});
@@ -59,12 +59,12 @@ function clearSecrets() {
 function lock(text = 'Wallet locked. Recovery fields and the local worker session were cleared.', restart = true) {
   walletList.reset(); history.reset(); history.root.hidden = true; $('#add-wallet').disabled = true;
   $('#wallet-count').textContent = `0 / ${MAX_ACCOUNTS}`; $('#wallet-creation-status').textContent = '';
-  $('#wallet-name-dialog').close(); $('#wallet-name').value = ''; $('#wallet-name-save').disabled = false; namingAccount = null;
+  $('#wallet-name-dialog').close(); $('#wallet-name').value = ''; $('#wallet-name-save').disabled = false; $('#wallet-name-save').textContent = 'Save name'; namingAccount = null;
   proofProgress.reset(); paymentControls();
   ++epoch; clearTimeout(timer); clearTimeout(pollTimer); onlineReady=false; onlineBusy=false; preparedId=null; worker?.terminate(); ready = false; capability(false);
   for (const request of pending.values()) request.reject(new Error('Wallet session was closed.'));
   pending.clear(); clearSecrets(); flow.close();
-  info = encrypted = imported = context = null; busy = false; stage = mode = '';
+  info = encrypted = imported = unlockingRecord = context = null; busy = false; stage = mode = '';
   $('#next').disabled = false; $('#send-open').disabled=true; $('#send-flow').close(); $('#balance-value').textContent='—'; $('#chain-status').textContent='Wallet locked.';
   contacts.clear();
   $('#locked-notes').hidden=true;$('#locked-note-list').replaceChildren();$('#balance-detail').textContent='Unlock to scan public compact records locally.';$('#asset-balances').replaceChildren();$('#payment-list').replaceChildren();$('#send-recipient').value='';$('#send-amount').value='';$('#send-review').textContent='';$('#send-error').textContent='';
@@ -98,7 +98,9 @@ function showStage(next) {
     $('#password').autocomplete = 'new-password';
   } else if (next === 'unlock') {
     $('#flow-title').textContent = 'Unlock your V1 wallet.';
-    $('#flow-description').textContent = 'Your password decrypts the selected wallet only on this device.';
+    $('#flow-description').textContent = imported
+      ? 'Enter the device password used to encrypt this backup.'
+      : `${savedWalletLabel(unlockingRecord)}. Enter this wallet's device password. Names appear after unlocking.`;
     display('password-fields', true); $('#confirm-field').hidden = true; $('#password').autocomplete = 'current-password';
     $('#next').textContent = imported ? 'Unlock and import ↗' : 'Unlock wallet ↗';
   }
@@ -112,13 +114,17 @@ function begin(nextMode) {
   $('#network').value = ENGINEERING.network; $('#account').value = '0';
   $('#lock').disabled = false; showStage('context'); flow.showModal();
 }
-async function reloadSaved() {
+async function reloadSaved(preferred = $('#saved-wallet').value) {
+  preferred ||= await selectedWallet();
   savedRecords = await records(); $('#saved').hidden = !savedRecords.length;
-  $('#saved-wallet').replaceChildren(...savedRecords.map((record, index) => {
+  $('#saved-wallet').replaceChildren(...savedRecords.map(record => {
     const option = document.createElement('option'); option.value = record.id;
-    option.textContent = `Wallet ${index + 1} · account ${record.account} · network ${record.network.slice(0, 10)}…`; return option;
+    option.textContent = savedWalletLabel(record); return option;
   }));
+  if (savedRecords.some(record => record.id === preferred)) $('#saved-wallet').value = preferred;
+  if ($('#saved-wallet').value) await selectedWallet($('#saved-wallet').value);
 }
+$('#saved-wallet').addEventListener('change', () => selectedWallet($('#saved-wallet').value));
 async function render(publicInfo, record, selected = false) {
   const token = epoch;
   if (!selected) {
@@ -193,20 +199,21 @@ $('#flow-form').addEventListener('submit', async event => {
       const resultPromise = call('seal', password, answers); password = answers = '';
       const result = await resultPromise; if (token !== epoch) return;
       const record = backup(context.network, context.account, result.bytes); result.bytes.fill(0);
-      await save(record); if (token !== epoch) return;
-      clearSecrets(); flow.close(); await render(result.info, record); await reloadSaved();
+      const id = await save(record); if (token !== epoch) return;
+      await reloadSaved(id); if (token !== epoch) return;
+      clearSecrets(); flow.close(); await render(result.info, record);
     } else if (stage === 'unlock') {
-      const record = imported || savedRecords.find(r => r.id === $('#saved-wallet').value);
+      const record = imported || unlockingRecord;
       if (!record) throw new Error('Select an encrypted wallet first.');
       let password = $('#password').value; $('#password').value = '';
       const resultPromise = call('unlock', record.network, bytes(record), password); password = '';
       const result = await resultPromise; if (token !== epoch) return;
       if (result.network !== record.network || result.account !== record.account) { await call('lock'); throw new Error('Backup recovery context does not match its authenticated wallet.'); }
       clearSecrets(); await render(result, record); if (token !== epoch) return;
-      if (imported) await save(imported); if (token !== epoch) return;
-      flow.close(); imported = null; await reloadSaved();
+      const id = imported ? await save(imported) : record.id; if (token !== epoch) return;
+      flow.close(); imported = unlockingRecord = null; await reloadSaved(id);
     }
-  } catch (error) { if (token === epoch) $('#flow-error').textContent = error.message; }
+  } catch (error) { if (token === epoch) { if (flow.open) $('#flow-error').textContent = error.message; else message(error.message, true); } }
   finally { if (token === epoch) { busy = false; $('#next').disabled = false; walletCreation(); } }
 });
 let passwordRevision = 0;
@@ -219,6 +226,10 @@ $('#password').addEventListener('input', async () => {
   } catch { /* Sealing still enforces the same policy inside WASM. */ }
 });
 $('#open-unlock').addEventListener('click', () => {
+  if (!ready || busy || !storageHealthy) return;
+  unlockingRecord = savedRecords.find(record => record.id === $('#saved-wallet').value);
+  if (!unlockingRecord) { message('Select an encrypted wallet first.', true); return; }
+  selectedWallet(unlockingRecord.id);
   clearSecrets(); ++epoch; imported = null; $('#lock').disabled = false; showStage('unlock'); flow.showModal();
 });
 $('#import-backup').addEventListener('click', () => $('#backup-file').click());
@@ -331,6 +342,8 @@ $('#wallet-name-dialog').addEventListener('cancel', event => { event.preventDefa
 $('#wallet-name-form').onsubmit = async event => {
   event.preventDefault(); if (!info || namingAccount === null || busy) return;
   const token = epoch; busy = true; $('#wallet-name-save').disabled = true;
+  $('#wallet-name-save').textContent = 'Saving…';
+  walletCreation();
   try {
     const result = await call('accounts-rename', namingAccount, $('#wallet-name').value);
     if (token !== epoch) return;
@@ -338,5 +351,5 @@ $('#wallet-name-form').onsubmit = async event => {
     $('#send-source').textContent = `From ${walletList.name(info.account)} · account ${info.account} · ${info.short_address}`;
     closeName(); message('Wallet name saved only in encrypted storage on this device.');
   } catch (error) { if (token === epoch) $('#wallet-name-error').textContent = error.message; }
-  finally { if (token === epoch) { busy = false; $('#wallet-name-save').disabled = false; } }
+  finally { if (token === epoch) { busy = false; $('#wallet-name-save').disabled = false; $('#wallet-name-save').textContent = 'Save name'; walletCreation(); } }
 };

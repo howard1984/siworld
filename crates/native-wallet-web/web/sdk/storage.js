@@ -1,6 +1,32 @@
 export const FORMAT = 'siworld-native-wallet-backup';
 export const MAX_BACKUP = 70 * 1024;
 export const DB_NAME = 'siworld-native-v1';
+// Remember only an opaque local record ID. Wallet names remain encrypted.
+// A separate database keeps older wallet builds able to open the vault store.
+export async function selectedWallet(id) {
+  let db;
+  try {
+    db = await new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB_NAME + '-preferences', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('selection');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(new Error('Wallet selection is unavailable.'));
+    });
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction('selection', id === undefined ? 'readonly' : 'readwrite');
+      const store = tx.objectStore('selection');
+      const request = id === undefined ? store.get('wallet') : store.put(id, 'wallet');
+      let value = '';
+      request.onsuccess = () => { value = id === undefined ? request.result || '' : id; };
+      tx.oncomplete = () => resolve(value);
+      tx.onabort = tx.onerror = () => reject(new Error('Wallet selection was not saved.'));
+    });
+  } catch { return id || ''; }
+  finally { db?.close(); }
+}
+export function savedWalletLabel(record) {
+  return `Encrypted wallet ${record.id} · account ${record.account}`;
+}
 export function parseBackup(text) {
   if (typeof text !== 'string' || new TextEncoder().encode(text).length > MAX_BACKUP) throw new Error('Encrypted backup is too large.');
   let data;

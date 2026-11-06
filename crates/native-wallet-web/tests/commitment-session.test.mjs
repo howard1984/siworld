@@ -26,6 +26,7 @@ class Tree {
     this.height++;
     return JSON.stringify({...JSON.parse(this.summary()), authentication_ciphertext_bytes:2});
   }
+  append_compact(bytes) { return this.append(bytes); }
   check_head(height, tip, previous) {
     if (String(this.height) !== height || id(this.height) !== tip || this.height < previous.height) throw new Error('Insufficient work.');
   }
@@ -37,6 +38,7 @@ function fixture() {
   let failAt = 0;
   const io = {
     storage: async (store, key, value) => {
+      if (store === 'compact') { assert.equal(value,undefined); return undefined; }
       assert.equal(store, 'private');
       if (value !== undefined) {
         assert.match(decoder.decode(value), /^sealed:[0-9]+$/);
@@ -87,12 +89,17 @@ test('invalid work preserves the accepted encrypted frontier and erases rejected
   assert.equal(JSON.parse(session.tree.summary()).height, 1);
 });
 
-test('cancellation leaves no partial candidate persisted', async () => {
+test('cancellation retains a verified shared prefix without declaring readiness', async () => {
   const f = fixture(), session = new CommitmentSession(anchor, config, Tree, f.io);
   const controller = new AbortController();
   await session.initialize();
   await assert.rejects(session.sync(head(3), controller.signal, () => controller.abort()), {name:'AbortError'});
-  assert.equal(f.writes.length, 0);
+  assert.equal(JSON.parse(session.tree.summary()).height, 1);
+  const restored = new CommitmentSession(anchor, config, Tree, f.io);
+  assert.equal((await restored.initialize()).height, 1);
+  const before = f.records.length;
+  await restored.sync(head(3));
+  assert.equal(f.records.length - before, 2);
   assert.ok(f.records.every(bytes => bytes.every(value => value === 0)));
 });
 
@@ -112,7 +119,7 @@ test('birthday view reuses an authenticated tree without repeating projection do
   const before=f.records.length;
   view=await session.atHeight(head(4),3);
   assert.equal(view.downloaded_bytes,0);assert.equal(view.authentication_ciphertext_bytes,0);
-  assert.equal(f.records.length,before);assert.equal(view.tree,session.tree);view.release();
+  assert.equal(f.records.length,before);assert.equal(view.tree.summary(),session.tree.summary());view.release();
 });
 test('older birthday reconstruction preserves the later encrypted frontier', async () => {
   const f=fixture(),session=new CommitmentSession(anchor,config,Tree,f.io);
@@ -120,7 +127,7 @@ test('older birthday reconstruction preserves the later encrypted frontier', asy
   const saved=[...f.saved.values()][0].slice(),writes=f.writes.length;
   const view=await session.atHeight(head(4),2);
   assert.equal(view.height,2);assert.equal(view.downloaded_bytes,8);assert.notEqual(view.tree,session.tree);
-  assert.equal(JSON.parse(session.tree.summary()).height,4);assert.equal(f.writes.length,writes);
+  assert.equal(JSON.parse(session.tree.summary()).height,4);assert.equal(f.writes.length,writes+1);
   assert.deepEqual([...f.saved.values()][0],saved);view.release();
   assert.ok(f.records.every(bytes=>bytes.every(value=>value===0)));
 });
@@ -130,4 +137,66 @@ test('malformed birthday indexes fail before downloading history or replacing a 
   await assert.rejects(session.atHeight(head(4),2),/Missing historical/);
   await assert.rejects(session.atHeight(head(4),5),/Invalid historical/);
   assert.equal(f.records.length,0);assert.equal(f.writes.length,0);
+});
+
+test('an earlier birthday reuses its encrypted boundary after another account advances history', async () => {
+  const f=fixture(), session=new CommitmentSession(anchor,config,Tree,f.io);
+  await session.initialize();
+  (await session.atHeight(head(5),2)).release();
+  (await session.atHeight(head(5),4)).release();
+  const restored=new CommitmentSession(anchor,config,Tree,f.io);
+  await restored.initialize();
+  const before=f.records.length;
+  const view=await restored.atHeight(head(5),2);
+  assert.equal(view.height,2);assert.equal(view.downloaded_bytes,0);
+  assert.equal(f.records.length,before);view.release();
+  assert.equal(JSON.parse(restored.tree.summary()).height,4);
+});
+
+test('an unavailable projection falls back once to authenticated compact input and erases it', async () => {
+  const f=fixture(), calls=[], raw=[];
+  const binary=async url=>{
+    calls.push(url);
+    if(url.includes('/commitments/'))throw Object.assign(new Error('Unavailable.'),{status:400});
+    assert.match(url,/\/compact\//);
+    const bytes=Uint8Array.of(Number('0x'+url.split('/').at(-1)),17,18,19);
+    raw.push(bytes);return {bytes};
+  };
+  const session=new CommitmentSession(anchor,config,Tree,{...f.io,binary});
+  await session.initialize();const view=await session.atHeight(head(3),3);
+  assert.equal(view.height,3);assert.equal(view.downloaded_bytes,12);view.release();
+  assert.equal(calls.filter(url=>url.includes('/commitments/')).length,1);
+  assert.equal(calls.filter(url=>url.includes('/compact/')).length,3);
+  assert.ok(raw.every(bytes=>bytes.every(value=>value===0)));
+});
+
+test('projection authentication errors fail closed without compact fallback', async () => {
+  const f=fixture();f.fail(1);
+  const session=new CommitmentSession(anchor,config,Tree,f.io);
+  await session.initialize();
+  await assert.rejects(session.sync(head(2)),/continuity/);
+  assert.ok(f.requested.every(url=>!url.includes('/compact/')));
+  assert.equal(f.writes.length,0);
+});
+
+test('a cancelled birthday remains reusable after a later account catches up', async () => {
+  const f=fixture(), session=new CommitmentSession(anchor,config,Tree,f.io), controller=new AbortController();
+  await session.initialize();
+  await assert.rejects(session.atHeight(head(4),2,controller.signal,()=>controller.abort()),{name:'AbortError'});
+  // Cancellation happened at the first block, before the original boundary.
+  assert.equal(JSON.parse(session.tree.summary()).height,1);
+  let view=await session.atHeight(head(4),2);view.release();
+  view=await session.atHeight(head(4),4);view.release();
+  const before=f.records.length;
+  view=await session.atHeight(head(4),2);view.release();
+  assert.equal(f.records.length,before);
+});
+
+test('long shared history persists checked prefixes before the requested head', async () => {
+  const f=fixture(),session=new CommitmentSession(anchor,config,Tree,f.io);
+  await session.initialize();
+  await session.sync(head(20),undefined,row=>{
+    if(row.height===16) assert.equal(decoder.decode(f.saved.get(session.key)),'sealed:16');
+  });
+  assert.equal(decoder.decode(f.saved.get(session.key)),'sealed:20');
 });
