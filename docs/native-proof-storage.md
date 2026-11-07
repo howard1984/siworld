@@ -46,7 +46,10 @@ records and base intact. Reopening checks the local signatures and complete
 compact prefix, then verifies the complete retained proof tail. Recent forks
 reconstruct from that base and cannot cross the existing finality boundary.
 Detached records below the base retain their compact public fields and local
-reward evidence while their proof bodies can expire.
+reward evidence while their proof bodies can expire. Expiry reconstructs public
+effects from authenticated compact records and compares every resulting state
+fingerprint with the fingerprint saved during independent block verification.
+It does not repeat expensive proof verification on the canonical-state owner.
 
 A local identity seal is not a remote checkpoint-authority quorum. This decoder
 must never be used to accept unauthenticated peer snapshots. The engineering
@@ -54,7 +57,10 @@ network's original genesis-reserved checkpoint authorities remain inactive; the
 engineering transition uses a separate release configuration. Non-fixture bootstrap and validator expiry is currently blocked in code until
 checkpoint delivery and retained-tail availability have been qualified. Metrics
 report `checkpoint_delivery_unavailable`; a local replay seal cannot remove this
-gate. An offline node beyond all retained proof windows cannot
+gate. Finality observation continues while checkpoint delivery is unqualified or
+stale. Explicit qualification requires a fresh confirmed canonical certificate
+from the release-pinned quorum; later expiry pauses after an 18-hour checkpoint
+age and never crosses the latest accepted checkpoint height. An offline node beyond all retained proof windows cannot
 yet automatically recover from a remote checkpoint in this implementation.
 
 ## Maintenance and disk accounting

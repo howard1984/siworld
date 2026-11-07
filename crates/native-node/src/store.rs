@@ -31,6 +31,7 @@ const FINGERPRINT_BYTES: usize = 32;
 mod checkpoint;
 pub mod engineering_checkpoint;
 mod miner_view;
+pub(super) mod public_replay;
 mod receipts;
 mod retention;
 #[cfg(test)]

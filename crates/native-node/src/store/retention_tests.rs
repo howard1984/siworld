@@ -380,29 +380,65 @@ fn validator_expiry_uses_observed_finality_time_and_preserves_recovery() {
             .unwrap(),
         0
     );
-    // Failure after the first record's conversion must roll back all writes.
-    assert!(
-        store
-            .expire_proofs(
-                1000 + SERVICE_RETENTION_SECONDS,
-                true,
-                &StorageVerifier::new(true)
-            )
-            .is_err()
-    );
-    assert!(store.block(1).is_ok());
-    assert_eq!(store.storage_base.as_ref().unwrap().height, 0);
-    assert_eq!(store.storage_metrics().unwrap()["pruned_proof_blocks"], 0);
+    // Either a changed worked public header or a changed saved fingerprint on
+    // the second row must roll back the already converted first row, its seal,
+    // proof accounting and the clock observation in the same transaction.
+    let original_second = {
+        let txn = store.database.begin_read().unwrap();
+        txn.open_table(BLOCKS)
+            .unwrap()
+            .get(2)
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec()
+    };
+    for (offset, reason) in [
+        (105, "storage finality belongs to another canonical block"),
+        (
+            original_second.len() - 1,
+            "storage replay fingerprint mismatch",
+        ),
+    ] {
+        let mut changed = original_second.clone();
+        changed[offset] ^= 1;
+        let txn = store.database.begin_write().unwrap();
+        txn.open_table(BLOCKS)
+            .unwrap()
+            .insert(2, changed.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        let before = retention_snapshot(&store);
+        assert_eq!(
+            store
+                .expire_proofs(
+                    1000 + SERVICE_RETENTION_SECONDS,
+                    true,
+                    &StorageVerifier::new(true)
+                )
+                .unwrap_err(),
+            reason
+        );
+        assert_eq!(retention_snapshot(&store), before);
+        assert!(store.block(1).is_ok());
+        assert_eq!(store.storage_base.as_ref().unwrap().height, 0);
+        assert_eq!(store.state().fingerprint(), expected);
+        assert_eq!(store.miner_reward_view().unwrap(), reward_before);
+        let txn = store.database.begin_write().unwrap();
+        txn.open_table(BLOCKS)
+            .unwrap()
+            .insert(2, original_second.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let unused_verifier = StorageVerifier::new(true);
     assert_eq!(
         store
-            .expire_proofs(
-                1000 + SERVICE_RETENTION_SECONDS,
-                true,
-                &StorageVerifier::new(false)
-            )
+            .expire_proofs(1000 + SERVICE_RETENTION_SECONDS, true, &unused_verifier)
             .unwrap(),
         2
     );
+    assert_eq!(unused_verifier.settlements.get(), 0);
     assert_eq!(
         store.storage_metrics().unwrap()["retained_proof_blocks"],
         24
@@ -445,6 +481,32 @@ fn validator_expiry_uses_observed_finality_time_and_preserves_recovery() {
     );
     assert_eq!(store.state().fingerprint(), expected);
     assert_eq!(store.miner_reward_view().unwrap(), reward_before);
+}
+
+/// Logical contents, rather than redb's abort-safe physical page allocation.
+fn retention_snapshot(store: &Store) -> Vec<Vec<u8>> {
+    let txn = store.database.begin_read().unwrap();
+    let mut result = Vec::new();
+    for row in txn.open_table(retention::STORAGE).unwrap().iter().unwrap() {
+        let (key, value) = row.unwrap();
+        let mut entry = key.value().as_bytes().to_vec();
+        entry.push(0);
+        entry.extend_from_slice(value.value());
+        result.push(entry);
+    }
+    for row in txn.open_table(retention::FINALITY).unwrap().iter().unwrap() {
+        let (height, value) = row.unwrap();
+        let mut entry = height.value().to_le_bytes().to_vec();
+        entry.extend_from_slice(value.value());
+        result.push(entry);
+    }
+    for row in txn.open_table(BLOCKS).unwrap().iter().unwrap() {
+        let (height, value) = row.unwrap();
+        let mut entry = height.value().to_le_bytes().to_vec();
+        entry.extend_from_slice(blake3::hash(value.value()).as_bytes());
+        result.push(entry);
+    }
+    result
 }
 
 #[test]

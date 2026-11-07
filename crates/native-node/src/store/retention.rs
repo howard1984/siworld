@@ -2,6 +2,7 @@
 use super::*;
 use crate::{
     compact::CompactBlock,
+    engineering_checkpoint::{self as checkpoint_auth, Roster},
     identity::NativeIdentity,
     p2p::Binding,
     storage_policy::{self, FinalityObservation, RecoveryBoundary, Role},
@@ -53,7 +54,7 @@ fn value(
         "base" => checkpoint::MAX_CHECKPOINT_BYTES,
         "seal" => 3373,
         "role" => 9,
-        "prefix" => 32,
+        "prefix" | "qualified_roster" => 32,
         "last_clock" | "local_blocks" => 8,
         _ => 0,
     };
@@ -231,7 +232,138 @@ pub(super) fn forget(txn: &redb::WriteTransaction, height: u64) -> Result<(), St
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ServiceGate {
+    Ready(RecoveryBoundary),
+    Paused(&'static str),
+}
 impl Store {
+    fn qualified_checkpoint_roster(&self) -> Result<Option<crate::wire::Hash>, String> {
+        if !is_enabled(&self.database)? {
+            return Ok(None);
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "checkpoint delivery policy unavailable")?;
+        let storage = transaction
+            .open_table(STORAGE)
+            .map_err(|_| "checkpoint delivery policy unavailable")?;
+        storage
+            .get("qualified_roster")
+            .map_err(|_| "checkpoint delivery policy unreadable")?
+            .map(|row| {
+                row.value()
+                    .try_into()
+                    .map_err(|_| "invalid checkpoint delivery qualification".into())
+            })
+            .transpose()
+    }
+    fn service_checkpoint_gate(
+        &self,
+        roster: Option<&Roster>,
+        now: u64,
+    ) -> Result<ServiceGate, String> {
+        let Some(roster) = roster else {
+            return Ok(ServiceGate::Paused("checkpoint_delivery_unavailable"));
+        };
+        if self.qualified_checkpoint_roster()? != Some(roster.digest()) {
+            return Ok(ServiceGate::Paused("checkpoint_acceptance_required"));
+        }
+        let Some(certificate) = self.latest_engineering_checkpoint()? else {
+            return Ok(ServiceGate::Paused("checkpoint_unavailable"));
+        };
+        let authenticated = match certificate.authenticate(roster, None, now) {
+            Ok(value) => value,
+            Err(_) => return Ok(ServiceGate::Paused("checkpoint_invalid")),
+        };
+        if !authenticated.pruning_fresh(now) {
+            return Ok(ServiceGate::Paused("checkpoint_stale"));
+        }
+        let statement = &certificate.statement;
+        let local_id = match self
+            .state
+            .snapshots
+            .iter()
+            .find(|snapshot| snapshot.selector.height == statement.height)
+        {
+            Some(snapshot) => snapshot.selector.block_id,
+            None => match self.canonical_id(statement.height) {
+                Ok(id) => id,
+                Err(_) => return Ok(ServiceGate::Paused("checkpoint_not_canonical")),
+            },
+        };
+        if statement.binding != Binding::new(&self.state.config)
+            || statement.block_id != local_id
+            || statement
+                .height
+                .checked_add(checkpoint_auth::CONFIRMATIONS)
+                .is_none_or(|minimum| minimum > self.state.height)
+        {
+            return Ok(ServiceGate::Paused("checkpoint_not_canonical"));
+        }
+        Ok(ServiceGate::Ready(RecoveryBoundary {
+            height: statement.height,
+            sealed_unix_seconds: statement.issued_unix_seconds,
+            tail_complete: true,
+        }))
+    }
+    /// Explicit activation after checkpoint delivery and recovery acceptance.
+    /// The CLI must use the immutable engineering release roster; a certificate
+    /// or peer cannot enable pruning or install replacement authorities.
+    pub fn qualify_service_checkpoint_delivery(
+        &mut self,
+        roster: &Roster,
+        now: u64,
+    ) -> Result<(), String> {
+        if self
+            .storage_role()?
+            .is_none_or(|role| !role.serves_historical_proofs())
+        {
+            return Err("checkpoint delivery qualification requires a service storage role".into());
+        }
+        if roster.binding() != Binding::new(&self.state.config) {
+            return Err("checkpoint delivery roster context mismatch".into());
+        }
+        if !self.state.config.fixture {
+            let release = checkpoint_auth::release_roster(Binding::new(&self.state.config))?
+                .ok_or("checkpoint release roster is not installed")?;
+            if release.digest() != roster.digest() {
+                return Err("checkpoint delivery requires the pinned release roster".into());
+            }
+        }
+        let certificate = self
+            .latest_engineering_checkpoint()?
+            .ok_or("checkpoint delivery requires an accepted certificate")?;
+        let authenticated = certificate.authenticate(roster, None, now)?;
+        if !authenticated.pruning_fresh(now)
+            || self.canonical_id(certificate.statement.height)? != certificate.statement.block_id
+            || certificate
+                .statement
+                .height
+                .checked_add(checkpoint_auth::CONFIRMATIONS)
+                .is_none_or(|minimum| minimum > self.state.height)
+        {
+            return Err(
+                "checkpoint delivery requires a fresh confirmed canonical checkpoint".into(),
+            );
+        }
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|_| "checkpoint qualification transaction unavailable")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|_| "checkpoint qualification durability unavailable")?;
+        transaction
+            .open_table(STORAGE)
+            .map_err(|_| "checkpoint qualification policy unavailable")?
+            .insert("qualified_roster", roster.digest().as_slice())
+            .map_err(|_| "checkpoint qualification write failed")?;
+        transaction
+            .commit()
+            .map_err(|_| "checkpoint qualification commit failed".into())
+    }
     /// Capacity is an alarm only and never disables validation or storage.
     pub fn storage_ingestion_ready(&self) -> Result<bool, String> {
         Ok(true)
@@ -275,6 +407,8 @@ impl Store {
             let mut meta = txn
                 .open_table(STORAGE)
                 .map_err(|_| "storage metadata initialization failed")?;
+            meta.remove("qualified_roster")
+                .map_err(|_| "storage qualification reset failed")?;
             for (key, value) in [
                 ("role", role.name().as_bytes()),
                 ("prefix", prefix.as_slice()),
@@ -383,18 +517,39 @@ impl Store {
         clock_certain: bool,
         verifier: &impl BlockVerifier,
     ) -> Result<u64, String> {
+        let roster = checkpoint_auth::release_roster(Binding::new(&self.state.config))?;
+        self.expire_proofs_with_roster(now, clock_certain, verifier, roster.as_ref())
+    }
+    pub(super) fn expire_proofs_with_roster(
+        &mut self,
+        now: u64,
+        clock_certain: bool,
+        _verifier: &impl BlockVerifier,
+        roster: Option<&Roster>,
+    ) -> Result<u64, String> {
         let Some(role) = self.storage_role()? else {
             return Ok(0);
         };
         if !clock_certain {
             return Ok(0);
         }
-        // Production services must retain their history until remote checkpoint
-        // publication and proof-tail delivery are qualified. A local replay
-        // seal alone cannot authorize network-wide history unavailability.
-        if role.serves_historical_proofs() && !self.state.config.fixture {
-            return Ok(0);
-        }
+        // Finality observation continues while delivery is unqualified or
+        // checkpoints are stale. Only proof deletion is paused by this gate.
+        let service_gate = if role.serves_historical_proofs()
+            && (!self.state.config.fixture
+                || roster.is_some()
+                || self.qualified_checkpoint_roster()?.is_some())
+        {
+            Some(self.service_checkpoint_gate(roster, now)?)
+        } else {
+            None
+        };
+        let can_prune = !matches!(service_gate, Some(ServiceGate::Paused(_)));
+        let checkpoint_ceiling = match service_gate {
+            Some(ServiceGate::Ready(boundary)) => boundary.height,
+            Some(ServiceGate::Paused(_)) => 0,
+            None => u64::MAX,
+        };
         let local_blocks = self
             .local_proof_blocks()?
             .unwrap_or(storage_policy::LOCAL_PROOF_BLOCKS);
@@ -465,7 +620,9 @@ impl Store {
         let old_height = base.height;
         let mut inspected_bytes = 0usize;
         for height in base.height.saturating_add(1)
-            ..=finalized.min(base.height.saturating_add(MAX_EXPIRE_BLOCKS))
+            ..=finalized
+                .min(checkpoint_ceiling)
+                .min(base.height.saturating_add(MAX_EXPIRE_BLOCKS))
         {
             let row = finality
                 .get(height)
@@ -481,10 +638,13 @@ impl Store {
                 .map_err(|_| "invalid storage identity")?;
             let observed =
                 u64::from_le_bytes(row[32..40].try_into().expect("checked finality record"));
-            let recovery = Some(RecoveryBoundary {
-                height,
-                sealed_unix_seconds: now,
-                tail_complete: true,
+            let recovery = Some(match service_gate {
+                Some(ServiceGate::Ready(boundary)) => boundary,
+                _ => RecoveryBoundary {
+                    height,
+                    sealed_unix_seconds: now,
+                    tail_complete: true,
+                },
             });
             if storage_policy::expired_with_local_blocks(
                 role,
@@ -523,17 +683,19 @@ impl Store {
             let stored = block_row.value().to_vec();
             drop(block_row);
             let (bytes, fingerprint) = split_record(&stored)?;
-            let block = Block::decode(bytes, &self.state.config.network)?;
-            if block.id()? != block_id {
+            let mut compact = CompactBlock::export_canonical(bytes)?;
+            let public = CompactBlock::decode(&compact)?;
+            if public.id != block_id {
                 return Err("storage finality belongs to another canonical block".into());
             }
-            // Revalidate the prefix being removed; never convert an unverified
-            // peer record into an authenticated local replay checkpoint.
-            base.apply(&block, verifier)?;
+            // Store open/append already verified these immutable canonical
+            // rows. Authenticate their public effects to the same worked seed
+            // and compare every independently saved full-state fingerprint.
+            // Repeating STARK verification here would stall owner-loop work.
+            super::public_replay::reconstruct_public_effects(&mut base, &public)?;
             if base.fingerprint().as_slice() != fingerprint {
                 return Err("storage replay fingerprint mismatch".into());
             }
-            let mut compact = CompactBlock::export_canonical(bytes)?;
             compact.extend_from_slice(fingerprint);
             prefix = next_prefix(prefix, height, &compact);
             blocks
@@ -548,10 +710,11 @@ impl Store {
         let deleted = base.height - old_height;
         // Detached branches can no longer be selected below this verified base.
         // Preserve their authenticated public fields and local reward evidence.
-        if txn
-            .list_tables()
-            .map_err(|_| "storage schema unavailable")?
-            .any(|table| table.name() == DETACHED.name())
+        if can_prune
+            && txn
+                .list_tables()
+                .map_err(|_| "storage schema unavailable")?
+                .any(|table| table.name() == DETACHED.name())
         {
             let mut detached = txn
                 .open_table(DETACHED)
@@ -685,6 +848,15 @@ impl Store {
         let checkpoint_age = latest_checkpoint
             .as_ref()
             .and_then(|c| now.and_then(|now| now.checked_sub(c.statement.issued_unix_seconds)));
+        let qualified = self.qualified_checkpoint_roster()?.is_some();
+        let release_roster = checkpoint_auth::release_roster(Binding::new(&self.state.config))?;
+        let gate = if role.is_some_and(Role::serves_historical_proofs)
+            && (!self.state.config.fixture || qualified || release_roster.is_some())
+        {
+            Some(self.service_checkpoint_gate(release_roster.as_ref(), now.unwrap_or(0))?)
+        } else {
+            None
+        };
         let (directory_logical, directory_allocated) =
             directory_sizes(self.path.parent().ok_or("storage directory missing")?)?;
         let metadata =
@@ -714,16 +886,18 @@ impl Store {
             "detached_proof_body_bytes":detached_proof_bytes,"detached_record_bytes":detached_record_bytes,
             "node_directory_logical_bytes":directory_logical,"node_directory_allocated_bytes":directory_allocated,
             "local_replay_base_height":self.storage_base.as_ref().map(|base| base.height),
-            "remote_checkpoint_bootstrap":false,
+            "remote_checkpoint_bootstrap":qualified && release_roster.is_some(),
+            "service_checkpoint_delivery_qualified":qualified,
             "latest_checkpoint_height":latest_checkpoint.as_ref().map(|c|c.statement.height),
             "latest_checkpoint_sequence":latest_checkpoint.as_ref().map(|c|c.statement.sequence),
             "last_checkpoint_publication_unix_seconds":latest_checkpoint.as_ref().map(|c|c.statement.issued_unix_seconds),
             "checkpoint_age_seconds":checkpoint_age,
-            "checkpoint_pruning_paused":role.is_some_and(Role::serves_historical_proofs)
-                && checkpoint_age.is_none_or(|age|age>storage_policy::CHECKPOINT_MAX_AGE_SECONDS),
+            "checkpoint_pruning_paused":matches!(gate, Some(ServiceGate::Paused(_))),
             "expiry_state":match role {
                 None => "unconfigured",
-                Some(role) if role.serves_historical_proofs() && !self.state.config.fixture => "checkpoint_delivery_unavailable",
+                Some(_) if matches!(gate, Some(ServiceGate::Paused(_))) => match gate {
+                    Some(ServiceGate::Paused(reason)) => reason, _ => "checkpoint_unavailable",
+                },
                 Some(_) => "active",
             },"retained_proof_blocks":role.map(|_| retained),
             "pruned_proof_blocks":role.map(|_| pruned),"database_logical_bytes":metadata.len(),
