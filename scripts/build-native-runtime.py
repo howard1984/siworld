@@ -69,7 +69,7 @@ def main():
     if args.output.exists():
         raise ValueError('Refusing to overwrite a release directory')
     manifest = ROOT / 'crates/native-node/Cargo.toml'
-    features = ['native-p2p'] if args.engineering_network else []
+    features = ['native-p2p', 'wallet-light-gateway'] if args.engineering_network else []
     command = ['cargo', 'build', '--release', '--locked', '--manifest-path', str(manifest),
                '--bin', 'siworld-native-node', '--bin', 'siworld-checkpoint-key']
     if features:
