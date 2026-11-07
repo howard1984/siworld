@@ -29,8 +29,10 @@ const LOCAL_REWARDS_VERSION: &[u8] = b"\x01\0\0\0\0\0\0\0\0";
 const HEAD_BYTES: usize = 72;
 const FINGERPRINT_BYTES: usize = 32;
 mod checkpoint;
+pub mod checkpoint_bootstrap;
 pub mod engineering_checkpoint;
 mod miner_view;
+pub(super) mod protected_history;
 pub(super) mod public_replay;
 mod receipts;
 mod retention;
@@ -1032,9 +1034,10 @@ fn validate_tables(
     let indexed = names.remove(LOCAL_REWARDS.name());
     names.remove(DETACHED.name());
     names.remove(engineering_checkpoint::ATTESTATIONS.name());
+    let protected = names.remove(protected_history::PROTECTED.name());
     let storage = names.remove(retention::STORAGE.name());
     let finality = names.remove(retention::FINALITY.name());
-    if storage != finality {
+    if storage != finality || (protected && !storage) {
         return Err("incomplete local proof storage schema".into());
     }
     let expected = BTreeSet::from([META.name().to_owned(), BLOCKS.name().to_owned()]);

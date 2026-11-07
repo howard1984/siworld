@@ -8,7 +8,7 @@ use crate::p2p::{
     Reservation, Role, Session,
 };
 use crate::peer_scheduler::{self, Attempt, Direction, Failure, Scheduler};
-use crate::runtime::resident::{OwnedRelay, OwnedSyncReply, ReplyMeta};
+use crate::runtime::resident::{OwnedCheckpointData, OwnedRelay, OwnedSyncReply, ReplyMeta};
 use crate::runtime::{self, Node, PreparedBlock, SyncAttempt};
 use crate::state::BlockVerifier;
 use crate::sync::Batch;
@@ -217,6 +217,37 @@ impl Configuration {
 
 type Answer<T> = SyncSender<Result<T, runtime::Error>>;
 enum Command {
+    CheckpointRequest {
+        id: u64,
+        reply: Answer<Vec<u8>>,
+    },
+    CheckpointServe {
+        id: u64,
+        body: Vec<u8>,
+        reply: Answer<OwnedCheckpointData>,
+    },
+    CheckpointPermanent {
+        id: u64,
+        body: Vec<u8>,
+        guard: Reservation,
+        reply: Answer<()>,
+    },
+    CheckpointTail {
+        id: u64,
+        block: Box<crate::wire::Block>,
+        guard: Reservation,
+        reply: Answer<()>,
+    },
+    CheckpointNext {
+        id: u64,
+        reply: Answer<Vec<u8>>,
+    },
+    CheckpointReceive {
+        id: u64,
+        body: Vec<u8>,
+        guard: Reservation,
+        reply: Answer<()>,
+    },
     RelayNext {
         id: u64,
         reply: Answer<Option<OwnedRelay>>,
@@ -342,6 +373,7 @@ struct Driver {
     role: Role,
     connections: u64,
     failures: u64,
+    checkpoints: Option<crate::checkpoint_service::Coordinator>,
     _configuration: Reservation,
 }
 impl Driver {
@@ -396,6 +428,7 @@ impl Driver {
             },
             connections: 0,
             failures: 0,
+            checkpoints: None,
             _configuration: configuration,
         })
     }
@@ -512,6 +545,9 @@ impl Driver {
             .collect();
         for id in finished {
             let worker = self.workers.remove(&id).expect("selected worker");
+            if let (Some(checkpoints), Some(peer)) = (&mut self.checkpoints, worker.peer) {
+                checkpoints.release_download_peer(peer);
+            }
             let failure = worker.join.join().unwrap_or(Failure::LocalResource);
             if let Some(token) = worker.token {
                 self.scheduler
@@ -649,6 +685,115 @@ impl Driver {
     ) -> Result<(), String> {
         let charge = charged._reservation;
         match charged.command {
+            Command::CheckpointRequest { id, reply } => {
+                let active = self
+                    .active(id)
+                    .and_then(|worker| worker.peer.ok_or_else(invalid));
+                let result = active.and_then(|peer| {
+                    if let Some(checkpoints) = &mut self.checkpoints {
+                        let now = wall_ms().map_err(runtime::Error::Local)? / 1000;
+                        // Start a quarantined catchup before attempting ordinary
+                        // history synchronization against a pruned service.
+                        if checkpoints.poll(node, now).is_err() {
+                            checkpoints.alert = Some("checkpoint_coordination_unavailable");
+                        }
+                        Ok(checkpoints.download_request(peer))
+                    } else {
+                        Ok(vec![0])
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            Command::CheckpointServe { id, body, reply } => {
+                let result = self
+                    .active(id)
+                    .and_then(|_| node.resident_serve_checkpoint(&body));
+                let _ = reply.send(result);
+            }
+            Command::CheckpointPermanent {
+                id,
+                body,
+                guard,
+                reply,
+            } => {
+                let active = self
+                    .active(id)
+                    .and_then(|worker| worker.peer.ok_or_else(invalid));
+                let result = active.and_then(|peer| {
+                    self.checkpoints
+                        .as_mut()
+                        .ok_or_else(invalid)?
+                        .push_permanent(
+                            node,
+                            peer,
+                            &body,
+                            wall_ms().map_err(runtime::Error::Local)? / 1000,
+                        )
+                        .map_err(|_| invalid())
+                });
+                drop(guard);
+                let _ = reply.send(result);
+            }
+            Command::CheckpointTail {
+                id,
+                block,
+                guard,
+                reply,
+            } => {
+                let active = self
+                    .active(id)
+                    .and_then(|worker| worker.peer.ok_or_else(invalid));
+                let result = active.and_then(|peer| {
+                    self.checkpoints
+                        .as_mut()
+                        .ok_or_else(invalid)?
+                        .push_tail(
+                            node,
+                            peer,
+                            &block,
+                            wall_ms().map_err(runtime::Error::Local)? / 1000,
+                        )
+                        .map_err(|_| invalid())
+                });
+                drop(guard);
+                let _ = reply.send(result);
+            }
+            Command::CheckpointNext { id, reply } => {
+                let result = self.active(id).and_then(|_| {
+                    self.checkpoints
+                        .as_ref()
+                        .map_or_else(
+                            || crate::checkpoint_service::Exchange::default().encode(),
+                            crate::checkpoint_service::Coordinator::outbound,
+                        )
+                        .map_err(runtime::Error::Local)
+                });
+                let _ = reply.send(result);
+            }
+            Command::CheckpointReceive {
+                id,
+                body,
+                guard,
+                reply,
+            } => {
+                let active = self
+                    .active(id)
+                    .and_then(|worker| worker.peer.ok_or_else(invalid));
+                let result = active.and_then(|peer| {
+                    if let Some(checkpoints) = &mut self.checkpoints {
+                        let now = wall_ms().map_err(runtime::Error::Local)? / 1000;
+                        checkpoints
+                            .receive(node, peer, &body, now)
+                            .map_err(|_| invalid())
+                    } else {
+                        crate::checkpoint_service::Exchange::decode(&body)
+                            .map(|_| ())
+                            .map_err(|_| invalid())
+                    }
+                });
+                drop(guard);
+                let _ = reply.send(result);
+            }
             Command::RelayNext { id, reply } => {
                 let result = self
                     .active_mut(id)
@@ -901,14 +1046,40 @@ fn connection(
             return Err(unavailable());
         }
         request = request.checked_add(1).ok_or_else(invalid)?;
-        // Identical deterministic turns avoid simultaneous sync requests. Each
-        // peer gets both directions every cycle; no advertised work is trusted.
+        // The extra phase is selected only by the authenticated TLS ALPN. A
+        // legacy peer negotiates the original profile and sees unchanged turns.
+        let (mut downloading, mut serving_download) = (false, false);
+        if session.checkpoints_enabled() {
+            if initiator {
+                checkpoint_send(id, request, &mut session, &budget, &tx, &cancel)?;
+                checkpoint_receive(id, request, &mut session, &budget, &tx, &cancel)?;
+                downloading = checkpoint_pull(id, request, &mut session, &budget, &tx, &cancel)?;
+                serving_download =
+                    checkpoint_serve(id, request, &mut session, &budget, &tx, &cancel)?;
+            } else {
+                checkpoint_receive(id, request, &mut session, &budget, &tx, &cancel)?;
+                checkpoint_send(id, request, &mut session, &budget, &tx, &cancel)?;
+                serving_download =
+                    checkpoint_serve(id, request, &mut session, &budget, &tx, &cancel)?;
+                downloading = checkpoint_pull(id, request, &mut session, &budget, &tx, &cancel)?;
+            }
+        }
+        // Deterministic turns keep both directions live. A staged checkpoint
+        // download replaces only that direction's unavailable history pull.
         if initiator {
-            pull_turn(id, request, &mut session, &budget, &tx, &cancel)?;
-            serve_turn(id, &mut session, &budget, &tx, &cancel)?;
+            if !downloading {
+                pull_turn(id, request, &mut session, &budget, &tx, &cancel)?;
+            }
+            if !serving_download {
+                serve_turn(id, &mut session, &budget, &tx, &cancel)?;
+            }
         } else {
-            serve_turn(id, &mut session, &budget, &tx, &cancel)?;
-            pull_turn(id, request, &mut session, &budget, &tx, &cancel)?;
+            if !serving_download {
+                serve_turn(id, &mut session, &budget, &tx, &cancel)?;
+            }
+            if !downloading {
+                pull_turn(id, request, &mut session, &budget, &tx, &cancel)?;
+            }
         }
         // Revision-two resident turns relay verified pending transactions in
         // both directions before their inclusion in a later block.
@@ -926,6 +1097,199 @@ fn connection(
             }
             std::thread::sleep(POLL);
         }
+    }
+}
+// At most 64 compact records or one full proof block per paired turn. Every
+// accepted record is staged before acknowledgement, allowing reauthentication
+// without restarting the download or retaining an unbounded in-memory prefix.
+fn checkpoint_pull<S: Read + Write>(
+    id: u64,
+    request: u64,
+    session: &mut Session<S>,
+    budget: &Budget,
+    tx: &SyncSender<ChargedCommand>,
+    cancel: &Cancellation,
+) -> Result<bool, runtime::Error> {
+    let mut active = false;
+    for _ in 0..64 {
+        let mut body = call(tx, budget, cancel, |reply| Command::CheckpointRequest {
+            id,
+            reply,
+        })?;
+        let mut requested =
+            crate::checkpoint_service::Request::decode(&body).map_err(|_| invalid())?;
+        // Do not combine a maximum proof block with the preceding compact
+        // batch in the same directional wire allowance. The empty request
+        // closes this phase while keeping ordinary history sync suspended.
+        if active && requested.is_some_and(|record| !record.permanent) {
+            body = vec![0];
+            requested = None;
+        }
+        session.send_control(p2p::GET_CHECKPOINT_DATA, request, &body)?;
+        if requested.is_none() {
+            return match session.receive()? {
+                Packet::Control {
+                    kind: p2p::END_BATCH,
+                    request: r,
+                    body,
+                    ..
+                } if r == request && body.is_empty() => Ok(active),
+                _ => Err(invalid()),
+            };
+        }
+        active = true;
+        match session.receive_before(&p2p::Deadline::new(EXCHANGE))? {
+            Packet::Control {
+                kind: p2p::COMPACT_BLOCK,
+                request: r,
+                body,
+                reservation,
+            } if r == request && requested.is_some_and(|r| r.permanent) => {
+                call(tx, budget, cancel, |reply| Command::CheckpointPermanent {
+                    id,
+                    body,
+                    guard: reservation,
+                    reply,
+                })?;
+            }
+            Packet::Block {
+                request: r,
+                block,
+                reservation,
+            } if r == request && requested.is_some_and(|r| !r.permanent) => {
+                call(tx, budget, cancel, |reply| Command::CheckpointTail {
+                    id,
+                    block,
+                    guard: reservation,
+                    reply,
+                })?;
+            }
+            Packet::Control {
+                kind: p2p::UNAVAILABLE,
+                request: r,
+                body,
+                ..
+            } if r == request && body.is_empty() => return Err(unavailable()),
+            _ => return Err(invalid()),
+        }
+        session.send_control(p2p::END_BATCH, request, &[])?;
+        if requested.is_some_and(|r| !r.permanent) {
+            break;
+        }
+    }
+    Ok(active)
+}
+fn checkpoint_serve<S: Read + Write>(
+    id: u64,
+    request: u64,
+    session: &mut Session<S>,
+    budget: &Budget,
+    tx: &SyncSender<ChargedCommand>,
+    cancel: &Cancellation,
+) -> Result<bool, runtime::Error> {
+    let mut active = false;
+    for _ in 0..64 {
+        let (body, _guard) = match session.receive_before(&p2p::Deadline::new(EXCHANGE))? {
+            Packet::Control {
+                kind: p2p::GET_CHECKPOINT_DATA,
+                request: r,
+                body,
+                reservation,
+            } if r == request => (body, reservation),
+            _ => return Err(invalid()),
+        };
+        let requested = crate::checkpoint_service::Request::decode(&body).map_err(|_| invalid())?;
+        if requested.is_none() {
+            session.send_control(p2p::END_BATCH, request, &[])?;
+            return Ok(active);
+        }
+        active = true;
+        let packet = match call(tx, budget, cancel, |reply| Command::CheckpointServe {
+            id,
+            body,
+            reply,
+        }) {
+            Ok(packet) => packet,
+            Err(_) => {
+                session.send_control(p2p::UNAVAILABLE, request, &[])?;
+                return Err(unavailable());
+            }
+        };
+        match packet {
+            OwnedCheckpointData::Permanent {
+                body,
+                reservation: _reservation,
+            } => session.send_control(p2p::COMPACT_BLOCK, request, &body)?,
+            OwnedCheckpointData::Tail { block, reservation } => {
+                session.send_reserved_block(request, &block, &reservation)?
+            }
+            OwnedCheckpointData::Empty => return Err(invalid()),
+        }
+        match session.receive_before(&p2p::Deadline::new(EXCHANGE))? {
+            Packet::Control {
+                kind: p2p::END_BATCH,
+                request: r,
+                body,
+                ..
+            } if r == request && body.is_empty() => (),
+            _ => return Err(invalid()),
+        }
+        if requested.is_some_and(|r| !r.permanent) {
+            break;
+        }
+    }
+    Ok(active)
+}
+fn checkpoint_send<S: Read + Write>(
+    id: u64,
+    request: u64,
+    session: &mut Session<S>,
+    budget: &Budget,
+    tx: &SyncSender<ChargedCommand>,
+    cancel: &Cancellation,
+) -> Result<(), runtime::Error> {
+    let _charge = budget.reserve(crate::checkpoint_service::MAX_EXCHANGE_BYTES)?;
+    let body = call(tx, budget, cancel, |reply| Command::CheckpointNext {
+        id,
+        reply,
+    })?;
+    session.send_control(p2p::CHECKPOINT, request, &body)?;
+    match session.receive()? {
+        Packet::Control {
+            kind: p2p::END_BATCH,
+            request: r,
+            body,
+            ..
+        } if r == request && body.is_empty() => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+fn checkpoint_receive<S: Read + Write>(
+    id: u64,
+    request: u64,
+    session: &mut Session<S>,
+    budget: &Budget,
+    tx: &SyncSender<ChargedCommand>,
+    cancel: &Cancellation,
+) -> Result<(), runtime::Error> {
+    let deadline = p2p::Deadline::new(EXCHANGE);
+    match session.receive_checkpoint_before(&deadline)? {
+        Packet::Control {
+            kind: p2p::CHECKPOINT,
+            request: r,
+            body,
+            reservation,
+        } if r == request => {
+            call(tx, budget, cancel, |reply| Command::CheckpointReceive {
+                id,
+                body,
+                guard: reservation,
+                reply,
+            })?;
+            session.send_control(p2p::END_BATCH, request, &[])?;
+            Ok(())
+        }
+        _ => Err(invalid()),
     }
 }
 fn relay_send<S: Read + Write>(
@@ -1330,6 +1694,24 @@ impl Mining {
         })
     }
 }
+fn checkpoint_status_observation(
+    directory: &Path,
+    checkpoints: &mut crate::checkpoint_service::Coordinator,
+    now: u64,
+) -> Value {
+    if checkpoints.alert == Some("checkpoint_status_export_unavailable") {
+        checkpoints.alert = None;
+    }
+    let mut metrics = checkpoints.metrics(now);
+    if atomic_json(&directory.join("checkpoint-service-status.json"), &metrics).is_err() {
+        checkpoints
+            .alert
+            .get_or_insert("checkpoint_status_export_unavailable");
+        metrics = checkpoints.metrics(now);
+    }
+    metrics
+}
+
 pub(super) fn continuous(
     directory: &Path,
     control: &Arc<Control>,
@@ -1343,11 +1725,16 @@ pub(super) fn continuous(
     store.require_local_reward_index()?;
     store.verify_local_rewards()?;
     let identity = Arc::new(
-        NativeIdentity::load(directory, &p2p::Binding::new(&chain))
-            .map_err(|_| "persistent native identity unavailable")?,
+        NativeIdentity::load(
+            &super::network_identity_directory(directory)?,
+            &p2p::Binding::new(&chain),
+        )
+        .map_err(|_| "persistent native identity unavailable")?,
     );
     let mut node = Node::new(store, verifier);
     let mut driver = Driver::new(identity, config, node.transport_budget())?;
+    driver.checkpoints = crate::checkpoint_service::Coordinator::load(directory, node.binding())?;
+    let mut checkpoint_poll: Option<Instant> = None;
     #[cfg(all(feature = "wallet-light-gateway", unix))]
     let mut wallet_gateway = crate::wallet_gateway::Gateway::from_environment()?;
     // Independent local-job ownership allowance: at most one prover and one
@@ -1385,6 +1772,26 @@ pub(super) fn continuous(
                 last_storage_maintenance = Some(Instant::now());
             }
             driver.poll()?;
+            if checkpoint_poll.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                if let Some(checkpoints) = &mut driver.checkpoints {
+                    let now = control.checked_wall()? / 1000;
+                    if checkpoints.poll(&mut node, now).is_err() {
+                        checkpoints.alert = Some("checkpoint_coordination_unavailable");
+                    }
+                    // Observation failures cannot stop the canonical owner.
+                    // A sanitized diagnostic still reaches the main status.
+                    let metrics = checkpoint_status_observation(directory, checkpoints, now);
+                    let mut status = control
+                        .status
+                        .lock()
+                        .map_err(|_| "checkpoint status unavailable")?;
+                    if let Some(storage) = &mut status.storage_metrics {
+                        storage["checkpoint_service"] = metrics;
+                    }
+                }
+                super::checkpoint_control::poll(directory, &control.identity.run_id, &mut node);
+                checkpoint_poll = Some(Instant::now());
+            }
             #[cfg(all(feature = "wallet-light-gateway", unix))]
             if let Some(gateway) = &mut wallet_gateway {
                 gateway.poll(&mut node);
@@ -1399,7 +1806,11 @@ pub(super) fn continuous(
                     Err(_) => return Err("resident owner command channel closed".into()),
                 }
             }
-            let mining_ready = !control.private_miner_view || driver.has_synced_peer();
+            let mining_ready = driver
+                .checkpoints
+                .as_ref()
+                .is_none_or(|c| !c.is_catching_up())
+                && (!control.private_miner_view || driver.has_synced_peer());
             if let Some(current) = &work {
                 if !mining_ready || current.fingerprint != node.state().fingerprint() {
                     current.cancel.store(true, Ordering::SeqCst);
@@ -1511,7 +1922,13 @@ pub(super) fn continuous(
                     reward_fingerprint = Some(fingerprint);
                 }
                 let connected = driver.scheduler.status().established;
-                let phase = if connected == 0 {
+                let catchup = driver
+                    .checkpoints
+                    .as_ref()
+                    .and_then(|c| c.catchup_metrics());
+                let phase = if catchup.is_some() {
+                    "checkpoint_catchup"
+                } else if connected == 0 {
                     "waiting_for_authenticated_peers"
                 } else if !driver.has_synced_peer() {
                     "synchronizing"
@@ -1526,7 +1943,7 @@ pub(super) fn continuous(
                     .map_err(|_| "private miner status unavailable")?;
                 let view = json!({"schema":1,"run_id":control.identity.run_id,"updated_unix_ms":wall_ms()?,
                     "height":node.state().height,"batch_goal_unverified":driver.sync_goal(),
-                    "phase":phase,"authenticated_peers":connected,"inbound_listener":driver.listener.is_some(),
+                    "phase":phase,"checkpoint_catchup":catchup,"authenticated_peers":connected,"inbound_listener":driver.listener.is_some(),
                     "pow_attempts":status.pow_attempts,"elapsed_monotonic_ms":elapsed_ms(status.started,Instant::now()),
                     "rewards":reward_view});
                 drop(status);

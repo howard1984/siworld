@@ -559,8 +559,10 @@ detached evidence. Transport has its own shared 640-MiB logical budget; the two
 budgets do not establish a combined process-memory bound. Non-tip ancestor reconstruction starts from the authenticated local replay
 base when proof expiry is configured, otherwise from genesis. Its 4,096-block
 replay-work guard is resource policy, not invalidity or a consensus horizon.
-Tip extension does not need that replay. Remote checkpoint bootstrap and
-long-offline recovery remain deployment gates for proof-expiring services.
+Tip extension does not need that replay. The engineering implementation adds
+release-pinned 2-of-2 coordination and quarantined permanent-data reconstruction
+with a fully verified proof tail. Live checkpoint bootstrap and long-offline
+recovery remain acceptance gates before explicit service expiry qualification.
 
 Seed-wallet APIs derive independent spend, deterministic ML-KEM view and
 256-bit change keys per network/account, authenticate output recovery after

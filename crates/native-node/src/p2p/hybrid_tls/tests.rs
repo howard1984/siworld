@@ -61,7 +61,10 @@ fn exclusive_profile_disables_fallback_key_logging_and_resumption() {
     }
     assert_eq!(
         config.client.alpn_protocols,
-        vec![PROTOCOL.as_bytes().to_vec()]
+        vec![
+            crate::p2p::CHECKPOINT_ALPN.to_vec(),
+            PROTOCOL.as_bytes().to_vec()
+        ]
     );
     assert_eq!(config.server.alpn_protocols, config.client.alpn_protocols);
     assert!(!config.client.key_log.will_log("CLIENT_TRAFFIC_SECRET_0"));
@@ -416,5 +419,56 @@ fn wire_budget_is_checked_before_polling_more_bytes() {
         assert_eq!(bounded.read(&mut out).await.unwrap(), 5);
         assert!(bounded.read(&mut out).await.is_err());
         assert_eq!(bounded.bytes, 5);
+    });
+}
+
+#[test]
+fn checkpoint_alpn_negotiates_without_breaking_legacy_crypto_profile() {
+    futures::executor::block_on(async {
+        for legacy_client in [false, true] {
+            for legacy_server in [false, true] {
+                let a = identity();
+                let b = identity();
+                let budget = Budget::default();
+                let mut client = Config::new(
+                    a.clone(),
+                    admission(&b, ConnectionRole::Initiator),
+                    budget.clone(),
+                )
+                .unwrap();
+                let mut server = Config::new(
+                    b.clone(),
+                    admission(&a, ConnectionRole::Responder),
+                    budget.clone(),
+                )
+                .unwrap();
+                if legacy_client {
+                    Arc::get_mut(&mut client.client).unwrap().alpn_protocols =
+                        vec![PROTOCOL.as_bytes().to_vec()];
+                }
+                if legacy_server {
+                    Arc::get_mut(&mut server.server).unwrap().alpn_protocols =
+                        vec![PROTOCOL.as_bytes().to_vec()];
+                }
+                let (sa, sb) = Duplex::pair(8192);
+                let (a, b) = futures::join!(
+                    client.upgrade_outbound(sa, PROTOCOL),
+                    server.upgrade_inbound(sb, PROTOCOL)
+                );
+                let a = a.unwrap();
+                let b = b.unwrap();
+                let expected = if legacy_client || legacy_server {
+                    PROTOCOL.as_bytes()
+                } else {
+                    crate::p2p::CHECKPOINT_ALPN
+                };
+                assert_eq!(a._stream.get_ref().1.alpn_protocol(), Some(expected));
+                assert_eq!(b._stream.get_ref().1.alpn_protocol(), Some(expected));
+                assert_eq!(a.peer, b.local);
+                assert_eq!(a.local, b.peer);
+                drop((a, b));
+                assert_eq!(budget.available().unwrap(), super::super::CONNECTION_BYTES);
+            }
+        }
     });
 }

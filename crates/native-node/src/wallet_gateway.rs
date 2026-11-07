@@ -228,6 +228,7 @@ impl Gateway {
                 && let Some(export) = &mut self.export
             {
                 export.publish(&node.state().config, &self.ids)?;
+                export.publish_checkpoint(node.store(), &self.ids)?;
             }
             Ok(())
         })();

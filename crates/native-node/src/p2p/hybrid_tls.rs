@@ -135,7 +135,10 @@ impl Config {
             .dangerous()
             .with_custom_certificate_verifier(verifier.clone())
             .with_client_cert_resolver(resolver.clone());
-        client.alpn_protocols = vec![PROTOCOL.as_bytes().to_vec()];
+        client.alpn_protocols = vec![
+            crate::p2p::CHECKPOINT_ALPN.to_vec(),
+            PROTOCOL.as_bytes().to_vec(),
+        ];
         client.key_log = Arc::new(rustls::NoKeyLog);
         client.resumption = rustls::client::Resumption::disabled();
         client.enable_early_data = false;
@@ -251,7 +254,7 @@ fn validate_negotiation(state: &rustls::CommonState) -> Result<(), Error> {
             != Some(rustls::NamedGroup::X25519MLKEM768)
         || state.negotiated_cipher_suite().map(|x| x.suite())
             != Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
-        || state.alpn_protocol() != Some(PROTOCOL.as_bytes())
+        || !matches!(state.alpn_protocol(), Some(value) if value == PROTOCOL.as_bytes() || value == crate::p2p::CHECKPOINT_ALPN)
         || !matches!(
             state.handshake_kind(),
             Some(rustls::HandshakeKind::Full | rustls::HandshakeKind::FullWithHelloRetryRequest)

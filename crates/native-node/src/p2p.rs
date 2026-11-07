@@ -19,6 +19,7 @@ pub use hybrid_tls::native::{NativeTlsAuthenticator, NativeTlsChannel};
 
 pub const VERSION: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CHECKPOINT_EXCHANGE_BYTES: usize = 16 * 1024;
 /// Compact skeletons include bounded native issuance records and their
 /// independent proofs. Ordinary control messages retain the smaller cap.
 pub const MAX_COMPACT_BYTES: usize = MAX_CONTROL_BYTES
@@ -34,6 +35,9 @@ pub const TRANSACTION: u8 = 5;
 pub const GET_TRANSACTIONS: u8 = 6;
 pub const UNAVAILABLE: u8 = 7;
 pub const END_BATCH: u8 = 8;
+pub const CHECKPOINT: u8 = 9;
+pub const GET_CHECKPOINT_DATA: u8 = 10;
+pub(crate) const CHECKPOINT_ALPN: &[u8] = b"/siworld/native-hybrid/checkpoint/1";
 pub const MAX_HANDSHAKES: usize = 16;
 pub const HANDSHAKE_BYTES: usize = 256 * 1024;
 pub const HANDSHAKE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
@@ -357,7 +361,7 @@ impl NegotiatedParameters<'_> {
         if self.tls_version != 0x0304
             || self.group != 0x11ec
             || self.cipher_suite != 0x1303
-            || self.alpn != b"/siworld/native-hybrid/1"
+            || !(self.alpn == b"/siworld/native-hybrid/1" || self.alpn == CHECKPOINT_ALPN)
             || self.resumed
             || self.early_data
         {
@@ -476,6 +480,8 @@ impl Hello {
 pub struct Authenticated<S> {
     channel: S,
     admission: AdmissionContext,
+    #[cfg(feature = "native-p2p")]
+    checkpoints: bool,
 }
 impl<S> Authenticated<S> {
     // Reserved for a separately reviewed in-crate hybrid provider. Keeping the
@@ -502,6 +508,8 @@ impl<S> Authenticated<S> {
         Ok(Self {
             channel,
             admission: admission.clone(),
+            #[cfg(feature = "native-p2p")]
+            checkpoints: parameters.alpn == CHECKPOINT_ALPN,
         })
     }
 }
@@ -540,6 +548,8 @@ pub struct Session<S> {
     role: Role,
     budget: Budget,
     _transport: Option<Reservation>,
+    #[cfg(feature = "native-p2p")]
+    checkpoints: bool,
 }
 pub enum Packet {
     Control {
@@ -576,6 +586,8 @@ impl<S: Read + Write> Session<S> {
         }
         admission.check()?;
         let binding = admission.binding();
+        #[cfg(feature = "native-p2p")]
+        let checkpoints = auth.checkpoints;
         let mut channel = auth.channel;
         let mut timed = Timed {
             channel: &mut channel,
@@ -596,6 +608,8 @@ impl<S: Read + Write> Session<S> {
             role: hello.role,
             budget,
             _transport: Some(permit.established()),
+            #[cfg(feature = "native-p2p")]
+            checkpoints,
         })
     }
     pub(crate) fn shares_budget(&self, budget: &Budget) -> bool {
@@ -603,6 +617,10 @@ impl<S: Read + Write> Session<S> {
     }
     pub(crate) fn binding(&self) -> Binding {
         self.binding
+    }
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn checkpoints_enabled(&self) -> bool {
+        self.checkpoints
     }
     pub fn peer(&self) -> Hash {
         self.peer
@@ -688,6 +706,16 @@ impl<S: Read + Write> Session<S> {
         deadline: &Deadline,
     ) -> Result<Packet, Error> {
         self.receive_frame(deadline.clone(), Some(&[GET_BLOCKS]))
+    }
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn receive_checkpoint_before(
+        &mut self,
+        deadline: &Deadline,
+    ) -> Result<Packet, Error> {
+        if !self.checkpoints {
+            return Err(Error::InvalidProtocol);
+        }
+        self.receive_frame(deadline.clone(), Some(&[CHECKPOINT]))
     }
     /// A resident relay follows remote canonical validation. Wait for its
     /// header within one exchange, then retain the ten-second body limit.
@@ -781,6 +809,8 @@ impl<S: Read + Write> Session<S> {
             role: Role::Validator,
             budget,
             _transport: None,
+            #[cfg(feature = "native-p2p")]
+            checkpoints: false,
         }
     }
 }
@@ -790,11 +820,15 @@ fn frame_header(
     network: &Hash,
     length: usize,
 ) -> Result<[u8; HEADER_BYTES], Error> {
-    if !(GET_BLOCKS..=END_BATCH).contains(&kind) {
+    if !(GET_BLOCKS..=GET_CHECKPOINT_DATA).contains(&kind) {
         return Err(Error::InvalidProtocol);
     }
     let maximum = if kind == BLOCK {
         MAX_BLOCK_BYTES
+    } else if kind == GET_CHECKPOINT_DATA {
+        41
+    } else if kind == CHECKPOINT {
+        MAX_CHECKPOINT_EXCHANGE_BYTES
     } else if kind == COMPACT_BLOCK {
         MAX_COMPACT_BYTES
     } else {

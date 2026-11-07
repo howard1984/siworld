@@ -124,6 +124,9 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         Some("synchronizing") => {
             "\u{540c}\u{6b65}\u{9a8c}\u{8bc1}\u{4e2d} / Synchronizing and verifying"
         }
+        Some("checkpoint_catchup") => {
+            "\u{4ece}\u{68c0}\u{67e5}\u{70b9}\u{8ffd}\u{8d76}\u{4e2d} / Catching up from checkpoint"
+        }
         Some("pow_search") => "PoW \u{641c}\u{7d22} / PoW search",
         Some("stopped") => "\u{5df2}\u{5e72}\u{51c0}\u{505c}\u{6b62} / Cleanly stopped",
         Some("template_preparation") => {
@@ -139,8 +142,21 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         .map(|n| format!("{n} (peer hint; pending verification)"))
         .unwrap_or_else(|| "unknown; no completion estimate".into());
     let rewards = &value["rewards"];
+    let catchup = if value["phase"] == "checkpoint_catchup" {
+        let progress = &value["checkpoint_catchup"];
+        let estimate = progress["eta_seconds"]
+            .as_u64()
+            .map(|seconds| format!("approximately {seconds} seconds"))
+            .unwrap_or_else(|| "waiting for a measured transfer rate".into());
+        format!(
+            "Checkpoint catchup verified height: {} | Target height: {} | Downloaded bytes: {} | Estimated remaining: {estimate}\n",
+            progress["height"], progress["goal_height"], progress["downloaded_bytes"]
+        )
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "\n{phase}\n\u{5df2}\u{9a8c}\u{8bc1}\u{9ad8}\u{5ea6} / Verified height: {} | Current batch goal: {goal}\n\u{8ba4}\u{8bc1}\u{8fde}\u{63a5} / Authenticated peers: {} | \u{6709}\u{6548}\u{7b97}\u{529b} / Effective hashrate: {rate}\n\u{4e3b}\u{94fe}\u{5df2}\u{6316}\u{533a}\u{5757} / Main-chain mined blocks: {} | Detached: {}\n\u{7d2f}\u{8ba1}\u{6210}\u{719f}\u{5956}\u{52b1} / Cumulative mature earned: {}\n\u{5f85}\u{6210}\u{719f}\u{5956}\u{52b1} / Pending maturity: {}\n\u{957f}\u{671f}\u{9501}\u{5b9a} / Long-term locked: {} | Next unlock height: {}\nRewards are cumulative earnings, not an unspent wallet balance. Candidates are not credited.\n",
+        "\n{phase}\n{catchup}\u{5df2}\u{9a8c}\u{8bc1}\u{9ad8}\u{5ea6} / Verified height: {} | Current batch goal: {goal}\n\u{8ba4}\u{8bc1}\u{8fde}\u{63a5} / Authenticated peers: {} | \u{6709}\u{6548}\u{7b97}\u{529b} / Effective hashrate: {rate}\n\u{4e3b}\u{94fe}\u{5df2}\u{6316}\u{533a}\u{5757} / Main-chain mined blocks: {} | Detached: {}\n\u{7d2f}\u{8ba1}\u{6210}\u{719f}\u{5956}\u{52b1} / Cumulative mature earned: {}\n\u{5f85}\u{6210}\u{719f}\u{5956}\u{52b1} / Pending maturity: {}\n\u{957f}\u{671f}\u{9501}\u{5b9a} / Long-term locked: {} | Next unlock height: {}\nRewards are cumulative earnings, not an unspent wallet balance. Candidates are not credited.\n",
         value["height"],
         value["authenticated_peers"],
         rewards["accepted_blocks"],
@@ -212,6 +228,34 @@ mod tests {
         assert_eq!(amount(&json!("1")).unwrap(), "0.00000001 SIP");
         assert!(amount(&json!("-1")).is_err());
         assert!(amount(&json!(12.5)).is_err());
+    }
+    #[test]
+    fn checkpoint_catchup_reports_observed_progress_and_optional_estimate() {
+        let mut value = json!({
+            "updated_unix_ms":100_000,"phase":"checkpoint_catchup","height":12,
+            "authenticated_peers":1,
+            "checkpoint_catchup":{"height":70,"checkpoint_height":72,"goal_height":96,
+                "downloaded_bytes":1234,"eta_seconds":null},
+            "rewards":{"accepted_blocks":0,"detached_blocks":0,"mature_earned_atoms":"0",
+                "pending_atoms":"0","long_locked_atoms":"0","next_unlock_height":null}
+        });
+        let output = render(&value, None, 100_000).unwrap();
+        assert!(output.contains("Catching up from checkpoint"));
+        assert!(
+            output.contains("verified height: 70 | Target height: 96 | Downloaded bytes: 1234")
+        );
+        assert!(output.contains("waiting for a measured transfer rate"));
+        value["checkpoint_catchup"]["eta_seconds"] = json!(42);
+        assert!(
+            render(&value, None, 100_000)
+                .unwrap()
+                .contains("approximately 42 seconds")
+        );
+        assert!(
+            !render(&value, None, 116_000)
+                .unwrap()
+                .contains("approximately")
+        );
     }
     #[test]
     fn stale_display_does_not_present_old_rewards_as_current() {

@@ -2,7 +2,8 @@
 //!
 //! The candidate TLS upgrade remains the only cryptographic path. The bridge
 //! supplies nonblocking TCP, finite polling slices and ownership transfer; it
-//! adds no fallback, identity discovery or application protocol negotiation.
+//! preserves the cryptographic profile and negotiates the optional checkpoint
+//! application phase through authenticated TLS ALPN.
 use super::{BoundedIo, CandidateConnection, Config, Error as TlsError, PROTOCOL};
 use crate::identity::NativeIdentity;
 use crate::p2p::{
@@ -77,6 +78,8 @@ impl NativeTlsAuthenticator {
                 stream.get_mut().1.set_buffer_limit(Some(TLS_BUFFER_BYTES))
             }
         }
+        let checkpoint_alpn =
+            stream.get_ref().1.alpn_protocol() == Some(crate::p2p::CHECKPOINT_ALPN);
         let channel = NativeTlsChannel {
             stream,
             cancellation: admission.cancellation().clone(),
@@ -93,7 +96,11 @@ impl NativeTlsAuthenticator {
                 tls_version: 0x0304,
                 group: 0x11ec,
                 cipher_suite: 0x1303,
-                alpn: PROTOCOL.as_bytes(),
+                alpn: if checkpoint_alpn {
+                    crate::p2p::CHECKPOINT_ALPN
+                } else {
+                    PROTOCOL.as_bytes()
+                },
                 resumed: false,
                 early_data: false,
             },

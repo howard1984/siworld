@@ -121,6 +121,19 @@ pub(super) fn load_base(
     let blocks = txn
         .open_table(BLOCKS)
         .map_err(|_| "storage canonical table unavailable")?;
+    let protected = if txn
+        .list_tables()
+        .map_err(|_| "protected history schema unavailable")?
+        .any(|table| table.name() == super::protected_history::PROTECTED.name())
+    {
+        Some(
+            txn.open_table(super::protected_history::PROTECTED)
+                .map_err(|_| "protected history index unavailable")?,
+        )
+    } else {
+        None
+    };
+    let mut protected_count = 0u64;
     let mut checked = initial_prefix(&config);
     let mut parent = config.genesis_id();
     for height in 1..=base.height {
@@ -129,12 +142,52 @@ pub(super) fn load_base(
             .map_err(|_| "storage prefix unavailable")?
             .ok_or("storage prefix missing")?;
         let (bytes, _) = split_record(row.value())?;
+        let normalized;
+        let record = if bytes.starts_with(b"SWLC0001") {
+            if protected
+                .as_ref()
+                .map(|index| index.get(height))
+                .transpose()
+                .map_err(|_| "protected history index unreadable")?
+                .flatten()
+                .is_some()
+            {
+                return Err("protected history is missing its full proof".into());
+            }
+            row.value()
+        } else {
+            let expected = protected
+                .as_ref()
+                .ok_or("full proof below replay base lacks protected history index")?
+                .get(height)
+                .map_err(|_| "protected history index unreadable")?
+                .ok_or("full proof below replay base lacks protection")?;
+            normalized = super::protected_history::authenticate(row.value(), expected.value())?;
+            protected_count += 1;
+            normalized.as_slice()
+        };
+        let (bytes, _) = split_record(record)?;
         let compact = CompactBlock::decode(bytes)?;
         if compact.block.height != height || compact.block.parent != parent {
             return Err("local storage public prefix is not canonical".into());
         }
-        checked = next_prefix(checked, height, row.value());
+        checked = next_prefix(checked, height, record);
         parent = compact.id;
+    }
+    if let Some(index) = protected {
+        let count = index
+            .len()
+            .map_err(|_| "protected history count unreadable")?;
+        if count > 0 {
+            if !role.serves_historical_proofs() || count != protected_count + 1 {
+                return Err("protected history differs from the sealed prefix".into());
+            }
+            let clock = index
+                .get(0)
+                .map_err(|_| "protected recovery clock unavailable")?
+                .ok_or("protected recovery clock missing")?;
+            super::protected_history::recovery_clock(clock.value())?;
+        }
     }
     if checked != prefix || parent != base.tip {
         return Err("local storage public prefix differs from sealed checkpoint".into());
@@ -708,9 +761,32 @@ impl Store {
                 .map_err(|_| "storage accounting write failed")?;
         }
         let deleted = base.height - old_height;
+        drop(blocks);
+        drop(finality);
+        let protected = super::protected_history::maintain(
+            &txn,
+            super::protected_history::Maintenance {
+                role,
+                base_height: base.height,
+                tip: self.state.height,
+                now,
+                last_clock: last,
+                new_session,
+                backward,
+                recovery: match service_gate {
+                    Some(ServiceGate::Ready(boundary)) => Some(boundary),
+                    _ => None,
+                },
+                deletion_enabled: can_prune,
+                remaining_blocks: MAX_EXPIRE_BLOCKS.saturating_sub(deleted),
+                remaining_bytes: MAX_EXPIRE_BYTES.saturating_sub(inspected_bytes),
+            },
+        )?;
+        inspected_bytes = inspected_bytes.saturating_add(protected.inspected_bytes);
         // Detached branches can no longer be selected below this verified base.
         // Preserve their authenticated public fields and local reward evidence.
         if can_prune
+            && protected.detached_ready
             && txn
                 .list_tables()
                 .map_err(|_| "storage schema unavailable")?
@@ -768,14 +844,12 @@ impl Store {
         }
         meta.insert("last_clock", now.to_le_bytes().as_slice())
             .map_err(|_| "storage clock write failed")?;
-        drop(blocks);
-        drop(finality);
         drop(meta);
         txn.commit()
             .map_err(|_| "storage expiration commit failed")?;
         self.retention_clock_started = true;
         self.storage_base = Some(base);
-        Ok(deleted)
+        Ok(deleted.saturating_add(protected.expired))
     }
 
     pub fn storage_metrics(&self) -> Result<Value, String> {
@@ -783,11 +857,25 @@ impl Store {
         let mut canonical_proof_bytes = 0u64;
         let mut retained = 0u64;
         let mut pruned = 0u64;
+        let mut protected_proof_bytes = 0u64;
+        let mut protected_proof_blocks = 0u64;
         let txn = self
             .database
             .begin_read()
             .map_err(|_| "storage metrics unavailable")?;
         if role.is_some() {
+            let protected = if txn
+                .list_tables()
+                .map_err(|_| "protected history metrics unavailable")?
+                .any(|table| table.name() == super::protected_history::PROTECTED.name())
+            {
+                Some(
+                    txn.open_table(super::protected_history::PROTECTED)
+                        .map_err(|_| "protected history metrics unavailable")?,
+                )
+            } else {
+                None
+            };
             let finality = txn
                 .open_table(FINALITY)
                 .map_err(|_| "storage metrics unavailable")?;
@@ -806,10 +894,32 @@ impl Store {
                     .checked_add(bytes)
                     .ok_or("proof metrics overflow")?;
                 if height.value() <= self.storage_base.as_ref().map_or(0, |base| base.height) {
-                    if bytes != 0 {
-                        return Err("expired proof accounting is nonzero".into());
+                    let marker = protected
+                        .as_ref()
+                        .map(|index| index.get(height.value()))
+                        .transpose()
+                        .map_err(|_| "protected history metrics unreadable")?
+                        .flatten();
+                    if let Some(marker) = marker {
+                        if bytes == 0
+                            || marker.value().len() != 64
+                            || marker.value()[..32] != row.value()[..32]
+                        {
+                            return Err(
+                                "protected proof metrics differ from canonical history".into()
+                            );
+                        }
+                        retained += 1;
+                        protected_proof_blocks += 1;
+                        protected_proof_bytes = protected_proof_bytes
+                            .checked_add(bytes)
+                            .ok_or("protected proof metrics overflow")?;
+                    } else {
+                        if bytes != 0 {
+                            return Err("expired proof accounting is nonzero".into());
+                        }
+                        pruned += 1;
                     }
-                    pruned += 1;
                 } else {
                     retained += 1;
                 }
@@ -883,6 +993,8 @@ impl Store {
             "storage_limit_scope":role.filter(|r| r.serves_historical_proofs()).map(|_| "native-owned-logical-file-bytes"),
             "proof_body_bytes":role.map(|_| canonical_proof_bytes.saturating_add(detached_proof_bytes)),
             "canonical_proof_body_bytes":role.map(|_| canonical_proof_bytes),
+            "protected_historical_proof_blocks":protected_proof_blocks,
+            "protected_historical_proof_bytes":protected_proof_bytes,
             "detached_proof_body_bytes":detached_proof_bytes,"detached_record_bytes":detached_record_bytes,
             "node_directory_logical_bytes":directory_logical,"node_directory_allocated_bytes":directory_allocated,
             "local_replay_base_height":self.storage_base.as_ref().map(|base| base.height),

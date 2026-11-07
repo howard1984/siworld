@@ -149,6 +149,44 @@ fn connect_pair(a: &mut Endpoint, b: &mut Endpoint) {
 
 #[cfg(unix)]
 #[test]
+fn unavailable_checkpoint_observation_does_not_interrupt_canonical_validation() {
+    use crate::{
+        checkpoint_service::Coordinator, engineering_checkpoint::Roster,
+        identity::checkpoint_authority::Authority,
+    };
+    let directory = Directory::new();
+    let second = Directory::new();
+    let binding = p2p::Binding::new(&configuration());
+    let a = Authority::initialize(&directory.0, binding).unwrap();
+    let b = Authority::initialize(&second.0, binding).unwrap();
+    let roster = Roster::new(binding, [a.public_key(), b.public_key()]).unwrap();
+    let mut coordinator = Coordinator::for_test(&directory.0, roster).unwrap();
+    let store = Store::open(
+        directory.0.join("chain.redb"),
+        configuration(),
+        &TestVerifier,
+    )
+    .unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    let status = directory.0.join("checkpoint-service-status.json");
+    std::fs::create_dir(&status).unwrap();
+    let metrics = checkpoint_status_observation(&directory.0, &mut coordinator, 21_600);
+    assert_eq!(metrics["alert"], "checkpoint_status_export_unavailable");
+    let block = candidate(node.state(), 100_000);
+    node.import_branch(0, &[block], CandidatePolicy::default())
+        .unwrap();
+    assert_eq!(node.state().height, 1);
+    std::fs::remove_dir(&status).unwrap();
+    let metrics = checkpoint_status_observation(&directory.0, &mut coordinator, 21_601);
+    assert_eq!(metrics["alert"], "checkpoint_stale");
+    assert!(coordinator.alert.is_none());
+    let exported: Value = serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap();
+    assert_eq!(exported, metrics);
+    assert_eq!(node.state().height, 1);
+}
+
+#[cfg(unix)]
+#[test]
 fn budget_alarm_does_not_interrupt_authenticated_peer_sync() {
     let mut source = Endpoint::new();
     let mut target = Endpoint::with_storage_role(Some(crate::storage_policy::Role::Validator));
@@ -1144,4 +1182,123 @@ fn outbound_only_miner_with_larger_identity_syncs_without_a_listener() {
     });
     assert!(miner.driver.listener.is_none());
     assert_eq!(miner.state().height, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_peer_downloads_checkpoint_prefix_and_verified_tail_over_authenticated_p2p() {
+    use crate::{
+        checkpoint_service::Coordinator,
+        engineering_checkpoint::{self as auth, Certificate, Roster},
+        identity::checkpoint_authority::Authority,
+        storage_policy::Role,
+    };
+    let mut source = Endpoint::with_storage_role(Some(Role::Bootstrap));
+    let mut target = Endpoint::new();
+    for index in 0..96 {
+        source.append(950_000_000 + index * 100_000);
+    }
+    let second_key = Directory::new();
+    let binding = p2p::Binding::new(&configuration());
+    let a = Authority::initialize(&source.directory.0, binding).unwrap();
+    let b = Authority::initialize(&second_key.0, binding).unwrap();
+    let roster = Roster::new(binding, [a.public_key(), b.public_key()]).unwrap();
+    let now = wall_ms().unwrap() / 1000;
+    let sequence = now / auth::INTERVAL_SECONDS;
+    let candidate = source
+        .node
+        .as_ref()
+        .unwrap()
+        .store()
+        .engineering_checkpoint_candidate(
+            &roster,
+            72,
+            sequence,
+            sequence * auth::INTERVAL_SECONDS,
+            &TestVerifier,
+        )
+        .unwrap();
+    let certificate = Certificate {
+        statement: candidate.statement().clone(),
+        votes: vec![
+            a.sign(&candidate, &roster).unwrap(),
+            b.sign(&candidate, &roster).unwrap(),
+        ],
+    };
+    source
+        .node
+        .as_mut()
+        .unwrap()
+        .resident_accept_checkpoint(&certificate, &roster, now, &candidate)
+        .unwrap();
+    let mut source_checkpoints =
+        Coordinator::for_test(&source.directory.0, roster.clone()).unwrap();
+    source_checkpoints
+        .poll(source.node.as_mut().unwrap(), now)
+        .unwrap();
+    source.driver.checkpoints = Some(source_checkpoints);
+    target.driver.checkpoints = Some(Coordinator::for_test(&target.directory.0, roster).unwrap());
+    source.follow(&target);
+    target.follow(&source);
+    let started = Instant::now();
+    while target.state().height != 96 {
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "checkpoint loopback did not finish: {:?}",
+            target
+                .driver
+                .checkpoints
+                .as_ref()
+                .unwrap()
+                .metrics(wall_ms().unwrap() / 1000)
+        );
+        source.tick();
+        target.tick();
+        std::thread::sleep(POLL);
+    }
+    assert_eq!(target.state().fingerprint(), source.state().fingerprint());
+    let store = target.node.as_ref().unwrap().store();
+    assert_eq!(
+        store
+            .latest_engineering_checkpoint()
+            .unwrap()
+            .unwrap()
+            .statement
+            .height,
+        72
+    );
+    // This distinguishes compact-prefix bootstrap from ordinary full history.
+    assert!(store.block(1).is_err());
+    assert!(store.public_compact_block(1).is_ok());
+    assert!(store.block(73).is_ok());
+    assert!(target.driver.checkpoints.as_ref().unwrap().alert.is_none());
+    assert!(!target.driver.checkpoints.as_ref().unwrap().is_catching_up());
+    let receipt: Value = serde_json::from_slice(
+        &std::fs::read(target.directory.0.join("checkpoint-recovery-receipt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["phase"], "completed");
+    assert_eq!(receipt["checkpoint_height"], 72);
+    assert_eq!(receipt["checkpoint_sequence"], sequence);
+    assert_eq!(receipt["final_height"], 96);
+    assert_eq!(receipt["final_tip"], local::hex(&target.state().tip));
+    assert_eq!(
+        receipt["final_state_fingerprint"],
+        local::hex(&target.state().fingerprint())
+    );
+    assert_eq!(
+        receipt["final_cumulative_work"],
+        local::hex(&target.state().cumulative_work.to_big_endian())
+    );
+    let expected_bytes: u64 = (1..=72)
+        .map(|height| store.public_compact_block(height).unwrap().len() as u64)
+        .chain((73..=96).map(|height| store.block(height).unwrap().encoded_len().unwrap() as u64))
+        .sum();
+    assert_eq!(receipt["downloaded_bytes"], expected_bytes);
+    assert!(receipt["elapsed_monotonic_ms"].as_u64().unwrap() > 0);
+    assert!(
+        receipt["started_unix_seconds"].as_u64().unwrap()
+            <= receipt["completed_unix_seconds"].as_u64().unwrap()
+    );
 }

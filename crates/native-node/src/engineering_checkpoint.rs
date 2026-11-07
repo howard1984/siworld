@@ -151,6 +151,7 @@ impl Reader<'_> {
 
 /// The two distinct public keys must be pinned by the engineering release.
 /// No key supplied by a checkpoint or a transport can extend this roster.
+#[derive(Clone)]
 pub struct Roster {
     binding: Binding,
     keys: [[u8; PUBLIC_KEY_BYTES]; 2],
@@ -178,6 +179,23 @@ impl Roster {
             hash.update(key);
         }
         *hash.finalize().as_bytes()
+    }
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn verify_vote(&self, statement: &Statement, vote: &Vote) -> Result<(), String> {
+        if statement.binding != self.binding || statement.roster != self.digest() {
+            return Err("checkpoint proposal context mismatch".into());
+        }
+        let key = self
+            .keys
+            .get(usize::from(vote.signer))
+            .ok_or("checkpoint signer is not pinned")?;
+        ml_dsa_65::verify(
+            &MLDSA65VerificationKey::new(*key),
+            &statement.encode(),
+            CONTEXT,
+            &MLDSA65Signature::new(vote.signature),
+        )
+        .map_err(|_| "checkpoint proposal signature invalid".into())
     }
     pub(crate) fn index(&self, key: &[u8; PUBLIC_KEY_BYTES]) -> Result<u8, String> {
         self.keys

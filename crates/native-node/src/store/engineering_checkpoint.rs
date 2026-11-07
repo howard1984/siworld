@@ -19,6 +19,16 @@ impl LocalCandidate {
     pub fn statement(&self) -> &Statement {
         &self.statement
     }
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn reissued(&self, sequence: u64, issued: u64) -> Self {
+        let mut statement = self.statement.clone();
+        statement.sequence = sequence;
+        statement.issued_unix_seconds = issued;
+        Self {
+            statement,
+            state_encoding: self.state_encoding.clone(),
+        }
+    }
     pub fn state_encoding(&self) -> &[u8] {
         &self.state_encoding
     }
@@ -130,38 +140,41 @@ impl Store {
                 "checkpoint height is not sufficiently confirmed on the canonical chain".into(),
             );
         }
-        let policy = CandidatePolicy {
-            max_replay_blocks: self.state.height,
-            ..CandidatePolicy::default()
-        };
-        let state = self
-            .ancestor_state(height, 0, policy, verifier)
-            .map_err(|_| "checkpoint local verified replay unavailable")?;
-        if self.canonical_id(height)? != state.tip {
-            return Err("checkpoint is not on the local greatest-work chain".into());
+        let _ = verifier; // This running store has already verified its canonical records.
+        self.engineering_checkpoint_snapshot(roster, height, sequence, issued)?
+            .finish(None)
+    }
+    /// Capture a stable read transaction; the background job never owns a live
+    /// Store, mutates canonical state, or accepts a remotely supplied State.
+    pub(crate) fn engineering_checkpoint_snapshot(
+        &self,
+        roster: &Roster,
+        height: u64,
+        sequence: u64,
+        issued: u64,
+    ) -> Result<CheckpointSnapshot, String> {
+        if roster.binding() != Binding::new(&self.state.config)
+            || height == 0
+            || !height.is_multiple_of(checkpoint_auth::HEIGHT_INTERVAL)
+            || height
+                .checked_add(checkpoint_auth::CONFIRMATIONS)
+                .is_none_or(|n| n > self.state.height)
+        {
+            return Err("checkpoint snapshot is not sufficiently confirmed locally".into());
         }
-        let prefix = digest(
-            "siworld engineering checkpoint permanent prefix v1",
-            |hash| {
-                hash.update(&self.state.config.genesis_id());
-            },
-        );
-        let mut hash =
-            blake3::Hasher::new_derive_key("siworld engineering checkpoint permanent records v1");
-        hash.update(&prefix);
-        for at in 1..=height {
-            let bytes = self.public_compact_block(at)?;
-            hash.update(&at.to_le_bytes());
-            hash.update(blake3::hash(&bytes).as_bytes());
-        }
-        summary(
-            &state,
-            roster,
+        Ok(CheckpointSnapshot {
+            transaction: self
+                .database
+                .begin_read()
+                .map_err(|_| "checkpoint snapshot unavailable")?,
+            config: self.state.config.clone(),
+            roster: roster.clone(),
+            height,
             sequence,
             issued,
-            *hash.finalize().as_bytes(),
-        )
+        })
     }
+
     pub fn sign_engineering_checkpoint(
         &self,
         authority: &Authority,
@@ -189,13 +202,12 @@ impl Store {
         now: u64,
         verifier: &impl BlockVerifier,
     ) -> Result<(), String> {
-        let previous = self.latest_engineering_checkpoint()?;
-        let cursor = previous.as_ref().map(|value| Cursor {
-            sequence: value.statement.sequence,
-            height: value.statement.height,
-            digest: value.statement.digest(),
-        });
-        certificate.authenticate(roster, cursor, now)?;
+        // Reject an authenticated off-chain statement before any historical
+        // reconstruction. A running node never changes chain state on mismatch.
+        certificate.authenticate(roster, self.checkpoint_cursor()?, now)?;
+        if self.canonical_id(certificate.statement.height)? != certificate.statement.block_id {
+            return Err("urgent checkpoint is not on the local greatest-work chain".into());
+        }
         let expected = self.engineering_checkpoint_candidate(
             roster,
             certificate.statement.height,
@@ -203,7 +215,34 @@ impl Store {
             certificate.statement.issued_unix_seconds,
             verifier,
         )?;
-        if expected.statement != certificate.statement {
+        self.accept_engineering_checkpoint_cached(certificate, roster, now, &expected)
+    }
+    pub(crate) fn checkpoint_cursor(&self) -> Result<Option<Cursor>, String> {
+        Ok(self.latest_engineering_checkpoint()?.map(|value| Cursor {
+            sequence: value.statement.sequence,
+            height: value.statement.height,
+            digest: value.statement.digest(),
+        }))
+    }
+    /// The cached candidate came from this node's independently verified local
+    /// records. Recheck its branch after background completion and before commit.
+    pub(crate) fn accept_engineering_checkpoint_cached(
+        &mut self,
+        certificate: &Certificate,
+        roster: &Roster,
+        now: u64,
+        expected: &LocalCandidate,
+    ) -> Result<(), String> {
+        certificate.authenticate(roster, self.checkpoint_cursor()?, now)?;
+        if expected.statement != certificate.statement
+            || expected.statement.binding != Binding::new(&self.state.config)
+            || expected
+                .statement
+                .height
+                .checked_add(checkpoint_auth::CONFIRMATIONS)
+                .is_none_or(|height| height > self.state.height)
+            || self.canonical_id(expected.statement.height)? != expected.statement.block_id
+        {
             return Err(
                 "urgent checkpoint mismatch with independently verified local state".into(),
             );
@@ -246,6 +285,69 @@ impl Store {
         bytes
             .map(|value| Certificate::decode(value.value()))
             .transpose()
+    }
+}
+
+/// Immutable local canonical-history snapshot for a bounded single background
+/// reconstruction job. Proof validity was established when this Store opened
+/// and accepted these records; each recovered state must reproduce its saved
+/// per-height fingerprint. This path is never used for remote untrusted data.
+pub(crate) struct CheckpointSnapshot {
+    transaction: redb::ReadTransaction,
+    config: Config,
+    roster: Roster,
+    height: u64,
+    sequence: u64,
+    issued: u64,
+}
+impl CheckpointSnapshot {
+    pub(crate) fn finish(
+        self,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<LocalCandidate, String> {
+        let table = self
+            .transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "checkpoint canonical snapshot unavailable")?;
+        let mut state = State::new(self.config)?;
+        let initial = blake3::derive_key(
+            "siworld engineering checkpoint permanent prefix v1",
+            &state.config.genesis_id(),
+        );
+        let mut prefix =
+            blake3::Hasher::new_derive_key("siworld engineering checkpoint permanent records v1");
+        prefix.update(&initial);
+        for height in 1..=self.height {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err("checkpoint snapshot cancelled".into());
+            }
+            let record = table
+                .get(height)
+                .map_err(|_| "checkpoint local record unavailable")?
+                .ok_or("checkpoint local canonical prefix incomplete")?;
+            let (bytes, fingerprint) = split_record(record.value())?;
+            let public = if bytes.starts_with(b"SWLC0001") {
+                bytes.to_vec()
+            } else {
+                crate::compact::CompactBlock::export_canonical(bytes)?
+            };
+            let compact = crate::compact::CompactBlock::decode(&public)?;
+            super::public_replay::reconstruct_public_effects(&mut state, &compact)?;
+            if state.height != height || state.fingerprint().as_slice() != fingerprint {
+                return Err(
+                    "urgent checkpoint independently verified local fingerprint mismatch".into(),
+                );
+            }
+            prefix.update(&height.to_le_bytes());
+            prefix.update(blake3::hash(&public).as_bytes());
+        }
+        summary(
+            &state,
+            &self.roster,
+            self.sequence,
+            self.issued,
+            *prefix.finalize().as_bytes(),
+        )
     }
 }
 

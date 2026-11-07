@@ -20,6 +20,17 @@ fn resident_candidate_policy() -> CandidatePolicy {
     }
 }
 
+pub(crate) enum OwnedCheckpointData {
+    Empty,
+    Permanent {
+        body: Vec<u8>,
+        reservation: Reservation,
+    },
+    Tail {
+        block: Box<Block>,
+        reservation: Reservation,
+    },
+}
 pub(crate) struct OwnedSyncReply {
     pub(crate) batch: Batch,
     pub(crate) reservation: Reservation,
@@ -66,6 +77,83 @@ pub(crate) struct OwnedRelay {
 }
 
 impl<V: BlockVerifier> Node<V> {
+    pub(crate) fn resident_checkpoint_qualify(&mut self, now: u64) -> Result<(), String> {
+        let roster =
+            crate::engineering_checkpoint::release_roster(p2p::Binding::new(&self.state().config))?
+                .ok_or("engineering checkpoint roster unavailable")?;
+        self.store.qualify_service_checkpoint_delivery(&roster, now)
+    }
+
+    pub(crate) fn resident_serve_checkpoint(
+        &self,
+        body: &[u8],
+    ) -> Result<OwnedCheckpointData, Error> {
+        let Some(request) =
+            crate::checkpoint_service::Request::decode(body).map_err(|_| invalid())?
+        else {
+            return Ok(OwnedCheckpointData::Empty);
+        };
+        if !self.store.serves_historical_proofs()? {
+            return Err(p2p::Error::Unavailable.into());
+        }
+        let certificate = self
+            .store
+            .latest_engineering_checkpoint()?
+            .ok_or(p2p::Error::Unavailable)?;
+        if certificate.statement.digest() != request.certificate
+            || request.permanent != (request.height <= certificate.statement.height)
+            || request.height > self.state().height
+        {
+            return Err(p2p::Error::Unavailable.into());
+        }
+        let reservation = self.budget.reserve(BLOCK_LOOKUP_BYTES)?;
+        if request.permanent {
+            Ok(OwnedCheckpointData::Permanent {
+                body: self.store.public_compact_block(request.height)?,
+                reservation,
+            })
+        } else {
+            Ok(OwnedCheckpointData::Tail {
+                block: Box::new(self.store.block(request.height)?),
+                reservation,
+            })
+        }
+    }
+
+    pub(crate) fn resident_checkpoint_push_tail(
+        &self,
+        session: &mut crate::store::checkpoint_bootstrap::CheckpointBootstrap,
+        block: &Block,
+    ) -> Result<(), String> {
+        session.push_tail(block, &self.verifier)
+    }
+    pub(crate) fn resident_adopt_checkpoint(
+        &mut self,
+        verified: crate::store::checkpoint_bootstrap::VerifiedBootstrap,
+        now: u64,
+    ) -> Result<u64, String> {
+        let generation = self
+            .production_generation
+            .checked_add(1)
+            .ok_or("production generation exhausted")?;
+        let bytes = self.store.adopt_engineering_bootstrap(verified, now)?;
+        self.production_generation = generation;
+        self.reconcile_pools()
+            .map_err(|_| "checkpoint adopted pool reconciliation unavailable")?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn resident_accept_checkpoint(
+        &mut self,
+        certificate: &crate::engineering_checkpoint::Certificate,
+        roster: &crate::engineering_checkpoint::Roster,
+        now: u64,
+        candidate: &crate::store::engineering_checkpoint::LocalCandidate,
+    ) -> Result<(), String> {
+        self.store
+            .accept_engineering_checkpoint_cached(certificate, roster, now, candidate)
+    }
+
     /// Return one already verified packet. Per-connection acknowledgements are
     /// bounded by the current pool and are reset after reauthentication.
     pub(crate) fn resident_relay_next(

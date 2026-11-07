@@ -74,6 +74,43 @@ impl Authority {
     pub fn public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
         self.public
     }
+    /// Recover a public vote after a crash without changing the statement at an
+    /// already used sequence. The private key is never included in the record.
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn saved_vote(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<(crate::engineering_checkpoint::Statement, Vote)>, String> {
+        let name = format!("engineering-checkpoint-vote-{sequence:020}.bin");
+        if !self
+            .directory
+            .join(&name)
+            .try_exists()
+            .map_err(|_| "checkpoint vote metadata unavailable")?
+        {
+            return Ok(None);
+        }
+        const STATEMENT_BYTES: usize = 624;
+        let storage = Storage::open(&self.directory)
+            .map_err(|_| "checkpoint authority storage unavailable")?;
+        let bytes = storage
+            .read_exact(&name, STATEMENT_BYTES + 1 + 3309)
+            .map_err(|_| "checkpoint saved vote unavailable")?;
+        let statement =
+            crate::engineering_checkpoint::Statement::decode(&bytes[..STATEMENT_BYTES])?;
+        if statement.sequence != sequence {
+            return Err("checkpoint saved sequence mismatch".into());
+        }
+        Ok(Some((
+            statement,
+            Vote {
+                signer: bytes[STATEMENT_BYTES],
+                signature: bytes[STATEMENT_BYTES + 1..]
+                    .try_into()
+                    .map_err(|_| "checkpoint saved vote shape")?,
+            },
+        )))
+    }
     /// Only Store can construct a locally verified candidate. Persist a public
     /// vote before returning it; signing a different statement at the same
     /// sequence fails without overwriting the earlier vote.

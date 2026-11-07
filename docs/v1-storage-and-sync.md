@@ -57,11 +57,12 @@ or authorize trust in another node's history.
 
 Maintenance batches are bounded. Database free pages are reusable immediately;
 file size can remain at its high-water mark until exclusive offline redb
-compaction. See [native storage operation](native-proof-storage.md). Remote
-checkpoint publication, fresh-node checkpoint installation and automatic
-long-offline recovery are separate integration gates. Do not deploy service
-proof expiry until an authenticated checkpoint and its complete proof tail can
-be delivered to new and recovering nodes.
+compaction. See [native storage operation](native-proof-storage.md). The engineering
+implementation includes two-authority publication and quarantined checkpoint
+reconstruction over the pinned-peer transport. Its live delivery, fresh-node
+installation and long-offline recovery remain acceptance gates. Service proof
+expiry requires explicit local qualification after those gates; an authenticated
+checkpoint and its complete proof tail must be available to recovering nodes.
 
 Unconfirmed transactions use bounded mempool TTL/expiry and byte admission;
 they do not create an unbounded disk spill. Orphaned data follows the

@@ -477,3 +477,73 @@ fn cleanup_never_removes_a_replacement_at_an_owned_temporary_name() {
     remove_owned_temporary(&temporary, &identity);
     assert_eq!(std::fs::read(&temporary).unwrap(), b"replacement evidence");
 }
+
+#[cfg(all(feature = "native-p2p", unix))]
+#[test]
+fn recovery_transport_is_specimen_scoped_and_preserves_storage_seals() {
+    use crate::{identity::NativeIdentity, p2p::Binding, state::Config};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let specimen = Directory::new();
+    let outside = Directory::new();
+    let transport = specimen.0.join("transport-identity");
+    fs::create_dir(&transport).unwrap();
+    fs::set_permissions(&transport, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        recovery_identity_directory(&specimen.0, None).unwrap(),
+        specimen.0
+    );
+    assert_eq!(
+        recovery_identity_directory(&specimen.0, Some(transport.as_os_str())).unwrap(),
+        transport.canonicalize().unwrap()
+    );
+    assert!(recovery_identity_directory(&specimen.0, Some(specimen.0.as_os_str())).is_err());
+    assert!(recovery_identity_directory(&specimen.0, Some(outside.0.as_os_str())).is_err());
+    let alias = specimen.0.join("transport-alias");
+    symlink(&transport, &alias).unwrap();
+    assert!(recovery_identity_directory(&specimen.0, Some(alias.as_os_str())).is_err());
+    let binding = Binding::new(&Config::development([231; 32], 0).unwrap());
+    let storage = NativeIdentity::initialize(&specimen.0.canonicalize().unwrap(), binding).unwrap();
+    let storage_public = storage.descriptor().unwrap();
+    let seal = storage.seal_local_storage([29; 32]).unwrap();
+    let temporary =
+        NativeIdentity::initialize(&transport.canonicalize().unwrap(), binding).unwrap();
+    assert_ne!(
+        storage_public.fingerprint(),
+        temporary.descriptor().unwrap().fingerprint()
+    );
+    storage_public
+        .verify_local_storage([29; 32], &seal)
+        .unwrap();
+    assert!(
+        temporary
+            .descriptor()
+            .unwrap()
+            .verify_local_storage([29; 32], &seal)
+            .is_err()
+    );
+    let reopened = NativeIdentity::load(&specimen.0.canonicalize().unwrap(), &binding).unwrap();
+    assert_eq!(
+        reopened.descriptor().unwrap().fingerprint(),
+        storage_public.fingerprint()
+    );
+    reopened
+        .descriptor()
+        .unwrap()
+        .verify_local_storage([29; 32], &seal)
+        .unwrap();
+}
+
+#[cfg(feature = "native-p2p")]
+#[test]
+fn recovery_transport_rejects_mining_listeners_and_miner_cli_before_start() {
+    assert!(check_recovery_transport(true, false, false, false).is_ok());
+    for (mining, listening, private_view) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        assert!(check_recovery_transport(true, mining, listening, private_view).is_err());
+        assert!(check_recovery_transport(false, mining, listening, private_view).is_ok());
+    }
+}

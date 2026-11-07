@@ -23,7 +23,11 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "native-p2p")]
+mod checkpoint_control;
+#[cfg(feature = "native-p2p")]
 pub mod network;
+#[cfg(feature = "native-p2p")]
+pub use checkpoint_control::request_checkpoint_qualification;
 
 pub const LEASE_FILE: &str = "service.lock";
 pub const STATUS_FILE: &str = "service-status.json";
@@ -1012,7 +1016,7 @@ pub fn run(directory: &Path) -> Result<(), String> {
     let rayon = std::env::var("RAYON_NUM_THREADS").ok();
     let hiding = std::env::var("SIWORLD_COMPOSITION_HIDING_WORKERS").ok();
     check_workers(rayon.as_deref(), hiding.as_deref())?;
-    run_controlled(directory, &config, None, false, |control| {
+    run_controlled(directory, &config, None, false, false, |control| {
         continuous(directory, control)
     })
 }
@@ -1030,6 +1034,55 @@ pub fn run_cli_miner(directory: &Path, peer_file: &Path) -> Result<(), String> {
     run_network_mode(directory, peer_file, true)
 }
 #[cfg(feature = "native-p2p")]
+fn network_identity_directory(directory: &Path) -> Result<PathBuf, String> {
+    recovery_identity_directory(
+        directory,
+        std::env::var_os("SIWORLD_RECOVERY_TRANSPORT_IDENTITY_DIRECTORY").as_deref(),
+    )
+}
+#[cfg(feature = "native-p2p")]
+fn recovery_identity_directory(
+    directory: &Path,
+    requested: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    let Some(requested) = requested else {
+        return Ok(directory.to_owned());
+    };
+    let requested = Path::new(requested);
+    let metadata =
+        fs::symlink_metadata(requested).map_err(|_| "recovery transport directory unavailable")?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("recovery transport identity requires its own regular directory".into());
+    }
+    let candidate = requested
+        .canonicalize()
+        .map_err(|_| "recovery transport directory unavailable")?;
+    let expected = directory
+        .canonicalize()
+        .map_err(|_| "recovery data directory unavailable")?
+        .join("transport-identity");
+    if candidate != expected {
+        return Err(
+            "recovery transport identity must use the specimen transport-identity directory".into(),
+        );
+    }
+    Ok(candidate)
+}
+#[cfg(feature = "native-p2p")]
+fn check_recovery_transport(
+    recovery: bool,
+    mining: bool,
+    listening: bool,
+    private_miner_view: bool,
+) -> Result<(), String> {
+    if recovery && (mining || listening || private_miner_view) {
+        return Err(
+            "recovery transport identity requires outbound-only non-mining configuration".into(),
+        );
+    }
+    Ok(())
+}
+#[cfg(feature = "native-p2p")]
 fn run_network_mode(
     directory: &Path,
     peer_file: &Path,
@@ -1038,13 +1091,34 @@ fn run_network_mode(
     let _lease = Lease::acquire(directory)?;
     let config = local::load(directory)?;
     let binding = crate::p2p::Binding::new(&config);
-    let identity = crate::identity::NativeIdentity::load(directory, &binding)
+    let recovery = std::env::var_os("SIWORLD_RECOVERY_TRANSPORT_IDENTITY_DIRECTORY").is_some();
+    let identity_directory = network_identity_directory(directory)?;
+    let identity = crate::identity::NativeIdentity::load(&identity_directory, &binding)
         .map_err(|_| "persistent native identity unavailable")?;
     let local_id = identity
         .descriptor()
         .map_err(|_| "local descriptor unavailable")?
         .fingerprint();
     let peers = network::Configuration::load(directory, peer_file, binding, local_id)?;
+    check_recovery_transport(
+        recovery,
+        peers.mining_enabled(),
+        peers.listening_enabled(),
+        private_miner_view,
+    )?;
+    if recovery {
+        let storage_identity = crate::identity::NativeIdentity::load(directory, &binding)
+            .map_err(|_| "copied storage identity unavailable")?;
+        let storage_id = storage_identity
+            .descriptor()
+            .map_err(|_| "copied storage descriptor unavailable")?
+            .fingerprint();
+        if storage_id == local_id {
+            return Err(
+                "recovery transport identity must differ from the copied storage identity".into(),
+            );
+        }
+    }
     if private_miner_view && (!peers.mining_enabled() || peers.listening_enabled()) {
         return Err("CLI miner requires outbound-only mining configuration".into());
     }
@@ -1068,6 +1142,7 @@ fn run_network_mode(
         &config,
         Some(digest),
         private_miner_view,
+        recovery,
         |control| network::continuous(directory, control, peers),
     )
 }
@@ -1077,6 +1152,7 @@ fn run_controlled(
     config: &crate::state::Config,
     peer_digest: Option<String>,
     private_miner_view: bool,
+    recovery: bool,
     action: impl FnOnce(&Arc<Control>) -> Result<(), String> + Send,
 ) -> Result<(), String> {
     let binary = std::env::current_exe().map_err(|_| "running binary identity unavailable")?;
@@ -1103,7 +1179,7 @@ fn run_controlled(
     let export_thread = std::thread::spawn(move || exporter(export_control));
     let result = (|| {
         let workers = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+            .num_threads(if recovery { 1 } else { 4 })
             .thread_name(|index| format!("native-prover-{index}"))
             .build()
             .map_err(|_| "resident prover worker-pool creation failed")?;

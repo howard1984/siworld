@@ -67,11 +67,14 @@ settlement benchmark. Operations monitoring pairs those values with process and
 cgroup memory, disk usage, height, tip and authenticated peer count. It must not
 add per-block real/padding counts or fee-tier telemetry.
 
-Known incomplete work includes Dandelion++, authenticated checkpoint startup,
-service-role proof pruning, production transport qualification, OIDC operations
-roles and miner template pipelining. The engineering transport uses pinned
+Known incomplete work includes Dandelion++, live checkpoint and service-retention
+acceptance, production transport qualification, OIDC operations roles and miner
+template pipelining. The engineering implementation provides release-pinned
+2-of-2 checkpoint coordination, quarantined reconstruction and explicit service
+expiry qualification; operating those paths requires measured delivery and
+recovery acceptance. The engineering transport uses pinned
 Ed25519/ML-DSA-65 identities with the hybrid TLS candidate; it does not establish
-permissionless discovery or sustained Internet acceptance. Until pruning exists,
+permissionless discovery or sustained Internet acceptance. Before service expiry is qualified,
 monitor actual disk growth and preserve records; do not claim a bounded
 24-hour service proof history. Existing smaller engineering disks are a temporary
 operating constraint, not the documented 500-GB deployment qualification.

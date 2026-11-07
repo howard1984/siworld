@@ -11,6 +11,7 @@ use std::{
 pub(super) struct PublicExport {
     root: PathBuf,
     published: Option<Hash>,
+    checkpoint_published: Option<Hash>,
     next: Instant,
 }
 impl PublicExport {
@@ -26,8 +27,63 @@ impl PublicExport {
         Ok(Self {
             root: root.into(),
             published: None,
+            checkpoint_published: None,
             next: Instant::now(),
         })
+    }
+
+    /// Only a certificate already accepted by the canonical store is exported.
+    /// Receivers independently authenticate the release-pinned authority quorum.
+    pub fn publish_checkpoint(
+        &mut self,
+        store: &crate::store::Store,
+        ids: &[Hash],
+    ) -> Result<(), String> {
+        if self.published != ids.last().copied() {
+            return Ok(());
+        }
+        let Some(certificate) = store.latest_engineering_checkpoint()? else {
+            return Ok(());
+        };
+        let statement = &certificate.statement;
+        let height =
+            usize::try_from(statement.height).map_err(|_| "Checkpoint export height limit.")?;
+        if height == 0 || ids.get(height - 1) != Some(&statement.block_id) {
+            return Err("Checkpoint export canonical prefix unavailable.".into());
+        }
+        let digest = statement.digest();
+        if self.checkpoint_published == Some(digest) {
+            return Ok(());
+        }
+        let bytes = certificate.encode()?;
+        if bytes.len() > crate::engineering_checkpoint::MAX_CERTIFICATE_BYTES {
+            return Err("Checkpoint export byte limit.".into());
+        }
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(|_| "Checkpoint export randomness unavailable.")?;
+        let temporary = self.root.join(format!("{}.tmp", hex(&random)));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|_| "Checkpoint export write unavailable.")?;
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "Checkpoint export write failed.")?;
+            fs::rename(&temporary, self.root.join("checkpoint.bin"))
+                .map_err(|_| "Checkpoint export commit failed.")?;
+            fs::File::open(&self.root)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| "Checkpoint export directory commit failed.")?;
+            self.checkpoint_published = Some(digest);
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
     }
 
     /// Call only after all canonical compact records have been durably installed.

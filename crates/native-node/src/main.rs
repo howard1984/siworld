@@ -10,11 +10,11 @@ use siworld_native_node::{
 use std::path::Path;
 fn help() {
     println!(
-        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
+        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\ncheckpoint-qualify-service DIRECTORY  Enable service expiry after checkpoint delivery acceptance\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
     );
     #[cfg(feature = "native-p2p")]
     println!(
-        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\nPublic peer discovery and public-network activation are disabled."
+        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\ncheckpoint-qualify-live DIRECTORY EXPECTED_RUN_ID  Request owner-bound service expiry qualification\nPublic peer discovery and public-network activation are disabled."
     );
     println!("\n{}", siworld_native_node::wallet_cli::HELP);
     println!(
@@ -217,6 +217,31 @@ fn run() -> Result<(), String> {
             } else {
                 store.compact_expired_storage(&verifier)?;
             }
+            println!("{}", store.storage_metrics()?);
+        }
+        #[cfg(feature = "native-p2p")]
+        "checkpoint-qualify-live" => {
+            if args.len() != 3 {
+                return Err("expected checkpoint-qualify-live DIRECTORY EXPECTED_RUN_ID".into());
+            }
+            service::request_checkpoint_qualification(path, &args[2])?;
+            println!("{}", serde_json::json!({"qualification_requested":true}));
+        }
+        "checkpoint-qualify-service" => {
+            exact(&args)?;
+            let config = config(path)?;
+            let roster = siworld_native_node::engineering_checkpoint::release_roster(
+                siworld_native_node::p2p::Binding::new(&config),
+            )?
+            .ok_or("engineering checkpoint authorities are not release-pinned")?;
+            let _lease = service::Lease::acquire(path)?;
+            let verifier = NativeVerifier::new()?;
+            let mut store = Store::open_existing(path.join("chain.redb"), config, &verifier)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "system clock precedes epoch")?
+                .as_secs();
+            store.qualify_service_checkpoint_delivery(&roster, now)?;
             println!("{}", store.storage_metrics()?);
         }
         "identity-init" | "identity-public" => {

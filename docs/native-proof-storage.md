@@ -1,7 +1,7 @@
 # Native Proof Storage
 
-Status: local storage implementation; remote checkpoint bootstrap and automatic
-long-offline recovery remain incomplete. This policy does not change transaction
+Status: engineering implementation with deployment and operating-system acceptance
+gates. This policy does not change transaction
 validity, proof profiles, rewards, difficulty or the 24-block reorganization rule.
 
 ## Role selection
@@ -27,8 +27,9 @@ At the 300-second target, the 24-hour finalized-proof window plus the existing
 24-block finality tail is nominally 312 blocks. Expiry follows elapsed time,
 not that estimated count. Checkpoint publication is due every 21,600 seconds
 (six hours), leaving headroom inside the 86,400-second proof window.
-Authenticated remote publication and tail delivery remain deployment gates;
-this cadence helper does not itself publish a checkpoint.
+The engineering coordinator schedules proposals independently of block production.
+Each authority builds its statement from independently verified local records;
+both votes are required before publication.
 
 ## Durable layout and recovery
 
@@ -46,10 +47,7 @@ records and base intact. Reopening checks the local signatures and complete
 compact prefix, then verifies the complete retained proof tail. Recent forks
 reconstruct from that base and cannot cross the existing finality boundary.
 Detached records below the base retain their compact public fields and local
-reward evidence while their proof bodies can expire. Expiry reconstructs public
-effects from authenticated compact records and compares every resulting state
-fingerprint with the fingerprint saved during independent block verification.
-It does not repeat expensive proof verification on the canonical-state owner.
+reward evidence while their proof bodies can expire.
 
 A local identity seal is not a remote checkpoint-authority quorum. This decoder
 must never be used to accept unauthenticated peer snapshots. The engineering
@@ -57,11 +55,9 @@ network's original genesis-reserved checkpoint authorities remain inactive; the
 engineering transition uses a separate release configuration. Non-fixture bootstrap and validator expiry is currently blocked in code until
 checkpoint delivery and retained-tail availability have been qualified. Metrics
 report `checkpoint_delivery_unavailable`; a local replay seal cannot remove this
-gate. Finality observation continues while checkpoint delivery is unqualified or
-stale. Explicit qualification requires a fresh confirmed canonical certificate
-from the release-pinned quorum; later expiry pauses after an 18-hour checkpoint
-age and never crosses the latest accepted checkpoint height. An offline node beyond all retained proof windows cannot
-yet automatically recover from a remote checkpoint in this implementation.
+gate. Engineering checkpoint recovery reconstructs a quarantined store from
+authenticated permanent public records and a fully verified proof tail before
+atomically adopting it. A certificate alone cannot install serialized state.
 
 ## Maintenance and disk accounting
 
@@ -132,14 +128,45 @@ compares the complete statement before accepting it. A mismatch returns an
 urgent diagnostic and never replaces local state. Dedicated signer journals
 refuse a different statement at an already signed sequence.
 
-Status: certificate authentication, local comparison and dedicated key tooling
-are implemented. Release roster pinning, independent host deployment, scheduled
-publication, P2P/export delivery, fresh-node permanent-data reconstruction,
-automatic long-offline recovery and urgent alert delivery remain qualification
-gates. Service proof expiry remains disabled until those gates are satisfied.
-A certificate with valid signatures alone cannot authorize network admission,
-state replacement or proof expiry. No production disk-reclamation or recovery
-measurement follows from synthetic tests.
+The engineering release pins two public verification keys to one exact network,
+genesis and verifier binding. The coordinator loads a private authority only on
+its origin host. A bounded background builder reconstructs confirmed state and
+compares every stored fingerprint before voting; write-once vote journals prevent
+signing a different statement at the same sequence. Checkpoint transport extends
+the pinned-peer protocol with a separate negotiated profile while preserving the
+legacy profile for older peers. Accepted certificates also enter the public export
+only after all referenced compact records and the canonical index are durable.
+The export transport supplies claims, not signing authority.
+
+Fresh and long-offline nodes download ordered permanent records into a private
+quarantine, reconstruct the complete state, compare the statement, then fully
+verify the proof tail against the greatest observed cumulative-work goal.
+Disconnection or goal replacement cannot authorize incomplete adoption. Mining
+remains disabled during checkpoint catchup. Private progress exports include
+height, payload bytes and a rate-based time estimate. A completed recovery writes
+a durable receipt with measured payload bytes, monotonic elapsed time and final
+state identity; an unavailable receipt raises a diagnostic without undoing an
+already verified adoption.
+
+Recovery of an existing service store preserves its historical full-proof rows
+in place under an authenticated protection index. Offline time is not credited
+toward retention. Those rows remain available and counted until their new local
+finality observation and checkpoint cutoff both permit expiry. No permanent
+public records are deleted.
+
+Non-fixture service expiry remains behind explicit local qualification after
+delivery and recovery acceptance. `checkpoint-qualify-service DIRECTORY` requires
+an idle exclusive lease and independent store replay. A running native-P2P owner
+can instead consume `checkpoint-qualify-live DIRECTORY EXPECTED_RUN_ID`; the
+request requires fresh status for that exact run and is stored privately. Neither
+network claims nor a service restart creates qualification. Invalid requests and
+checkpoint status export failures leave canonical validation running.
+
+Deployment, full-native-proof fresh download, real elapsed retention and
+long-offline recovery remain acceptance gates. A certificate with valid
+signatures alone cannot authorize network admission, state replacement or proof
+expiry. Synthetic tests do not establish production disk-reclamation, Windows
+download volume or recovery throughput.
 
 ## Validation boundaries
 
