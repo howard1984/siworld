@@ -16,6 +16,28 @@ export async function storePrivatePair(firstKey, first, secondKey, second) {
     catch{tx.abort();reject(new Error('Durable scan state failed; the previous wallet was preserved.'));}
   });}finally{db.close();}
 }
+// Public ciphertext cache policy only; private journals and scan states stay intact.
+export const COMPACT_REORG_BLOCKS = 128;
+export async function pruneCompact(height) {
+  if (!Number.isSafeInteger(height) || height < 0 || height > 1000000) throw new Error('Invalid compact cache boundary.');
+  const from = Math.max(1, height - COMPACT_REORG_BLOCKS + 1);
+  if (from === 1) return 0;
+  const db = await database();
+  try {return await new Promise((resolve, reject) => {
+    const tx = db.transaction('compact', 'readwrite');
+    let removed = 0;
+    tx.oncomplete = () => resolve(removed);
+    tx.onabort = tx.onerror = () => reject(new Error('Public cache cleanup is pending. Private wallet data was preserved.'));
+    const request = tx.objectStore('compact').openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      const value = cursor.value;
+      if (Number.isSafeInteger(value?.height) && value.height >= 1 && value.height < from) {cursor.delete(); removed++;}
+      cursor.continue();
+    };
+  });} finally {db.close();}
+}
 export const hex=bytes=>Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('');
 export const unhex=text=>{if(typeof text!=='string'||text.length%2||!/^[0-9a-f]*$/.test(text))throw new Error('Invalid binary encoding.');return Uint8Array.from(text.match(/../g)||[],p=>parseInt(p,16));};
 export const hash=async bytes=>hex(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)));

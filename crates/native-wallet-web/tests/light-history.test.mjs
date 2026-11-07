@@ -338,3 +338,69 @@ test('HTTP 400 projection fallback shares history while retaining account-specif
     if(savedNavigator)Object.defineProperty(globalThis,'navigator',savedNavigator);else delete globalThis.navigator;
   }
 });
+
+test('a legacy journal recovers pruned public blocks without changing its pending payments', async () => {
+  const savedFetch=globalThis.fetch,savedNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  const privateValues=new Map(), publicValues=new Map(), requested=[];
+  const wallet=BrowserWallet.restore(config.network,0,config.words);
+  const pinned={...config,name:'siworld-eng-1',api:'https://wallet.invalid/api'};
+  const io={storage:async(store,key,value)=>{
+    const values=store==='private'?privateValues:publicValues;
+    if(value!==undefined)values.set(key,structuredClone(value));
+    return values.has(key)?structuredClone(values.get(key)):undefined;
+  },batch:async(a,av,b,bv)=>{privateValues.set(a,new Uint8Array(av));privateValues.set(b,new Uint8Array(bv));},prune:async()=>{}};
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{locks:{request:(_key,options,action)=>(action||options)()}}});
+  const session=new LightSession(wallet,pinned,io),statement='a'.repeat(64);
+  try {
+    await session.initialize();
+    const payments=[{id:'synthetic-pending',phase:'unknown',statement_id:statement,inputs:[],input_atoms:'1',ever_submitted:true}];
+    const legacy={version:1,network:config.network,height:1,tip:config.rows[0].block_id,payments};
+    const plain=new TextEncoder().encode(JSON.stringify(legacy));
+    privateValues.set(session.key,wallet.protect_local(plain));plain.fill(0);
+    wallet.free();
+    const reopened=BrowserWallet.restore(config.network,0,config.words);
+    try {
+      globalThis.fetch=async url=>{
+        requested.push(url);
+        if(url.includes('/chain?'))return Response.json({ids:[config.rows[0].block_id]});
+        assert.ok(url.endsWith('/compact/'+config.rows[0].block_id));return new Response(bytes);
+      };
+      const restored=new LightSession(reopened,pinned,io);
+      const result=await restored.initialize();
+      assert.equal(result.height,1);assert.equal(result.ready,false);assert.ok(result.received_records.length>0);
+      assert.deepEqual(restored.journal.payments,payments);assert.equal(restored.journal.version,2);
+      assert.equal(requested.filter(url=>url.includes('/compact/')).length,1);
+      assert.ok(privateValues.has('scan:'+restored.key));
+    }finally{reopened.free();}
+  }finally{
+    globalThis.fetch=savedFetch;
+    if(savedNavigator)Object.defineProperty(globalThis,'navigator',savedNavigator);else delete globalThis.navigator;
+  }
+});
+
+test('public cleanup runs after the private commit and failure preserves a usable accepted balance', async () => {
+  const savedFetch=globalThis.fetch,savedNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  const wallet=BrowserWallet.restore(config.network,0,config.words),values=new Map();
+  const pinned={...config,name:'siworld-eng-1',api:'https://wallet.invalid/api'};
+  let committed=false,pruned=0;
+  const session=new LightSession(wallet,pinned,{storage:async(store,key,value)=>{
+    if(value!==undefined)values.set(store+key,structuredClone(value));return values.get(store+key);
+  },batch:async(a,av,b,bv)=>{values.set('private'+a,av);values.set('private'+b,bv);committed=true;},prune:async height=>{
+    assert.ok(committed);assert.equal(JSON.parse(wallet.light_balance()).height,height);pruned++;throw new Error('Synthetic cleanup failure.');
+  }});
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{locks:{request:(_key,options,action)=>(action||options)()}}});
+  globalThis.fetch=async url=>{
+    if(url.endsWith('/head'))return Response.json({network:config.network,genesis:config.genesis,height:1,tip:config.rows[0].block_id});
+    if(url.includes('/chain?'))return Response.json({ids:[config.rows[0].block_id]});
+    return new Response(bytes);
+  };
+  try {
+    await session.initialize();const result=await session.sync();
+    assert.equal(pruned,1);assert.equal(result.ready,true);assert.equal(result.height,1);
+    assert.equal(result.public_cache_cleanup_pending,true);assert.ok(result.received_records.length>0);
+    const retried=await session.sync();assert.equal(retried.ready,true);assert.equal(pruned,2);
+  }finally{
+    wallet.free();globalThis.fetch=savedFetch;
+    if(savedNavigator)Object.defineProperty(globalThis,'navigator',savedNavigator);else delete globalThis.navigator;
+  }
+});

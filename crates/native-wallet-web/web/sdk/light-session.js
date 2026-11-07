@@ -1,4 +1,4 @@
-import {stored,storePrivatePair,hash,fetchLimited,readJSON} from './online-storage.js';
+import {stored,storePrivatePair,pruneCompact,COMPACT_REORG_BLOCKS,hash,fetchLimited,readJSON} from './online-storage.js';
 const encode=value=>new TextEncoder().encode(JSON.stringify(value));
 const idPattern=/^[0-9a-f]{64}$/;
 function scanProgress(phase, start, from, height, target) {
@@ -37,7 +37,7 @@ export class AddressDirectory {
   }
 }
 export class LightSession {
-  constructor(wallet,config,io={}) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();this.storage=io.storage||stored;this.batch=io.batch||storePrivatePair;this.history=io.history;this.birthHeight=io.birthday?.birth_height??0;}
+  constructor(wallet,config,io={}) {this.wallet=wallet;this.config=config;this.ready=false;this.syncing=false;this.journal=null;this.key=null;this.times=new Map();this.storage=io.storage||stored;this.batch=io.batch||storePrivatePair;this.prune=io.prune||pruneCompact;this.history=io.history;this.birthHeight=io.birthday?.birth_height??0;}
   decodeJournal(bytes) {
     const plain=this.wallet.open_local(bytes);
     try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(plain));}finally{plain.fill(0);}
@@ -89,10 +89,37 @@ export class LightSession {
     const start=performance.now();
     onProgress(scanProgress('cache',start,0,0,this.journal.height));
     const chain=[];let tip=this.journal.tip;
-    for(let height=this.journal.height;height>0;height--){const c=await this.storage('compact',tip);if(!c||c.height!==height||!idPattern.test(c.parent))throw new Error('Compact cache is incomplete. Restore public history before sending.');chain.push({id:tip,height:c.height,parent:c.parent});tip=c.parent;}
+    for(let height=this.journal.height;height>0;height--){const c=await this.storage('compact',tip);if(!c)return this.replayMissing(onProgress);if(c.height!==height||!idPattern.test(c.parent))throw new Error('Compact cache is invalid. Preserve the payment journal before recovery.');chain.push({id:tip,height:c.height,parent:c.parent});tip=c.parent;}
     if(tip!==this.config.genesis)throw new Error('Compact cache has a different genesis.');
     this.wallet.begin_candidate();
     try{for(const c of chain.reverse()){const record=await this.storage('compact',c.id);if(!record)throw new Error('Compact cache was removed during replay.');const state=JSON.parse(this.wallet.append_compact(record.bytes));if(state.tip!==c.id)throw new Error('Compact cache identity mismatch.');if(state.owned_receipts)this.times.set(c.id,state.block_timestamp);onProgress(scanProgress('cache',start,0,state.height,this.journal.height));}this.wallet.commit_candidate(String(this.journal.height),this.journal.tip);}catch(error){this.wallet.abort_candidate();throw error;}
+  }
+  async replayMissing(onProgress=()=>{}) {
+    const start=performance.now(),head=this.journal;
+    let previous=0,parent=this.config.genesis;
+    this.wallet.begin_candidate();
+    try {
+      while(previous<head.height){
+        const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${previous+1}&limit=128`,{signal:AbortSignal.timeout(15000)});
+        if(!Array.isArray(page.ids)||!page.ids.length||page.ids.length>128||page.ids.length>head.height-previous)throw new Error('Incomplete recovery chain index.');
+        for(const id of page.ids){
+          if(!idPattern.test(id))throw new Error('Invalid recovery chain identity.');
+          const cached=await this.storage('compact',id);
+          const bytes=cached?.bytes||(await fetchLimited(`${this.base}/v1/compact/${id}`,{signal:AbortSignal.timeout(30000)})).bytes;
+          const state=JSON.parse(this.wallet.append_compact(bytes));
+          if(state.tip!==id||state.height!==previous+1)throw new Error('Recovery block identity or height differs.');
+          if(state.owned_receipts)this.times.set(id,state.block_timestamp);
+          if(!cached&&state.height>head.height-COMPACT_REORG_BLOCKS)await this.storage('compact',id,{id,parent,height:state.height,bytes});
+          parent=id;previous=state.height;
+          onProgress(scanProgress('cache',start,0,previous,head.height));
+        }
+      }
+      this.wallet.check_candidate(String(head.height),head.tip);
+      this.wallet.commit_candidate(String(head.height),head.tip);
+    }catch(error){this.wallet.abort_candidate();throw error;}
+  }
+  async cleanupPublicCache() {
+    try {await this.prune(this.journal.height);return false;}catch{return true;}
   }
   cancelSync() { this.syncController?.abort(new DOMException('Balance synchronization paused for a wallet change.', 'AbortError')); }
   async sync(onProgress=()=>{}) {
@@ -104,7 +131,7 @@ export class LightSession {
       controller.signal.throwIfAborted();
       const head=await readJSON(`${this.base}/v1/head`,{signal:signal(15000)});
       if(head.network!==this.config.network||head.genesis!==this.config.genesis||!idPattern.test(head.tip)||!Number.isSafeInteger(head.height)||head.height<0||head.height>1000000)throw new Error('Engineering head does not match the pinned network.');
-      if(head.tip===this.journal.tip&&head.height===this.journal.height){this.ready=true;return this.summary();}
+      if(head.tip===this.journal.tip&&head.height===this.journal.height){this.ready=true;return {...this.summary(),public_cache_cleanup_pending:await this.cleanupPublicCache()};}
       let extension=false;
       if(this.journal.height>0&&head.height>this.journal.height){const page=await readJSON(`${this.base}/v1/chain?tip=${head.tip}&from=${this.journal.height}&limit=1`,{signal:signal(15000)});extension=Array.isArray(page.ids)&&page.ids.length===1&&page.ids[0]===this.journal.tip;}
       let parent=extension?this.journal.tip:this.config.genesis;let previous=extension?this.journal.height:0;let downloaded=0,incidental=0;
@@ -140,7 +167,7 @@ export class LightSession {
       // Persist before replacing the accepted in-memory state. Cancellation
       // after this point must finish both steps so disk and memory agree.
       await this.persistScan({...this.journal,height:head.height,tip:head.tip,payments});
-      this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded,authentication_ciphertext_bytes:incidental};
+      this.wallet.commit_candidate(String(head.height),head.tip);this.ready=true;return {...this.summary(),downloaded_bytes:downloaded,authentication_ciphertext_bytes:incidental,public_cache_cleanup_pending:await this.cleanupPublicCache()};
     });}catch(error){this.wallet.abort_candidate();throw error;}finally{this.syncing=false;this.syncController=null;}
   }
   async prepare(recipient,resolved,amount,priority,onProgress=()=>{}) {

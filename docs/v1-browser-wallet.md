@@ -156,6 +156,23 @@ ciphertext and nullifier records, plus authenticated tree-state witnesses,
 or a reviewed standardized outboard proof format for the existing hash.
 This task implements neither a consensus-format change nor a mainnet launch.
 
+### Public compact cache retention
+
+Public compact records are retained for the most recent 128 block heights,
+including cached branches within that window. Cleanup starts only after the
+encrypted scan state and payment journal are durably stored and the candidate
+is accepted in memory. Cleanup failure preserves the accepted balance, displays
+a retry notice and is retried at the next synchronization. Private notes, tree
+paths, maturity metadata, receipt history and payment reservations are not part
+of this public-cache cleanup.
+
+The retention window is a local cache policy, not a consensus finality rule.
+Older branches can be downloaded and verified again. A legacy journal without
+an encrypted scan cache reconstructs missing public history from its recorded
+tip, verifies every recovered compact block and checks the final height and tip
+before creating a new encrypted cache. Sending remains paused during recovery;
+existing finalized packets and their reservations are preserved.
+
 ### Commitment-only history and local tree reuse
 
 The historical `SWLT0001` application response is a projection of an existing

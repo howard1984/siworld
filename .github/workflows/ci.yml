@@ -98,6 +98,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Browser history-cache and proof-progress contracts
+        run: node --test crates/native-wallet-web/tests/online-storage.test.mjs crates/native-wallet-web/tests/commitment-session.test.mjs crates/native-wallet-web/tests/proof-progress.test.mjs
       - name: Publication manifest and documentation
         run: |
           python3 scripts/check-repository.py
