@@ -219,7 +219,15 @@ fn offline_check_reports_only_replayed_state_and_integer_receipt_count() {
         &json!({"height": 999, "proof_replay_checked": true}),
     )
     .unwrap();
-    let summary = check_offline(&directory).unwrap();
+    let mut summary = check_offline(&directory).unwrap();
+    let storage = summary
+        .as_object_mut()
+        .unwrap()
+        .remove("storage_metrics")
+        .unwrap();
+    assert_eq!(storage["policy_active"], false);
+    assert!(storage["role"].is_null());
+    assert!(storage["database_allocated_bytes"].is_u64());
     assert_eq!(
         summary,
         json!({
@@ -228,6 +236,8 @@ fn offline_check_reports_only_replayed_state_and_integer_receipt_count() {
             "tip": local::hex(&state.tip),
             "state_fingerprint": local::hex(&state.fingerprint()),
             "proof_replay_checked": true,
+            "proof_tail_replay_checked": true,
+            "local_checkpoint_verified": false,
             "local_reward_receipts_checked": 0,
             "validation_scope": "indexed-local-rewards",
         })
