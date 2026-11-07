@@ -253,14 +253,17 @@ completed-state availability. Report peaks and slopes by phase and process
 epoch. Missing state-category measurements or unexplained growth blocks
 resource qualification; a short flat interval is not a total-state bound.
 
-Three days means at least 259,200 elapsed seconds after depth-24 finality.
+Service-node retention means at least 86,400 elapsed seconds after observed
+depth-24 finality. Miner and ordinary stores retain 96 canonical proof blocks.
 At the target rate, include the 24 unresolved blocks when sizing the proof
-store: the nominal steady-state window is 888 blocks. Require accelerated
-boundary/crash tests and at least one real three-day retention/deletion
+store: the nominal service window is 312 blocks. Require accelerated
+boundary/crash tests and at least one real 24-hour service retention/deletion
 lifecycle before claiming this gate closed. Short burn-in cannot substitute for
 that lifecycle. Delete eligible online proof bodies and sidecars after the full
-three-day interval; uncertainty in clock/finality fails toward longer
-retention. Preserve all public records and accepted state. Test clock changes,
+24-hour interval; uncertainty in clock/finality fails toward longer
+retention. Publish and authenticate checkpoints every six hours and verify complete tail
+availability before enabling service expiry. Preserve all public records and
+accepted state. Test clock changes,
 partial deletion, restart and disk pressure; never shorten retention to recover
 free space.
 

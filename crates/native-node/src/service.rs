@@ -33,6 +33,20 @@ const MAX_JSON_BYTES: u64 = 65_536;
 const MAX_CLOCK_DRIFT_MS: u64 = 30_000;
 const POW_ITERATIONS: u64 = 64;
 
+pub(super) fn configure_storage_startup(store: &mut Store) -> Result<(), String> {
+    let role = std::env::var("SIWORLD_STORAGE_ROLE").ok();
+    let blocks = std::env::var("SIWORLD_STORAGE_KEEP_BLOCKS").ok();
+    if let Some(policy) =
+        crate::storage_policy::StartupPolicy::parse(role.as_deref(), blocks.as_deref())?
+    {
+        store.configure_storage(policy.role)?;
+        if let Some(blocks) = policy.local_blocks {
+            store.configure_local_proof_blocks(blocks)?;
+        }
+    }
+    Ok(())
+}
+
 fn wall_ms() -> Result<u64, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,6 +209,7 @@ fn json_bytes(value: &Value) -> Result<Vec<u8>, String> {
 }
 fn write_once(path: &Path, value: &Value) -> Result<(), String> {
     let bytes = json_bytes(value)?;
+    let _budget = crate::storage_budget::auxiliary_write(path, bytes.len() as u64, false)?;
     let parent = path
         .parent()
         .ok_or("service evidence requires a parent directory")?;
@@ -340,6 +355,7 @@ pub struct Status {
     network_status: Option<Value>,
     block_timestamp: u64,
     template_generation_ms: Option<u64>,
+    storage_metrics: Option<Value>,
 }
 impl Status {
     pub fn new(_identity: &RunIdentity) -> Self {
@@ -360,6 +376,7 @@ impl Status {
             network_status: None,
             block_timestamp: 0,
             template_generation_ms: None,
+            storage_metrics: None,
         }
     }
     pub fn observation_elapsed_ms(&self, now: Instant) -> u64 {
@@ -394,6 +411,7 @@ impl Status {
         let observation = self.observation_elapsed_ms(now);
         let mut value = json!({"schema_version":1,"run_id":identity.run_id,"process_id":identity.process_id,"network_id":local::hex(&identity.network),"binary_sha256":identity.binary_sha256,"configuration_sha256":identity.configuration_sha256,"sequence":sequence,"phase":self.phase,"height":self.height,"tip":local::hex(&self.tip),"state_fingerprint":local::hex(&self.state_fingerprint),"cumulative_work":self.cumulative_work,"state_available":self.state_available,"updated_unix_ms":wall_ms()?,"started_unix_ms":identity.started_unix_ms,"elapsed_monotonic_ms":elapsed_ms(self.started,now),"observation_elapsed_ms":observation,"observation_target_ms":OBSERVATION_TARGET_MS,"observation_complete":observation_complete(observation) && self.error_code.is_none(),"pow_attempts":self.pow_attempts,"progress_sequence":self.progress_sequence,"last_progress_elapsed_ms":self.last_progress_elapsed_ms,"error_code":self.error_code,"network":self.network_status,"peer_configuration_sha256":identity.peer_configuration_sha256});
         value["chain_metrics"] = json!({"last_block_timestamp": self.block_timestamp});
+        value["storage_metrics"] = json!(self.storage_metrics);
         value["production_metrics"] = json!({"last_template_generation_ms": self.template_generation_ms,
             "scope": "block-assembly-including-settlement-proof-excluding-pow"});
         Ok(value)
@@ -414,6 +432,9 @@ fn remove_owned_temporary(path: &Path, identity: &fs::Metadata) {
 /// Replace only a private regular destination, using a unique owned temporary.
 /// Failure removes that temporary only and preserves pre-existing evidence.
 pub fn atomic_json(destination: &Path, value: &Value) -> Result<(), String> {
+    // Charge the entire temporary file while the old export still exists.
+    let _budget =
+        crate::storage_budget::auxiliary_write(destination, json_bytes(value)?.len() as u64, true)?;
     #[cfg(windows)]
     {
         let parent = destination.parent().ok_or("export parent required")?;
@@ -644,6 +665,8 @@ impl Control {
             .map_err(|_| "service status lock poisoned")?;
         let value = json!({"schema_version":1,"run_id":self.identity.run_id,"sequence":self.sequence()?,"event":event,"height":status.height,"tip":local::hex(&status.tip),"elapsed_monotonic_ms":elapsed_ms(status.started,Instant::now()),"error_code":status.error_code});
         let path = self.directory.join("service-events.jsonl");
+        let _budget =
+            crate::storage_budget::auxiliary_write(&path, json_bytes(&value)?.len() as u64, false)?;
         let mut file = match new_file(&path) {
             Ok(file) => file,
             Err(_) => checked_file(&path, true, u64::MAX)?,
@@ -833,7 +856,8 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
     }
     let verifier = NativeVerifier::new()?;
     control.phase("replaying")?;
-    let store = Store::open_existing(directory.join("chain.redb"), config.clone(), &verifier)?;
+    let mut store = Store::open_existing(directory.join("chain.redb"), config.clone(), &verifier)?;
+    configure_storage_startup(&mut store)?;
     verify_rewards(directory, &store, control)?;
     let mut node = crate::runtime::Node::new(store, NativeVerifier::new()?);
     control.state(node.state())?;
@@ -857,6 +881,14 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
             status.progress()?;
         }
         loop {
+            if node.store().storage_role()?.is_some() {
+                node.maintain_storage(control.checked_wall()? / 1000, true)?;
+                control
+                    .status
+                    .lock()
+                    .map_err(|_| "storage status unavailable")?
+                    .storage_metrics = node.store().storage_metrics().ok();
+            }
             if control.stop()? {
                 break;
             }
@@ -1176,12 +1208,16 @@ pub fn check_offline(directory: &Path) -> Result<Value, String> {
         }
         (checked, "strict-legacy-rewards")
     };
+    let storage = store.storage_metrics()?;
     Ok(json!({
         "schema": 1,
         "height": store.state().height,
         "tip": local::hex(&store.state().tip),
         "state_fingerprint": local::hex(&store.state().fingerprint()),
-        "proof_replay_checked": true,
+        "proof_replay_checked": storage["pruned_proof_blocks"].as_u64().unwrap_or(0) == 0,
+        "proof_tail_replay_checked": true,
+        "local_checkpoint_verified": storage["pruned_proof_blocks"].as_u64().unwrap_or(0) > 0,
+        "storage_metrics": storage,
         "local_reward_receipts_checked": checked,
         "validation_scope": scope,
     }))

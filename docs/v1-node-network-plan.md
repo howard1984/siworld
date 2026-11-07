@@ -296,17 +296,17 @@ store transition; each successful adoption establishes a fresh base for the
 next batch. This full-proof engineering path does not authenticate checkpoints
 or provide pruned-history bootstrap.
 
-The retention and checkpoint behavior below remains required design work; no
-three-day deletion or trusted-checkpoint importer is implemented by the chain
-library.
+The local native store implements role-based expiry and a same-node sealed
+replay base. Remote checkpoint trust and delivery remain incomplete; non-fixture
+service expiry is gated until those paths are qualified.
 
-Keep transaction, settlement and native issuance proofs and received private
-fee sidecars until three elapsed days after final confirmation, then delete
-them from the online proof store. The nominal depth-24 finality delay is two hours, so a
-target-rate node retains 888 blocks in steady state: 24 unresolved blocks plus
-864 finalized blocks. Persist finality and retention metadata and extend the
-window when clocks, reorganization state or recovery are uncertain. Never use a
-fixed block count to shorten the elapsed-time requirement.
+Bootstrap and validator nodes retain transaction, settlement and native issuance
+proof bodies until at least 24 elapsed hours after observed finality. At the
+300-second target, 24 unresolved blocks plus 288 finalized blocks give a nominal
+312-block service window. Miner and ordinary nodes retain the latest 96 blocks
+without historical proof service. Private sidecars follow bounded admission
+expiry. Persist finality metadata and extend retention on clock or recovery
+uncertainty; a block count cannot shorten the elapsed-time requirement.
 
 Every node permanently retains public data without pruning: block headers and
 PoW, output commitments and commitment-tree state, ciphertexts, nullifiers,
@@ -317,8 +317,7 @@ snapshot selectors or the trusted verifier manifest. Keep proof and sidecar
 stores bounded separately from memory pools and test interrupted deletion,
 restart, clock adjustment and reorganization near finality.
 
-V1 has no archive-node role and does not retain proof bodies beyond the three-day
-window. A release checkpoint distributed with the node and authenticated PoW is
+V1 has no archive-node role; proof-body expiry follows the local role window. A release checkpoint distributed with the node and authenticated PoW is
 the default new-node synchronization path. The checkpoint binds the network and
 genesis identity, block identity, cumulative work, accepted state commitments,
 complete snapshot window, verifier manifest and permanent-data roots. Verify
@@ -329,19 +328,17 @@ explicit trust assumption; unauthenticated peer agreement, matching roots or
 header work cannot prove deleted transaction proofs. Test wrong-network, stale,
 conflicting, incomplete and unavailable checkpoints fail closed.
 
-At 576 positions per 300 seconds, three-day post-finality retention including
-the nominal finality delay uses 335,714,239,488 bytes for capped transaction
-proofs, settlement proofs and sidecars. Reserving one additional capped native
-issuance proof per block adds 465,567,744 bytes, for a conditional total of
-336,179,807,232 bytes. The 2,115-byte multi-asset position adds
-128,061,388,800 permanent bytes/year. Use [the storage component
-model](v1-storage-and-sync.md) for year-1/3/5 and 10k/50k demand estimates.
-Measure indexes, full state, amortized records, issuance, WAL/compaction and
-recovery space before qualifying the 500-GB floor or 1-TB recommendation.
+At 576 positions per 300 seconds, the nominal 312-block service window
+requires 118,158,124,032 rolling bytes at the planning proof caps. Permanent
+positions add 128,061,388,800 bytes/year at maximum load. Bootstrap/validator
+stores raise an alarm at a 200-GB managed-file budget; that alarm does not
+stop ingestion or validation, or authorize deleting protected records. Use [the component
+model](v1-storage-and-sync.md) for conditional workload estimates; measure
+indexes, state, issuance and compaction before deployment qualification.
 
 Project-operated object storage backs up permanent public data but is not an
 archive for deleted proofs. Upload finalized block segments at least every six
-hours with immutable versioning, publish a signed daily manifest, and create a
+hours with immutable versioning, publish a signed six-hourly manifest, and create a
 weekly full checkpoint snapshot. Restore into an isolated node by verifying
 object hashes/signatures, replaying blocks and PoW, rebuilding indexes, and
 comparing roots, work and state before promotion. Run monthly restore checks and
@@ -524,8 +521,8 @@ network only after the relevant service and reward-cycle gates pass.
 
 ## Backup checkpoint freshness
 
-A weekly full snapshot alone is insufficient once proofs expire after
-three days. Export an authenticated, consistent confirmed-state checkpoint
+A weekly full snapshot alone is insufficient once service proofs expire after
+24 hours. Export an authenticated, consistent confirmed-state checkpoint
 (full or a complete authenticated delta chain) at least every six hours,
 together with the public-data manifest. Weekly full snapshots remain a
 compaction/recovery convenience. Before replaying a restored checkpoint's

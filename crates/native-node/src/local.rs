@@ -188,6 +188,8 @@ pub fn save_reward(path: &Path, id: &Hash, secret: &[u8]) -> Result<(), String> 
     if secret.is_empty() || secret.len() > MAX_REWARD_SECRET {
         return Err("invalid reward receipt size".into());
     }
+    let _budget =
+        crate::storage_budget::auxiliary_write(&reward_path(path, id), secret.len() as u64, false)?;
     let mut file = private_new(&reward_path(path, id))?;
     file.write_all(secret)
         .and_then(|_| file.sync_all())

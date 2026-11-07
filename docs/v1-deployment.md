@@ -68,12 +68,12 @@ cgroup memory, disk usage, height, tip and authenticated peer count. It must not
 add per-block real/padding counts or fee-tier telemetry.
 
 Known incomplete work includes Dandelion++, authenticated checkpoint startup,
-three-day proof pruning, production transport qualification, OIDC operations
+service-role proof pruning, production transport qualification, OIDC operations
 roles and miner template pipelining. The engineering transport uses pinned
 Ed25519/ML-DSA-65 identities with the hybrid TLS candidate; it does not establish
 permissionless discovery or sustained Internet acceptance. Until pruning exists,
 monitor actual disk growth and preserve records; do not claim a bounded
-three-day on-disk history. Existing smaller engineering disks are a temporary
+24-hour service proof history. Existing smaller engineering disks are a temporary
 operating constraint, not the documented 500-GB deployment qualification.
 
 ## Roles and fault domains
@@ -221,34 +221,27 @@ memory safety.
 Use [V1 Storage, Retention and Bootstrap](v1-storage-and-sync.md) and reproduce
 the explicit planning model with
 `python3 scripts/v1-storage-budget.py --economic-rewards`.
-The three-output codec has 2,115 permanent bytes/position. At the 640-KiB
-transaction cap, ordinary transaction proofs, settlement proofs and sidecars
-require 335.831 GB at the nominal 888-block window; an additional capped
-issuance proof/block brings the rolling budget to 336.296 GB. Include 64 KiB
-permanent block records and 16 KiB permanent issuance records/block, 25% of all permanent bytes for indexes/state, 16 GB database
-working space, a one-time 64-KiB fund genesis registry, 20 GB system/recovery
-files, and 20% device free:
+The three-output codec has 2,115 permanent bytes/position. A service node's
+24-hour finalized-proof window plus the nominal depth-24 finality tail is 312
+blocks at the target rate. At the current caps, the model has 117.995 GB of
+transaction proofs, settlement proofs and sidecars, plus 0.164 GB of issuance
+proof allowance. Database overhead and permanent records are additional.
 
 | Workload | Device year 1 | Device year 3 | Device year 5 |
 | --- | ---: | ---: | ---: |
-| Maximum 576 positions/block | 678.922 GB | 1,106.024 GB | 1,533.127 GB |
-| 10,000/day, minimum 64-position blocks | 128.560 GB | 199.937 GB | 271.313 GB |
-| 50,000/day, adaptive grouping | 246.391 GB | 393.923 GB | 541.455 GB |
-| 50,000/day, uniform 176 positions | 248.952 GB | 398.143 GB | 547.335 GB |
+| Maximum 576 positions/block | 406.249 GB | 833.352 GB | 1,260.454 GB |
+| 10,000/day, minimum 64-position blocks | 97.508 GB | 168.885 GB | 240.261 GB |
+| 50,000/day, adaptive grouping | 163.612 GB | 311.144 GB | 458.676 GB |
+| 50,000/day, uniform 176 positions | 165.045 GB | 314.237 GB | 463.428 GB |
 
-**500 GB usable SSD is the installation minimum; 1 TB is recommended** for
-both miners and validators. That minimum does not qualify continuous maximum
-load: year-one used bytes are 543.137 GB before the 20% free reserve. A 1-TB
-device reaches the modeled free-space threshold after approximately **2.50 full
-load years**; year three needs 1,106.024 GB, rather than fitting 1 TB.
-
-At 10,000/day, 500 GB has modeled headroom beyond five years: the year-five
-device requirement is 271.313 GB. At 50,000/day, adaptive packing needs
-541.455 GB in year five and uniform 176-position blocks need 547.335 GB;
-both exceed 500 GB including the free reserve. Do not promise five years on
-500 GB for every early workload. These conditional horizons depend on the
-final measured overheads, packing and workload. Publish actual growth and expand storage before reserves are
-consumed; retain 576 positions and the complete three-day proof window.
+These device estimates are conditional workload projections. Bootstrap and
+validator native-managed files raise an alarm at the 200-GB application
+budget. This is not a hard capacity ceiling: validation and ingestion continue,
+and protected proofs and permanent records remain intact. This service-node
+alarm does not apply to miner and ordinary stores. Monitor actual filesystem
+free space separately; physical exhaustion can still cause write failures. Checkpoint publication is required
+every six hours and authenticated delivery must be ready before service
+proof expiry is enabled.
 
 The 64-KiB block reserve covers the maximum five-note/eight-claim economic
 format plus provisional persistent-record overhead. The immutable genesis
@@ -293,13 +286,13 @@ valid load, and a seven-day independent-host soak containing at least
 72 hours of maximum load. The windows may overlap once the configuration is
 frozen. Report steady memory slope, component disk growth,
 write amplification, CPU/queue saturation and actual framing/recovery traffic.
-The soak is not evidence for three-day deletion: observe the real elapsed
+The soak is not evidence for 24-hour service deletion: observe the real elapsed
 retention lifecycle as well as accelerated crash/clock/pruning regressions.
 
 Project-operated object storage must back up permanent public data without
 becoming an archive for deleted proof bodies. Upload each finalized block
 segment (or at least every six hours) with immutable versioning, publish a
-signed daily manifest, and create a weekly full checkpoint snapshot. Restore
+signed six-hourly manifest, and create a weekly full checkpoint snapshot. Restore
 into an isolated node by verifying object hashes and signatures, replaying
 ordered blocks and PoW, rebuilding indexes and comparing state roots, work and
 nullifier/commitment roots before promotion. Run a monthly restore check and a
@@ -392,8 +385,8 @@ measurements qualify whole-node sustained operation.
 
 ## Backup checkpoint freshness
 
-A weekly full snapshot alone is insufficient once proofs expire after
-three days. Export an authenticated, consistent confirmed-state checkpoint
+A weekly full snapshot alone is insufficient once service proofs expire after
+24 hours. Export an authenticated, consistent confirmed-state checkpoint
 (full or a complete authenticated delta chain) at least every six hours,
 together with the public-data manifest. Weekly full snapshots remain a
 compaction/recovery convenience. Before replaying a restored checkpoint's

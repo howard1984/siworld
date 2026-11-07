@@ -122,6 +122,14 @@ impl<V: BlockVerifier> Node<V> {
     pub fn store(&self) -> &Store {
         &self.store
     }
+    pub fn maintain_storage(
+        &mut self,
+        unix_seconds: u64,
+        clock_certain: bool,
+    ) -> Result<u64, String> {
+        self.store
+            .expire_proofs(unix_seconds, clock_certain, &self.verifier)
+    }
     pub fn mempool(&self) -> &Mempool {
         &self.mempool
     }

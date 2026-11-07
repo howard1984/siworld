@@ -218,10 +218,13 @@ Use confidential fee commitments with native fixed-capacity settlement.
 Nodes validate fee-opening sidecars against the transaction and commitment
 before admission; no additional sidecar signature or encryption layer is
 selected. Planned hybrid X25519 + ML-KEM transport handles connection secrecy.
-Transaction, settlement and native issuance proofs and private sidecars remain online until
-three elapsed days after final confirmation, then are deleted. Public data is
-permanent on every node; no V1 archive-node role retains proof bodies beyond
-that window. Openings use eight independent canonical KoalaBear elements,
+Transaction, settlement and native issuance proof bodies follow local role
+storage policy: bootstrap and validator nodes retain at least 24 elapsed
+hours after observed finality and provide synchronization within that window;
+miner and ordinary nodes retain the latest 96 blocks and disable historical
+proof service. The 24-block consensus reorganization limit is unchanged.
+Private sidecars follow bounded admission expiry. Public data remains permanent
+on every node; no V1 archive-node role is selected. Openings use eight independent canonical KoalaBear elements,
 approximately 247.91 bits of entropy. The corrected settlement AIR keeps the
 fee total and miner amount private and proves the mode-selected reward-note
 commitments, height/index-derived nonces and authenticated unlock plan. Network, height and the ordered
@@ -267,7 +270,7 @@ invalid padding or exceeding caps.
 ## Node and network implementation
 
 The [integration plan](v1-node-network-plan.md) covers the shared atomic block
-transition, bounded admission, compact relay, three-day proof retention,
+transition, bounded admission, compact relay, role-based proof retention,
 permanent public-data storage, checkpoint-plus-PoW synchronization, authenticated X25519 + ML-KEM transport and
 Dandelion++. Use groups of 16, 64–576 positions and `MAX_REORG_DEPTH=24`.
 The fixed settlement AIR has 576 openings; smaller blocks derive canonical
@@ -286,7 +289,7 @@ The retained seven-node network, history and keys remain unchanged.
 The 5-GiB zero-swap generation measurements do not set a formal miner RAM
 requirement. The [qualification profiles](v1-deployment.md) start at four
 vCPUs/16 GB for validators and at least four vCPUs/32 GB for
-miners, with 500 GB usable SSD minimum and 1 TB recommended, plus separately
+miners, with host capacity qualified separately from the role-specific node-file budget, plus separately
 budgeted backups. These profiles
 are unqualified until sustained integrated measurements pass. Linux x86-64-v3
 is the measured platform; macOS and Windows need their own adapters and
@@ -321,7 +324,7 @@ does not change runtime proof decoders or consensus limits, replace maximal
 fee/full-block acceptance, or establish sustained node resource acceptance.
 
 At the target block rate, proofs and sidecars including the nominal depth-24
-finality tail require 336,296,199,168 rolling bytes at the separate caps.
+finality tail require 118,158,124,032 rolling bytes at the separate caps.
 The 2,115-byte position codec adds 128,061,388,800 permanent bytes/year at
 full load. The [finite storage model](v1-storage-and-sync.md) also reserves
 64 KiB/block for economic permanent block records, 16 KiB/block for issuance records,
@@ -332,16 +335,15 @@ pending actual database and encoded-record measurements.
 Reproduce the economic-format model with
 `python3 scripts/v1-storage-budget.py --economic-rewards`; the unflagged
 8-KiB-block-record scenario is retained only as earlier planning evidence.
-With the free-space reserve, full-load device needs at years 1/3/5 are
-678.776/1,105.879/1,532.981 GB. A 1-TB device reaches the modeled reserve after
-approximately 2.50 full-load years and does not cover year three. At 10,000
-submitted transactions/day, the minimum-block case needs
-128.415/199.791/271.168 GB. At 50,000/day, adaptive packing needs
-246.246/393.778/541.310 GB; uniform 176-position blocks require
-248.806/397.998/547.189 GB. A 500-GB device is an early-load profile, not a
-full-load year-one or workload-independent five-year guarantee. Retain the
-500-GB minimum and 1-TB recommendation as workload-qualified profiles and
-plan expansion from measured growth. The five-note/eight-claim reserve is independent of the 32-wallet genesis
+With the free-space reserve, the 24-hour service-window model needs
+406.249/833.352/1,260.454 GB at full load for years 1/3/5. These are workload
+estimates. The 200-GB service-node budget is an operational alarm threshold,
+not a write ceiling or an ingestion gate. Budget pressure must not shorten proof
+retention, delete permanent records, or stop validation. Permanent growth and
+physical disk exhaustion remain capacity-planning risks.
+The [component model](v1-storage-and-sync.md) gives the conditional 10k/50k
+workload estimates and separates the host device from managed node files.
+The five-note/eight-claim reserve is independent of the 32-wallet genesis
 registry. A one-time 64-KiB registry reserve is also included. Production
 remains fail-closed without explicit genesis-bound public keys, exact
 basis-point shares and a team residue index. Never shorten retention or
@@ -357,7 +359,7 @@ real/padding classifications and padding-queue counts.
 
 Qualification requires a 72-hour maximum-load hardware run and a seven-day
 independent-host soak containing at least 72 hours at maximum load; windows
-may overlap on the frozen configuration. Observe a real three-day-after-finality
+may overlap on the frozen configuration. Observe a real 24-hour-after-finality
 retention lifecycle as well as accelerated deletion/recovery tests. The
 [acceptance matrix](prover-acceptance.md#gate-6-sustained-observation-retention-and-recovery)
 defines RPO zero for durable records, ten-minute ordinary restart and a
@@ -419,8 +421,23 @@ All nodes permanently retain headers/PoW, output commitments and tree state,
 ciphertexts, nullifiers, fee commitments, proof-free settlement declarations,
 miner reward notes, development-fund spend records with ML-DSA signatures,
 asset issuance records and recent-root snapshots. Only transaction proofs,
-settlement proofs, native issuance proofs and sidecars expire, three elapsed
-days after final confirmation.
+settlement proofs and native issuance proofs expire according to the local
+role policy: 24 elapsed hours after observed finality for bootstrap and
+validator nodes, and the latest 96 blocks for miner and ordinary nodes.
+Bootstrap and validator stores alarm at 200,000,000,000 bytes of managed file
+content. This threshold does not block database growth, auxiliary writes,
+block ingestion, or verification. It never permits permanent-data deletion or
+expiry inside the retention window. Miner and ordinary proof windows default
+to 96 blocks, are locally configurable, and cannot be set below 24 blocks.
+Service checkpoint publication is required every six hours. The engineering
+transition uses two independent ML-DSA-65 checkpoint authorities with a 2-of-2
+quorum, separate from peer and fund keys. Its keys are engineering-only release
+configuration and do not change genesis or mainnet checkpoint trust. A service
+must retain every proof after the latest valid checkpoint. A checkpoint older
+than 18 hours raises an alarm and suspends pruning; fresh valid publication
+restores eligibility. Authenticated remote bootstrap, permanent-data
+reconstruction and tail delivery remain qualification gates before service
+expiry. Private sidecars use bounded admission expiry.
 There is no V1 archive role. Release-pinned checkpoint plus PoW is the default
 new-node path; full historical proof validation is a future upgrade.
 
@@ -539,11 +556,11 @@ detach at most 24 blocks. Replacement canonical rows, accepted head/fingerprint
 and checksummed detached evidence commit atomically. The default policy permits
 32 candidate blocks, a 640-MiB logical candidate budget and 1 GiB of retained
 detached evidence. Transport has its own shared 640-MiB logical budget; the two
-budgets do not establish a combined process-memory bound. Non-tip ancestor reconstruction replays from
-genesis and has a height-4,096 local work guard; exceeding it is resource
-unavailability, not invalidity or a consensus horizon. Tip extension does not
-need that replay. Qualified checkpoint/replay and time-based evidence pruning
-remain necessary for long-lived deployment.
+budgets do not establish a combined process-memory bound. Non-tip ancestor reconstruction starts from the authenticated local replay
+base when proof expiry is configured, otherwise from genesis. Its 4,096-block
+replay-work guard is resource policy, not invalidity or a consensus horizon.
+Tip extension does not need that replay. Remote checkpoint bootstrap and
+long-offline recovery remain deployment gates for proof-expiring services.
 
 Seed-wallet APIs derive independent spend, deterministic ML-KEM view and
 256-bit change keys per network/account, authenticate output recovery after
@@ -561,8 +578,7 @@ synthetic-verifier state/transport tests and native-proof tests. Tests with
 synthetic funding do not establish end-to-end valid-chain wallet acceptance or
 production cryptographic transport. Unsupported issuance operations remain
 absent until the dedicated testnet fund account, atomic fee collection and
-resource bounds are configured and implemented. Three-day proof/sidecar
-retention, checkpoint bootstrap, configured fund operation, protected wallet durability,
+resource bounds are configured and implemented. Role-based proof retention, checkpoint bootstrap, configured fund operation, protected wallet durability,
 transport privacy and sustained network acceptance remain separate gates.
 No library test changes the frozen single-node observation or the retained
 seven-node network.

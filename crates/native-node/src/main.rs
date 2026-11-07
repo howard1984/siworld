@@ -10,7 +10,7 @@ use siworld_native_node::{
 use std::path::Path;
 fn help() {
     println!(
-        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Replay every proof and check every local reward receipt\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
+        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
     );
     #[cfg(feature = "native-p2p")]
     println!(
@@ -131,6 +131,94 @@ fn run() -> Result<(), String> {
             exact(&args)?;
             println!("{}", genesis_identifier(path)?);
         }
+        "storage-role" => {
+            if args.len() != 3 {
+                return Err(
+                    "expected storage-role DIRECTORY bootstrap|validator|miner|ordinary".into(),
+                );
+            }
+            let role = siworld_native_node::storage_policy::Role::parse(&args[2])?;
+            let _lease = service::Lease::acquire(path)?;
+            let verifier = NativeVerifier::new()?;
+            let mut store =
+                Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+            store.configure_storage(role)?;
+            println!("{}", store.storage_metrics()?);
+        }
+        "storage-keep-blocks" => {
+            if args.len() != 3 {
+                return Err("expected storage-keep-blocks DIRECTORY BLOCKS".into());
+            }
+            let blocks = args[2]
+                .parse::<u64>()
+                .map_err(|_| "invalid retained proof count")?;
+            let _lease = service::Lease::acquire(path)?;
+            let verifier = NativeVerifier::new()?;
+            let mut store =
+                Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+            store.configure_local_proof_blocks(blocks)?;
+            println!("{}", store.storage_metrics()?);
+        }
+        "storage-maintain" => {
+            if args.len() != 4 {
+                return Err("expected storage-maintain DIRECTORY miner|ordinary BLOCKS".into());
+            }
+            let policy = siworld_native_node::storage_policy::StartupPolicy::parse(
+                Some(&args[2]),
+                Some(&args[3]),
+            )?
+            .ok_or("explicit storage policy required")?;
+            if policy.role.serves_historical_proofs() {
+                return Err("offline drain is limited to miner and ordinary roles".into());
+            }
+            let _lease = service::Lease::acquire(path)?;
+            let verifier = NativeVerifier::new()?;
+            let mut store =
+                Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+            let before = store.storage_metrics()?;
+            store.configure_storage(policy.role)?;
+            store.configure_local_proof_blocks(
+                policy.local_blocks.ok_or("proof window required")?,
+            )?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "system clock precedes epoch")?
+                .as_secs();
+            let mut expired = 0u64;
+            loop {
+                let count = store.expire_proofs(now, true, &verifier)?;
+                expired = expired
+                    .checked_add(count)
+                    .ok_or("expired proof count overflow")?;
+                if count == 0 {
+                    break;
+                }
+            }
+            let compacted = store.compact_expired_storage(&verifier)?;
+            store.verify_local_rewards()?;
+            println!(
+                "{}",
+                serde_json::json!({"before":before,"after":store.storage_metrics()?,
+                "expired_blocks":expired,"compacted":compacted,"reward_replay_verified":true})
+            );
+        }
+        "storage-expire" | "storage-compact" => {
+            exact(&args)?;
+            let _lease = service::Lease::acquire(path)?;
+            let verifier = NativeVerifier::new()?;
+            let mut store =
+                Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+            if args[0] == "storage-expire" {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| "system clock precedes epoch")?
+                    .as_secs();
+                store.expire_proofs(now, true, &verifier)?;
+            } else {
+                store.compact_expired_storage(&verifier)?;
+            }
+            println!("{}", store.storage_metrics()?);
+        }
         "identity-init" | "identity-public" => {
             exact(&args)?;
             let binding = siworld_native_node::p2p::Binding::new(&config(path)?);
@@ -140,6 +228,15 @@ fn run() -> Result<(), String> {
                 siworld_native_node::identity::NativeIdentity::load(path, &binding)
             }
             .map_err(|_| "native identity initialization or authentication rejected")?;
+            if args[0] == "identity-init" && path.join("chain.redb").is_file() {
+                let _lease = service::Lease::acquire(path)?;
+                let verifier = NativeVerifier::new()?;
+                let mut store =
+                    Store::open_existing(path.join("chain.redb"), config(path)?, &verifier)?;
+                if store.state().height == 0 && store.storage_role()?.is_none() {
+                    store.configure_storage(siworld_native_node::storage_policy::Role::Ordinary)?;
+                }
+            }
             let descriptor = identity
                 .descriptor()
                 .map_err(|_| "native identity descriptor rejected")?;

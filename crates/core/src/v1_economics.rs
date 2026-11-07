@@ -6,6 +6,7 @@
 //! payouts are transfers, and must not be counted as additional issuance.
 
 use std::collections::{BTreeMap, VecDeque};
+mod cache;
 
 pub const INITIAL_REWARD: u64 = 3_394_524_515;
 pub const EPOCH_BLOCKS: u64 = 4_032;

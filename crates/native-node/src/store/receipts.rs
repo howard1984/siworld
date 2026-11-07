@@ -65,6 +65,11 @@ impl Owner {
     }
     pub(super) fn save(&self, id: &Hash, secret: &[u8]) -> Result<(), String> {
         self.check(true)?;
+        let _budget = crate::storage_budget::auxiliary_write(
+            &self.path.join("receipt"),
+            secret.len() as u64,
+            false,
+        )?;
         crate::local::save_reward_at(&self.directory, id, secret)?;
         self.check(true)
     }
@@ -79,6 +84,7 @@ impl Owner {
 #[cfg(windows)]
 pub(super) struct Owner {
     directory: siworld_miner_platform::Directory,
+    path: std::path::PathBuf,
     database_name: std::ffi::OsString,
     identity: (u32, u64),
 }
@@ -86,6 +92,10 @@ pub(super) struct Owner {
 impl Owner {
     pub(super) fn bind(path: &Path, database: &File) -> Result<Self, String> {
         let owner = Self {
+            path: path
+                .parent()
+                .ok_or("database parent unavailable")?
+                .to_owned(),
             directory: siworld_miner_platform::Directory::open(
                 path.parent().ok_or("database parent unavailable")?,
             )?,
@@ -108,6 +118,11 @@ impl Owner {
     }
     pub(super) fn save(&self, id: &Hash, secret: &[u8]) -> Result<(), String> {
         self.check()?;
+        let _budget = crate::storage_budget::auxiliary_write(
+            &self.path.join("receipt"),
+            secret.len() as u64,
+            false,
+        )?;
         if secret.is_empty() || secret.len() > crate::producer::MAX_REWARD_SECRET_BYTES {
             return Err("invalid reward receipt size".into());
         }

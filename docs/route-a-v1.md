@@ -445,14 +445,16 @@ The following changes are proposed and are not implemented by this document:
 - Set the new route's local `MAX_REORG_DEPTH` to 24. Test depth 23/24/25,
   root-window boundaries and conflict re-admission. A deeper fork requires
   explicit checkpoint recovery rather than silent partial rollback.
-- Retain transaction, settlement and native issuance proofs and private fee
-  sidecars until three elapsed days **after final confirmation**, then delete
-  them from the online proof store. At a 300-second target, depth 24 is two hours nominally,
-  so the steady-state retention window is 888 blocks: 24 unresolved blocks and
-  864 finalized blocks. Finality is a deterministic depth rule rather than a
-  wall-clock guarantee; persist finality/retention metadata and extend the
-  window after uncertain clocks, reorganizations or recovery. Never shorten it
-  by a nominal block count.
+- Bootstrap and validator nodes retain transaction, settlement and native
+  issuance proofs for at least 24 elapsed hours after observed finality;
+  the nominal 300-second-target window is 312 blocks, including the existing
+  24-block finality tail. Miner and ordinary nodes retain the latest 96 blocks
+  without historical proof service. Private sidecars use bounded admission
+  expiry. Persist finality/retention metadata and extend the window after
+  uncertain clocks or recovery. Checkpoint publication is required every six
+  hours; remote trust and tail delivery must be qualified before service expiry.
+  The 200-GB service-node budget cannot authorize permanent-data deletion,
+  reduced verification, or expiry of proofs younger than the role window.
 - Preserve public data on every node without pruning: block headers and PoW,
   output commitments and commitment-tree state, ciphertexts, nullifiers, fee
   commitments, block settlement declarations without proofs, miner reward
@@ -470,7 +472,7 @@ The following changes are proposed and are not implemented by this document:
   peer roots cannot prove proofs that have been deleted. Test stale, conflicting,
   incomplete and wrong-network checkpoints fail closed.
 - Back up permanent public data to versioned object storage at least every six
-  hours, publish a signed daily manifest and create a weekly full checkpoint
+  hours, publish a signed six-hourly manifest and create a weekly full checkpoint
   snapshot. Restore in an isolated node by verifying object hashes/signatures,
   replaying blocks and PoW, rebuilding indexes and comparing roots/work before
   promotion. Run monthly restore checks and quarterly replacement-host tests.
@@ -492,7 +494,7 @@ or unrelated CI smoke test cannot replace those artifacts.
 
 The [node and network integration plan](v1-node-network-plan.md) gives concrete
 admission budgets and remaining milestones: shared block transition,
-verification service and padding pool, compact relay, three-day retention,
+verification service and padding pool, compact relay, role-based proof retention,
 public-data backup and checkpoint-plus-PoW synchronization, hybrid transport,
 source-hiding relay and
 new-network acceptance. The [network design](v1-network-design.md) fixes the
@@ -534,8 +536,8 @@ signature cannot replace the supply proof or verified SIP fee payment.
 
 ## Backup checkpoint freshness
 
-A weekly full snapshot alone is insufficient once proofs expire after
-three days. Export an authenticated, consistent confirmed-state checkpoint
+A weekly full snapshot alone is insufficient once service proofs expire after
+24 hours. Export an authenticated, consistent confirmed-state checkpoint
 (full or a complete authenticated delta chain) at least every six hours,
 together with the public-data manifest. Weekly full snapshots remain a
 compaction/recovery convenience. Before replaying a restored checkpoint's

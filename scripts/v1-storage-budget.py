@@ -17,7 +17,7 @@ TRANSACTION_PROOF_CAP = 655_360
 SETTLEMENT_PROOF_CAP = 655_360
 ISSUANCE_PROOF_CAP = 524_288
 SIDECAR_BYTES = 78
-RETENTION_BLOCKS = 3 * BLOCKS_PER_DAY + 24
+RETENTION_BLOCKS = BLOCKS_PER_DAY + 24
 SYSTEM_BYTES = 20_000_000_000
 BLOCK_RECORD_ALLOWANCE = 8192
 ECONOMIC_BLOCK_RECORD_ALLOWANCE = 65_536
@@ -98,7 +98,7 @@ def report(permanent_bytes=2115, transaction_proof_cap=TRANSACTION_PROOF_CAP,
                 'settlement_proof_cap_bytes': settlement_proof_cap,
                 'issuance_proof_cap_bytes': issuance_proof_cap,
                 'sidecar_bytes': SIDECAR_BYTES,
-                'finality_delay_blocks': 24, 'retention_days_after_finality': 3,
+                'finality_delay_blocks': 24, 'retention_days_after_finality': 1,
                 'index_state_percent_of_permanent_records': 25,
                 'device_free_percent': 20,
             },
@@ -140,7 +140,7 @@ if __name__ == '__main__':
     parser.add_argument('--economic-rewards', action='store_true',
                         help='allow 64 KiB per block for five reward notes and eight signed fund payouts')
     parser.add_argument('--legacy-baseline', action='store_true',
-                        help='reproduce the prior model with all proof caps set to 524288 bytes')
+                        help='use prior 524288-byte proof caps with the current retention window')
     args = parser.parse_args()
     if args.economic_rewards and args.legacy_baseline:
         parser.error('--economic-rewards and --legacy-baseline are mutually exclusive')

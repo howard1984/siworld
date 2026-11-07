@@ -1,6 +1,7 @@
 //! Native V1 engineering chain and network interfaces, separate from the retained node.
 #![forbid(unsafe_code)]
 
+pub mod engineering_checkpoint;
 pub mod engineering_genesis;
 pub mod fund_spend;
 pub mod issuance;
@@ -10,9 +11,12 @@ pub mod mining;
 pub mod pool;
 pub mod producer;
 pub mod proof_codec;
+pub mod proof_storage;
 pub mod proofs;
 pub mod service;
 pub mod state;
+pub(crate) mod storage_budget;
+pub mod storage_policy;
 pub mod store;
 pub mod wire;
 
@@ -46,10 +50,8 @@ mod fixtures;
 #[cfg(feature = "wallet-light-gateway")]
 #[path = "../../native-wallet-engine/src/commitment.rs"]
 pub mod commitment;
-#[cfg(feature = "wallet-light-gateway")]
 #[path = "../../native-wallet-engine/src/compact.rs"]
 pub mod compact;
-#[cfg(feature = "wallet-light-gateway")]
 #[path = "../../native-wallet-engine/src/ranges.rs"]
 pub mod ranges;
 #[cfg(all(feature = "wallet-light-gateway", unix))]

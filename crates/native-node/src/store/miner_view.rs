@@ -40,10 +40,10 @@ impl Store {
                 .map_err(|_| "reward display history unreadable")?;
             let block = stored
                 .map(|bytes| {
-                    Block::decode(split_record(bytes.value())?.0, &self.state.config.network)
+                    public_record(split_record(bytes.value())?.0, &self.state.config.network)
                 })
                 .transpose()?;
-            let Some(block) = block.filter(|block| block.id().is_ok_and(|got| got == id)) else {
+            let Some((block, _)) = block.filter(|(_, got)| *got == id) else {
                 detached = detached
                     .checked_add(1)
                     .ok_or("reward display count overflow")?;

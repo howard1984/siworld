@@ -114,7 +114,7 @@ pub fn canonical_id(store: &Store, height: u64) -> Result<Hash, String> {
     if height == 0 {
         Ok(store.state().config.genesis_id())
     } else {
-        store.block(height)?.id()
+        store.canonical_id(height)
     }
 }
 pub struct Batch {
@@ -132,6 +132,9 @@ pub fn serve_batch(
     limit: usize,
     byte_budget: usize,
 ) -> Result<Batch, String> {
+    if !store.serves_historical_proofs()? {
+        return Err("historical proof service disabled for this local storage role".into());
+    }
     if limit == 0
         || limit > MAX_BATCH_BLOCKS
         || byte_budget > 640 * 1024 * 1024

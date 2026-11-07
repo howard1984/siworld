@@ -26,27 +26,27 @@ class StorageBudgetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             budget.positions_per_day(165_889)
 
-    def test_finality_delay_is_added_before_three_day_expiry(self):
+    def test_finality_delay_is_added_before_twenty_four_hour_expiry(self):
         result = baseline_estimate(165_888, 1)
-        self.assertEqual(budget.RETENTION_BLOCKS, 888)
-        self.assertEqual(result['rolling_positions'], 511_488)
-        self.assertEqual(result['transaction_settlement_sidecar_rolling_bytes'], 268_788_876_288)
-        self.assertEqual(result['issuance_proof_rolling_allowance_bytes'], 465_567_744)
-        self.assertEqual(result['rolling_bytes'], 269_254_444_032)
+        self.assertEqual(budget.RETENTION_BLOCKS, 312)
+        self.assertEqual(result['rolling_positions'], 179_712)
+        self.assertEqual(result['transaction_settlement_sidecar_rolling_bytes'], 94_439_334_912)
+        self.assertEqual(result['issuance_proof_rolling_allowance_bytes'], 163_577_856)
+        self.assertEqual(result['rolling_bytes'], 94_602_912_768)
 
     def test_multiyear_public_growth_does_not_repeat_the_rolling_cache(self):
         first = baseline_estimate(165_888, 1)
         fifth = baseline_estimate(165_888, 5)
         self.assertEqual(first['rolling_bytes'], fifth['rolling_bytes'])
         self.assertEqual(fifth['permanent_public_bytes'], 640_306_944_000)
-        self.assertGreater(first['device_bytes_with_20_percent_free'], 500_000_000_000)
+        self.assertLess(first['device_bytes_with_20_percent_free'], 500_000_000_000)
         self.assertGreater(fifth['device_bytes_with_20_percent_free'], 1_000_000_000_000)
 
     def test_adaptive_window_rounds_up_to_complete_groups(self):
         result = baseline_estimate(50_000, 1)
-        self.assertEqual(result['rolling_positions'], 154_176)
+        self.assertEqual(result['rolling_positions'], 54_176)
         self.assertEqual(result['rolling_positions'] % 16, 0)
-        self.assertGreaterEqual(result['rolling_positions'] * 288, 50_000 * 888)
+        self.assertGreaterEqual(result['rolling_positions'] * 288, 50_000 * 312)
 
     def test_finite_block_and_issuance_allowances_are_included(self):
         result = baseline_estimate(165_888, 3)
@@ -61,14 +61,14 @@ class StorageBudgetTests(unittest.TestCase):
         result = budget.report()
         self.assertEqual(result['parameters']['transaction_proof_cap_bytes'], 655_360)
         full = result['cases']['maximum']
-        self.assertEqual(full[0]['rolling_bytes'], 336_296_199_168)
-        self.assertEqual(full[0]['used_bytes'], 535_602_221_568)
-        self.assertEqual(full[2]['device_bytes_with_20_percent_free'], 1_486_032_888_960)
-        self.assertGreater(full[1]['device_bytes_with_20_percent_free'], 1_000_000_000_000)
+        self.assertEqual(full[0]['rolling_bytes'], 118_158_124_032)
+        self.assertEqual(full[0]['used_bytes'], 317_464_146_432)
+        self.assertEqual(full[2]['device_bytes_with_20_percent_free'], 1_213_360_295_040)
+        self.assertLess(full[1]['device_bytes_with_20_percent_free'], 1_000_000_000_000)
         adaptive = result['cases']['transactions_50000_per_day_adaptive_packing'][2]
         uniform = result['cases']['transactions_50000_per_day_uniform_176'][2]
         self.assertLess(adaptive['device_bytes_with_20_percent_free'], 500_000_000_000)
-        self.assertGreater(uniform['device_bytes_with_20_percent_free'], 500_000_000_000)
+        self.assertLess(uniform['device_bytes_with_20_percent_free'], 500_000_000_000)
 
     def test_transaction_cap_growth_changes_only_rolling_transactions(self):
         base = baseline_estimate(165_888, 3, transaction_proof_cap=524_288)
@@ -89,7 +89,7 @@ class StorageBudgetTests(unittest.TestCase):
         self.assertEqual(result['parameters']['transaction_proof_cap_bytes'], 768 * 1024)
         self.assertEqual(result['parameters']['settlement_proof_cap_bytes'], 655_360)
         self.assertEqual(result['parameters']['issuance_proof_cap_bytes'], 524_288)
-        self.assertEqual(result['parameters']['retention_days_after_finality'], 3)
+        self.assertEqual(result['parameters']['retention_days_after_finality'], 1)
         for name, rows in result['cases'].items():
             self.assertEqual([row['years'] for row in rows], [1, 3, 5])
             self.assertEqual(len({row['rolling_bytes'] for row in rows}), 1, name)
@@ -123,7 +123,7 @@ class StorageBudgetTests(unittest.TestCase):
                                   'permanent_issuance_allowance_bytes',
                                   'database_working_allowance_bytes', 'system_bytes'):
                     self.assertEqual(after[component], before[component])
-        self.assertEqual(result['cases']['maximum'][0]['used_bytes'], 543_137_305_088)
+        self.assertEqual(result['cases']['maximum'][0]['used_bytes'], 324_999_229_952)
 
     def test_genesis_registry_is_one_time_and_independent_of_workload(self):
         result = budget.report(economic_rewards=True)

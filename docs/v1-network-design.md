@@ -130,8 +130,8 @@ forbids signing conflicting ancestry. Export only after crash-consistent state
 and finality checks. A checkpoint becomes the bootstrap node's immutable
 finalized base; it cannot authorize a rollback of already accepted history.
 
-Initial publication cadence is at least every six hours, with a signed
-24-hour expiry. Expiry is a local availability policy, not consensus time.
+Publish a confirmed checkpoint at least every six hours, within the service
+proof-retention window, with a signed expiry no longer than 24 hours. Expiry is a local availability policy, not consensus time.
 Uncertain clocks, expired manifests, missing payload chunks or an insufficient
 quorum fail closed. Binary releases pin the authority/network/verifier policy
 and an initial confirmed checkpoint, not an assumption that an old bundled

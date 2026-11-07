@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 const CPU_UNSUPPORTED: i32 = 78;
 const LAUNCH_FAILURE: i32 = 126;
-const EXECUTABLES: &[&str] = &["siworld-native-node"];
+const EXECUTABLES: &[&str] = &["siworld-native-node", "siworld-checkpoint-key"];
 
 #[derive(Clone, Copy, Debug)]
 struct Feature {

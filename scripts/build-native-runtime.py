@@ -35,6 +35,16 @@ def package(worker, output, receipt, release):
         shutil.copy2(worker, installed)
         if expected != release.digest(worker) or expected != release.digest(installed) or isa['binary_sha256'] != expected:
             raise ValueError('Native worker changed during packaging')
+        key_worker = worker.with_name('siworld-checkpoint-key')
+        if 'checkpoint_key_sha256' in receipt:
+            key_digest = receipt['checkpoint_key_sha256']
+            if not key_worker.is_file() or release.digest(key_worker) != key_digest:
+                raise ValueError('Checkpoint key worker digest mismatch')
+            key_installed = staging / 'libexec/siworld-checkpoint-key'
+            shutil.copy2(key_worker, key_installed)
+            if release.digest(key_installed) != key_digest:
+                raise ValueError('Checkpoint key worker changed during packaging')
+            shutil.copy2(launcher, staging / 'bin/siworld-checkpoint-key')
         (staging / 'build-receipt.json').write_text(json.dumps({
             'worker': 'siworld-native-node', 'worker_isa': 'x86-64-v3',
             'bootstrap_isa': 'x86-64', 'bootstrap_sha256': release.digest(launcher),
@@ -61,7 +71,7 @@ def main():
     manifest = ROOT / 'crates/native-node/Cargo.toml'
     features = ['native-p2p'] if args.engineering_network else []
     command = ['cargo', 'build', '--release', '--locked', '--manifest-path', str(manifest),
-               '--bin', 'siworld-native-node']
+               '--bin', 'siworld-native-node', '--bin', 'siworld-checkpoint-key']
     if features:
         command += ['--features', ','.join(features)]
     subprocess.run(command, cwd=ROOT, check=True)
@@ -75,6 +85,7 @@ def main():
         'cargo_working_directory': 'repository-root',
         'repository_config_sha256': release.digest(ROOT / '.cargo/config.toml'),
         'cargo_features': features,
+        'checkpoint_key_sha256': release.digest(worker.with_name('siworld-checkpoint-key')),
     }
     package(worker, args.output.resolve(), receipt, release)
     print(json.dumps({'worker': 'siworld-native-node', 'packaged': True}))

@@ -25,15 +25,43 @@ Every node permanently retains the following public data without pruning:
 - public asset issuance records, declared supplies and metadata; and
 - recent-root tree snapshots and canonical block identities.
 
-Only transaction, settlement and native issuance proofs and private fee-opening
-sidecars expire. Signed issuance declarations and initial note commitments
-remain permanent. Keep these proof bodies and sidecars for at least 259,200
-elapsed seconds after final confirmation, then delete them. Persist the finality/deletion metadata and
-extend retention on clock or recovery uncertainty. Age alone cannot delete an
-unfinalized block's proof. At a five-minute target and depth-24 finality, the
-nominal rolling store covers 888 blocks: 24 unresolved blocks plus three days
-of finalized blocks. Faster blocks require more storage; 888 is a sizing
-example, not permission to delete by block count.
+Only transaction, settlement and native issuance proof bodies expire. Signed
+issuance declarations and initial note commitments remain permanent. Local
+storage roles select retention without changing block validity or fork choice:
+
+| Local role | Proof retention | Historical proof synchronization |
+| --- | --- | --- |
+| Bootstrap | At least 86,400 elapsed seconds after observed finality | Available within the retained window |
+| Validator | At least 86,400 elapsed seconds after observed finality | Available within the retained window |
+| Miner | Latest 96 canonical blocks | Disabled |
+| Ordinary | Latest 96 canonical blocks | Disabled |
+
+The consensus reorganization bound remains 24 blocks. The 96-block local
+window does not increase that bound. Private fee-opening sidecars retain their
+existing bounded admission lifecycle and are not added to permanent storage.
+
+Persist finality and deletion metadata. Extend retention on clock or recovery
+uncertainty; age alone cannot remove an unfinalized block's proof. Service
+expiry uses the first local observation of finality for the exact block ID,
+never the producer's timestamp. Restart downtime does not advance the certain
+retention clock. At a five-minute target and depth-24 finality, 312 blocks is a
+nominal service-store sizing example, not permission to expire by height.
+
+The native store can atomically replace expired canonical and detached proof
+records with authenticated compact public records and a sealed local replay
+base. Reopening authenticates the compact prefix and local seal, then verifies
+all retained proof-bearing blocks through the unchanged transition. Local
+reward receipts remain independently checked. This local base records prior
+verification by the same node; it does not satisfy the remote checkpoint quorum
+or authorize trust in another node's history.
+
+Maintenance batches are bounded. Database free pages are reusable immediately;
+file size can remain at its high-water mark until exclusive offline redb
+compaction. See [native storage operation](native-proof-storage.md). Remote
+checkpoint publication, fresh-node checkpoint installation and automatic
+long-offline recovery are separate integration gates. Do not deploy service
+proof expiry until an authenticated checkpoint and its complete proof tail can
+be delivered to new and recovering nodes.
 
 Unconfirmed transactions use bounded mempool TTL/expiry and byte admission;
 they do not create an unbounded disk spill. Orphaned data follows the
@@ -54,8 +82,8 @@ peer root or PoW does not prove deleted historical transactions.
 A release bundles a confirmed checkpoint and pins the authentication policy.
 If that bundled checkpoint is too old to validate its complete proof tail,
 fetch a newer confirmed checkpoint authenticated under the same pinned roster
-and network/verifier policy. The six-hour checkpoint publication cadence is
-independent of binary release cadence. Refuse bootstrap if no authenticated
+and network/verifier policy. Six-hour checkpoint publication is independent of binary release cadence and
+must keep the latest usable checkpoint within the service proof window. Refuse bootstrap if no authenticated
 checkpoint with an available proof tail can be obtained; old release data plus
 PoW alone cannot bridge deleted proofs.
 
@@ -91,23 +119,23 @@ measured database overhead remain integration work.
 Use decimal GB, 365-day years, 288 target blocks/day and 576 positions/block.
 Use the engineering-frozen **655,360-byte (640-KiB) transaction proof cap** independently
 of the 655,360-byte settlement and 524,288-byte issuance caps, plus 78-byte sidecars. The nominal rolling window
-is 888 blocks; it does not accumulate again each year. A larger proof cap adds
+is 312 blocks; it does not accumulate again each year. A larger proof cap adds
 rolling storage while the permanent 2,115-byte position ledger is unchanged.
 
 At that planning transaction cap, the nominal full-load rolling store is:
 
-| Rolling component (888 blocks) | Bytes |
+| Rolling component (312 blocks) | Bytes |
 | --- | ---: |
-| Transaction proofs | 335,208,775,680 |
-| Settlement proofs | 581,959,680 |
-| Sidecars | 39,896,064 |
-| Ordinary transaction, settlement and sidecar subtotal | 335,830,631,424 |
-| Additional issuance proof allowance | 465,567,744 |
-| Total rolling allowance | 336,296,199,168 |
+| Transaction proofs | 117,776,056,320 |
+| Settlement proofs | 204,472,320 |
+| Sidecars | 14,017,536 |
+| Ordinary transaction, settlement and sidecar subtotal | 117,994,546,176 |
+| Additional issuance proof allowance | 163,577,856 |
+| Total rolling allowance | 118,158,124,032 |
 
 The finite issuance scenario reserves one additional capped native issuance
 proof/block beyond ordinary positions. The total rolling allowance is
-**336.296 GB**. This overcounts if issuance occupies an ordinary transaction
+**118.158 GB**. This overcounts if issuance occupies an ordinary transaction
 position. The retained cap sizes rolling storage; new lock fields fit the
 fixed note/body padding, so permanent per-position bytes are unchanged.
 The source-bound measurements fit their recorded admission caps; their frozen
@@ -149,9 +177,9 @@ allowances as actual database overhead or finalized consensus limits.
 
 | Maximum load | Permanent positions | Block allowance | Issuance allowance | Index/state allowance | Used capacity | Device with 20% free |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Year 1 | 128.061 GB | 6.889 GB | 1.722 GB | 34.168 GB | 543.137 GB | 678.922 GB |
-| Year 3 | 384.184 GB | 20.667 GB | 5.167 GB | 102.505 GB | 884.819 GB | 1,106.024 GB |
-| Year 5 | 640.307 GB | 34.446 GB | 8.611 GB | 170.841 GB | 1,226.501 GB | 1,533.127 GB |
+| Year 1 | 128.061 GB | 6.889 GB | 1.722 GB | 34.168 GB | 324.999 GB | 406.249 GB |
+| Year 3 | 384.184 GB | 20.667 GB | 5.167 GB | 102.505 GB | 666.681 GB | 833.352 GB |
+| Year 5 | 640.307 GB | 34.446 GB | 8.611 GB | 170.841 GB | 1,008.363 GB | 1,260.454 GB |
 
 Used capacity includes the one-time 64-KiB genesis registry, rolling allowance, 16-GB database working space
 and 20-GB system allowance. Required device capacity divides used bytes by
@@ -164,17 +192,17 @@ issuance/block allowances even at low demand:
 
 | Workload | Rolling store | Used year 1 | Used year 3 | Used year 5 |
 | --- | ---: | ---: | ---: | ---: |
-| Maximum 576 positions/block | 336.296 GB | 543.137 GB | 884.819 GB | 1,226.501 GB |
-| 10,000/day, minimum 64-position blocks | 38.297 GB | 102.848 GB | 159.949 GB | 217.050 GB |
-| 50,000/day, adaptive grouping | 102.100 GB | 197.113 GB | 315.139 GB | 433.164 GB |
-| 50,000/day, uniform 176 positions | 103.485 GB | 199.161 GB | 318.515 GB | 437.868 GB |
+| Maximum 576 positions/block | 118.158 GB | 324.999 GB | 666.681 GB | 1,008.363 GB |
+| 10,000/day, minimum 64-position blocks | 13.456 GB | 78.007 GB | 135.108 GB | 192.209 GB |
+| 50,000/day, adaptive grouping | 35.877 GB | 130.890 GB | 248.915 GB | 366.941 GB |
+| 50,000/day, uniform 176 positions | 36.359 GB | 132.036 GB | 251.389 GB | 370.743 GB |
 
 | Workload | Device year 1 | Device year 3 | Device year 5 |
 | --- | ---: | ---: | ---: |
-| Maximum 576 positions/block | 678.922 GB | 1,106.024 GB | 1,533.127 GB |
-| 10,000/day, minimum 64-position blocks | 128.560 GB | 199.937 GB | 271.313 GB |
-| 50,000/day, adaptive grouping | 246.391 GB | 393.923 GB | 541.455 GB |
-| 50,000/day, uniform 176 positions | 248.952 GB | 398.143 GB | 547.335 GB |
+| Maximum 576 positions/block | 406.249 GB | 833.352 GB | 1,260.454 GB |
+| 10,000/day, minimum 64-position blocks | 97.508 GB | 168.885 GB | 240.261 GB |
+| 50,000/day, adaptive grouping | 163.612 GB | 311.144 GB | 458.676 GB |
+| 50,000/day, uniform 176 positions | 165.045 GB | 314.237 GB | 463.428 GB |
 
 Reproduce these tables with
 `python3 scripts/v1-storage-budget.py --economic-rewards`, using
@@ -183,40 +211,31 @@ Settlement and issuance limits have separate arguments; do not raise them
 implicitly when changing the transaction limit. The unflagged command uses
 the 8-KiB block-record layout with current independent cap defaults, so it does
 not reproduce earlier numeric evidence unchanged. `--legacy-baseline`
-explicitly restores all three 524,288-byte caps. These historical layouts do
+restores all three 524,288-byte caps while keeping the current 24-hour service window. These historical layouts do
 not size the economic reward format; `--legacy-baseline` cannot be combined with
 `--economic-rewards`. Rolling positions round up to complete groups of sixteen. Low-demand cases assume steady traffic and
 the stated packing; arbitrary bursts or faster block production can need the
 full rolling reserve. A dedicated `extra_permanent_bytes` term permits adding
 measured costs beyond these allowances without hiding them.
 
-Both miners and validators retain **500 GB usable SSD as the installation
-minimum**, with **1 TB recommended**. The installation minimum does not qualify
-continuous maximum load: year-one used bytes already exceed 500 GB and require
-678.922 GB with the free reserve. At full load a 1-TB device reaches the modeled
-20% free threshold after approximately **2.50 years**. Year three requires
-1,106.024 GB, so a 1-TB device does not meet the modeled three-year full-load
-requirement.
-
-At 10,000/day, 500 GB has substantial modeled headroom beyond five years:
-the year-five device estimate is 271.313 GB. At 50,000/day, year five needs
-541.455 GB with adaptive packing or 547.335 GB with uniform 176-position
-blocks. Both exceed 500 GB when the required free reserve is included.
-A blanket five-year claim for a 500-GB device is therefore unsupported;
-packing, bursts and measured database overhead affect that horizon.
-Expansion planning must preserve all 576 positions and the complete three-day-after-finality retention window.
+Bootstrap and validator stores use a 200-GB managed-file-content alarm
+threshold. Crossing it does not stop validation or ingestion and never changes
+proof retention or permanent-data lifetime. It is not a disk quota. A finite
+physical device still needs free-space monitoring and capacity planning.
+Miner and ordinary stores retain 96 blocks by default, configurable down to
+24 blocks, and do not expose historical proof service.
 
 These are conditional planning horizons, not promises independent of actual
-record sizes, workload or database layout. Replace every allowance with final
-encoded/measured evidence before deployment qualification. Monitor growth and
-expand before free-space reserves are consumed. Never reclaim permanent
-public data or unexpired proofs to avoid an orderly storage stop.
+record sizes, workload or database layout. Replace allowances with measured
+evidence before deployment qualification. Monitor growth and maintain healthy
+redundant services. Never reclaim permanent public data or unexpired proofs to
+avoid an orderly local storage stop.
 
 ## Backup and monitoring
 
 Project-operated object storage backs up permanent public data only; it is not
 an archive for expired proofs or sidecars. Upload finalized segments at least
-every six hours with immutable object hashes/versioning, publish signed daily
+every six hours with immutable object hashes/versioning, publish signed six-hourly
 manifests and create weekly full checkpoint snapshots. The backup RPO is at
 most six hours; acknowledged local durable records still require RPO zero.
 
@@ -232,7 +251,7 @@ not public backup inputs.
 Monitor total encoded bytes/positions, proof-age/deletion lag, separate permanent
 data/index/state growth, free-space reserve, backup lag and recovery failures.
 Never emit real/padding counts, hidden fees, peer addresses or timed nullifiers.
-One real three-day-after-finality lifecycle is required by
+One real 24-hour-after-finality lifecycle is required by
 [V1 acceptance](prover-acceptance.md), alongside accelerated crash/clock tests.
 
 ## Supply audit implementation requirement
@@ -265,8 +284,8 @@ JSON sum does not constitute a supply audit.
 
 ## Backup checkpoint freshness
 
-A weekly full snapshot alone is insufficient once proofs expire after
-three days. Export an authenticated, consistent confirmed-state checkpoint
+A weekly full snapshot alone is insufficient once service proofs expire after
+24 hours. Export an authenticated, consistent confirmed-state checkpoint
 (full or a complete authenticated delta chain) at least every six hours,
 together with the public-data manifest. Weekly full snapshots remain a
 compaction/recovery convenience. Before replaying a restored checkpoint's

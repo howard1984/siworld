@@ -1338,7 +1338,8 @@ pub(super) fn continuous(
     let mining = config.mining;
     let chain = local::load(directory)?;
     let verifier = NativeVerifier::new()?;
-    let store = Store::open_existing(directory.join("chain.redb"), chain.clone(), &verifier)?;
+    let mut store = Store::open_existing(directory.join("chain.redb"), chain.clone(), &verifier)?;
+    super::configure_storage_startup(&mut store)?;
     store.require_local_reward_index()?;
     store.verify_local_rewards()?;
     let identity = Arc::new(
@@ -1360,12 +1361,29 @@ pub(super) fn continuous(
     let mut proof: Option<ProofTask> = None;
     let mut work: Option<Mining> = None;
     let mut last_private_view = Instant::now();
+    let mut last_storage_maintenance: Option<Instant> = None;
+    let mut storage_maintenance_interval = Duration::from_secs(60);
     let mut reward_fingerprint = None;
     let mut reward_view = Value::Null;
     control.state(node.state())?;
     control.phase("networking")?;
     let result: Result<(), String> = (|| {
         while !control.stop()? {
+            if last_storage_maintenance
+                .is_none_or(|last| last.elapsed() >= storage_maintenance_interval)
+            {
+                let now = control.checked_wall()? / 1000;
+                let expired = node.maintain_storage(now, true)?;
+                storage_maintenance_interval =
+                    Duration::from_secs(if expired > 0 { 5 } else { 60 });
+                control.phase("networking")?;
+                control
+                    .status
+                    .lock()
+                    .map_err(|_| "storage status unavailable")?
+                    .storage_metrics = node.store().storage_metrics().ok();
+                last_storage_maintenance = Some(Instant::now());
+            }
             driver.poll()?;
             #[cfg(all(feature = "wallet-light-gateway", unix))]
             if let Some(gateway) = &mut wallet_gateway {

@@ -1,8 +1,9 @@
 //! Durable canonical history for the disposable native engineering chain.
 //!
-//! Opening always replays every stored block through the caller's verifier. A
-//! saved fingerprint detects inconsistent records; it never replaces proof or
-//! state-transition verification. Failed opens preserve the database for review.
+//! Opening verifies the sealed local replay base, when present, and replays
+//! every retained proof through the unchanged transition. A local seal records
+//! prior verification; it is not a peer checkpoint quorum. Failed opens preserve
+//! the database for review.
 use crate::chain::{self, BranchOutcome, CandidatePolicy, ChainError, ValidatedBranch};
 use crate::state::{BlockVerifier, Config, State};
 use crate::wire::{Block, MAX_BLOCK_BYTES};
@@ -27,13 +28,21 @@ const LOCAL_REWARDS_MARKER: &str = "local-production-receipts";
 const LOCAL_REWARDS_VERSION: &[u8] = b"\x01\0\0\0\0\0\0\0\0";
 const HEAD_BYTES: usize = 72;
 const FINGERPRINT_BYTES: usize = 32;
+mod checkpoint;
+pub mod engineering_checkpoint;
 mod miner_view;
 mod receipts;
+mod retention;
+#[cfg(test)]
+mod retention_tests;
 
 pub struct Store {
     database: Database,
     state: State,
     receipt_owner: receipts::Owner,
+    path: std::path::PathBuf,
+    storage_base: Option<State>,
+    retention_clock_started: bool,
 }
 
 impl Store {
@@ -72,18 +81,26 @@ impl Store {
         // An allocator or checksum repair may discard evidence. Recovery of an
         // unclean or damaged database requires a separate, explicit review.
         builder.set_repair_callback(|session| session.abort());
+        let backend = redb::backends::FileBackend::new(file)
+            .map_err(|_| "native database backend unavailable")?;
         let database = builder
-            .create_file(file)
+            .create_with_backend(backend)
             .map_err(|_| "invalid, damaged or unavailable native database")?;
         if created {
             initialize(&database, &config)?;
             sync_parent(path)?;
         }
-        let state = replay(&database, config, verifier)?;
+        let base = retention::load_base(&database, config.clone(), path)?;
+        let storage_base = base.clone();
+        let state =
+            replay_history(&database, config, verifier, None, base).map(|(state, _)| state)?;
         let store = Self {
             database,
             state,
             receipt_owner,
+            path: path.to_owned(),
+            storage_base,
+            retention_clock_started: false,
         };
         if store.has_local_reward_index()? {
             store.verify_local_rewards()?;
@@ -201,24 +218,23 @@ impl Store {
                 .map_err(|_| "native canonical record unreadable")?
                 .map(|record| {
                     let (bytes, _) = split_record(record.value())?;
-                    Block::decode(bytes, &self.state.config.network)
+                    public_record(bytes, &self.state.config.network)
                 })
                 .transpose()?;
-            let block = if let Some(block) =
-                canonical_block.filter(|block| block.id().is_ok_and(|got| got == id))
-            {
-                block
-            } else {
-                let record = detached
-                    .as_ref()
-                    .ok_or("indexed local block is neither canonical nor retained")?
-                    .get(id.as_slice())
-                    .map_err(|_| "native detached local record unreadable")?
-                    .ok_or("indexed local detached block missing")?;
-                let (bytes, _) = split_record(detached_record(record.value())?)?;
-                Block::decode(bytes, &self.state.config.network)?
-            };
-            if block.height != height || block.id()? != id {
+            let (block, actual_id) =
+                if let Some(record) = canonical_block.filter(|(_, got)| *got == id) {
+                    record
+                } else {
+                    let record = detached
+                        .as_ref()
+                        .ok_or("indexed local block is neither canonical nor retained")?
+                        .get(id.as_slice())
+                        .map_err(|_| "native detached local record unreadable")?
+                        .ok_or("indexed local detached block missing")?;
+                    let (bytes, _) = split_record(detached_record(record.value())?)?;
+                    public_record(bytes, &self.state.config.network)?
+                };
+            if block.height != height || actual_id != id {
                 return Err("indexed local block identity mismatch".into());
             }
             let receipt = self.receipt_owner.read(&id)?;
@@ -251,6 +267,9 @@ impl Store {
             .map_err(|_| "native block record unreadable")?
             .ok_or("canonical block missing")?;
         let (bytes, _) = split_record(value.value())?;
+        if bytes.starts_with(b"SWLC0001") {
+            return Err("canonical proof expired under local storage policy; request it from a service node".into());
+        }
         let block = Block::decode(bytes, &self.state.config.network)?;
         if block.height != height {
             return Err("canonical block key mismatch".into());
@@ -258,15 +277,37 @@ impl Store {
         Ok(block)
     }
 
-    #[cfg(feature = "wallet-light-gateway")]
+    pub fn canonical_id(&self, height: u64) -> Result<crate::wire::Hash, String> {
+        if height == 0 {
+            return Ok(self.state.config.genesis_id());
+        }
+        let txn = self
+            .database
+            .begin_read()
+            .map_err(|_| "canonical identity unavailable")?;
+        let blocks = txn
+            .open_table(BLOCKS)
+            .map_err(|_| "canonical identity unavailable")?;
+        let record = blocks
+            .get(height)
+            .map_err(|_| "canonical identity unreadable")?
+            .ok_or("canonical identity missing")?;
+        Ok(public_record(split_record(record.value())?.0, &self.state.config.network)?.1)
+    }
+
     pub fn public_block_id(&self, height: u64) -> Result<crate::wire::Hash, String> {
-        self.with_public_block(height, crate::compact::CompactBlock::canonical_id)
+        self.canonical_id(height)
     }
-    #[cfg(feature = "wallet-light-gateway")]
     pub fn public_compact_block(&self, height: u64) -> Result<Vec<u8>, String> {
-        self.with_public_block(height, crate::compact::CompactBlock::export_canonical)
+        self.with_public_block(height, |bytes| {
+            if bytes.starts_with(b"SWLC0001") {
+                crate::compact::CompactBlock::decode(bytes)?;
+                Ok(bytes.to_vec())
+            } else {
+                crate::compact::CompactBlock::export_canonical(bytes)
+            }
+        })
     }
-    #[cfg(feature = "wallet-light-gateway")]
     fn with_public_block<T>(
         &self,
         height: u64,
@@ -370,7 +411,8 @@ impl Store {
             chain::check_state_budget(&self.state, candidate_bytes, policy)?;
             return Ok(self.state.clone());
         }
-        if height > policy.max_replay_blocks {
+        let base_height = self.storage_base.as_ref().map_or(0, |base| base.height);
+        if height < base_height || height - base_height > policy.max_replay_blocks {
             return Err(ChainError::ResourceExhausted(
                 "canonical ancestor replay allowance",
             ));
@@ -395,8 +437,11 @@ impl Store {
                 "native block count differs from accepted state".into(),
             ));
         }
-        let mut ancestor = State::new(self.state.config.clone()).map_err(ChainError::Local)?;
-        for next in 1..=height {
+        let mut ancestor = match &self.storage_base {
+            Some(base) => base.clone(),
+            None => State::new(self.state.config.clone()).map_err(ChainError::Local)?,
+        };
+        for next in ancestor.height.saturating_add(1)..=height {
             let record = table
                 .get(next)
                 .map_err(|_| ChainError::Local("native ancestor record unreadable".into()))?
@@ -422,7 +467,7 @@ impl Store {
     }
 
     /// Canonical rows, detached evidence and the head move at one durable redb
-    /// commit boundary. Failed validation, capacity checks or writes cannot expose
+    /// commit boundary. Failed validation or writes cannot expose
     /// a partial branch; accepted memory changes only after commit succeeds.
     fn commit_branch(
         &mut self,
@@ -539,6 +584,7 @@ impl Store {
                 canonical
                     .remove(height)
                     .map_err(|_| local("native canonical detach failed"))?;
+                retention::forget(&txn, height).map_err(ChainError::Local)?;
             }
             for (height, record) in &branch.records {
                 if canonical
@@ -551,6 +597,12 @@ impl Store {
                 canonical
                     .insert(*height, record.as_slice())
                     .map_err(|_| local("native canonical attachment failed"))?;
+                let block = Block::decode(
+                    split_record(record).map_err(ChainError::Local)?.0,
+                    &self.state.config.network,
+                )
+                .map_err(ChainError::Local)?;
+                retention::record(&txn, &block).map_err(ChainError::Local)?;
             }
             meta.insert("head", head(&branch.accepted).as_slice())
                 .map_err(|_| local("native head write failed"))?;
@@ -671,6 +723,7 @@ impl Store {
             let _ = blocks
                 .insert(block.height, record.as_slice())
                 .map_err(|_| "native block write failed")?;
+            retention::record(&txn, block)?;
             let next_head = head(&accepted);
             let _ = meta
                 .insert("head", next_head.as_slice())
@@ -729,12 +782,21 @@ fn initialize(database: &Database, config: &Config) -> Result<(), String> {
         .map_err(|_| "native database initialization commit failed".to_owned())
 }
 
-fn replay(
-    database: &impl ReadableDatabase,
-    config: Config,
-    verifier: &impl BlockVerifier,
-) -> Result<State, String> {
-    replay_history(database, config, verifier, None).map(|(state, _)| state)
+fn public_record(
+    bytes: &[u8],
+    network: &crate::wire::Hash,
+) -> Result<(Block, crate::wire::Hash), String> {
+    if bytes.starts_with(b"SWLC0001") {
+        let compact = crate::compact::CompactBlock::decode(bytes)?;
+        if &compact.block.network != network {
+            return Err("permanent record network mismatch".into());
+        }
+        Ok((compact.block, compact.id))
+    } else {
+        let block = Block::decode(bytes, network)?;
+        let id = block.id()?;
+        Ok((block, id))
+    }
 }
 
 /// Verify bounded idle history without initialization, repair or writes.
@@ -763,7 +825,16 @@ pub(crate) fn read_only_history(
     if !after.is_file() || !same_file(&before, &after) {
         return Err("wallet history path changed".into());
     }
-    replay_history(&database, config, verifier, Some((max_blocks, max_bytes)))
+    if retention::load_base(&database, config.clone(), path)?.is_some_and(|base| base.height > 0) {
+        return Err("full-proof wallet replay unavailable after proof expiry; use authenticated permanent history".into());
+    }
+    replay_history(
+        &database,
+        config,
+        verifier,
+        Some((max_blocks, max_bytes)),
+        None,
+    )
 }
 
 fn replay_history(
@@ -771,6 +842,7 @@ fn replay_history(
     config: Config,
     verifier: &impl BlockVerifier,
     limits: Option<(u64, usize)>,
+    base: Option<State>,
 ) -> Result<(State, Vec<Block>), String> {
     let mut retained = Vec::new();
     let mut inspected_bytes = 0usize;
@@ -815,8 +887,8 @@ fn replay_history(
             let (key, record) = row.map_err(|_| "native detached record unreadable")?;
             let (bytes, _) = split_record(detached_record(record.value())?)?;
             account(bytes.len())?;
-            let block = Block::decode(bytes, &config.network)?;
-            if key.value() != block.id()?.as_slice() {
+            let (_, actual_id) = public_record(bytes, &config.network)?;
+            if key.value() != actual_id.as_slice() {
                 return Err("native detached identity mismatch".into());
             }
         }
@@ -853,12 +925,18 @@ fn replay_history(
     if blocks.len().map_err(|_| "native block count unreadable")? != height {
         return Err("native block count disagrees with committed head".into());
     }
-    let mut state = State::new(config)?;
+    let mut state = match base {
+        Some(base) => base,
+        None => State::new(config)?,
+    };
     for row in blocks
         .iter()
         .map_err(|_| "native block iteration unavailable")?
     {
         let (key, value) = row.map_err(|_| "native block record unreadable")?;
+        if key.value() <= state.height {
+            continue;
+        }
         if state.height.checked_add(1) != Some(key.value()) {
             return Err("missing or gapped canonical block".into());
         }
@@ -952,6 +1030,12 @@ fn validate_tables(
     let mut names: BTreeSet<_> = tables.map(|table| table.name().to_owned()).collect();
     let indexed = names.remove(LOCAL_REWARDS.name());
     names.remove(DETACHED.name());
+    names.remove(engineering_checkpoint::ATTESTATIONS.name());
+    let storage = names.remove(retention::STORAGE.name());
+    let finality = names.remove(retention::FINALITY.name());
+    if storage != finality {
+        return Err("incomplete local proof storage schema".into());
+    }
     let expected = BTreeSet::from([META.name().to_owned(), BLOCKS.name().to_owned()]);
     if has_multimap || names != expected {
         return Err("native database schema mismatch".into());

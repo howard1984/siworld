@@ -233,11 +233,12 @@ fn initialize(root: &Path, bundle_path: &Path) -> Result<PathBuf, String> {
         &network.join("peers.json"),
         &json!({"version":1,"engineering":true,"listen":null,"mining":true,"peers":peers}),
     )?;
-    Store::open(
+    let mut store = Store::open(
         network.join("chain.redb"),
         local::load(&network)?,
         &NativeVerifier::new()?,
     )?;
+    store.configure_storage(siworld_native_node::storage_policy::Role::Miner)?;
     Ok(network)
 }
 

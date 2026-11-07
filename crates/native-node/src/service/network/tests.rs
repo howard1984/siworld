@@ -42,19 +42,23 @@ struct Endpoint {
 }
 impl Endpoint {
     fn new() -> Self {
+        Self::with_storage_role(None)
+    }
+    fn with_storage_role(role: Option<crate::storage_policy::Role>) -> Self {
         let directory = Directory::new();
-        let node = Node::new(
-            Store::open(
-                directory.0.join("chain.redb"),
-                configuration(),
-                &TestVerifier,
-            )
-            .unwrap(),
-            TestVerifier,
-        );
+        let mut store = Store::open(
+            directory.0.join("chain.redb"),
+            configuration(),
+            &TestVerifier,
+        )
+        .unwrap();
         let identity = Arc::new(
             NativeIdentity::initialize(&directory.0, p2p::Binding::new(&configuration())).unwrap(),
         );
+        if let Some(role) = role {
+            store.configure_storage(role).unwrap();
+        }
+        let node = Node::new(store, TestVerifier);
         let config = Configuration {
             listen: Some((Ipv4Addr::LOCALHOST, 0).into()),
             mining: false,
@@ -141,6 +145,62 @@ fn connect_pair(a: &mut Endpoint, b: &mut Endpoint) {
     until(a, b, |a, b| {
         a.driver.scheduler.status().established == 1 && b.driver.scheduler.status().established == 1
     });
+}
+
+#[cfg(unix)]
+#[test]
+fn budget_alarm_does_not_interrupt_authenticated_peer_sync() {
+    let mut source = Endpoint::new();
+    let mut target = Endpoint::with_storage_role(Some(crate::storage_policy::Role::Validator));
+    source.append(100_000);
+    let pressure = target.directory.0.join("capacity-pressure.fixture");
+    std::fs::File::create_new(&pressure)
+        .unwrap()
+        .set_len(200_000_000_001)
+        .unwrap();
+    assert!(
+        target
+            .node
+            .as_ref()
+            .unwrap()
+            .store()
+            .storage_ingestion_ready()
+            .unwrap()
+    );
+    assert_eq!(
+        target
+            .node
+            .as_ref()
+            .unwrap()
+            .store()
+            .storage_metrics()
+            .unwrap()["storage_budget_exceeded"],
+        true
+    );
+    connect_pair(&mut source, &mut target);
+    until(&mut source, &mut target, |a, b| {
+        a.state().fingerprint() == b.state().fingerprint()
+    });
+    source.append(200_000);
+    until(&mut source, &mut target, |a, b| {
+        a.state().fingerprint() == b.state().fingerprint()
+    });
+    assert_eq!(target.state().height, 2);
+    assert_eq!(target.driver.scheduler.status().disabled, 0);
+    let expected = target.state().fingerprint();
+    target.driver.shutdown().unwrap();
+    drop(target.node.take());
+    let reopened = Store::open_existing(
+        target.directory.0.join("chain.redb"),
+        configuration(),
+        &TestVerifier,
+    )
+    .unwrap();
+    assert_eq!(reopened.state().fingerprint(), expected);
+    assert_eq!(
+        reopened.storage_metrics().unwrap()["storage_budget_exceeded"],
+        true
+    );
 }
 
 #[test]

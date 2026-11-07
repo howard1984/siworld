@@ -55,6 +55,33 @@ def compile_guard(command, **kwargs):
 
 
 class NativeRuntimeReleaseTests(unittest.TestCase):
+    def test_checkpoint_key_worker_is_guarded_and_bound_to_its_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worker = worker_at(directory)
+            key_worker = worker_at(directory, name='siworld-checkpoint-key', data=ELF + b'key')
+            receipt = {**receipt_for(worker), 'checkpoint_key_sha256': RELEASE.digest(key_worker)}
+            output = Path(directory) / 'release'
+            with patch.object(RELEASE, 'inspect_proof', return_value=inspection_for(worker)), \
+                 patch.object(NATIVE.subprocess, 'run', side_effect=compile_guard):
+                NATIVE.package(worker, output, receipt, RELEASE)
+            self.assertEqual((output / 'bin/siworld-checkpoint-key').read_bytes(), GUARD)
+            self.assertEqual((output / 'libexec/siworld-checkpoint-key').read_bytes(), key_worker.read_bytes())
+            saved = json.loads((output / 'build-receipt.json').read_text())
+            self.assertEqual(saved['worker_build_receipt']['checkpoint_key_sha256'],
+                             RELEASE.digest(output / 'libexec/siworld-checkpoint-key'))
+
+    def test_unbound_checkpoint_key_worker_never_creates_a_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worker = worker_at(directory)
+            worker_at(directory, name='siworld-checkpoint-key')
+            receipt = {**receipt_for(worker), 'checkpoint_key_sha256': '0' * 64}
+            output = Path(directory) / 'release'
+            with patch.object(RELEASE, 'inspect_proof', return_value=inspection_for(worker)), \
+                 patch.object(NATIVE.subprocess, 'run', side_effect=compile_guard), \
+                 self.assertRaisesRegex(ValueError, 'key worker digest mismatch'):
+                NATIVE.package(worker, output, receipt, RELEASE)
+            self.assertFalse(output.exists())
+
     def test_rejects_malformed_wrong_architecture_and_wrong_worker(self):
         cases = [
             ('wrong-name', 'composition-bench', ELF, 0o755),
