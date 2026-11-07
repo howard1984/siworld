@@ -217,14 +217,17 @@ impl Gateway {
         if (self.submit_only && self.export.is_none()) || Instant::now() < self.retry_at {
             return;
         }
-        // Read committed history only. One compact record per canonical-owner turn.
+        // Share one history backfill allowance across requests and export work:
+        // at most one canonical anchor lookup, one new ID and one compact record.
+        // Read requests never perform additional canonical history generation.
         let result: Result<(), String> = (|| {
-            self.index(node)?;
+            self.index_step(node)?;
             if self.indexed < self.ids.len() {
                 self.compact(node, self.indexed)?;
                 self.indexed += 1;
             }
-            if self.indexed == self.ids.len()
+            if self.index_complete(node)
+                && self.indexed == self.ids.len()
                 && let Some(export) = &mut self.export
             {
                 export.publish(&node.state().config, &self.ids)?;
@@ -241,18 +244,20 @@ impl Gateway {
             }
         }
     }
-    fn index<V: BlockVerifier>(&mut self, node: &Node<V>) -> Result<(), String> {
-        if node.state().height > 1_000_000 {
-            return Err("Engineering wallet index height limit.".into());
-        }
-        if self.ids.len() as u64 == node.state().height
+    fn index_complete<V: BlockVerifier>(&self, node: &Node<V>) -> bool {
+        self.ids.len() as u64 == node.state().height
             && self
                 .ids
                 .last()
                 .copied()
                 .unwrap_or(node.state().config.genesis_id())
                 == node.state().tip
-        {
+    }
+    fn index_step<V: BlockVerifier>(&mut self, node: &Node<V>) -> Result<(), String> {
+        if node.state().height > 1_000_000 {
+            return Err("Engineering wallet index height limit.".into());
+        }
+        if self.index_complete(node) {
             return Ok(());
         }
         if self.ids.len() as u64 > node.state().height
@@ -263,39 +268,43 @@ impl Gateway {
             self.ids.clear();
             self.indexed = 0;
         }
-        while (self.ids.len() as u64) < node.state().height {
+        if (self.ids.len() as u64) < node.state().height {
             self.ids
                 .push(node.store().public_block_id(self.ids.len() as u64 + 1)?);
         }
-        if self
-            .ids
-            .last()
-            .copied()
-            .unwrap_or(node.state().config.genesis_id())
-            != node.state().tip
-        {
+        if self.ids.len() as u64 == node.state().height && !self.index_complete(node) {
             return Err("Public history does not reach accepted native head.".into());
         }
         Ok(())
     }
-    fn compact<V: BlockVerifier>(&self, node: &Node<V>, at: usize) -> Result<Vec<u8>, String> {
+    fn cached_compact(&self, at: usize) -> Result<Option<Vec<u8>>, String> {
         let id = self.ids[at];
         let path = self.cache.join(format!("{}.bin", crate::local::hex(&id)));
-        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-            if !metadata.is_file()
-                || metadata.uid() != rustix::process::geteuid().as_raw()
-                || metadata.permissions().mode() & 0o777 != 0o600
-                || metadata.len() > MAX_RESPONSE as u64
-            {
-                return Err("Compact archive record invalid.".into());
-            }
-            let bytes = std::fs::read(&path).map_err(|_| "Compact archive unreadable.")?;
-            let record = crate::compact::CompactBlock::decode(&bytes)?;
-            if record.id != id {
-                return Err("Compact archive identity mismatch.".into());
-            }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Compact archive metadata unavailable.".into()),
+        };
+        if !metadata.is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.len() > MAX_RESPONSE as u64
+        {
+            return Err("Compact archive record invalid.".into());
+        }
+        let bytes = std::fs::read(&path).map_err(|_| "Compact archive unreadable.")?;
+        let record = crate::compact::CompactBlock::decode(&bytes)?;
+        if record.id != id {
+            return Err("Compact archive identity mismatch.".into());
+        }
+        Ok(Some(bytes))
+    }
+    fn compact<V: BlockVerifier>(&self, node: &Node<V>, at: usize) -> Result<Vec<u8>, String> {
+        if let Some(bytes) = self.cached_compact(at)? {
             return Ok(bytes);
         }
+        let id = self.ids[at];
+        let path = self.cache.join(format!("{}.bin", crate::local::hex(&id)));
         let bytes = node.store().public_compact_block(at as u64 + 1)?;
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(|_| "Compact archive randomness unavailable.")?;
@@ -368,7 +377,9 @@ impl Gateway {
                     .into_bytes(),
             );
         }
-        self.index(node)?;
+        if !self.index_complete(node) || self.indexed != self.ids.len() {
+            return Err("Public history backfill is incomplete.".into());
+        }
         let result = match kind {
             0 if body.is_empty() => {
                 json!({"network":crate::local::hex(&node.state().config.network),"genesis":crate::local::hex(&node.state().config.genesis_id()),"height":node.state().height,"compact_available_height":self.indexed,"tip":crate::local::hex(&node.state().tip)})
@@ -409,7 +420,9 @@ impl Gateway {
                     .iter()
                     .position(|known| *known == id)
                     .ok_or("Compact block unavailable.")?;
-                return self.compact(node, at);
+                return self
+                    .cached_compact(at)?
+                    .ok_or("Compact block unavailable.".into());
             }
             _ => return Err("Unsupported public-data operation.".into()),
         };
@@ -525,6 +538,7 @@ mod tests {
                 & 0o777,
             0o600
         );
+        gateway.poll(&mut node);
         let value: Value =
             serde_json::from_slice(&gateway.dispatch(&mut node, 0, b"").unwrap()).unwrap();
         assert_eq!(value["height"], 1);
@@ -618,6 +632,7 @@ mod tests {
         let next = candidate(node.state(), 500000);
         node.import_branch(1, &[next], crate::chain::CandidatePolicy::default())
             .unwrap();
+        gateway.poll(&mut node);
         let pinned: Value =
             serde_json::from_slice(&gateway.dispatch(&mut node, 1, index.as_bytes()).unwrap())
                 .unwrap();

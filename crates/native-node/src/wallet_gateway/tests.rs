@@ -26,6 +26,241 @@ fn private_file(path: &Path) {
     assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
 }
 
+fn append_blocks(node: &mut Node<TestVerifier>, count: u32, seed: u32) {
+    for at in 0..count {
+        let block = candidate(node.state(), seed + at * 100_000);
+        node.import_branch(
+            node.state().height,
+            &[block],
+            crate::chain::CandidatePolicy::default(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn cold_index_and_queued_public_reads_share_one_bounded_owner_turn() {
+    let root = root();
+    let config = Config::development([25; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 3, 1500);
+    let tip = node.state().tip;
+    let mut gateway = Gateway::bind(&root.join("s")).unwrap();
+    let (send, receive) = mpsc::sync_channel(1);
+    gateway.rx = receive;
+    for expected in 1..=3 {
+        let (reply, response) = mpsc::sync_channel(1);
+        send.send(Request {
+            kind: 0,
+            body: Vec::new(),
+            reply,
+        })
+        .unwrap();
+        gateway.poll(&mut node);
+        assert_eq!(gateway.ids.len(), expected, "one new identity per turn");
+        assert_eq!(gateway.indexed, expected, "one compact record per turn");
+        assert!(response.try_recv().unwrap().is_err(), "warming reads wait");
+    }
+    let status: Value =
+        serde_json::from_slice(&gateway.dispatch(&mut node, 0, b"").unwrap()).unwrap();
+    assert_eq!(status["height"], 3);
+    assert_eq!(status["tip"], crate::local::hex(&tip));
+    // A read request must never generate a missing compact record on the owner.
+    let missing = gateway
+        .cache
+        .join(format!("{}.bin", crate::local::hex(&tip)));
+    std::fs::remove_file(&missing).unwrap();
+    assert!(gateway.dispatch(&mut node, 2, &tip).is_err());
+    assert!(!missing.exists());
+    drop(gateway);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cold_export_accepts_queued_submission_without_waiting_for_history() {
+    use native::{
+        codec::encode_digest,
+        multi_asset::{F, Hasher},
+    };
+    use p3_field::PrimeCharacteristicRing;
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([27; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 3, 1500);
+    let mut gateway = Gateway::configured(None, Some(&root.join("s")), Some(&public))
+        .unwrap()
+        .unwrap();
+    let mut transaction = candidate(node.state(), 400_000).transactions.remove(0);
+    transaction.record.fee_commit =
+        encode_digest(&Hasher::new().fee_commit(100, &[F::from_u32(22); 8]));
+    let sidecar = crate::wire::Sidecar {
+        transaction_id: transaction
+            .record
+            .statement_id(&node.state().config.network),
+        fee: 100,
+        blind: [22; 8],
+    };
+    let mut packet = transaction
+        .encode_envelope(&node.state().config.network)
+        .unwrap();
+    packet.extend(sidecar.encode().unwrap());
+    let (send, receive) = mpsc::sync_channel(1);
+    gateway.rx = receive;
+    let (reply, response) = mpsc::sync_channel(1);
+    send.send(Request {
+        kind: 3,
+        body: packet,
+        reply,
+    })
+    .unwrap();
+    gateway.poll(&mut node);
+    assert!(response.try_recv().unwrap().is_ok());
+    assert_eq!(node.mempool().len(), 1);
+    assert_eq!(
+        gateway.ids.len(),
+        1,
+        "submission cannot trigger full backfill"
+    );
+    assert!(!public.join("chain.json").exists());
+    drop(gateway);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cold_partial_index_reanchors_before_following_a_changed_owner_head() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([28; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config.clone(), &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 3, 1500);
+    let mut gateway = Gateway::export_only(&public).unwrap();
+    gateway.poll(&mut node);
+    let old_first = gateway.ids[0];
+    let fork = Store::open(root.join("fork.redb"), config, &TestVerifier).unwrap();
+    let mut fork = Node::new(fork, TestVerifier);
+    append_blocks(&mut fork, 2, 400_000);
+    gateway.poll(&mut fork);
+    assert_eq!(gateway.ids.len(), 1);
+    assert_ne!(gateway.ids[0], old_first);
+    assert_eq!(gateway.ids[0], fork.store().public_block_id(1).unwrap());
+    assert_eq!(gateway.indexed, 1);
+    assert!(!public.join("chain.json").exists());
+    append_blocks(&mut fork, 1, 700_000);
+    gateway.poll(&mut fork);
+    assert_eq!(gateway.ids.len(), 2);
+    assert!(!public.join("chain.json").exists());
+    gateway.poll(&mut fork);
+    let exported: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    assert_eq!(exported["height"], 3);
+    assert_eq!(exported["tip"], crate::local::hex(&fork.state().tip));
+    assert!(
+        public
+            .join(format!("{}.bin", crate::local::hex(&old_first)))
+            .exists()
+    );
+    drop(gateway);
+    drop(fork);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cold_export_preserves_complete_head_until_backfill_then_handles_append_and_reorg() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([26; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config.clone(), &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    let mut gateway = Gateway::export_only(&public).unwrap();
+    gateway.poll(&mut node);
+    let genesis_export = std::fs::read(public.join("chain.json")).unwrap();
+    append_blocks(&mut node, 3, 1500);
+    for expected in 1..=3 {
+        gateway.export.as_mut().unwrap().allow_next();
+        gateway.poll(&mut node);
+        assert_eq!(gateway.ids.len(), expected);
+        if expected < 3 {
+            assert_eq!(
+                std::fs::read(public.join("chain.json")).unwrap(),
+                genesis_export
+            );
+        }
+    }
+    let before_reorg = std::fs::read(public.join("chain.json")).unwrap();
+    let exported: Value = serde_json::from_slice(&before_reorg).unwrap();
+    assert_eq!(exported["height"], 3);
+    let old_ids = gateway.ids.clone();
+    append_blocks(&mut node, 1, 500_000);
+    gateway.export.as_mut().unwrap().allow_next();
+    gateway.poll(&mut node);
+    assert_eq!(gateway.ids.len(), 4);
+    let before_reorg = std::fs::read(public.join("chain.json")).unwrap();
+
+    // Independently verified histories exercise the gateway's owner-head boundary;
+    // fork choice is tested separately and is not changed by gateway scheduling.
+    let fork = Store::open(root.join("fork.redb"), config.clone(), &TestVerifier).unwrap();
+    let mut fork = Node::new(fork, TestVerifier);
+    append_blocks(&mut fork, 4, 600_000);
+    for expected in 1..=4 {
+        gateway.export.as_mut().unwrap().allow_next();
+        gateway.poll(&mut fork);
+        assert_eq!(gateway.ids.len(), expected);
+        if expected < 4 {
+            assert_eq!(
+                std::fs::read(public.join("chain.json")).unwrap(),
+                before_reorg
+            );
+        }
+    }
+    let fork_export = std::fs::read(public.join("chain.json")).unwrap();
+    let exported: Value = serde_json::from_slice(&fork_export).unwrap();
+    assert_eq!(exported["tip"], crate::local::hex(&fork.state().tip));
+    for id in old_ids {
+        assert!(
+            public
+                .join(format!("{}.bin", crate::local::hex(&id)))
+                .exists()
+        );
+    }
+    let shorter = Store::open(root.join("shorter.redb"), config, &TestVerifier).unwrap();
+    let mut shorter = Node::new(shorter, TestVerifier);
+    append_blocks(&mut shorter, 2, 1_100_000);
+    for expected in 1..=2 {
+        gateway.export.as_mut().unwrap().allow_next();
+        gateway.poll(&mut shorter);
+        assert_eq!(gateway.ids.len(), expected);
+        if expected < 2 {
+            assert_eq!(
+                std::fs::read(public.join("chain.json")).unwrap(),
+                fork_export
+            );
+        }
+    }
+    let exported: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    assert_eq!(exported["height"], 2);
+    assert_eq!(exported["tip"], crate::local::hex(&shorter.state().tip));
+    for id in exported["ids"].as_array().unwrap() {
+        assert!(
+            public
+                .join(format!("{}.bin", id.as_str().unwrap()))
+                .is_file()
+        );
+    }
+    drop(gateway);
+    drop(shorter);
+    drop(fork);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn export_defaults_off_and_invalid_configuration_does_not_stop_node() {
     assert!(Gateway::configured(None, None, None).unwrap().is_none());
