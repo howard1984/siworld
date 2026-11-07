@@ -162,6 +162,15 @@ request requires fresh status for that exact run and is stored privately. Neithe
 network claims nor a service restart creates qualification. Invalid requests and
 checkpoint status export failures leave canonical validation running.
 
+`checkpoint-signing-live DIRECTORY EXPECTED_RUN_ID paused|active` controls only
+the current owner's engineering proposal and vote paths. It requires the same
+fresh run binding and private request contract. Paused authorities continue
+receiving complete certificates and validating blocks; they suppress local
+proposal advertisements and create no votes. A new owner run defaults active
+and rejects old pending intent. The private receipt records the actual pause
+state. This control supports elapsed-time publication-outage acceptance without
+changing the host clock, chain validity or service-expiry qualification.
+
 Deployment, full-native-proof fresh download, real elapsed retention and
 long-offline recovery remain acceptance gates. A certificate with valid
 signatures alone cannot authorize network admission, state replacement or proof

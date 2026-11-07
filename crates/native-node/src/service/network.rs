@@ -1773,6 +1773,11 @@ pub(super) fn continuous(
             }
             driver.poll()?;
             if checkpoint_poll.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                super::checkpoint_control::poll_signing(
+                    directory,
+                    &control.identity.run_id,
+                    driver.checkpoints.as_mut(),
+                );
                 if let Some(checkpoints) = &mut driver.checkpoints {
                     let now = control.checked_wall()? / 1000;
                     if checkpoints.poll(&mut node, now).is_err() {

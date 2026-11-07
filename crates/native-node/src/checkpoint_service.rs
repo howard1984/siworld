@@ -155,6 +155,7 @@ pub(crate) struct Coordinator {
     download_owner: Option<crate::wire::Hash>,
     #[cfg(feature = "native-p2p")]
     catchup: Option<Catchup>,
+    signing_paused: bool,
     pub(crate) alert: Option<&'static str>,
 }
 #[cfg(feature = "native-p2p")]
@@ -201,6 +202,7 @@ impl Coordinator {
             remote_goal_owner: None,
             download_owner: None,
             catchup: None,
+            signing_paused: false,
             alert: None,
         })
     }
@@ -210,13 +212,43 @@ impl Coordinator {
         value.directory = directory.to_owned();
         Ok(value)
     }
+    #[cfg(test)]
+    pub(crate) fn for_test_signer(
+        directory: &Path,
+        roster: Roster,
+        authority: Authority,
+    ) -> Result<Self, String> {
+        let mut value = Self::new(roster, Some(authority))?;
+        value.directory = directory.to_owned();
+        Ok(value)
+    }
     pub(crate) fn outbound(&self) -> Result<Vec<u8>, String> {
         Exchange {
-            proposal: self.proposal.clone(),
+            proposal: if self.signing_paused {
+                None
+            } else {
+                self.proposal.clone()
+            },
             certificate: self.accepted.clone(),
             goal: self.local_head.clone(),
         }
         .encode()
+    }
+    pub(crate) fn signing_paused(&self) -> bool {
+        self.signing_paused
+    }
+    /// Operator intent is scoped to this process run. No key, persisted vote,
+    /// accepted certificate or ordinary validation state is changed.
+    pub(crate) fn set_signing_paused(&mut self, paused: bool) -> Result<(), String> {
+        if self.signer.is_none() {
+            return Err("checkpoint signing requires a local authority".into());
+        }
+        self.signing_paused = paused;
+        if paused {
+            self.proposal = None;
+            self.incoming = None;
+        }
+        Ok(())
     }
     pub(crate) fn receive<V: BlockVerifier>(
         &mut self,
@@ -493,7 +525,8 @@ impl Coordinator {
                 }
             }
         }
-        if self.signer == Some(1)
+        if !self.signing_paused
+            && self.signer == Some(1)
             && let Some(proposal) = &self.incoming
         {
             let statement = proposal.statement.clone();
@@ -542,7 +575,7 @@ impl Coordinator {
                 }
             }
         }
-        if self.signer == Some(0) {
+        if !self.signing_paused && self.signer == Some(0) {
             let sequence = now / auth::INTERVAL_SECONDS;
             if sequence > 0
                 && self
@@ -694,7 +727,7 @@ impl Coordinator {
             .accepted
             .as_ref()
             .and_then(|c| now.checked_sub(c.statement.issued_unix_seconds));
-        serde_json::json!({"enabled":true,"authority":self.signer.is_some(),
+        serde_json::json!({"enabled":true,"authority":self.signer.is_some(),"signing_paused":self.signing_paused,
             "summary_building":self.build.is_some(),"catchup":self.catchup.as_ref().map(Catchup::metrics),"latest_height":self.accepted.as_ref().map(|c|c.statement.height),
             "latest_sequence":self.accepted.as_ref().map(|c|c.statement.sequence),"age_seconds":age,
             "pruning_paused":age.is_none_or(|age|age>auth::MAX_AGE_SECONDS),
@@ -800,11 +833,33 @@ mod coordination_tests {
         let before = na.state().fingerprint();
         let mut ca = Coordinator::new(roster.clone(), Some(a)).unwrap();
         let mut cb = Coordinator::new(roster.clone(), Some(b)).unwrap();
+        ca.set_signing_paused(true).unwrap();
+        ca.poll(&mut na, 21_600).unwrap();
+        assert!(ca.proposal.is_none());
+        assert!(ca.build.is_none());
+        assert!(
+            ca.authority
+                .as_ref()
+                .unwrap()
+                .saved_vote(1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ca.metrics(21_600)["signing_paused"], true);
+        ca.set_signing_paused(false).unwrap();
         settle(&mut ca, &mut na, 21_600, |c| c.proposal.is_some());
         let first = ca.proposal.as_ref().unwrap().statement.digest();
+        ca.set_signing_paused(true).unwrap();
+        assert!(
+            Exchange::decode(&ca.outbound().unwrap())
+                .unwrap()
+                .proposal
+                .is_none()
+        );
         drop(ca);
         let a = Authority::load(&da.0, binding).unwrap();
         let mut ca = Coordinator::new(roster.clone(), Some(a)).unwrap();
+        assert!(!ca.signing_paused());
         ca.poll(&mut na, 21_605).unwrap();
         assert_eq!(ca.proposal.as_ref().unwrap().statement.digest(), first);
         cb.receive(&nb, [1; 32], &ca.outbound().unwrap(), 21_605)
@@ -844,6 +899,7 @@ mod coordination_tests {
                 .is_some_and(|p| p.statement.sequence == 5)
         });
         assert_eq!(cb.metrics(108_000)["pruning_paused"], false);
+        ca.set_signing_paused(true).unwrap();
         // A valid superseded advertisement must not disconnect a peer during
         // the normal publication transition or roll back accepted state.
         let old = Exchange {
@@ -863,6 +919,7 @@ mod coordination_tests {
                 .is_some_and(|p| p.statement.sequence == 5)
         });
         assert_eq!(before, na.state().fingerprint());
+        assert!(ca.signing_paused());
         let mut bad = ca.outbound().unwrap();
         bad[20] ^= 1;
         assert!(cb.receive(&nb, [1; 32], &bad, 108_000).is_err());
@@ -930,6 +987,7 @@ mod coordination_tests {
         cc.poll(&mut nc, 129_600).unwrap();
         assert!(cc.catchup.is_some());
         assert_ne!(cc.download_request([1; 32]), [0]);
+        ca.set_signing_paused(false).unwrap();
         settle(&mut ca, &mut na, 129_600, |c| {
             c.proposal
                 .as_ref()
@@ -937,6 +995,28 @@ mod coordination_tests {
         });
         cb.receive(&nb, [1; 32], &ca.outbound().unwrap(), 129_600)
             .unwrap();
+        cb.set_signing_paused(true).unwrap();
+        // A proposal received during the pause may be validated and queued but
+        // cannot generate a countersignature or fresh quorum.
+        cb.receive(&nb, [1; 32], &ca.outbound().unwrap(), 129_600)
+            .unwrap();
+        cb.poll(&mut nb, 129_600).unwrap();
+        assert_eq!(cb.accepted.as_ref().unwrap().statement.sequence, 5);
+        assert!(
+            cb.authority
+                .as_ref()
+                .unwrap()
+                .saved_vote(6)
+                .unwrap()
+                .is_none()
+        );
+        let next = candidate(na.state(), 920_000_000);
+        na.import_branch(96, std::slice::from_ref(&next), Default::default())
+            .unwrap();
+        nb.import_branch(96, &[next], Default::default()).unwrap();
+        assert_eq!(na.state().height, 97);
+        assert_eq!(na.state().fingerprint(), nb.state().fingerprint());
+        cb.set_signing_paused(false).unwrap();
         settle(&mut cb, &mut nb, 129_600, |c| {
             c.accepted
                 .as_ref()

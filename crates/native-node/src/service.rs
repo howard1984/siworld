@@ -27,7 +27,7 @@ mod checkpoint_control;
 #[cfg(feature = "native-p2p")]
 pub mod network;
 #[cfg(feature = "native-p2p")]
-pub use checkpoint_control::request_checkpoint_qualification;
+pub use checkpoint_control::{request_checkpoint_qualification, request_checkpoint_signing};
 
 pub const LEASE_FILE: &str = "service.lock";
 pub const STATUS_FILE: &str = "service-status.json";

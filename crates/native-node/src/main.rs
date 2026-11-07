@@ -14,7 +14,7 @@ fn help() {
     );
     #[cfg(feature = "native-p2p")]
     println!(
-        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\ncheckpoint-qualify-live DIRECTORY EXPECTED_RUN_ID  Request owner-bound service expiry qualification\nPublic peer discovery and public-network activation are disabled."
+        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\ncheckpoint-qualify-live DIRECTORY EXPECTED_RUN_ID  Request owner-bound service expiry qualification\ncheckpoint-signing-live DIRECTORY EXPECTED_RUN_ID paused|active  Request run-bound checkpoint signing control\nPublic peer discovery and public-network activation are disabled."
     );
     println!("\n{}", siworld_native_node::wallet_cli::HELP);
     println!(
@@ -226,6 +226,22 @@ fn run() -> Result<(), String> {
             }
             service::request_checkpoint_qualification(path, &args[2])?;
             println!("{}", serde_json::json!({"qualification_requested":true}));
+        }
+        #[cfg(feature = "native-p2p")]
+        "checkpoint-signing-live" => {
+            if args.len() != 4 {
+                return Err(
+                    "expected checkpoint-signing-live DIRECTORY EXPECTED_RUN_ID paused|active"
+                        .into(),
+                );
+            }
+            let paused = match args[3].as_str() {
+                "paused" => true,
+                "active" => false,
+                _ => return Err("expected checkpoint signing state paused or active".into()),
+            };
+            service::request_checkpoint_signing(path, &args[2], paused)?;
+            println!("{}", serde_json::json!({"signing_state_requested":args[3]}));
         }
         "checkpoint-qualify-service" => {
             exact(&args)?;
