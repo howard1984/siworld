@@ -169,14 +169,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(original, restored);
-        assert!(
-            EconomicsLedger::from_authenticated_encoding(
-                &encoded[..encoded.len() - 1],
-                original.params().clone(),
-                original.fund_allocation().cloned()
-            )
-            .is_err()
-        );
+        assert!(EconomicsLedger::from_authenticated_encoding(
+            &encoded[..encoded.len() - 1],
+            original.params().clone(),
+            original.fund_allocation().cloned()
+        )
+        .is_err());
         for h in 51..=80 {
             assert_eq!(
                 original.advance(h, RewardMode::Holder).unwrap(),

@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "status": "executed-accounting-reference",
-  "source_base_commit": "176d3307f015c7e66f0d864747a7709fad01fa03",
+  "source_base_commit": "38feabee009c72a2aa5aecfe678c51039aa383e7",
   "source_identification": "Uncommitted source is identified by the exact source hashes below.",
   "execution_environment": {
     "os": "macOS",
@@ -11,8 +11,9 @@
   "test": "v1_economics::tests::seeded_twenty_year_modes_preserve_supply_and_curve",
   "command": "cargo test --release --locked -p siworld-core v1_economics::tests::seeded_twenty_year_modes_preserve_supply_and_curve -- --ignored --exact --nocapture",
   "sources_sha256": {
-    "crates/core/src/v1_economics.rs": "c9d07422c957de6d99760a87f8d0e501c4f424f2890e1ecbbe39d2f8293ca7e8",
-    "crates/core/src/v1_economics_tests.rs": "9d596561667de03dbc4e919761ba1b5ae8d00506c297e39c4816225822874b4f"
+    "crates/core/src/v1_economics.rs": "f83784fd9fadfd6e7bd18b213831f65272ab2d03cb38ff64ab741661ad379726",
+    "crates/core/src/v1_economics_tests.rs": "9d596561667de03dbc4e919761ba1b5ae8d00506c297e39c4816225822874b4f",
+    "crates/core/src/v1_economics/cache.rs": "5fb63da5bf26117eea1956b60b82c3eadfc865ad872993babf54bc653fe0572a"
   },
   "simulation": {
     "burned": 45846774833460,
