@@ -20,7 +20,31 @@ fn digests(out: &mut Vec<u8>, values: impl ExactSizeIterator<Item = DigestBytes>
         out.extend_from_slice(&value);
     }
 }
+pub(super) fn encoded_len(state: &State) -> usize {
+    // Fixed fields, six count prefixes, two blob prefixes and final fingerprint.
+    let mut bytes = 8usize + 32 + 32 + 8 + 32 + 64 + 6 * 8 + 48 + 2 * 8 + 32;
+    for (count, width) in [
+        (state.timestamps.len(), 8),
+        (state.leaves.len(), 48),
+        (state.spent.len(), 48),
+        (state.commitments.len(), 48),
+        (state.tree.cache_frontier().len(), 48),
+        (state.snapshots.len(), 136),
+    ] {
+        bytes = bytes.saturating_add(count.saturating_mul(width));
+    }
+    state
+        .assets
+        .visit_encoding(&mut |part| bytes = bytes.saturating_add(part.len()));
+    state
+        .economics
+        .visit_encoding(&mut |part| bytes = bytes.saturating_add(part.len()));
+    bytes
+}
 pub(super) fn encode(state: &State) -> Result<Vec<u8>, String> {
+    if encoded_len(state) > MAX_CHECKPOINT_BYTES {
+        return Err("local checkpoint byte budget exceeded".into());
+    }
     let mut bytes = MAGIC.to_vec();
     bytes.extend_from_slice(&state.config.genesis_id());
     bytes.extend_from_slice(&crate::proofs::protocol_profile_fingerprint());
@@ -217,6 +241,7 @@ mod tests {
                 .unwrap();
         }
         let bytes = encode(&state).unwrap();
+        assert_eq!(encoded_len(&state), bytes.len());
         let mut restored = decode_sealed(&bytes, config.clone()).unwrap();
         assert_eq!(restored.fingerprint(), state.fingerprint());
         assert_eq!(restored.leaves, state.leaves);

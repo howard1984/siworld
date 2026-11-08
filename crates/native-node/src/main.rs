@@ -14,7 +14,7 @@ fn help() {
     );
     #[cfg(feature = "native-p2p")]
     println!(
-        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\ncheckpoint-qualify-live DIRECTORY EXPECTED_RUN_ID  Request owner-bound service expiry qualification\ncheckpoint-signing-live DIRECTORY EXPECTED_RUN_ID paused|active  Request run-bound checkpoint signing control\nPublic peer discovery and public-network activation are disabled."
+        "\ninit-peer DIRECTORY GENESIS_DIRECTORY EXPECTED_GENESIS_ID  Initialize a fresh peer from independently checked public ASERT rules\nrun-network DIRECTORY PEER_CONFIG  Listen and reconnect to pinned engineering peers\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT  Persist an independently verified public identity pin\npeer-admit-fixture-live DIRECTORY EXPECTED_RUN_ID SPECIMEN_ID DESCRIPTOR_FILE FINGERPRINT  Admit one run-local outbound-only recovery fixture\ncheckpoint-qualify-live DIRECTORY EXPECTED_RUN_ID  Request owner-bound service expiry qualification\ncheckpoint-signing-live DIRECTORY EXPECTED_RUN_ID paused|active  Request run-bound checkpoint signing control\nPublic peer discovery and public-network activation are disabled."
     );
     println!("\n{}", siworld_native_node::wallet_cli::HELP);
     println!(
@@ -218,6 +218,23 @@ fn run() -> Result<(), String> {
                 store.compact_expired_storage(&verifier)?;
             }
             println!("{}", store.storage_metrics()?);
+        }
+        #[cfg(feature = "native-p2p")]
+        "peer-admit-fixture-live" => {
+            if args.len() != 6 {
+                return Err("expected peer-admit-fixture-live DIRECTORY EXPECTED_RUN_ID SPECIMEN_ID DESCRIPTOR_FILE FINGERPRINT".into());
+            }
+            service::request_fixture_admission(
+                path,
+                &args[2],
+                &args[3],
+                Path::new(&args[4]),
+                &args[5],
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({"fixture_admission_requested":true})
+            );
         }
         #[cfg(feature = "native-p2p")]
         "checkpoint-qualify-live" => {

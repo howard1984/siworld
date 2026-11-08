@@ -72,6 +72,7 @@ enum Phase {
 struct Peer {
     phase: Phase,
     failures: u32,
+    _admission: Option<Reservation>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -139,6 +140,7 @@ impl Scheduler {
                         Peer {
                             phase: Phase::Ready(now_ms),
                             failures: 0,
+                            _admission: None,
                         },
                     )
                     .is_some()
@@ -165,6 +167,34 @@ impl Scheduler {
             next: 0,
             stopped: false,
         })
+    }
+    /// A checked owner request can add one inbound-only fixture without
+    /// replacing configured peers, restarting attempts or releasing budgets.
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn admit_fixture(&mut self, peer: Hash, now: u64) -> Result<(), Error> {
+        self.clock(now)?;
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
+        if peer == [0; 32] || peer == self.local || self.peers.contains_key(&peer) {
+            return Err(Error::InvalidIdentity);
+        }
+        if self.peers.len() >= MAX_PEERS {
+            return Err(Error::Capacity);
+        }
+        let reservation = self
+            .budget
+            .reserve(PEER_BYTES)
+            .map_err(|_| Error::Capacity)?;
+        self.peers.insert(
+            peer,
+            Peer {
+                phase: Phase::Ready(now),
+                failures: 0,
+                _admission: Some(reservation),
+            },
+        );
+        Ok(())
     }
     fn clock(&mut self, now: u64) -> Result<(), Error> {
         if now < self.last_ms {

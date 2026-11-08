@@ -128,6 +128,19 @@ impl NativeIdentity {
         Ok(Self::from_seeds(*expected, &ed25519, &ml_dsa))
     }
 
+    /// A missing identity remains absent. An existing invalid identity is never
+    /// treated as permission to recreate it or disable local authentication.
+    pub(crate) fn load_if_present(
+        directory: &Path,
+        expected: &Binding,
+    ) -> Result<Option<Self>, Error> {
+        match std::fs::symlink_metadata(directory.join(IDENTITY_FILE)) {
+            Ok(_) => Self::load(directory, expected).map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(Error::Storage),
+        }
+    }
+
     /// Export only public keys, their context binding and possession signatures.
     /// Fresh hedging changes the ML-DSA signature, not the public fingerprint.
     pub fn descriptor(&self) -> Result<Descriptor, Error> {

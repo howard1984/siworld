@@ -45,6 +45,16 @@ def package(worker, output, receipt, release):
             if release.digest(key_installed) != key_digest:
                 raise ValueError('Checkpoint key worker changed during packaging')
             shutil.copy2(launcher, staging / 'bin/siworld-checkpoint-key')
+        qualify_worker = worker.with_name('siworld-restart-qualify')
+        if 'restart_qualify_sha256' in receipt:
+            qualify_digest = receipt['restart_qualify_sha256']
+            if not qualify_worker.is_file() or release.digest(qualify_worker) != qualify_digest:
+                raise ValueError('Restart qualification worker digest mismatch')
+            qualify_installed = staging / 'libexec/siworld-restart-qualify'
+            shutil.copy2(qualify_worker, qualify_installed)
+            if release.digest(qualify_installed) != qualify_digest:
+                raise ValueError('Restart qualification worker changed during packaging')
+            shutil.copy2(launcher, staging / 'bin/siworld-restart-qualify')
         (staging / 'build-receipt.json').write_text(json.dumps({
             'worker': 'siworld-native-node', 'worker_isa': 'x86-64-v3',
             'bootstrap_isa': 'x86-64', 'bootstrap_sha256': release.digest(launcher),
@@ -71,7 +81,8 @@ def main():
     manifest = ROOT / 'crates/native-node/Cargo.toml'
     features = ['native-p2p', 'wallet-light-gateway'] if args.engineering_network else []
     command = ['cargo', 'build', '--release', '--locked', '--manifest-path', str(manifest),
-               '--bin', 'siworld-native-node', '--bin', 'siworld-checkpoint-key']
+               '--bin', 'siworld-native-node', '--bin', 'siworld-checkpoint-key',
+               '--bin', 'siworld-restart-qualify']
     if features:
         command += ['--features', ','.join(features)]
     subprocess.run(command, cwd=ROOT, check=True)
@@ -86,6 +97,7 @@ def main():
         'repository_config_sha256': release.digest(ROOT / '.cargo/config.toml'),
         'cargo_features': features,
         'checkpoint_key_sha256': release.digest(worker.with_name('siworld-checkpoint-key')),
+        'restart_qualify_sha256': release.digest(worker.with_name('siworld-restart-qualify')),
     }
     package(worker, args.output.resolve(), receipt, release)
     print(json.dumps({'worker': 'siworld-native-node', 'packaged': True}))

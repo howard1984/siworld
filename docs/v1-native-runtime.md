@@ -350,8 +350,8 @@ checks each block's timestamp, required target and sequential BLAKE3 work;
 the target interval is 300 seconds. A local sleep does not substitute for work,
 and stochastic block intervals need not equal exactly five minutes.
 
-`run` acquires an exclusive engineering-directory lease, replays existing
-history and reward receipts, then prepares one resident prover. A private
+`run` acquires an exclusive engineering-directory lease, resumes its authenticated
+committed local state and verifies reward receipts, then prepares one resident prover. A private
 queue independently verifies generated positions before reserving their
 identities, inputs, outputs and bytes. The service produces 64-position blocks
 and replenishes the queue during work search, subject to its 128-entry and
@@ -372,7 +372,7 @@ graceful stop:
 
 A stop request is checked at safe boundaries and during work batches; an
 in-progress proof may finish before shutdown. Graceful shutdown closes the
-writer, replays all accepted blocks and verifies every local reward receipt.
+writer, authenticates its durable committed state and verifies every local reward receipt.
 It preserves the database, run receipts and event history. Error paths preserve
 their evidence and do not automatically retry or restore earlier state.
 `check` always acquires the engineering lease and fully replays the database
@@ -380,6 +380,45 @@ and reward receipts; use it after the service exits. `status` returns the
 private export when one exists, including a stopped run's final export;
 otherwise it acquires the lease and replays an idle store. An exported status
 is not an independent replay. Use `service-status` for explicit live inspection.
+
+### Authenticated local restart
+
+Resident services and the Windows miner persist a versioned local restart record
+in the same immediate redb transaction as each accepted canonical head. It contains
+the complete verified state and public reward witnesses, sealed by the existing
+Ed25519 and ML-DSA-65 node identity. No new key is generated. The proof-expiry
+replay floor remains separate and continues to limit historical reorganizations.
+Startup verifies the configuration, proof profile, both signatures, committed
+head, canonical anchor, ownership index and existing private reward receipts.
+Only blocks after an older authenticated restart record undergo proof verification.
+An unchanged head preserves its existing restart record without rewriting it.
+
+Malformed, incomplete, foreign or incompatible restart records fail closed. An
+absent record requires retained-proof audit before qualification; this legacy
+migration cost is separate from a subsequent normal restart. An explicit
+`siworld-restart-qualify DIRECTORY CERTIFICATE_FILE PERMANENT_RECORD_DIRECTORY`
+can instead qualify a legacy store against the release-pinned checkpoint quorum.
+Input files `1.bin` through the checkpoint height contain the existing authenticated
+compact format. The tool reconstructs the entire signed permanent prefix, verifies
+every local checkpoint-to-head proof, and requires the exact existing committed
+head before writing a local restart record. It never rewrites canonical history.
+`--profile` measures only prefix reconstruction and state encoding without opening
+the canonical database or adopting a checkpoint.
+
+Restart authentication records prior local verification; it does not audit every
+historical database row on each start. Explicit `check` still verifies all retained
+proofs, detached evidence and the complete sealed pruning prefix. Historical proof
+corruption is detected by that audit or subsequent authenticated access, rather
+than silently repaired. The restart representation has a 512 MiB state bound and
+a separate 512 MiB reward witness bound. These are local resource limits, not
+consensus validity rules. Exceeding either bound atomically discards only the
+optional restart record and preserves canonical acceptance; subsequent startup
+requires a retained-proof audit. Corrupt records and storage errors still fail
+closed. The authenticated expiry floor is checked against its canonical anchor
+and matching retained snapshots without a historical proof scan.
+Older strict-schema binaries do not understand the new
+table; operational recovery must retain a compatible binary. The old binary's
+shutdown replay cannot be changed by replacing its executable on disk.
 
 ### Real 24-hour observation
 

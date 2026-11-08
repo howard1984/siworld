@@ -16,14 +16,24 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 struct TestDir(PathBuf);
 impl TestDir {
     fn new() -> Self {
-        let base = std::env::temp_dir();
+        let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         loop {
             let path = base.join(format!(
                 "siworld-native-store-{}-{}",
                 std::process::id(),
                 NEXT_DIR.fetch_add(1, Ordering::Relaxed)
             ));
-            match std::fs::create_dir(&path) {
+            #[cfg(not(windows))]
+            let created = std::fs::create_dir(&path);
+            #[cfg(windows)]
+            let created = if path.exists() {
+                Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+            } else {
+                siworld_miner_platform::Directory::create(&path)
+                    .map(|_| ())
+                    .map_err(std::io::Error::other)
+            };
+            match created {
                 Ok(()) => return Self(path),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => panic!("cannot create synthetic test directory: {error}"),
@@ -211,6 +221,366 @@ fn replay_does_not_trust_the_saved_fingerprint_in_place_of_proofs() {
     };
     assert!(Store::open(dir.db(), config(), &verifier).is_err());
     assert_eq!(verifier.transactions.get(), 1);
+}
+
+fn restart_identity(dir: &TestDir) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    crate::identity::NativeIdentity::initialize(&dir.0, crate::p2p::Binding::new(&config()))
+        .unwrap();
+}
+
+#[test]
+fn authenticated_restart_does_not_repeat_committed_proof_verification() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let mut store = Store::open(dir.db(), config(), &TestVerifier::default()).unwrap();
+    for seed in [1, 100_000] {
+        let block = candidate(store.state(), seed);
+        store.append(&block, &TestVerifier::default()).unwrap();
+    }
+    let expected = store.state().fingerprint();
+    drop(store);
+    let verifier = TestVerifier {
+        reject: true,
+        ..Default::default()
+    };
+    let resumed = Store::resume_existing(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(resumed.state().fingerprint(), expected);
+    assert_eq!(verifier.transactions.get(), 0);
+    assert_eq!(verifier.settlements.get(), 0);
+    drop(resumed);
+    // The independent offline audit continues to verify every retained proof.
+    assert!(Store::open_existing(dir.db(), config(), &verifier).is_err());
+}
+
+#[test]
+fn miner_initialization_resumes_existing_history_and_preserves_its_seal() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_err());
+    let mut store = Store::open_or_resume(dir.db(), config(), &TestVerifier::default()).unwrap();
+    let block = candidate(store.state(), 1);
+    store.append(&block, &TestVerifier::default()).unwrap();
+    let seal = store
+        .database
+        .begin_read()
+        .unwrap()
+        .open_table(resume::RESUME)
+        .unwrap()
+        .get("seal")
+        .unwrap()
+        .unwrap()
+        .value()
+        .to_vec();
+    drop(store);
+    let verifier = TestVerifier {
+        reject: true,
+        ..Default::default()
+    };
+    let resumed = Store::open_or_resume(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(resumed.state().height, 1);
+    assert_eq!(verifier.transactions.get(), 0);
+    let read = resumed.database.begin_read().unwrap();
+    assert_eq!(
+        read.open_table(resume::RESUME)
+            .unwrap()
+            .get("seal")
+            .unwrap()
+            .unwrap()
+            .value(),
+        seal
+    );
+}
+
+#[test]
+fn authenticated_restart_verifies_only_a_committed_tail_after_the_seal() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let (first, _) = populated(&dir.db());
+    let mut accepted = State::new(config()).unwrap();
+    accepted.apply(&first, &TestVerifier::default()).unwrap();
+    let second = candidate(&accepted, 100_000);
+    accepted.apply(&second, &TestVerifier::default()).unwrap();
+    let mut record = second.encode().unwrap();
+    record.extend_from_slice(&accepted.fingerprint());
+    tamper(&dir.db(), |transaction| {
+        transaction
+            .open_table(BLOCKS)
+            .unwrap()
+            .insert(2, record.as_slice())
+            .unwrap();
+        transaction
+            .open_table(META)
+            .unwrap()
+            .insert("head", head(&accepted).as_slice())
+            .unwrap();
+    });
+    let verifier = TestVerifier::default();
+    let resumed = Store::resume_existing(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(resumed.state().fingerprint(), accepted.fingerprint());
+    assert_eq!(verifier.transactions.get(), 64);
+    assert_eq!(verifier.settlements.get(), 1);
+}
+
+#[test]
+fn legacy_restart_performs_one_audit_then_reuses_the_verified_commit() {
+    let dir = TestDir::new();
+    populated(&dir.db());
+    restart_identity(&dir);
+    let verifier = TestVerifier::default();
+    drop(Store::resume_existing(dir.db(), config(), &verifier).unwrap());
+    assert_eq!(verifier.transactions.get(), 64);
+    let verifier = TestVerifier::default();
+    drop(Store::resume_existing(dir.db(), config(), &verifier).unwrap());
+    assert_eq!(verifier.transactions.get(), 0);
+    assert_eq!(verifier.settlements.get(), 0);
+}
+
+#[test]
+fn aborted_or_rejected_updates_preserve_the_authenticated_restart_boundary() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let (first, expected) = populated(&dir.db());
+    let mut store = Store::resume_existing(dir.db(), config(), &TestVerifier::default()).unwrap();
+    let mut second = candidate(store.state(), 100_000);
+    second.transactions[63].proof = vec![0];
+    assert!(store.append(&second, &TestVerifier::default()).is_err());
+    {
+        let transaction = store.database.begin_write().unwrap();
+        transaction.open_table(BLOCKS).unwrap().remove(1).unwrap();
+        transaction
+            .open_table(META)
+            .unwrap()
+            .insert("head", [0u8; 72].as_slice())
+            .unwrap();
+        // No commit: the prior state and its authenticated seal remain atomic.
+    }
+    drop(store);
+    let verifier = TestVerifier {
+        reject: true,
+        ..Default::default()
+    };
+    let resumed = Store::resume_existing(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(resumed.state().fingerprint(), expected);
+    assert_eq!(resumed.block(1).unwrap(), first);
+    assert_eq!(verifier.transactions.get(), 0);
+}
+
+#[test]
+fn malformed_or_foreign_restart_records_are_rejected_without_replacement() {
+    for key in ["state", "rewards", "seal"] {
+        let dir = TestDir::new();
+        restart_identity(&dir);
+        populated(&dir.db());
+        let mut changed = Vec::new();
+        tamper(&dir.db(), |transaction| {
+            let mut table = transaction.open_table(resume::RESUME).unwrap();
+            changed = table.get(key).unwrap().unwrap().value().to_vec();
+            changed[0] ^= 1;
+            table.insert(key, changed.as_slice()).unwrap();
+        });
+        assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_err());
+        let database = Database::open(dir.db()).unwrap();
+        let read = database.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(resume::RESUME)
+                .unwrap()
+                .get(key)
+                .unwrap()
+                .unwrap()
+                .value(),
+            changed
+        );
+    }
+    let source = TestDir::new();
+    restart_identity(&source);
+    populated(&source.db());
+    let other = TestDir::new();
+    restart_identity(&other);
+    std::fs::copy(source.db(), other.db()).unwrap();
+    assert!(Store::resume_existing(other.db(), config(), &TestVerifier::default()).is_err());
+}
+
+#[test]
+fn incomplete_restart_or_missing_identity_never_silently_downgrades() {
+    for key in ["state", "rewards", "seal"] {
+        let dir = TestDir::new();
+        restart_identity(&dir);
+        populated(&dir.db());
+        tamper(&dir.db(), |transaction| {
+            transaction
+                .open_table(resume::RESUME)
+                .unwrap()
+                .remove(key)
+                .unwrap();
+        });
+        assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_err());
+        let database = Database::open(dir.db()).unwrap();
+        let read = database.begin_read().unwrap();
+        let table = read.open_table(resume::RESUME).unwrap();
+        assert_eq!(table.len().unwrap(), 2);
+        assert!(table.get(key).unwrap().is_none());
+    }
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    populated(&dir.db());
+    let identity = dir.0.join("native-peer-identity.secret");
+    let preserved = dir.0.join("preserved-identity.fixture");
+    std::fs::rename(&identity, &preserved).unwrap();
+    assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_err());
+    assert!(!identity.exists());
+    let foreign = TestDir::new();
+    restart_identity(&foreign);
+    std::fs::copy(foreign.0.join("native-peer-identity.secret"), &identity).unwrap();
+    assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_err());
+    std::fs::remove_file(&identity).unwrap();
+    std::fs::rename(&preserved, &identity).unwrap();
+    assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_ok());
+}
+
+#[test]
+fn restart_expiry_floor_must_match_the_committed_branch_and_anchor() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let mut store = Store::open(dir.db(), config(), &TestVerifier::default()).unwrap();
+    let genesis = store.state().clone();
+    let block = candidate(store.state(), 1);
+    store.append(&block, &TestVerifier::default()).unwrap();
+    let floor = store.state().clone();
+    let second = candidate(store.state(), 100_000);
+    store.append(&second, &TestVerifier::default()).unwrap();
+    assert!(resume::check_floor(&store.database, store.state(), &genesis).is_ok());
+    assert!(resume::check_floor(&store.database, store.state(), &floor).is_ok());
+    let (alternative, _) = branch(&genesis, 1, 1_000_000);
+    let mut different = genesis.clone();
+    different
+        .apply(&alternative[0], &TestVerifier::default())
+        .unwrap();
+    assert!(resume::check_floor(&store.database, store.state(), &different).is_err());
+    let mut wrong_root = floor.clone();
+    wrong_root.snapshots.back_mut().unwrap().recent_root[0] ^= 1;
+    assert!(resume::check_floor(&store.database, store.state(), &wrong_root).is_err());
+    let accepted = store.state().clone();
+    let transaction = store.database.begin_write().unwrap();
+    transaction
+        .open_table(BLOCKS)
+        .unwrap()
+        .remove(floor.height)
+        .unwrap();
+    transaction.commit().unwrap();
+    assert!(resume::check_floor(&store.database, &accepted, &floor).is_err());
+}
+
+#[test]
+fn restart_capacity_exhaustion_disables_acceleration_without_rejecting_valid_blocks() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let mut store = Store::open(dir.db(), config(), &TestVerifier::default()).unwrap();
+    let block = candidate(store.state(), 1);
+    store.append(&block, &TestVerifier::default()).unwrap();
+    store.resume_cache.as_mut().unwrap().maximum_bytes = 1;
+    let block = candidate(store.state(), 100_000);
+    store.append(&block, &TestVerifier::default()).unwrap();
+    assert!(store.resume_cache.is_none());
+    let expected = store.state().fingerprint();
+    let transaction = store.database.begin_read().unwrap();
+    assert!(
+        !transaction
+            .list_tables()
+            .unwrap()
+            .any(|table| table.name() == resume::RESUME.name())
+    );
+    drop(transaction);
+    drop(store);
+    // The optional cache is absent, so a later restart performs the explicit
+    // retained-proof audit before creating a new qualified acceleration record.
+    let verifier = TestVerifier::default();
+    let resumed = Store::resume_existing(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(resumed.state().fingerprint(), expected);
+    assert_eq!(verifier.transactions.get(), 128);
+}
+
+#[test]
+fn restart_rejects_head_rollback_missing_anchor_and_unverified_tail() {
+    for kind in 0..3 {
+        let dir = TestDir::new();
+        restart_identity(&dir);
+        let (first, _) = populated(&dir.db());
+        let mut state = State::new(config()).unwrap();
+        state.apply(&first, &TestVerifier::default()).unwrap();
+        let next = candidate(&state, 100_000);
+        state.apply(&next, &TestVerifier::default()).unwrap();
+        tamper(&dir.db(), |transaction| {
+            if kind == 0 {
+                transaction
+                    .open_table(META)
+                    .unwrap()
+                    .insert("head", head(&State::new(config()).unwrap()).as_slice())
+                    .unwrap();
+            } else if kind == 1 {
+                transaction.open_table(BLOCKS).unwrap().remove(1).unwrap();
+            } else {
+                let mut unverified = next.clone();
+                unverified.transactions[0].proof[0] = 0;
+                let mut record = unverified.encode().unwrap();
+                record.extend_from_slice(&state.fingerprint());
+                transaction
+                    .open_table(BLOCKS)
+                    .unwrap()
+                    .insert(2, record.as_slice())
+                    .unwrap();
+                transaction
+                    .open_table(META)
+                    .unwrap()
+                    .insert("head", head(&state).as_slice())
+                    .unwrap();
+            }
+        });
+        assert!(Store::resume_existing(dir.db(), config(), &TestVerifier::default()).is_err());
+    }
+}
+
+#[test]
+fn authenticated_reorganization_resumes_the_accepted_branch_without_replaying_it() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let mut store = Store::open(dir.db(), config(), &TestVerifier::default()).unwrap();
+    let genesis = store.state().clone();
+    let first = candidate(store.state(), 1);
+    store.append(&first, &TestVerifier::default()).unwrap();
+    let (replacement, expected) = branch(&genesis, 2, 100_000);
+    store
+        .consider_branch(
+            0,
+            &replacement,
+            CandidatePolicy::default(),
+            &TestVerifier::default(),
+        )
+        .unwrap();
+    drop(store);
+    let verifier = TestVerifier {
+        reject: true,
+        ..Default::default()
+    };
+    let mut store = Store::resume_existing(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(store.state().fingerprint(), expected.fingerprint());
+    assert_eq!(store.detached_count().unwrap(), 1);
+    assert_eq!(verifier.transactions.get(), 0);
+    // The current-head cache must not become the reorganization replay floor.
+    let (next, expected) = branch(&genesis, 3, 1_000_000);
+    store
+        .consider_branch(
+            0,
+            &next,
+            CandidatePolicy::default(),
+            &TestVerifier::default(),
+        )
+        .unwrap();
+    assert_eq!(store.state().fingerprint(), expected.fingerprint());
 }
 
 #[test]

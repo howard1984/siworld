@@ -1,8 +1,8 @@
 //! Durable canonical history for the disposable native engineering chain.
 //!
-//! Opening verifies the sealed local replay base, when present, and replays
-//! every retained proof through the unchanged transition. A local seal records
-//! prior verification; it is not a peer checkpoint quorum. Failed opens preserve
+//! Audits replay retained proofs through the unchanged transition. Services may
+//! resume an atomically sealed, previously verified local state and verify only
+//! its tail. A local seal is not a peer checkpoint quorum. Failed opens preserve
 //! the database for review.
 use crate::chain::{self, BranchOutcome, CandidatePolicy, ChainError, ValidatedBranch};
 use crate::state::{BlockVerifier, Config, State};
@@ -35,6 +35,7 @@ mod miner_view;
 pub(super) mod protected_history;
 pub(super) mod public_replay;
 mod receipts;
+mod resume;
 mod retention;
 #[cfg(test)]
 mod retention_tests;
@@ -46,6 +47,7 @@ pub struct Store {
     path: std::path::PathBuf,
     storage_base: Option<State>,
     retention_clock_started: bool,
+    resume_cache: Option<resume::Context>,
 }
 
 impl Store {
@@ -56,7 +58,7 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
     ) -> Result<Self, String> {
-        Self::open_inner(path.as_ref(), config, verifier, true)
+        Self::open_inner(path.as_ref(), config, verifier, true, false)
     }
 
     /// Opens a previously initialized history. Read, validation and production
@@ -67,7 +69,27 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
     ) -> Result<Self, String> {
-        Self::open_inner(path.as_ref(), config, verifier, false)
+        Self::open_inner(path.as_ref(), config, verifier, false, false)
+    }
+
+    /// Resume a locally authenticated committed state, or verify a legacy store
+    /// once before establishing its first authenticated restart record.
+    pub fn resume_existing(
+        path: impl AsRef<Path>,
+        config: Config,
+        verifier: &impl BlockVerifier,
+    ) -> Result<Self, String> {
+        Self::open_inner(path.as_ref(), config, verifier, false, true)
+    }
+
+    /// Explicit miner initialization may create an absent store. Existing
+    /// histories use the same authenticated resume path as resident services.
+    pub fn open_or_resume(
+        path: impl AsRef<Path>,
+        config: Config,
+        verifier: &impl BlockVerifier,
+    ) -> Result<Self, String> {
+        Self::open_inner(path.as_ref(), config, verifier, true, true)
     }
 
     fn open_inner(
@@ -75,6 +97,7 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
         create_allowed: bool,
+        resume_allowed: bool,
     ) -> Result<Self, String> {
         config.validate()?;
         let (file, created) = open_regular_file(path, create_allowed)?;
@@ -93,26 +116,83 @@ impl Store {
             initialize(&database, &config)?;
             sync_parent(path)?;
         }
-        let base = retention::load_base(&database, config.clone(), path)?;
+        let cached = resume::load(&database, path, &config)?;
+        let cached_head = cached.as_ref().map(|(state, _)| head(state));
+        let base = if resume_allowed && cached.is_some() {
+            retention::load_base_sealed(&database, config.clone(), path)?
+        } else {
+            retention::load_base(&database, config.clone(), path)?
+        };
         let storage_base = base.clone();
-        let state =
-            replay_history(&database, config, verifier, None, base).map(|(state, _)| state)?;
-        let store = Self {
+        let (replay_base, resume_cache) = if resume_allowed {
+            match cached {
+                Some((state, cache)) => {
+                    if let Some(floor) = &storage_base {
+                        resume::check_floor(&database, &state, floor)?;
+                    }
+                    (Some(state), Some(cache))
+                }
+                None => (base, None),
+            }
+        } else {
+            (base, None)
+        };
+        let audit = resume_cache.is_none();
+        let state = replay_history(&database, config, verifier, None, replay_base, audit)
+            .map(|(state, _)| state)?;
+        let mut store = Self {
             database,
             state,
             receipt_owner,
             path: path.to_owned(),
             storage_base,
             retention_clock_started: false,
+            resume_cache,
         };
         if store.has_local_reward_index()? {
             store.verify_local_rewards()?;
+            if store.resume_cache.is_none()
+                && let Some(mut cache) = resume::Context::new(path, &store.state.config)?
+            {
+                cache.collect_rewards(&store)?;
+                store.resume_cache = Some(cache);
+            }
+            if cached_head.as_ref() != Some(&head(&store.state)) {
+                store.persist_resume()?;
+            }
         }
         Ok(store)
     }
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    fn persist_resume(&mut self) -> Result<(), String> {
+        if let Some(cache) = &self.resume_cache {
+            let mut transaction = self
+                .database
+                .begin_write()
+                .map_err(|_| "restart migration write unavailable")?;
+            transaction
+                .set_durability(Durability::Immediate)
+                .map_err(|_| "restart durability unavailable")?;
+            check_metadata(
+                &transaction
+                    .open_table(META)
+                    .map_err(|_| "restart metadata unavailable")?,
+                &self.state.config,
+                &head(&self.state),
+            )?;
+            let persisted = cache.write(&transaction, &self.state, &cache.rewards)?;
+            transaction
+                .commit()
+                .map_err(|_| "restart migration commit failed")?;
+            if !persisted {
+                self.resume_cache = None;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn save_reward_receipt(
@@ -175,6 +255,13 @@ impl Store {
     /// Missing or modified local evidence is fatal rather than inferred remote.
     pub fn verify_local_rewards(&self) -> Result<u64, String> {
         self.require_local_reward_index()?;
+        if let Some(cache) = &self.resume_cache {
+            resume::check_rewards(&self.database, &cache.rewards)?;
+            for reward in cache.rewards.values() {
+                reward.validate(self)?;
+            }
+            return Ok(cache.rewards.len() as u64);
+        }
         let txn = self
             .database
             .begin_read()
@@ -610,9 +697,40 @@ impl Store {
             meta.insert("head", head(&branch.accepted).as_slice())
                 .map_err(|_| local("native head write failed"))?;
         }
+        let mut next_rewards = self
+            .resume_cache
+            .as_ref()
+            .map(|cache| cache.rewards.clone());
+        if let Some(rewards) = &mut next_rewards {
+            for reward in rewards
+                .values_mut()
+                .filter(|reward| reward.height > ancestor_height)
+            {
+                reward.canonical = branch.records.iter().any(|(height, record)| {
+                    *height == reward.height
+                        && public_record(
+                            split_record(record).expect("validated branch record").0,
+                            &self.state.config.network,
+                        )
+                        .is_ok_and(|(_, id)| id == reward.id)
+                });
+            }
+        }
+        let persisted = if let (Some(cache), Some(rewards)) = (&self.resume_cache, &next_rewards) {
+            cache
+                .write(&txn, &branch.accepted, rewards)
+                .map_err(ChainError::Local)?
+        } else {
+            false
+        };
         txn.commit()
             .map_err(|_| local("native branch commit failed"))?;
         self.state = branch.accepted;
+        if !persisted {
+            self.resume_cache = None;
+        } else if let (Some(cache), Some(rewards)) = (&mut self.resume_cache, next_rewards) {
+            cache.rewards = rewards;
+        }
         Ok(())
     }
 
@@ -732,8 +850,30 @@ impl Store {
                 .insert("head", next_head.as_slice())
                 .map_err(|_| "native head write failed")?;
         }
+        let mut next_rewards = self
+            .resume_cache
+            .as_ref()
+            .map(|cache| cache.rewards.clone());
+        if let Some(rewards) = &mut next_rewards {
+            if let Some(digest) = local_receipt {
+                let reward = resume::Context::reward(block, digest)?;
+                rewards.insert(reward.id, reward);
+            } else if let Some(reward) = rewards.get_mut(&block.id()?) {
+                reward.canonical = true;
+            }
+        }
+        let persisted = if let (Some(cache), Some(rewards)) = (&self.resume_cache, &next_rewards) {
+            cache.write(&txn, &accepted, rewards)?
+        } else {
+            false
+        };
         txn.commit().map_err(|_| "native block commit failed")?;
         self.state = accepted;
+        if !persisted {
+            self.resume_cache = None;
+        } else if let (Some(cache), Some(rewards)) = (&mut self.resume_cache, next_rewards) {
+            cache.rewards = rewards;
+        }
         Ok(())
     }
 }
@@ -837,6 +977,7 @@ pub(crate) fn read_only_history(
         verifier,
         Some((max_blocks, max_bytes)),
         None,
+        true,
     )
 }
 
@@ -846,6 +987,7 @@ fn replay_history(
     verifier: &impl BlockVerifier,
     limits: Option<(u64, usize)>,
     base: Option<State>,
+    audit_evidence: bool,
 ) -> Result<(State, Vec<Block>), String> {
     let mut retained = Vec::new();
     let mut inspected_bytes = 0usize;
@@ -875,10 +1017,11 @@ fn replay_history(
             .next()
             .is_some(),
     )?;
-    if txn
-        .list_tables()
-        .map_err(|_| "native database schema unreadable")?
-        .any(|table| table.name() == DETACHED.name())
+    if audit_evidence
+        && txn
+            .list_tables()
+            .map_err(|_| "native database schema unreadable")?
+            .any(|table| table.name() == DETACHED.name())
     {
         let detached = txn
             .open_table(DETACHED)
@@ -933,7 +1076,7 @@ fn replay_history(
         None => State::new(config)?,
     };
     for row in blocks
-        .iter()
+        .range(state.height.saturating_add(1)..)
         .map_err(|_| "native block iteration unavailable")?
     {
         let (key, value) = row.map_err(|_| "native block record unreadable")?;
@@ -1034,6 +1177,7 @@ fn validate_tables(
     let indexed = names.remove(LOCAL_REWARDS.name());
     names.remove(DETACHED.name());
     names.remove(engineering_checkpoint::ATTESTATIONS.name());
+    names.remove(resume::RESUME.name());
     let protected = names.remove(protected_history::PROTECTED.name());
     let storage = names.remove(retention::STORAGE.name());
     let finality = names.remove(retention::FINALITY.name());

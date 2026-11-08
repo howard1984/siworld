@@ -1302,3 +1302,88 @@ fn fresh_peer_downloads_checkpoint_prefix_and_verified_tail_over_authenticated_p
             <= receipt["completed_unix_seconds"].as_u64().unwrap()
     );
 }
+
+fn admit_fixture(provider: &mut Endpoint, fixture: &Endpoint) {
+    let descriptor = fixture.driver.identity.descriptor().unwrap();
+    let public = json!({"version":1,"fingerprint":local::hex(&descriptor.fingerprint()),
+        "descriptor":local::hex(&descriptor.encode())});
+    let public_file = fixture.directory.0.join("fixture-public.json");
+    atomic_json(&public_file, &public).unwrap();
+    let run = "a".repeat(64);
+    atomic_json(
+        &provider.directory.0.join(STATUS_FILE),
+        &json!({"run_id":run,"phase":"networking","updated_unix_ms":wall_ms().unwrap()}),
+    )
+    .unwrap();
+    super::super::fixture_control::request_fixture_admission(
+        &provider.directory.0,
+        &run,
+        "checkpoint-test",
+        &public_file,
+        public["fingerprint"].as_str().unwrap(),
+    )
+    .unwrap();
+    // The test coordinator has the same public roster, without authority keys.
+    let second = Directory::new();
+    let binding = p2p::Binding::new(&configuration());
+    let a = crate::identity::checkpoint_authority::Authority::initialize(
+        &provider.directory.0,
+        binding,
+    )
+    .unwrap();
+    let b =
+        crate::identity::checkpoint_authority::Authority::initialize(&second.0, binding).unwrap();
+    let roster =
+        crate::engineering_checkpoint::Roster::new(binding, [a.public_key(), b.public_key()])
+            .unwrap();
+    provider.driver.checkpoints = Some(
+        crate::checkpoint_service::Coordinator::for_test(&provider.directory.0, roster).unwrap(),
+    );
+    provider
+        .driver
+        .poll_fixture_admission(&provider.directory.0, &run, binding);
+    assert!(provider.driver.fixture.is_some());
+    assert!(provider.driver.peers.is_empty());
+    assert_eq!(provider.driver.scheduler.status().configured, 1);
+}
+
+#[test]
+fn live_fixture_admission_authenticates_without_dial_or_peer_file_change() {
+    let mut provider = Endpoint::new();
+    let mut fixture = Endpoint::new();
+    fixture.follow(&provider);
+    fixture.driver.listener = None;
+    admit_fixture(&mut provider, &fixture);
+    provider.append(81);
+    until(&mut provider, &mut fixture, |a, b| {
+        a.driver.scheduler.status().established == 1 && b.state().height == a.state().height
+    });
+    assert_eq!(
+        provider.state().fingerprint(),
+        fixture.state().fingerprint()
+    );
+    assert!(!fixture.driver.status(false)["mining"].as_bool().unwrap());
+    assert!(!provider.directory.0.join("fixture-peers.json").exists());
+    assert_eq!(
+        provider
+            .driver
+            .workers
+            .values()
+            .filter(|w| w.token.is_some())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn live_fixture_admission_rejects_mining_hello_before_owner_authentication() {
+    let mut provider = Endpoint::new();
+    let mut fixture = Endpoint::new();
+    fixture.follow(&provider);
+    fixture.driver.listener = None;
+    fixture.driver.role = Role::Miner;
+    admit_fixture(&mut provider, &fixture);
+    until(&mut provider, &mut fixture, |a, _| a.driver.failures > 0);
+    assert_eq!(provider.driver.connections, 0);
+    assert_eq!(provider.driver.scheduler.status().established, 0);
+}

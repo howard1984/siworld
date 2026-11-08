@@ -91,6 +91,24 @@ pub(super) fn load_base(
     config: Config,
     path: &Path,
 ) -> Result<Option<State>, String> {
+    load_base_inner(database, config, path, true)
+}
+/// Services already authenticated their committed state. Authenticate the
+/// independently sealed expiry floor without rereading historical proof rows.
+/// Explicit audits retain full prefix and protected-record verification.
+pub(super) fn load_base_sealed(
+    database: &impl ReadableDatabase,
+    config: Config,
+    path: &Path,
+) -> Result<Option<State>, String> {
+    load_base_inner(database, config, path, false)
+}
+fn load_base_inner(
+    database: &impl ReadableDatabase,
+    config: Config,
+    path: &Path,
+    verify_prefix: bool,
+) -> Result<Option<State>, String> {
     if !is_enabled(database)? {
         return Ok(None);
     }
@@ -118,6 +136,9 @@ pub(super) fn load_base(
         .verify_local_storage(blake3::derive_key(DOMAIN, &message), &seal)
         .map_err(|_| "local storage checkpoint seal mismatch")?;
     let base = checkpoint::decode_sealed(&bytes, config.clone())?;
+    if !verify_prefix {
+        return Ok(Some(base));
+    }
     let blocks = txn
         .open_table(BLOCKS)
         .map_err(|_| "storage canonical table unavailable")?;
@@ -1039,6 +1060,7 @@ impl Store {
             verifier,
             None,
             base,
+            true,
         )?
         .0;
         if checked.fingerprint() != before {

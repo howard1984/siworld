@@ -5,6 +5,9 @@ use serde_json::{Value, json};
 impl Store {
     pub fn miner_reward_view(&self) -> Result<Value, String> {
         self.require_local_reward_index()?;
+        if let Some(cache) = &self.resume_cache {
+            return self.cached_miner_reward_view(cache);
+        }
         let transaction = self
             .database
             .begin_read()
@@ -77,6 +80,60 @@ impl Store {
             accepted = accepted
                 .checked_add(1)
                 .ok_or("reward display count overflow")?;
+        }
+        Ok(
+            json!({"accepted_blocks":accepted,"detached_blocks":detached,
+            "mature_earned_atoms":mature.to_string(),"pending_atoms":pending.to_string(),
+            "long_locked_atoms":locked.to_string(),"next_unlock_height":unlocks.keys().next(),
+            "scope":"local-produced-main-chain-cumulative-earned-not-wallet-balance"}),
+        )
+    }
+
+    fn cached_miner_reward_view(&self, cache: &resume::Context) -> Result<Value, String> {
+        resume::check_rewards(&self.database, &cache.rewards)?;
+        let mut accepted = 0u64;
+        let mut detached = 0u64;
+        let mut mature = 0u128;
+        let mut pending = 0u128;
+        let mut locked = 0u128;
+        let mut unlocks = std::collections::BTreeMap::<u64, u128>::new();
+        for reward in cache.rewards.values() {
+            if !reward.canonical {
+                detached += 1;
+                continue;
+            }
+            let receipt = self.receipt_owner.read(&reward.id)?;
+            if local_receipt_digest(&reward.id, &receipt) != reward.digest {
+                return Err("reward display receipt changed".into());
+            }
+            for (index, (amount, unlock)) in crate::producer::reward_material_amounts(
+                self.state.config.network,
+                reward.height,
+                reward.mode,
+                &reward.records,
+                &receipt,
+            )?
+            .into_iter()
+            .enumerate()
+            {
+                let target = if self.state.height >= unlock {
+                    &mut mature
+                } else if index == 0 {
+                    &mut pending
+                } else {
+                    &mut locked
+                };
+                *target = target
+                    .checked_add(u128::from(amount))
+                    .ok_or("reward display amount overflow")?;
+                if self.state.height < unlock {
+                    let entry = unlocks.entry(unlock).or_default();
+                    *entry = entry
+                        .checked_add(u128::from(amount))
+                        .ok_or("reward display lock overflow")?;
+                }
+            }
+            accepted += 1;
         }
         Ok(
             json!({"accepted_blocks":accepted,"detached_blocks":detached,

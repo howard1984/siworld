@@ -55,6 +55,33 @@ def compile_guard(command, **kwargs):
 
 
 class NativeRuntimeReleaseTests(unittest.TestCase):
+    def test_restart_qualification_worker_is_guarded_and_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worker = worker_at(directory)
+            qualifier = worker_at(directory, name='siworld-restart-qualify', data=ELF + b'qualify')
+            receipt = {**receipt_for(worker), 'restart_qualify_sha256': RELEASE.digest(qualifier)}
+            output = Path(directory) / 'release'
+            with patch.object(RELEASE, 'inspect_proof', return_value=inspection_for(worker)), \
+                 patch.object(NATIVE.subprocess, 'run', side_effect=compile_guard):
+                NATIVE.package(worker, output, receipt, RELEASE)
+            self.assertEqual((output / 'bin/siworld-restart-qualify').read_bytes(), GUARD)
+            self.assertEqual((output / 'libexec/siworld-restart-qualify').read_bytes(), qualifier.read_bytes())
+            saved = json.loads((output / 'build-receipt.json').read_text())
+            self.assertEqual(saved['worker_build_receipt']['restart_qualify_sha256'],
+                             RELEASE.digest(output / 'libexec/siworld-restart-qualify'))
+
+    def test_changed_restart_qualification_worker_prevents_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worker = worker_at(directory)
+            worker_at(directory, name='siworld-restart-qualify')
+            receipt = {**receipt_for(worker), 'restart_qualify_sha256': '0' * 64}
+            output = Path(directory) / 'release'
+            with patch.object(RELEASE, 'inspect_proof', return_value=inspection_for(worker)), \
+                 patch.object(NATIVE.subprocess, 'run', side_effect=compile_guard), \
+                 self.assertRaisesRegex(ValueError, 'qualification worker digest mismatch'):
+                NATIVE.package(worker, output, receipt, RELEASE)
+            self.assertFalse(output.exists())
+
     def test_checkpoint_key_worker_is_guarded_and_bound_to_its_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             worker = worker_at(directory)

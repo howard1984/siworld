@@ -319,23 +319,39 @@ fn prepare_rewards(
 /// Authenticate each local encryption receipt against its ordered block reward.
 /// Spending keys remain in the seed-backed wallet, never in these receipts.
 pub fn validate_reward_secret(block: &Block, secret: &[u8]) -> Result<(), String> {
-    let count = match block.reward_mode {
+    validate_reward_material(
+        block.network,
+        block.height,
+        block.reward_mode,
+        &block.rewards,
+        secret,
+    )
+}
+
+pub(crate) fn validate_reward_material(
+    network: crate::wire::Hash,
+    height: u64,
+    mode: RewardMode,
+    rewards: &[RewardRecord],
+    secret: &[u8],
+) -> Result<(), String> {
+    let count = match mode {
         RewardMode::Voyager => 1,
         RewardMode::Holder => 5,
     };
-    if block.rewards.len() != count
+    if rewards.len() != count
         || secret.len() != 48 + count * REWARD_ENTRY_BYTES
         || &secret[..4] != REWARD_SECRET_MAGIC
         || secret[4..6] != REWARD_SECRET_VERSION.to_le_bytes()
-        || secret[6..38] != block.network
-        || secret[38..46] != block.height.to_le_bytes()
-        || secret[46] != block.reward_mode.to_byte()
+        || secret[6..38] != network
+        || secret[38..46] != height.to_le_bytes()
+        || secret[46] != mode.to_byte()
         || usize::from(secret[47]) != count
     {
         return Err("local reward recovery record binding mismatch".into());
     }
     let h = Hasher::new();
-    for (index, record) in block.rewards.iter().enumerate() {
+    for (index, record) in rewards.iter().enumerate() {
         let entry = &secret[48 + index * REWARD_ENTRY_BYTES..48 + (index + 1) * REWARD_ENTRY_BYTES];
         if entry[..48] != record.commitment {
             return Err("reward receipt commitment mismatch".into());
@@ -363,14 +379,14 @@ pub fn validate_reward_secret(block: &Block, secret: &[u8]) -> Result<(), String
                 &address,
                 &commitment,
                 &decode_payment(&record.ciphertext),
-                &EncryptionContext::new(block.network),
+                &EncryptionContext::new(network),
             )
             .map_err(|_| "reward recovery authentication failed")?;
         if note.owner != owner
             || note.rseed != rseed
             || note.asset_id != SIP_ASSET_ID
-            || note.rho != h.reward_rho(block.height, index)
-            || note.unlock_height < block.height
+            || note.rho != h.reward_rho(height, index)
+            || note.unlock_height < height
         {
             return Err("reward recovery note mismatch".into());
         }
@@ -381,9 +397,24 @@ pub fn validate_reward_secret(block: &Block, secret: &[u8]) -> Result<(), String
 /// Private presentation only. Authenticate the complete existing receipt before
 /// extracting earned amounts; this does not define or change reward rules.
 pub(crate) fn reward_note_amounts(block: &Block, secret: &[u8]) -> Result<Vec<(u64, u64)>, String> {
-    validate_reward_secret(block, secret)?;
-    block
-        .rewards
+    reward_material_amounts(
+        block.network,
+        block.height,
+        block.reward_mode,
+        &block.rewards,
+        secret,
+    )
+}
+
+pub(crate) fn reward_material_amounts(
+    network: crate::wire::Hash,
+    height: u64,
+    mode: RewardMode,
+    rewards: &[RewardRecord],
+    secret: &[u8],
+) -> Result<Vec<(u64, u64)>, String> {
+    validate_reward_material(network, height, mode, rewards, secret)?;
+    rewards
         .iter()
         .enumerate()
         .map(|(index, record)| {
@@ -402,7 +433,7 @@ pub(crate) fn reward_note_amounts(block: &Block, secret: &[u8]) -> Result<Vec<(u
                     &address,
                     &decode_digest(&record.commitment).map_err(|_| "invalid reward commitment")?,
                     &decode_payment(&record.ciphertext),
-                    &EncryptionContext::new(block.network),
+                    &EncryptionContext::new(network),
                 )
                 .map_err(|_| "reward display authentication failed")?;
             Ok((note.value, note.unlock_height))

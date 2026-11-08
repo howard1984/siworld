@@ -362,6 +362,7 @@ struct Driver {
     identity: Arc<NativeIdentity>,
     local: Hash,
     peers: Arc<BTreeMap<Hash, Peer>>,
+    fixture: Option<super::fixture_control::FixtureAdmission>,
     budget: Budget,
     scheduler: Scheduler,
     started: Instant,
@@ -413,6 +414,7 @@ impl Driver {
             identity,
             local,
             peers: config.peers,
+            fixture: None,
             budget,
             scheduler,
             started: Instant::now(),
@@ -431,6 +433,25 @@ impl Driver {
             checkpoints: None,
             _configuration: configuration,
         })
+    }
+    fn poll_fixture_admission(&mut self, directory: &Path, run_id: &str, binding: p2p::Binding) {
+        let now = self.now();
+        let eligible =
+            self.listener.is_some() && self.role == Role::Validator && self.checkpoints.is_some();
+        let scheduler = &mut self.scheduler;
+        super::fixture_control::poll(
+            directory,
+            run_id,
+            binding,
+            self.local,
+            eligible,
+            &mut self.fixture,
+            |expected| {
+                scheduler
+                    .admit_fixture(expected.fingerprint(), now)
+                    .map_err(|_| "fixture scheduler admission rejected".into())
+            },
+        );
     }
     fn has_synced_peer(&self) -> bool {
         self.workers.values().any(|w| {
@@ -482,6 +503,7 @@ impl Driver {
         let cancellation = cancel.clone();
         let identity = self.identity.clone();
         let peers = self.peers.clone();
+        let fixture = self.fixture.clone();
         let budget = self.budget.clone();
         let tx = self.tx.clone();
         let local = self.local;
@@ -499,6 +521,7 @@ impl Driver {
                     local,
                     identity,
                     peers,
+                    fixture,
                     role,
                     budget,
                     tx,
@@ -594,7 +617,9 @@ impl Driver {
         let outbound_only = self.listener.is_none();
         let ready: Vec<_> = ready
             .into_iter()
-            .filter(|peer| self.peers[peer].dial && (outbound_only || local < *peer))
+            .filter(|peer| {
+                self.peers.get(peer).is_some_and(|p| p.dial) && (outbound_only || local < *peer)
+            })
             .collect();
         for peer in ready {
             if self.workers.len() >= MAX_WORKERS {
@@ -619,7 +644,11 @@ impl Driver {
         let worker = self.workers.get(&id).ok_or_else(unavailable)?;
         if worker.cancel.is_cancelled()
             || worker.join.is_finished()
-            || !self.peers.contains_key(&peer)
+            || !(self.peers.contains_key(&peer)
+                || self
+                    .fixture
+                    .as_ref()
+                    .is_some_and(|f| f.expected(peer).is_some()))
         {
             return Err(unavailable());
         }
@@ -982,6 +1011,7 @@ fn connection(
     local: Hash,
     identity: Arc<NativeIdentity>,
     peers: Arc<BTreeMap<Hash, Peer>>,
+    fixture: Option<super::fixture_control::FixtureAdmission>,
     role: Role,
     budget: Budget,
     tx: SyncSender<ChargedCommand>,
@@ -1019,7 +1049,11 @@ fn connection(
         }
         route[4..].try_into().expect("fixed route hint")
     };
-    let expected = peers.get(&peer).ok_or_else(invalid)?.expected.clone();
+    let expected = peers
+        .get(&peer)
+        .map(|p| p.expected.clone())
+        .or_else(|| fixture.as_ref().and_then(|f| f.expected(peer)))
+        .ok_or_else(invalid)?;
     let admission = AdmissionContext::new_started(
         expected,
         if initiator {
@@ -1032,6 +1066,13 @@ fn connection(
     );
     let mut auth = p2p::NativeTlsAuthenticator::new(identity, budget.clone());
     let mut session = p2p::establish_socket(socket, &mut auth, &admission, role, budget.clone())?;
+    if !peers.contains_key(&peer)
+        && !fixture
+            .as_ref()
+            .is_some_and(|f| f.permits_role(peer, session.role()))
+    {
+        return Err(invalid());
+    }
     call(&tx, &budget, &cancel, |reply| Command::Authenticated {
         id,
         peer,
@@ -1720,7 +1761,7 @@ pub(super) fn continuous(
     let mining = config.mining;
     let chain = local::load(directory)?;
     let verifier = NativeVerifier::new()?;
-    let mut store = Store::open_existing(directory.join("chain.redb"), chain.clone(), &verifier)?;
+    let mut store = Store::resume_existing(directory.join("chain.redb"), chain.clone(), &verifier)?;
     super::configure_storage_startup(&mut store)?;
     store.require_local_reward_index()?;
     store.verify_local_rewards()?;
@@ -1773,6 +1814,7 @@ pub(super) fn continuous(
             }
             driver.poll()?;
             if checkpoint_poll.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                driver.poll_fixture_admission(directory, &control.identity.run_id, node.binding());
                 super::checkpoint_control::poll_signing(
                     directory,
                     &control.identity.run_id,
@@ -2000,7 +2042,7 @@ pub(super) fn continuous(
     );
     drop(node);
     let replayed =
-        Store::open_existing(directory.join("chain.redb"), chain, &NativeVerifier::new()?)?;
+        Store::resume_existing(directory.join("chain.redb"), chain, &NativeVerifier::new()?)?;
     replayed.require_local_reward_index()?;
     replayed.verify_local_rewards()?;
     let actual = (

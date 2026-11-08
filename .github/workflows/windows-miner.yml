@@ -105,7 +105,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Synthetic native transport, custody and reward regressions
         run: |
-          foreach ($filter in @('service::network::tests', 'store::local_reward_tests', 'wallet_vault::tests', 'producer::tests::every_reward_is_seed_recoverable_with_unique_indexed_nullifiers')) {
+          foreach ($filter in @('service::network::tests', 'store::tests', 'store::checkpoint_bootstrap::tests', 'store::local_reward_tests', 'wallet_vault::tests', 'producer::tests::every_reward_is_seed_recoverable_with_unique_indexed_nullifiers')) {
             cargo test --release --locked --target x86_64-pc-windows-msvc --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib $filter
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }

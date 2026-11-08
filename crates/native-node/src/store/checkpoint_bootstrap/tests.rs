@@ -140,6 +140,218 @@ fn fixture_session(directory: &Directory) -> CheckpointBootstrap {
     )
     .unwrap()
 }
+
+#[test]
+fn legacy_restart_qualification_uses_quorum_prefix_and_exact_verified_tail() {
+    let history = history();
+    let node = Directory::new();
+    let path = node.0.join("chain.redb");
+    let mut store = Store::open(
+        &path,
+        history.config.clone(),
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    for block in &history.full {
+        store.append(block, &crate::fixtures::TestVerifier).unwrap();
+    }
+    drop(store);
+    NativeIdentity::initialize(&node.0, Binding::new(&history.config)).unwrap();
+    let result = Store::qualify_restart_existing(
+        &path,
+        history.config.clone(),
+        history.certificate.clone(),
+        roster(&history.config),
+        21_600,
+        &node.0.join("qualification-stage.redb"),
+        |height| Ok(history.permanent[(height - 1) as usize].clone()),
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    assert_eq!(result["checkpoint_height"], 72);
+    assert_eq!(result["verified_tail_blocks"], 24);
+    assert_eq!(result["height"], 96);
+    assert_eq!(result["restart_cache_verified"], true);
+    assert_eq!(result["tip"], crate::local::hex(&history.final_state.tip));
+    assert_eq!(
+        result["cumulative_work"],
+        crate::local::hex(&history.final_state.cumulative_work.to_big_endian())
+    );
+    struct Reject;
+    impl crate::state::BlockVerifier for Reject {
+        fn transaction(
+            &self,
+            _: &native::codec::PublicTransaction,
+            _: &native::codec::ProofContext,
+            _: &native::multi_asset::Digest,
+            _: &native::multi_asset::Digest,
+            _: &[u8],
+        ) -> Result<(), String> {
+            Err("proof verification must not repeat".into())
+        }
+        fn settlement(
+            &self,
+            _: &[native::multi_asset::Digest],
+            _: &native::settlement::RewardPlan,
+            _: Hash,
+            _: Hash,
+            _: &[native::multi_asset::Digest],
+            _: &[u8],
+        ) -> Result<(), String> {
+            Err("proof verification must not repeat".into())
+        }
+    }
+    let resumed = Store::resume_existing(&path, history.config.clone(), &Reject).unwrap();
+    assert_eq!(
+        resumed.state().fingerprint(),
+        history.final_state.fingerprint()
+    );
+    assert!(!node.0.join("qualification-stage.redb").exists());
+}
+
+#[test]
+fn legacy_restart_qualification_rejects_unmatched_head_without_sealing_it() {
+    let history = history();
+    let node = Directory::new();
+    let path = node.0.join("chain.redb");
+    let mut store = Store::open(
+        &path,
+        history.config.clone(),
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    for block in &history.full {
+        store.append(block, &crate::fixtures::TestVerifier).unwrap();
+    }
+    drop(store);
+    NativeIdentity::initialize(&node.0, Binding::new(&history.config)).unwrap();
+    let database = Database::open(&path).unwrap();
+    let transaction = database.begin_write().unwrap();
+    let mut saved = head(&history.final_state);
+    saved[40] ^= 1;
+    transaction
+        .open_table(META)
+        .unwrap()
+        .insert("head", saved.as_slice())
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(database);
+    assert!(
+        Store::qualify_restart_existing(
+            &path,
+            history.config.clone(),
+            history.certificate.clone(),
+            roster(&history.config),
+            21_600,
+            &node.0.join("qualification-stage.redb"),
+            |height| Ok(history.permanent[(height - 1) as usize].clone()),
+            &crate::fixtures::TestVerifier
+        )
+        .is_err()
+    );
+    let database = Database::open(&path).unwrap();
+    assert!(
+        !database
+            .begin_read()
+            .unwrap()
+            .list_tables()
+            .unwrap()
+            .any(|table| table.name() == resume::RESUME.name())
+    );
+}
+
+#[test]
+fn legacy_restart_qualification_failures_preserve_history_and_leave_no_cache() {
+    let history = history();
+    let node = Directory::new();
+    let path = node.0.join("chain.redb");
+    let mut store = Store::open(
+        &path,
+        history.config.clone(),
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    for block in &history.full {
+        store.append(block, &crate::fixtures::TestVerifier).unwrap();
+    }
+    let before = recovery_snapshot(&store);
+    drop(store);
+    NativeIdentity::initialize(&node.0, Binding::new(&history.config)).unwrap();
+    let stage = node.0.join("qualification-stage.redb");
+    for kind in 0..5 {
+        let mut certificate = history.certificate.clone();
+        let mut now = 21_600;
+        if kind == 0 {
+            certificate.votes.truncate(1);
+        } else if kind == 1 {
+            certificate.votes[0].signer = 2;
+        } else if kind == 2 {
+            now += crate::storage_policy::CHECKPOINT_MAX_AGE_SECONDS + 1;
+        }
+        let result = Store::qualify_restart_existing(
+            &path,
+            history.config.clone(),
+            certificate,
+            roster(&history.config),
+            now,
+            &stage,
+            |height| {
+                if kind == 3 && height == 2 {
+                    return Ok(history.permanent[2].clone());
+                }
+                Ok(history.permanent[(height - 1) as usize].clone())
+            },
+            &QualificationVerifier { reject: kind == 4 },
+        );
+        assert!(result.is_err(), "qualification rejection case {kind}");
+        assert!(!stage.exists());
+        // Inspect logical rows directly: an independent replay here would hide
+        // accidental migration writes by creating a fresh restart record.
+        let database = Database::open(&path).unwrap();
+        let (file, _) = open_regular_file(&path, false).unwrap();
+        let inspected = Store {
+            database,
+            state: history.final_state.clone(),
+            receipt_owner: receipts::Owner::bind(&path, &file).unwrap(),
+            path: path.clone(),
+            storage_base: None,
+            retention_clock_started: false,
+            resume_cache: None,
+        };
+        assert_eq!(recovery_snapshot(&inspected), before);
+    }
+}
+
+struct QualificationVerifier {
+    reject: bool,
+}
+impl crate::state::BlockVerifier for QualificationVerifier {
+    fn transaction(
+        &self,
+        transaction: &native::codec::PublicTransaction,
+        context: &native::codec::ProofContext,
+        first: &native::multi_asset::Digest,
+        second: &native::multi_asset::Digest,
+        proof: &[u8],
+    ) -> Result<(), String> {
+        if self.reject {
+            return Err("qualification tail rejected".into());
+        }
+        crate::fixtures::TestVerifier.transaction(transaction, context, first, second, proof)
+    }
+    fn settlement(
+        &self,
+        transactions: &[native::multi_asset::Digest],
+        plan: &native::settlement::RewardPlan,
+        first: Hash,
+        second: Hash,
+        roots: &[native::multi_asset::Digest],
+        proof: &[u8],
+    ) -> Result<(), String> {
+        crate::fixtures::TestVerifier.settlement(transactions, plan, first, second, roots, proof)
+    }
+}
+
 #[test]
 fn fresh_reconstruction_tail_and_atomic_adoption_reopen_match_full_verification() {
     let history = history();

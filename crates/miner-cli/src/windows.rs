@@ -233,7 +233,7 @@ fn initialize(root: &Path, bundle_path: &Path) -> Result<PathBuf, String> {
         &network.join("peers.json"),
         &json!({"version":1,"engineering":true,"listen":null,"mining":true,"peers":peers}),
     )?;
-    let mut store = Store::open(
+    let mut store = Store::open_or_resume(
         network.join("chain.redb"),
         local::load(&network)?,
         &NativeVerifier::new()?,

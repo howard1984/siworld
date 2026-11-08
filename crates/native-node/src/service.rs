@@ -25,6 +25,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "native-p2p")]
 mod checkpoint_control;
 #[cfg(feature = "native-p2p")]
+mod fixture_control;
+#[cfg(feature = "native-p2p")]
+pub use fixture_control::request_fixture_admission;
+#[cfg(feature = "native-p2p")]
 pub mod network;
 #[cfg(feature = "native-p2p")]
 pub use checkpoint_control::{request_checkpoint_qualification, request_checkpoint_signing};
@@ -860,7 +864,8 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
     }
     let verifier = NativeVerifier::new()?;
     control.phase("replaying")?;
-    let mut store = Store::open_existing(directory.join("chain.redb"), config.clone(), &verifier)?;
+    let mut store =
+        Store::resume_existing(directory.join("chain.redb"), config.clone(), &verifier)?;
     configure_storage_startup(&mut store)?;
     verify_rewards(directory, &store, control)?;
     let mut node = crate::runtime::Node::new(store, NativeVerifier::new()?);
@@ -982,8 +987,9 @@ fn continuous(directory: &Path, control: &Control) -> Result<(), String> {
         node.state().cumulative_work,
     );
     drop(node);
-    // Graceful stop requires a full independent replay and every reward receipt.
-    let replayed = Store::open_existing(directory.join("chain.redb"), config, &verifier)?;
+    // Check the durable commit and every receipt without repeating historical
+    // proofs. The explicit offline check retains independent proof auditing.
+    let replayed = Store::resume_existing(directory.join("chain.redb"), config, &verifier)?;
     verify_rewards(directory, &replayed, control)?;
     let actual = (
         replayed.state().height,

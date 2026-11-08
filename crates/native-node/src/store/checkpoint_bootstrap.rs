@@ -255,6 +255,22 @@ impl CheckpointBootstrap {
             self.downloaded,
         )
     }
+    /// Measure the authenticated prefix representation without adopting it or
+    /// treating the incomplete proof tail as a usable node state.
+    pub fn verified_prefix_metrics(&self) -> Result<serde_json::Value, String> {
+        let state = self
+            .checkpoint_state
+            .as_ref()
+            .filter(|_| !self.failed)
+            .ok_or("checkpoint prefix has not been authenticated")?;
+        let start = std::time::Instant::now();
+        let bytes = checkpoint::encode(state)?;
+        Ok(
+            serde_json::json!({"height":state.height,"state_bytes":bytes.len(),
+            "state_encode_ms":start.elapsed().as_millis(),"prefix_bytes":self.downloaded,
+            "state_fingerprint":crate::local::hex(&state.fingerprint()),"tail_verified":false}),
+        )
+    }
     /// Staged progress only; this state has no adoption capability until finish.
     #[cfg(feature = "native-p2p")]
     pub(crate) fn staged_state(&self) -> &State {
@@ -307,6 +323,196 @@ impl VerifiedBootstrap {
 }
 
 impl Store {
+    /// Qualify an existing legacy store without replaying proofs covered by a
+    /// pinned checkpoint quorum. The public prefix is reconstructed and its
+    /// complete signed summary checked; every checkpoint-to-head proof is
+    /// verified. The resulting state must exactly match the existing committed
+    /// head. Canonical history, proof retention and rewards are not rewritten.
+    /// The caller must hold the exclusive service lease for this directory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qualify_restart_existing(
+        path: &Path,
+        config: Config,
+        certificate: Certificate,
+        roster: Roster,
+        now: u64,
+        staging_path: &Path,
+        mut permanent: impl FnMut(u64) -> Result<Vec<u8>, String>,
+        verifier: &impl BlockVerifier,
+    ) -> Result<serde_json::Value, String> {
+        config.validate()?;
+        let (file, _) = open_regular_file(path, false)?;
+        let receipt_owner = receipts::Owner::bind(path, &file)?;
+        let mut builder = Database::builder();
+        builder.set_cache_size(32 * 1024 * 1024);
+        builder.set_repair_callback(|session| session.abort());
+        let database = builder
+            .create_with_backend(
+                redb::backends::FileBackend::new(file)
+                    .map_err(|_| "restart qualification backend unavailable")?,
+            )
+            .map_err(|_| "restart qualification database is active or damaged")?;
+        let context = resume::Context::new(path, &config)?
+            .ok_or("restart qualification requires existing persistent identity")?;
+        if resume::load(&database, path, &config)?.is_some() {
+            return Err("store already has an authenticated restart record".into());
+        }
+        let mut store = Self {
+            database,
+            state: State::new(config.clone())?,
+            receipt_owner,
+            path: path.to_owned(),
+            storage_base: None,
+            retention_clock_started: false,
+            resume_cache: None,
+        };
+        let previous = store.checkpoint_cursor()?;
+        let mut session = CheckpointBootstrap::begin(
+            staging_path,
+            config.clone(),
+            certificate.clone(),
+            roster,
+            previous,
+            now,
+            Work::zero(),
+            BootstrapLimits::default(),
+        )?;
+        let transaction = store
+            .database
+            .begin_read()
+            .map_err(|_| "restart qualification read unavailable")?;
+        let indexed = validate_tables(
+            transaction
+                .list_tables()
+                .map_err(|_| "restart schema unreadable")?,
+            transaction
+                .list_multimap_tables()
+                .map_err(|_| "restart schema unreadable")?
+                .next()
+                .is_some(),
+        )?;
+        if !indexed {
+            return Err("restart qualification requires indexed local rewards".into());
+        }
+        let meta = transaction
+            .open_table(META)
+            .map_err(|_| "restart metadata unavailable")?;
+        check_index_marker(&meta, indexed)?;
+        if meta
+            .get("config")
+            .map_err(|_| "restart configuration unavailable")?
+            .ok_or("restart configuration missing")?
+            .value()
+            != configuration(&config)
+        {
+            return Err("restart qualification configuration mismatch".into());
+        }
+        let saved = meta
+            .get("head")
+            .map_err(|_| "restart committed head unavailable")?
+            .ok_or("restart committed head missing")?;
+        let saved: [u8; HEAD_BYTES] = saved
+            .value()
+            .try_into()
+            .map_err(|_| "restart committed head invalid")?;
+        let height = u64::from_le_bytes(saved[..8].try_into().expect("bounded height"));
+        let checkpoint_height = certificate.statement.height;
+        if height > BootstrapLimits::default().max_height
+            || height < checkpoint_height.saturating_add(CONFIRMATIONS)
+        {
+            return Err("restart qualification head is outside checkpoint tail limits".into());
+        }
+        let blocks = transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "restart history unavailable")?;
+        if blocks
+            .len()
+            .map_err(|_| "restart history count unavailable")?
+            != height
+        {
+            return Err("restart history count differs from committed head".into());
+        }
+        for next in 1..=checkpoint_height {
+            session.push_permanent(&permanent(next)?)?;
+        }
+        for next in checkpoint_height + 1..=height {
+            let row = blocks
+                .get(next)
+                .map_err(|_| "restart tail unreadable")?
+                .ok_or("restart tail missing")?;
+            let (bytes, fingerprint) = split_record(row.value())?;
+            let block = Block::decode(bytes, &config.network)?;
+            session.push_tail(&block, verifier)?;
+            if session.state.fingerprint().as_slice() != fingerprint {
+                return Err("restart qualification tail fingerprint mismatch".into());
+            }
+        }
+        let bootstrap = session.finish()?;
+        if head(&bootstrap.state) != saved {
+            return Err("restart qualification differs from exact committed head".into());
+        }
+        // Independently bind the anchor to the local row, not an export cursor.
+        let row = blocks
+            .get(height)
+            .map_err(|_| "restart head anchor unavailable")?
+            .ok_or("restart head anchor missing")?;
+        if public_record(split_record(row.value())?.0, &config.network)?.1 != bootstrap.state.tip {
+            return Err("restart qualification local head identity mismatch".into());
+        }
+        store.state = bootstrap.state.clone();
+        let mut context = context;
+        let source = bootstrap
+            .staging
+            .database()
+            .begin_read()
+            .map_err(|_| "restart verified prefix unavailable")?;
+        let staged = source
+            .open_table(STAGED)
+            .map_err(|_| "restart verified records unavailable")?;
+        context.collect_rewards_from(&store, &staged)?;
+        store.resume_cache = Some(context);
+        // persist_resume checks the exact head again in the immediate write.
+        store.persist_resume()?;
+        if store.resume_cache.is_none() {
+            return Err("qualified state exceeds optional restart capacity".into());
+        }
+        let (sealed_state, sealed_context) = resume::load(&store.database, path, &config)?
+            .ok_or("qualified restart record missing after commit")?;
+        if head(&sealed_state) != head(&store.state) {
+            return Err("qualified restart record changed after commit".into());
+        }
+        for reward in sealed_context.rewards.values() {
+            reward.validate(&store)?;
+        }
+        let cache_read = store
+            .database
+            .begin_read()
+            .map_err(|_| "restart metrics unavailable")?;
+        let cache_table = cache_read
+            .open_table(resume::RESUME)
+            .map_err(|_| "restart metrics unavailable")?;
+        let state_bytes = cache_table
+            .get("state")
+            .map_err(|_| "restart metrics unavailable")?
+            .ok_or("restart state missing")?
+            .value()
+            .len();
+        let reward_bytes = cache_table
+            .get("rewards")
+            .map_err(|_| "restart metrics unavailable")?
+            .ok_or("restart rewards missing")?
+            .value()
+            .len();
+        Ok(
+            serde_json::json!({"schema":1,"height":height,"checkpoint_height":checkpoint_height,
+            "verified_tail_blocks":height-checkpoint_height,"local_reward_witnesses":store.resume_cache.as_ref().expect("qualified cache").rewards.len(),
+            "state_fingerprint":crate::local::hex(&store.state.fingerprint()),"canonical_history_rewritten":false,
+            "tip":crate::local::hex(&store.state.tip),"cumulative_work":crate::local::hex(&store.state.cumulative_work.to_big_endian()),
+            "restart_cache_verified":true,
+            "restart_state_bytes":state_bytes,"restart_reward_bytes":reward_bytes}),
+        )
+    }
+
     /// Atomically adopt a fresh or genuinely stale local node. A running node
     /// never uses a checkpoint to overwrite a divergent locally verified state.
     /// Existing local reward ownership and all permanent records remain intact.
@@ -547,10 +753,36 @@ impl Store {
             .map_err(|_| "checkpoint head unavailable")?
             .insert("head", head(&bootstrap.state).as_slice())
             .map_err(|_| "checkpoint head write failed")?;
+        let mut next_rewards = self
+            .resume_cache
+            .as_ref()
+            .map(|cache| cache.rewards.clone());
+        if let Some(rewards) = &mut next_rewards {
+            for reward in rewards.values_mut() {
+                reward.canonical = staged
+                    .get(reward.height)
+                    .map_err(|_| "checkpoint restart reward unavailable")?
+                    .map(|row| {
+                        public_record(split_record(row.value())?.0, &self.state.config.network)
+                    })
+                    .transpose()?
+                    .is_some_and(|(_, id)| id == reward.id);
+            }
+        }
+        let persisted = if let (Some(cache), Some(rewards)) = (&self.resume_cache, &next_rewards) {
+            cache.write(&transaction, &bootstrap.state, rewards)?
+        } else {
+            false
+        };
         transaction
             .commit()
             .map_err(|_| "checkpoint adoption commit failed")?;
         self.state = bootstrap.state;
+        if !persisted {
+            self.resume_cache = None;
+        } else if let (Some(cache), Some(rewards)) = (&mut self.resume_cache, next_rewards) {
+            cache.rewards = rewards;
+        }
         self.storage_base = Some(bootstrap.checkpoint_state);
         self.retention_clock_started = false;
         Ok(bootstrap.downloaded)

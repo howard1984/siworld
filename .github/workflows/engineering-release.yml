@@ -46,6 +46,7 @@ jobs:
               'source_commit': os.environ['SOURCE_COMMIT'],
               'worker_sha256': digest(root / 'libexec/siworld-native-node'),
               'checkpoint_key_sha256': digest(root / 'libexec/siworld-checkpoint-key'),
+              'restart_qualify_sha256': digest(root / 'libexec/siworld-restart-qualify'),
               'roles': ['bootstrap', 'validator', 'miner', 'wallet-cli'],
               'cargo_features': ['native-p2p', 'wallet-light-gateway'],
               'network_class': 'resettable-engineering'}

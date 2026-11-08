@@ -136,6 +136,7 @@ fn storage_capacity_failure_preserves_state_rewards_and_other_node_progress() {
             path: path.clone(),
             storage_base: base,
             retention_clock_started: false,
+            resume_cache: None,
         };
         let mut next = crate::producer::production_fixture(store.state(), 300_000).block;
         next.settlement_proof = vec![1; crate::wire::MAX_SETTLEMENT_PROOF];
