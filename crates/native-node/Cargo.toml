@@ -25,6 +25,13 @@ native-p2p = ["hybrid-tls-candidate"]
 peer-qualification = ["native-p2p"]
 # Explicit private IPC; does not create a public HTTP listener.
 wallet-light-gateway = []
+# Explicit offline acceptance target, excluded from production packaging.
+checkpoint-rejection-acceptance = []
+
+[[bin]]
+name = "siworld-checkpoint-rejection-acceptance"
+path = "src/bin/siworld-checkpoint-rejection-acceptance.rs"
+required-features = ["checkpoint-rejection-acceptance"]
 
 [[bin]]
 name = "siworld-compact-inspect"

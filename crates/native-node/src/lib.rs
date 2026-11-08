@@ -1,6 +1,8 @@
 //! Native V1 engineering chain and network interfaces, separate from the retained node.
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "checkpoint-rejection-acceptance", unix))]
+pub mod checkpoint_rejection_acceptance;
 #[cfg(feature = "native-p2p")]
 pub(crate) mod checkpoint_service;
 pub mod engineering_checkpoint;

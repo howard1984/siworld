@@ -35,6 +35,8 @@ mod miner_view;
 pub(super) mod protected_history;
 pub(super) mod public_replay;
 mod receipts;
+#[cfg(all(feature = "checkpoint-rejection-acceptance", unix))]
+mod rejection_evidence;
 mod resume;
 mod retention;
 #[cfg(test)]

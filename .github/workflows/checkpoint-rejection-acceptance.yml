@@ -1,0 +1,175 @@
+name: Offline checkpoint rejection acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/checkpoint-rejection-acceptance.yml'
+      - 'crates/native-node/Cargo.toml'
+      - 'crates/native-node/src/lib.rs'
+      - 'crates/native-node/src/store.rs'
+      - 'crates/native-node/src/checkpoint_rejection_acceptance.rs'
+      - 'crates/native-node/src/checkpoint_rejection_acceptance/tests.rs'
+      - 'crates/native-node/src/bin/siworld-checkpoint-rejection-acceptance.rs'
+      - 'crates/native-node/src/store/rejection_evidence.rs'
+      - 'docs/checkpoint-rejection-acceptance.md'
+      - 'docs/checkpoint-rejection-ci.md'
+  pull_request:
+    paths:
+      - '.github/workflows/checkpoint-rejection-acceptance.yml'
+      - 'crates/native-node/Cargo.toml'
+      - 'crates/native-node/src/lib.rs'
+      - 'crates/native-node/src/store.rs'
+      - 'crates/native-node/src/checkpoint_rejection_acceptance.rs'
+      - 'crates/native-node/src/checkpoint_rejection_acceptance/tests.rs'
+      - 'crates/native-node/src/bin/siworld-checkpoint-rejection-acceptance.rs'
+      - 'crates/native-node/src/store/rejection_evidence.rs'
+      - 'docs/checkpoint-rejection-acceptance.md'
+      - 'docs/checkpoint-rejection-ci.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checkpoint-rejection-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Offline checkpoint rejection tests and Linux artifact
+    # Reuse the branch-push result for same-repository PRs and fast-forward main.
+    # Fork PRs still run without credentials or deployment permissions.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref != 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.local/checkpoint-rejection-target
+      CARGO_BUILD_JOBS: 2
+      RAYON_NUM_THREADS: 1
+      SIWORLD_COMPOSITION_HIDING_WORKERS: 1
+      ACCEPTANCE_FEATURES: native-p2p,wallet-light-gateway,checkpoint-rejection-acceptance
+      ACCEPTANCE_TARGET: x86_64-unknown-linux-gnu
+      SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install pinned toolchain and qualify the runner CPU
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy --target x86_64-unknown-linux-gnu
+          python3 - <<'PY'
+          import importlib.util, os, tomllib
+          spec = importlib.util.spec_from_file_location('controlled', 'scripts/build-prover-release.py')
+          release = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(release)
+          release.validate_platform()
+          release.validate_environment(os.environ)
+          release.validate_config(tomllib.loads(open('.cargo/config.toml').read()))
+          assert tomllib.loads(open('rust-toolchain.toml').read())['toolchain']['channel'] == '1.99.1'
+          PY
+          mkdir -p .local/checkpoint-rejection-artifact/bin .local/checkpoint-rejection-artifact/libexec
+          rustc +1.99.1 scripts/native-runtime-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 --target x86_64-unknown-linux-gnu -o .local/checkpoint-rejection-artifact/bin/checkpoint-cpu-check
+          .local/checkpoint-rejection-artifact/bin/checkpoint-cpu-check --check-cpu > .local/checkpoint-rejection-artifact/cpu-admission.json
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          workspaces: crates/native-node -> ../../.local/checkpoint-rejection-target
+          key: checkpoint-rejection-linux-v1
+      - name: Check feature formatting and linting
+        run: |
+          cargo +1.99.1 fmt --manifest-path crates/native-node/Cargo.toml -- --check
+          cargo +1.99.1 clippy --locked --manifest-path crates/native-node/Cargo.toml --features "$ACCEPTANCE_FEATURES" --target "$ACCEPTANCE_TARGET" --all-targets -- -D warnings
+      - name: Run the four focused acceptance harness tests once
+        run: |
+          set -euo pipefail
+          cargo +1.99.1 test --release --locked --manifest-path crates/native-node/Cargo.toml --features "$ACCEPTANCE_FEATURES" --target "$ACCEPTANCE_TARGET" --lib checkpoint_rejection_acceptance::tests -- --test-threads=1 | tee .local/checkpoint-rejection-focused-tests.log
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+          text = Path('.local/checkpoint-rejection-focused-tests.log').read_text()
+          match = re.search(r'test result: ok\. 4 passed; 0 failed; 0 ignored; 0 measured; \d+ filtered out; finished in ([0-9.]+)s', text)
+          assert match, 'Expected exactly four passing focused tests'
+          Path('.local/checkpoint-rejection-artifact/focused-tests.json').write_text(json.dumps({
+              'schema': 1, 'passed': 4, 'failed': 0, 'ignored': 0,
+              'elapsed_seconds_text': match.group(1),
+              'scope': 'synthetic-chain harness and offline admission guards',
+              'live_fixture_executed': False}, indent=2) + '\n')
+          PY
+      - name: Build only the standalone acceptance executable
+        run: |
+          cargo +1.99.1 build --release --locked --manifest-path crates/native-node/Cargo.toml --features "$ACCEPTANCE_FEATURES" --target "$ACCEPTANCE_TARGET" --bin siworld-checkpoint-rejection-acceptance
+      - name: Bind source, toolchain, ISA and standalone artifact
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_SERVER_URL: ${{ github.server_url }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, importlib.util, json, os, re, shutil, subprocess
+          from pathlib import Path
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+          commit = os.environ['SOURCE_COMMIT']
+          assert re.fullmatch('[0-9a-f]{40}', commit)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == commit
+          assert not subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], text=True).strip()
+          target = os.environ['ACCEPTANCE_TARGET']
+          features = os.environ['ACCEPTANCE_FEATURES'].split(',')
+          assert target == 'x86_64-unknown-linux-gnu'
+          assert features == ['native-p2p', 'wallet-light-gateway', 'checkpoint-rejection-acceptance']
+          artifact = Path('.local/checkpoint-rejection-artifact')
+          worker = Path(os.environ['CARGO_TARGET_DIR']) / target / 'release/siworld-checkpoint-rejection-acceptance'
+          header = worker.read_bytes()[:20]
+          assert header[:6] == b'\x7fELF\x02\x01' and header[18:20] == b'\x3e\x00'
+          spec = importlib.util.spec_from_file_location('isa', 'scripts/check-prover-isa.py')
+          isa = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(isa)
+          inspection = isa.inspect(worker)
+          installed = artifact / 'libexec/siworld-checkpoint-rejection-acceptance'
+          shutil.copy2(worker, installed)
+          assert digest(installed) == digest(worker) == inspection['binary_sha256']
+          wrapper = artifact / 'bin/siworld-checkpoint-rejection-acceptance'
+          wrapper.write_text('#!/bin/sh\nset -eu\npackage_bin=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)\n"$package_bin/checkpoint-cpu-check" --check-cpu >/dev/null\nexec "$package_bin/../libexec/siworld-checkpoint-rejection-acceptance" "$@"\n')
+          wrapper.chmod(0o755)
+          source_paths = [
+              '.cargo/config.toml', 'rust-toolchain.toml', 'crates/native-node/Cargo.lock',
+              'crates/native-node/Cargo.toml', 'crates/native-node/src/lib.rs', 'crates/native-node/src/store.rs',
+              'crates/native-node/src/checkpoint_rejection_acceptance.rs',
+              'crates/native-node/src/checkpoint_rejection_acceptance/tests.rs',
+              'crates/native-node/src/bin/siworld-checkpoint-rejection-acceptance.rs',
+              'crates/native-node/src/store/rejection_evidence.rs',
+              'scripts/native-runtime-launcher.rs', 'scripts/build-prover-release.py', 'scripts/check-prover-isa.py',
+              '.github/workflows/checkpoint-rejection-acceptance.yml']
+          run_url = os.environ['WORKFLOW_SERVER_URL'] + '/' + os.environ['WORKFLOW_REPOSITORY'] + '/actions/runs/' + os.environ['WORKFLOW_RUN_ID']
+          receipt = {
+              'schema': 1, 'source_commit': commit, 'cargo_features': features, 'cargo_default_features': True,
+              'target': target, 'toolchain': '1.99.1', 'worker_isa': 'x86-64-v3', 'bootstrap_isa': 'x86-64',
+              'effective_rustflags': '-C target-cpu=x86-64-v3', 'cargo_working_directory': 'repository-root',
+              'worker_sha256': digest(installed), 'bootstrap_sha256': digest(artifact / 'bin/checkpoint-cpu-check'),
+              'wrapper_sha256': digest(wrapper), 'repository_config_sha256': digest(Path('.cargo/config.toml')),
+              'compiler': subprocess.check_output(['rustc', '+1.99.1', '-vV'], text=True),
+              'source_files': {p: digest(Path(p)) for p in source_paths}, 'isa_inspection': inspection,
+              'workflow_ref': os.environ['WORKFLOW_REF'], 'workflow_run_id': os.environ['WORKFLOW_RUN_ID'],
+              'workflow_run_attempt': os.environ['WORKFLOW_RUN_ATTEMPT'], 'workflow_run_url': run_url,
+              'focused_tests': json.loads((artifact / 'focused-tests.json').read_text()),
+              'normal_runtime_package': False, 'release_published': False, 'live_fixture_executed': False}
+          (artifact / 'build-receipt.json').write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
+          files = sorted(p for p in artifact.rglob('*') if p.is_file())
+          (artifact / 'SHA256SUMS').write_text(''.join(digest(p) + '  ' + str(p.relative_to(artifact)) + '\n' for p in files))
+          PY
+          (
+            cd .local/checkpoint-rejection-artifact
+            sha256sum --check SHA256SUMS
+          )
+          mkdir -p .local/checkpoint-rejection-assets
+          tar -czf .local/checkpoint-rejection-assets/checkpoint-rejection-linux-x86_64.tar.gz -C .local checkpoint-rejection-artifact
+          cd .local/checkpoint-rejection-assets
+          sha256sum checkpoint-rejection-linux-x86_64.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checkpoint-rejection-linux-x86_64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: .local/checkpoint-rejection-assets/
+          if-no-files-found: error
+          retention-days: 14
