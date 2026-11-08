@@ -1,8 +1,11 @@
 # Engineering checkpoint authority transition
 
-Status: transition support is implemented; the published engineering release
-roster remains the original two-authority roster. No third authority or cutover
-sequence is activated by this document or by a network message.
+Status: release-pinned scheduling and native transition admission are
+implemented. The compiled roster schedules a transition by its first sequence.
+Deployment and live acceptance remain separate operational prerequisites.
+The transition begins at sequence `83065`, corresponding to
+`2026-11-09T06:00:00Z` for the six-hour engineering interval. Earlier sequences
+retain the original two-authority roster and digest.
 
 ## Trust policy and compatibility
 
@@ -59,12 +62,37 @@ A later interval may proceed once independent canonical views agree.
 
 Generate the third engineering test key only on its authorized origin. Collect
 only its public key through the reviewed transport; private bytes remain there.
-Before selecting a cutover, reconcile every authority's real accepted cursor and
-all persisted public signing-journal sequence metadata, including prepared votes
-not yet combined into certificates. Choose a future cutover strictly greater
-than every such sequence, allowing the same reviewed package to be installed
-before that interval. An anticipated sequence inferred only from wall time is
-insufficient. This support code does not select or activate that value.
+The fully measured selection route reconciles every authority's real accepted
+cursor and all authenticated public signing journals, including prepared votes
+not yet combined into certificates. Its future cutover must exceed every such
+sequence and leave enough time for reviewed source, required CI, matching
+packages, distribution and sequential rollout.
+
+A conditional selection route may preserve an unknown Miner accepted cursor
+and journal inventory while using the authenticated complete journals of both
+original authorities to bound the legacy quorum's emitted votes. This route
+also requires reviewed original-key custody and signing-source evidence and a
+registered third key from an exclusive initialization. The reviewed origin
+operation generated that key, made no signing requests and did not adopt or
+enroll it; its authority-subdirectory inventory was complete at registration.
+These scoped facts do not establish complete inventory of the enclosing root
+or absolute historical nonuse. Explicit remaining build and rollout allowances,
+clock tolerance and native admission on all three actual nodes are required.
+The route does not establish an all-authority sequence floor, cursor zero,
+historical absence or complete Miner writer lineage. Wall time alone cannot
+bound signed sequences. Long-running acceptance exercises remain separate from
+maintenance and release scheduling; their evidence is required before claiming
+those acceptance results.
+
+Each node must pass `checkpoint-transition-check` after any required one-time
+restart qualification and immediately before its own proof deletion, key
+adoption, configuration activation or service start. The command authenticates
+its actual accepted certificate and all local public signing journals under the
+final compiled roster; every sequence must be below the cutover. Malformed,
+foreign, conflicting, unauthenticated or out-of-range evidence rejects admission
+and preserves the records. A reached boundary requires reconciliation. All
+three nodes must pass before transition completion is reported; their stops
+and admissions may occur sequentially.
 
 Pin the public key and cutover in the release roster, review the exact combined
 source and package, and verify all required checks before rollout. Preserve all

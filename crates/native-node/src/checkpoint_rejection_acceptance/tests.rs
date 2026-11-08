@@ -174,6 +174,13 @@ fn links_and_changed_public_configuration_fail_admission_without_store_open() {
 
 #[test]
 fn finite_production_api_rejections_preserve_full_semantics_and_exact_reopen() {
+    exercise_finite_rejection_fixture(None);
+    for pair in [[0, 1], [0, 2], [1, 2]] {
+        exercise_finite_rejection_fixture(Some(pair));
+    }
+}
+
+fn exercise_finite_rejection_fixture(transition_pair: Option<[usize; 2]>) {
     // Independent synthetic authorities and a synthetic chain verifier exercise
     // harness control flow. This test is not actual native-chain acceptance.
     let parent = Directory::new();
@@ -185,7 +192,27 @@ fn finite_production_api_rejections_preserve_full_semantics_and_exact_reopen() {
     let second = Directory::new();
     let a = Authority::initialize(&first.0, binding).unwrap();
     let b = Authority::initialize(&second.0, binding).unwrap();
-    let roster = Roster::new(binding, [a.public_key(), b.public_key()]).unwrap();
+    let third = transition_pair.map(|_| Directory::new());
+    let c = third
+        .as_ref()
+        .map(|directory| Authority::initialize(&directory.0, binding).unwrap());
+    let roster = if let Some(authority) = c.as_ref() {
+        let roster = Roster::with_transition(
+            binding,
+            [a.public_key(), b.public_key()],
+            authority.public_key(),
+            1,
+        )
+        .unwrap();
+        // Index 2 is a pinned signer after the release-pinned cutover. Reusing
+        // it as an unknown signer can produce the wrong layer or an acceptance.
+        assert_eq!(roster.index_for_sequence(&authority.public_key(), 2), Ok(2));
+        roster
+    } else {
+        Roster::new(binding, [a.public_key(), b.public_key()]).unwrap()
+    };
+    let pair = transition_pair.unwrap_or([0, 1]);
+    let authorities = [&a, &b, c.as_ref().unwrap_or(&b)];
     let verifier = crate::fixtures::TestVerifier;
     let mut store = Store::open(data.join("chain.redb"), config.clone(), &verifier).unwrap();
     store.configure_storage(Role::Validator).unwrap();
@@ -200,14 +227,13 @@ fn finite_production_api_rejections_preserve_full_semantics_and_exact_reopen() {
             .unwrap();
         let cert = Certificate {
             statement: candidate.statement().clone(),
-            votes: vec![
-                store
-                    .sign_engineering_checkpoint(&a, &roster, &candidate)
-                    .unwrap(),
-                store
-                    .sign_engineering_checkpoint(&b, &roster, &candidate)
-                    .unwrap(),
-            ],
+            votes: pair
+                .map(|index| {
+                    store
+                        .sign_engineering_checkpoint(authorities[index], &roster, &candidate)
+                        .unwrap()
+                })
+                .to_vec(),
         };
         store
             .accept_engineering_checkpoint(&cert, &roster, issued, &verifier)
@@ -216,6 +242,12 @@ fn finite_production_api_rejections_preserve_full_semantics_and_exact_reopen() {
     }
     let all = cases(&certificates[1], &certificates[0]).unwrap();
     assert_eq!(all.len(), 5);
+    let unknown = Certificate::decode(&all[1].bytes).unwrap();
+    assert_eq!(unknown.votes[1].signer, u8::MAX);
+    assert_eq!(
+        unknown.authenticate(&roster, None, 43_200).err().unwrap(),
+        all[1].expected
+    );
     assert_eq!(
         Certificate::decode(&all[0].bytes).err().unwrap(),
         "two checkpoint signatures required"
@@ -243,6 +275,49 @@ fn finite_production_api_rejections_preserve_full_semantics_and_exact_reopen() {
     )
     .unwrap();
     assert_eq!(results.len(), 5);
+    for (result, (name, layer, code)) in results.iter().zip([
+        (
+            "one_signature",
+            "production_certificate_decoder",
+            "two checkpoint signatures required",
+        ),
+        (
+            "unknown_signer",
+            "production_store_authentication",
+            "both distinct pinned checkpoint signers required in canonical order",
+        ),
+        (
+            "state_digest_mismatch",
+            "production_store_signature_authentication",
+            "checkpoint signature invalid",
+        ),
+        (
+            "not_on_selected_most_work_chain",
+            "production_store_signature_authentication",
+            "checkpoint signature invalid",
+        ),
+        (
+            "sequence_regression",
+            "production_store_persisted_cursor",
+            "checkpoint sequence rollback or equivocation",
+        ),
+    ]) {
+        assert_eq!(result["case"], name);
+        assert_eq!(result["verification_layer"], layer);
+        assert_eq!(result["rejection_code"], code);
+        assert_eq!(
+            result["quorum_authenticated_input"],
+            name == "sequence_regression"
+        );
+        assert_eq!(
+            result["authenticated_state_or_chain_mismatch_exercised"],
+            false
+        );
+        assert_eq!(
+            result["before_invariant_sha256"],
+            result["after_invariant_sha256"]
+        );
+    }
     assert_eq!(results[2]["rejection_code"], "checkpoint signature invalid");
     assert_eq!(results[3]["rejection_code"], "checkpoint signature invalid");
     assert_eq!(
