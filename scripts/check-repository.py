@@ -30,6 +30,7 @@ DOCUMENTS = {
     "v1-offline-fund-keys.md",
     "v1-browser-wallet.md", "windows-native-miner.md", "native-proof-storage.md",
     "checkpoint-rejection-acceptance.md", "checkpoint-rejection-ci.md",
+    "engineering-checkpoint-roster-transition.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
