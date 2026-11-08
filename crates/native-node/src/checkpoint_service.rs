@@ -43,8 +43,8 @@ impl Proposal {
             .ok_or("checkpoint proposal truncated")?;
         let statement = Statement::decode(&bytes[..length])?;
         let signer = bytes[length];
-        if signer != 0 {
-            return Err("checkpoint proposal requires the pinned leader".into());
+        if signer > 2 {
+            return Err("checkpoint proposal signer index outside supported roster".into());
         }
         Ok(Self {
             statement,
@@ -273,6 +273,13 @@ impl Coordinator {
         if let Some(proposal) = &packet.proposal {
             self.roster
                 .verify_vote(&proposal.statement, &proposal.vote)?;
+            if !self
+                .roster
+                .three_authority_sequence(proposal.statement.sequence)
+                && proposal.vote.signer != 0
+            {
+                return Err("checkpoint legacy proposal requires the pinned leader".into());
+            }
         }
         if let Some(certificate) = packet.certificate {
             // A peer may advertise its previous publication while learning a
@@ -351,7 +358,13 @@ impl Coordinator {
         self.cached
             .as_ref()
             .filter(|candidate| candidate.statement().height == statement.height)
-            .map(|candidate| candidate.reissued(statement.sequence, statement.issued_unix_seconds))
+            .map(|candidate| {
+                candidate.reissued(
+                    &self.roster,
+                    statement.sequence,
+                    statement.issued_unix_seconds,
+                )
+            })
     }
     fn request_build<V: BlockVerifier>(
         &mut self,
@@ -397,7 +410,11 @@ impl Coordinator {
     ) -> Result<(), String> {
         self.local_head = Some(Goal::local(node));
         if self.accepted.is_none() {
-            self.accepted = node.store().latest_engineering_checkpoint()?;
+            let stored = node.store().latest_engineering_checkpoint()?;
+            if let Some(certificate) = &stored {
+                certificate.authenticate(&self.roster, None, now)?;
+            }
+            self.accepted = stored;
         }
         if self.catchup.as_ref().is_some_and(|download| {
             now.checked_sub(download.certificate.statement.issued_unix_seconds)
@@ -520,6 +537,9 @@ impl Coordinator {
                             &candidate,
                         )?;
                         self.accepted = Some(certificate);
+                        if self.alert == Some("checkpoint_signing_conflict") {
+                            self.alert = None;
+                        }
                         self.proposal = None;
                     }
                 } else {
@@ -532,9 +552,26 @@ impl Coordinator {
                 }
             }
         }
+        // A pending certificate may have advanced the cursor after a proposal
+        // was queued. Retire that proposal before any durable countersignature.
+        if let Some(proposal) = &self.incoming
+            && let Some(cursor) = node.store().checkpoint_cursor()?
+            && (proposal.statement.sequence <= cursor.sequence
+                || proposal.statement.height < cursor.height)
+        {
+            if proposal.statement.check_cursor(Some(cursor)).is_err() {
+                self.alert = Some("checkpoint_signing_conflict");
+            }
+            self.incoming = None;
+        }
         if !self.signing_paused
-            && self.signer == Some(1)
+            && self.signer.is_some()
             && let Some(proposal) = &self.incoming
+            && self.signer != Some(proposal.vote.signer)
+            && (self
+                .roster
+                .three_authority_sequence(proposal.statement.sequence)
+                || self.signer == Some(1) && proposal.vote.signer == 0)
         {
             let statement = proposal.statement.clone();
             if statement.issued_unix_seconds / auth::INTERVAL_SECONDS
@@ -554,23 +591,38 @@ impl Coordinator {
                         self.alert = Some("checkpoint_local_state_mismatch");
                         self.incoming = None;
                     } else {
-                        let vote = node.store().sign_engineering_checkpoint(
-                            self.authority.as_ref().expect("signer"),
-                            &self.roster,
-                            &candidate,
-                        )?;
-                        let certificate = Certificate {
-                            statement,
-                            votes: vec![proposal.vote.clone(), vote],
-                        };
-                        node.resident_accept_checkpoint(
-                            &certificate,
-                            &self.roster,
-                            now,
-                            &candidate,
-                        )?;
-                        self.accepted = Some(certificate);
-                        self.incoming = None;
+                        let authority = self.authority.as_ref().expect("signer");
+                        if authority
+                            .saved_vote(statement.sequence)?
+                            .is_some_and(|(saved, _)| saved != statement)
+                        {
+                            // Different local proposals may race after a peer
+                            // outage. Preserve the original durable vote and
+                            // continue ordinary validation; never re-sign it.
+                            self.alert = Some("checkpoint_signing_conflict");
+                            self.incoming = None;
+                        } else {
+                            let vote = node.store().sign_engineering_checkpoint(
+                                authority,
+                                &self.roster,
+                                &candidate,
+                            )?;
+                            let mut votes = vec![proposal.vote.clone(), vote];
+                            votes.sort_by_key(|vote| vote.signer);
+                            let certificate = Certificate { statement, votes };
+                            node.resident_accept_checkpoint(
+                                &certificate,
+                                &self.roster,
+                                now,
+                                &candidate,
+                            )?;
+                            self.accepted = Some(certificate);
+                            if self.alert == Some("checkpoint_signing_conflict") {
+                                self.alert = None;
+                            }
+                            self.proposal = None;
+                            self.incoming = None;
+                        }
                     }
                 } else {
                     self.request_build(
@@ -582,7 +634,7 @@ impl Coordinator {
                 }
             }
         }
-        if !self.signing_paused && self.signer == Some(0) {
+        if !self.signing_paused && self.signer.is_some() {
             let sequence = now / auth::INTERVAL_SECONDS;
             if sequence > 0
                 && self
@@ -590,19 +642,40 @@ impl Coordinator {
                     .as_ref()
                     .is_none_or(|value| value.statement.sequence < sequence)
             {
-                if self
-                    .proposal
-                    .as_ref()
-                    .is_none_or(|proposal| proposal.statement.sequence != sequence)
+                if (self.roster.three_authority_sequence(sequence) || self.signer == Some(0))
+                    && self
+                        .proposal
+                        .as_ref()
+                        .is_none_or(|proposal| proposal.statement.sequence != sequence)
                 {
                     self.proposal = self
                         .authority
                         .as_ref()
                         .expect("signer")
                         .saved_vote(sequence)?
-                        .map(|(statement, vote)| Proposal { statement, vote });
+                        .map(|(statement, vote)| -> Result<_, String> {
+                            self.roster.verify_vote(&statement, &vote)?;
+                            if Some(vote.signer) != self.signer {
+                                return Err(
+                                    "saved checkpoint vote belongs to another authority".into()
+                                );
+                            }
+                            Ok(Proposal { statement, vote })
+                        })
+                        .transpose()?;
                 }
+                let proposer = self.signer.expect("authority");
+                let delay = if self.roster.three_authority_sequence(sequence) {
+                    Some(u64::from(proposer) * 60)
+                } else {
+                    (proposer == 0).then_some(0)
+                };
+                let slot_open = delay.is_some_and(|delay| {
+                    now.checked_sub(sequence * auth::INTERVAL_SECONDS)
+                        .is_some_and(|elapsed| elapsed >= delay)
+                });
                 if self.proposal.is_none()
+                    && slot_open
                     && let Some(height) = auth::scheduled_height(node.state().height)
                 {
                     let issued = sequence * auth::INTERVAL_SECONDS;
@@ -610,7 +683,7 @@ impl Coordinator {
                         .cached
                         .as_ref()
                         .filter(|candidate| candidate.statement().height == height)
-                        .map(|candidate| candidate.reissued(sequence, issued));
+                        .map(|candidate| candidate.reissued(&self.roster, sequence, issued));
                     if let Some(candidate) = cached {
                         let vote = node.store().sign_engineering_checkpoint(
                             self.authority.as_ref().expect("signer"),
@@ -1063,6 +1136,318 @@ mod coordination_tests {
         assert_eq!(
             cc.catchup.as_ref().unwrap().certificate.statement.sequence,
             6
+        );
+    }
+    struct CursorSigningFixture {
+        _directory: Directory,
+        store: Store,
+        roster: Roster,
+        authority: Authority,
+        candidate: LocalCandidate,
+        certificate: Certificate,
+        conflicting: Proposal,
+    }
+    fn cursor_signing_fixture() -> CursorSigningFixture {
+        use libcrux_ml_dsa::ml_dsa_65;
+        let config = Config::development([225; 32], 0).unwrap();
+        let binding = Binding::new(&config);
+        let directory = Directory::new(&config);
+        let authority = Authority::initialize(&directory.0, binding).unwrap();
+        let keys = [53, 71].map(|seed| ml_dsa_65::generate_key_pair([seed; 32]));
+        let roster = Roster::with_transition(
+            binding,
+            [
+                *keys[0].verification_key.as_ref(),
+                *keys[1].verification_key.as_ref(),
+            ],
+            authority.public_key(),
+            5,
+        )
+        .unwrap();
+        let mut store = Store::open(directory.0.join("chain.redb"), config, &TestVerifier).unwrap();
+        for index in 0..96 {
+            let block = candidate(store.state(), 900_000_000 + index * 100_000);
+            store.append(&block, &TestVerifier).unwrap();
+        }
+        let candidate = store
+            .engineering_checkpoint_candidate(
+                &roster,
+                72,
+                6,
+                6 * auth::INTERVAL_SECONDS,
+                &TestVerifier,
+            )
+            .unwrap();
+        let sign = |statement: &Statement, index: u8| Vote {
+            signer: index,
+            signature: *ml_dsa_65::sign(
+                &keys[usize::from(index)].signing_key,
+                &statement.encode(),
+                auth::CONTEXT,
+                [83; 32],
+            )
+            .unwrap()
+            .as_ref(),
+        };
+        let certificate = Certificate {
+            statement: candidate.statement().clone(),
+            votes: [0, 1]
+                .into_iter()
+                .map(|index| sign(candidate.statement(), index))
+                .collect(),
+        };
+        // A Byzantine member can sign a second claim without its honest
+        // peers' write-once journals. The third authority must still refuse it.
+        let changed = candidate.reissued(&roster, 6, 6 * auth::INTERVAL_SECONDS + 1);
+        let conflicting = Proposal {
+            statement: changed.statement().clone(),
+            vote: sign(changed.statement(), 0),
+        };
+        CursorSigningFixture {
+            _directory: directory,
+            store,
+            roster,
+            authority,
+            candidate,
+            certificate,
+            conflicting,
+        }
+    }
+    #[test]
+    fn accepted_cursor_guards_store_signing_and_preserves_identical_vote_idempotence() {
+        let mut fixture = cursor_signing_fixture();
+        let now = 6 * auth::INTERVAL_SECONDS + 1;
+        let before = fixture.store.state().fingerprint();
+        fixture
+            .store
+            .accept_engineering_checkpoint_cached(
+                &fixture.certificate,
+                &fixture.roster,
+                now,
+                &fixture.candidate,
+            )
+            .unwrap();
+        assert!(fixture.authority.saved_vote(6).unwrap().is_none());
+        let conflicting = fixture.candidate.reissued(&fixture.roster, 6, now);
+        assert!(
+            fixture
+                .store
+                .sign_engineering_checkpoint(&fixture.authority, &fixture.roster, &conflicting)
+                .is_err(),
+            "an accepted sequence must reject a different digest before durable signing"
+        );
+        assert!(fixture.authority.saved_vote(6).unwrap().is_none());
+        let stale = fixture
+            .candidate
+            .reissued(&fixture.roster, 5, 5 * auth::INTERVAL_SECONDS);
+        assert!(
+            fixture
+                .store
+                .sign_engineering_checkpoint(&fixture.authority, &fixture.roster, &stale)
+                .is_err()
+        );
+        assert!(fixture.authority.saved_vote(5).unwrap().is_none());
+        let first = fixture
+            .store
+            .sign_engineering_checkpoint(&fixture.authority, &fixture.roster, &fixture.candidate)
+            .unwrap();
+        let repeated = fixture
+            .store
+            .sign_engineering_checkpoint(&fixture.authority, &fixture.roster, &fixture.candidate)
+            .unwrap();
+        assert_eq!(first.signature, repeated.signature);
+        assert_eq!(fixture.store.state().fingerprint(), before);
+        assert_eq!(
+            fixture.store.checkpoint_cursor().unwrap().unwrap().digest,
+            fixture.certificate.statement.digest()
+        );
+    }
+    #[test]
+    fn accepted_cursor_discards_prequeued_conflict_without_creating_third_vote() {
+        let fixture = cursor_signing_fixture();
+        let now = 6 * auth::INTERVAL_SECONDS + 1;
+        let mut node = Node::new(fixture.store, TestVerifier);
+        let before = node.state().fingerprint();
+        let mut coordinator =
+            Coordinator::new(fixture.roster.clone(), Some(fixture.authority)).unwrap();
+        coordinator.cached = Some(fixture.candidate);
+        let packet = Exchange {
+            proposal: Some(fixture.conflicting),
+            certificate: Some(fixture.certificate.clone()),
+            ..Default::default()
+        }
+        .encode()
+        .unwrap();
+        coordinator.receive(&node, [19; 32], &packet, now).unwrap();
+        assert!(coordinator.incoming.is_some());
+        assert!(coordinator.pending.is_some());
+        assert!(
+            coordinator
+                .authority
+                .as_ref()
+                .unwrap()
+                .saved_vote(6)
+                .unwrap()
+                .is_none()
+        );
+        let result = coordinator.poll(&mut node, now);
+        assert!(
+            coordinator
+                .authority
+                .as_ref()
+                .unwrap()
+                .saved_vote(6)
+                .unwrap()
+                .is_none(),
+            "accepting the other pair's certificate must not create a conflicting journal"
+        );
+        result.unwrap();
+        assert!(coordinator.incoming.is_none());
+        assert_eq!(
+            coordinator.accepted.as_ref().unwrap().statement,
+            fixture.certificate.statement
+        );
+        assert_eq!(
+            node.store().checkpoint_cursor().unwrap().unwrap().digest,
+            fixture.certificate.statement.digest()
+        );
+        coordinator.poll(&mut node, now + 1).unwrap();
+        assert_eq!(node.state().fingerprint(), before);
+    }
+    #[test]
+    fn transition_all_surviving_pairs_publish_and_restore_without_rewriting_votes() {
+        let config = Config::development([224; 32], 0).unwrap();
+        let binding = Binding::new(&config);
+        let directories: Vec<_> = (0..3).map(|_| Directory::new(&config)).collect();
+        let authorities: Vec<_> = directories
+            .iter()
+            .map(|d| Authority::initialize(&d.0, binding).unwrap())
+            .collect();
+        let roster = Roster::with_transition(
+            binding,
+            [authorities[0].public_key(), authorities[1].public_key()],
+            authorities[2].public_key(),
+            5,
+        )
+        .unwrap();
+        drop(authorities);
+        let mut stores: Vec<_> = directories
+            .iter()
+            .map(|d| Store::open(d.0.join("chain.redb"), config.clone(), &TestVerifier).unwrap())
+            .collect();
+        for index in 0..96 {
+            let block = candidate(stores[0].state(), 900_000_000 + index * 100_000);
+            for store in &mut stores {
+                store.append(&block, &TestVerifier).unwrap();
+            }
+        }
+        let mut nodes: Vec<_> = stores
+            .into_iter()
+            .map(|s| Node::new(s, TestVerifier))
+            .collect();
+        let before = nodes[0].state().fingerprint();
+        let load = |index: usize| {
+            Coordinator::new(
+                roster.clone(),
+                Some(Authority::load(&directories[index].0, binding).unwrap()),
+            )
+            .unwrap()
+        };
+        let mut third_before = load(2);
+        third_before
+            .poll(&mut nodes[2], 4 * auth::INTERVAL_SECONDS + 120)
+            .unwrap();
+        assert!(third_before.proposal.is_none());
+        assert!(third_before.build.is_none());
+        drop(third_before);
+        // Legacy publication followed by each authorized pair; the missing
+        // third authority is never polled and supplies no vote.
+        for (sequence, pair) in [(4, [0, 1]), (5, [0, 1]), (6, [0, 2]), (7, [1, 2])] {
+            let [left, right] = pair;
+            let now = sequence * auth::INTERVAL_SECONDS + 120;
+            let mut proposer = load(left);
+            let mut counter = load(right);
+            if sequence == 7 {
+                proposer
+                    .poll(&mut nodes[left], sequence * auth::INTERVAL_SECONDS + 59)
+                    .unwrap();
+                assert!(proposer.proposal.is_none());
+                assert!(proposer.build.is_none());
+            }
+            settle(&mut proposer, &mut nodes[left], now, |c| {
+                c.proposal.is_some()
+            });
+            let proposal_digest = proposer.proposal.as_ref().unwrap().statement.digest();
+            drop(proposer);
+            let mut proposer = load(left);
+            proposer.poll(&mut nodes[left], now).unwrap();
+            assert_eq!(
+                proposer.proposal.as_ref().unwrap().statement.digest(),
+                proposal_digest
+            );
+            counter
+                .receive(&nodes[right], [11; 32], &proposer.outbound().unwrap(), now)
+                .unwrap();
+            settle(&mut counter, &mut nodes[right], now, |c| {
+                c.accepted
+                    .as_ref()
+                    .is_some_and(|v| v.statement.sequence == sequence)
+            });
+            let certificate = counter.accepted.as_ref().unwrap();
+            assert_eq!(
+                certificate
+                    .votes
+                    .iter()
+                    .map(|v| usize::from(v.signer))
+                    .collect::<Vec<_>>(),
+                pair
+            );
+            certificate.authenticate(&roster, None, now).unwrap();
+            proposer
+                .receive(&nodes[left], [12; 32], &counter.outbound().unwrap(), now)
+                .unwrap();
+            settle(&mut proposer, &mut nodes[left], now, |c| {
+                c.accepted
+                    .as_ref()
+                    .is_some_and(|v| v.statement.sequence == sequence)
+            });
+            assert_eq!(nodes[left].state().fingerprint(), before);
+            assert_eq!(nodes[right].state().fingerprint(), before);
+            let candidate = proposer.cached.as_ref().unwrap().reissued(
+                &roster,
+                sequence,
+                sequence * auth::INTERVAL_SECONDS + 1,
+            );
+            assert!(
+                nodes[left]
+                    .store()
+                    .sign_engineering_checkpoint(
+                        proposer.authority.as_ref().unwrap(),
+                        &roster,
+                        &candidate
+                    )
+                    .err()
+                    .unwrap()
+                    .contains("equivocation")
+            );
+        }
+        assert_eq!(
+            nodes[1]
+                .store()
+                .checkpoint_cursor()
+                .unwrap()
+                .unwrap()
+                .sequence,
+            7
+        );
+        assert_eq!(
+            nodes[2]
+                .store()
+                .checkpoint_cursor()
+                .unwrap()
+                .unwrap()
+                .sequence,
+            7
         );
     }
 }

@@ -1020,3 +1020,130 @@ fn existing_service_recovery_preserves_protected_proofs_and_expires_atomically()
         history.final_state.fingerprint()
     );
 }
+
+#[test]
+fn transition_bootstrap_dual_reader_reopens_legacy_and_third_signer_checkpoints() {
+    let history = history();
+    let binding = Binding::new(&history.config);
+    let keys = [17, 29, 43].map(|seed| ml_dsa_65::generate_key_pair([seed; 32]));
+    let upgraded = Roster::with_transition(
+        binding,
+        [
+            *keys[0].verification_key.as_ref(),
+            *keys[1].verification_key.as_ref(),
+        ],
+        *keys[2].verification_key.as_ref(),
+        2,
+    )
+    .unwrap();
+    let legacy_cursor = Cursor {
+        sequence: 1,
+        height: 72,
+        digest: history.certificate.statement.digest(),
+    };
+    for (sequence, pair) in [(1, [0_u8, 1]), (2, [1, 2])] {
+        let issued = sequence * auth::INTERVAL_SECONDS;
+        let local = engineering_checkpoint::summary(
+            &history.checkpoint_state,
+            &upgraded,
+            sequence,
+            issued,
+            history.certificate.statement.permanent_prefix_digest,
+        )
+        .unwrap();
+        let statement = local.statement().clone();
+        let certificate = Certificate {
+            statement: statement.clone(),
+            votes: pair
+                .into_iter()
+                .map(|index| Vote {
+                    signer: index,
+                    signature: *ml_dsa_65::sign(
+                        &keys[usize::from(index)].signing_key,
+                        &statement.encode(),
+                        auth::CONTEXT,
+                        [47; 32],
+                    )
+                    .unwrap()
+                    .as_ref(),
+                })
+                .collect(),
+        };
+        if sequence == 1 {
+            assert_eq!(certificate.statement, history.certificate.statement);
+        }
+        let stage = Directory::new();
+        let directory = Directory::new();
+        NativeIdentity::initialize(&directory.0, binding).unwrap();
+        let mut session = CheckpointBootstrap::begin(
+            &stage.0.join("stage.redb"),
+            history.config.clone(),
+            certificate.clone(),
+            upgraded.clone(),
+            (sequence == 2).then_some(legacy_cursor),
+            issued,
+            Work::zero(),
+            BootstrapLimits::default(),
+        )
+        .unwrap();
+        for compact in &history.permanent {
+            session.push_permanent(compact).unwrap();
+        }
+        for block in &history.tail {
+            session
+                .push_tail(block, &crate::fixtures::TestVerifier)
+                .unwrap();
+        }
+        let verified = session.finish().unwrap();
+        let transferred = verified.downloaded_bytes();
+        let path = directory.0.join("chain.redb");
+        let mut store = Store::open(
+            &path,
+            history.config.clone(),
+            &crate::fixtures::TestVerifier,
+        )
+        .unwrap();
+        assert_eq!(
+            store.adopt_engineering_bootstrap(verified, issued).unwrap(),
+            transferred
+        );
+        assert_eq!(
+            store.state().fingerprint(),
+            history.final_state.fingerprint()
+        );
+        assert_eq!(store.verify_local_rewards().unwrap(), 0);
+        drop(store);
+        let mut reopened = Store::open_existing(
+            &path,
+            history.config.clone(),
+            &crate::fixtures::TestVerifier,
+        )
+        .unwrap();
+        let saved = reopened.latest_engineering_checkpoint().unwrap().unwrap();
+        saved
+            .authenticate(&upgraded, reopened.checkpoint_cursor().unwrap(), issued)
+            .unwrap();
+        assert_eq!(saved.statement, certificate.statement);
+        assert_eq!(
+            reopened.state().fingerprint(),
+            history.final_state.fingerprint()
+        );
+        if sequence == 2 {
+            assert!(
+                reopened
+                    .accept_engineering_checkpoint(
+                        &history.certificate,
+                        &upgraded,
+                        issued,
+                        &crate::fixtures::TestVerifier
+                    )
+                    .is_err()
+            );
+            assert_eq!(reopened.checkpoint_cursor().unwrap().unwrap().sequence, 2);
+            assert_eq!(
+                reopened.state().fingerprint(),
+                history.final_state.fingerprint()
+            );
+        }
+    }
+}

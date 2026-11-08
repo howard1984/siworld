@@ -20,8 +20,9 @@ impl LocalCandidate {
         &self.statement
     }
     #[cfg(feature = "native-p2p")]
-    pub(crate) fn reissued(&self, sequence: u64, issued: u64) -> Self {
+    pub(crate) fn reissued(&self, roster: &Roster, sequence: u64, issued: u64) -> Self {
         let mut statement = self.statement.clone();
+        statement.roster = roster.digest_for_sequence(sequence);
         statement.sequence = sequence;
         statement.issued_unix_seconds = issued;
         Self {
@@ -49,7 +50,7 @@ pub(super) fn summary(
     let totals = state.economics.totals();
     let statement = Statement {
         binding: Binding::new(&state.config),
-        roster: roster.digest(),
+        roster: roster.digest_for_sequence(sequence),
         sequence,
         issued_unix_seconds: issued,
         height: state.height,
@@ -184,6 +185,10 @@ impl Store {
         // A candidate cannot be retargeted to a different store or an abandoned
         // canonical branch between independent replay and signing.
         let statement = candidate.statement();
+        // The local vote journal may be empty even when another quorum already
+        // committed this sequence. Check the durable acceptance cursor before
+        // creating any vote; an identical accepted statement remains idempotent.
+        statement.check_cursor(self.checkpoint_cursor()?)?;
         if statement.binding != Binding::new(&self.state.config)
             || self.canonical_id(statement.height)? != statement.block_id
             || statement

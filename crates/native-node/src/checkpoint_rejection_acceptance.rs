@@ -311,7 +311,7 @@ fn cases(current: &Certificate, old: &Certificate) -> Result<Vec<Case>, String> 
     let mut single = current_bytes[..2 + statement_len + 1 + 1 + SIGNATURE_BYTES].to_vec();
     single[2 + statement_len] = 1;
     let mut unknown = current.clone();
-    unknown.votes[1].signer = 2;
+    unknown.votes[1].signer = u8::MAX;
     let mut state = current.clone();
     // A changed statement at the existing sequence is equivocation. Advance
     // only the untrusted claim to exercise signature checking after the cursor.

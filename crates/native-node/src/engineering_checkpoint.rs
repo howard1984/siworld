@@ -133,6 +133,16 @@ impl Statement {
             &self.encode(),
         )
     }
+    pub(crate) fn check_cursor(&self, last: Option<Cursor>) -> Result<(), String> {
+        if let Some(last) = last
+            && (self.sequence < last.sequence
+                || self.height < last.height
+                || self.sequence == last.sequence && self.digest() != last.digest)
+        {
+            return Err("checkpoint sequence rollback or equivocation".into());
+        }
+        Ok(())
+    }
 }
 struct Reader<'a>(&'a [u8]);
 impl Reader<'_> {
@@ -149,12 +159,18 @@ impl Reader<'_> {
     }
 }
 
-/// The two distinct public keys must be pinned by the engineering release.
+/// Engineering release-pinned authorities, with an optional explicit transition.
 /// No key supplied by a checkpoint or a transport can extend this roster.
 #[derive(Clone)]
 pub struct Roster {
     binding: Binding,
     keys: [[u8; PUBLIC_KEY_BYTES]; 2],
+    transition: Option<Transition>,
+}
+#[derive(Clone)]
+struct Transition {
+    third: [u8; PUBLIC_KEY_BYTES],
+    first_sequence: u64,
 }
 impl Roster {
     pub(crate) fn binding(&self) -> Binding {
@@ -164,9 +180,55 @@ impl Roster {
         if keys[0] == keys[1] || keys.iter().any(|key| key == &[0; PUBLIC_KEY_BYTES]) {
             return Err("checkpoint authorities must be distinct".into());
         }
-        Ok(Self { binding, keys })
+        Ok(Self {
+            binding,
+            keys,
+            transition: None,
+        })
+    }
+    /// The first new-roster sequence must exceed all accepted and persisted
+    /// signing journal sequences before a release pins this transition.
+    pub fn with_transition(
+        binding: Binding,
+        keys: [[u8; PUBLIC_KEY_BYTES]; 2],
+        third: [u8; PUBLIC_KEY_BYTES],
+        first_sequence: u64,
+    ) -> Result<Self, String> {
+        let mut roster = Self::new(binding, keys)?;
+        if first_sequence == 0 || third == [0; PUBLIC_KEY_BYTES] || roster.keys.contains(&third) {
+            return Err(
+                "checkpoint transition requires a distinct third authority and sequence".into(),
+            );
+        }
+        roster.transition = Some(Transition {
+            third,
+            first_sequence,
+        });
+        Ok(roster)
     }
     pub fn digest(&self) -> Hash {
+        if let Some(transition) = &self.transition {
+            let mut hash =
+                blake3::Hasher::new_derive_key("siworld engineering checkpoint roster v2");
+            hash.update(&self.legacy_digest());
+            hash.update(&transition.first_sequence.to_le_bytes());
+            hash.update(&[2, 3]);
+            hash.update(&transition.third);
+            *hash.finalize().as_bytes()
+        } else {
+            self.legacy_digest()
+        }
+    }
+    /// Legacy statements retain their exact original roster commitment.
+    /// A new-roster statement cannot move its pinned cutover by network input.
+    pub fn digest_for_sequence(&self, sequence: u64) -> Hash {
+        if self.three_authority_sequence(sequence) {
+            self.digest()
+        } else {
+            self.legacy_digest()
+        }
+    }
+    fn legacy_digest(&self) -> Hash {
         let mut hash = blake3::Hasher::new_derive_key("siworld engineering checkpoint roster v1");
         for value in [
             self.binding.network,
@@ -180,15 +242,41 @@ impl Roster {
         }
         *hash.finalize().as_bytes()
     }
+    pub(crate) fn three_authority_sequence(&self, sequence: u64) -> bool {
+        self.transition
+            .as_ref()
+            .is_some_and(|t| sequence >= t.first_sequence)
+    }
+    fn key_for_sequence(
+        &self,
+        sequence: u64,
+        signer: u8,
+    ) -> Result<&[u8; PUBLIC_KEY_BYTES], String> {
+        match signer {
+            0 | 1 => Ok(&self.keys[usize::from(signer)]),
+            2 if self.three_authority_sequence(sequence) => {
+                Ok(&self.transition.as_ref().expect("active transition").third)
+            }
+            _ => Err("checkpoint signer is not pinned for this sequence".into()),
+        }
+    }
+    pub(crate) fn index_for_sequence(
+        &self,
+        key: &[u8; PUBLIC_KEY_BYTES],
+        sequence: u64,
+    ) -> Result<u8, String> {
+        let index = self.index(key)?;
+        self.key_for_sequence(sequence, index)?;
+        Ok(index)
+    }
     #[cfg(feature = "native-p2p")]
     pub(crate) fn verify_vote(&self, statement: &Statement, vote: &Vote) -> Result<(), String> {
-        if statement.binding != self.binding || statement.roster != self.digest() {
+        if statement.binding != self.binding
+            || statement.roster != self.digest_for_sequence(statement.sequence)
+        {
             return Err("checkpoint proposal context mismatch".into());
         }
-        let key = self
-            .keys
-            .get(usize::from(vote.signer))
-            .ok_or("checkpoint signer is not pinned")?;
+        let key = self.key_for_sequence(statement.sequence, vote.signer)?;
         ml_dsa_65::verify(
             &MLDSA65VerificationKey::new(*key),
             &statement.encode(),
@@ -202,6 +290,12 @@ impl Roster {
             .iter()
             .position(|value| value == key)
             .map(|index| index as u8)
+            .or_else(|| {
+                self.transition
+                    .as_ref()
+                    .filter(|t| &t.third == key)
+                    .map(|_| 2)
+            })
             .ok_or("checkpoint signer is not pinned".into())
     }
 }
@@ -285,27 +379,30 @@ impl Certificate {
         now: u64,
     ) -> Result<AuthenticatedCheckpoint, String> {
         self.statement.check_shape()?;
-        if self.statement.binding != roster.binding || self.statement.roster != roster.digest() {
+        if self.statement.binding != roster.binding
+            || self.statement.roster != roster.digest_for_sequence(self.statement.sequence)
+        {
             return Err("checkpoint network or authority roster mismatch".into());
         }
         if now < self.statement.issued_unix_seconds {
             return Err("checkpoint publication is in the future".into());
         }
-        if let Some(last) = last
-            && (self.statement.sequence < last.sequence
-                || self.statement.height < last.height
-                || self.statement.sequence == last.sequence
-                    && self.statement.digest() != last.digest)
+        self.statement.check_cursor(last)?;
+        if self.votes.len() != 2
+            || self.votes[0].signer >= self.votes[1].signer
+            || self.votes.iter().any(|vote| {
+                roster
+                    .key_for_sequence(self.statement.sequence, vote.signer)
+                    .is_err()
+            })
         {
-            return Err("checkpoint sequence rollback or equivocation".into());
-        }
-        if self.votes.len() != 2 || self.votes[0].signer != 0 || self.votes[1].signer != 1 {
             return Err(
                 "both distinct pinned checkpoint signers required in canonical order".into(),
             );
         }
         let message = self.statement.encode();
-        for (vote, key) in self.votes.iter().zip(&roster.keys) {
+        for vote in &self.votes {
+            let key = roster.key_for_sequence(self.statement.sequence, vote.signer)?;
             ml_dsa_65::verify(
                 &MLDSA65VerificationKey::new(*key),
                 &message,

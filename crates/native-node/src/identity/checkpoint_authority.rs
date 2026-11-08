@@ -120,10 +120,12 @@ impl Authority {
         roster: &Roster,
     ) -> Result<Vote, String> {
         let statement = candidate.statement();
-        if statement.binding != self.binding || statement.roster != roster.digest() {
+        if statement.binding != self.binding
+            || statement.roster != roster.digest_for_sequence(statement.sequence)
+        {
             return Err("checkpoint signer context mismatch".into());
         }
-        let signer = roster.index(&self.public)?;
+        let signer = roster.index_for_sequence(&self.public, statement.sequence)?;
         let storage = Storage::open(&self.directory)
             .map_err(|_| "checkpoint authority storage unavailable")?;
         let name = format!("engineering-checkpoint-vote-{:020}.bin", statement.sequence);
