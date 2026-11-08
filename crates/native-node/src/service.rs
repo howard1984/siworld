@@ -1305,5 +1305,30 @@ pub fn check_offline(directory: &Path) -> Result<Value, String> {
     }))
 }
 
+/// Authenticate a previously verified exact-head local restart record while
+/// the service is idle. This is deliberately not a historical proof audit.
+pub fn restart_check_offline(directory: &Path) -> Result<Value, String> {
+    let _lease = Lease::acquire(directory)?;
+    let verifier = NativeVerifier::new()?;
+    let store = Store::check_restart_existing(
+        directory.join("chain.redb"),
+        local::load(directory)?,
+        &verifier,
+    )?;
+    let checked = store.verify_local_rewards()?;
+    Ok(json!({
+        "schema": 1,
+        "height": store.state().height,
+        "tip": local::hex(&store.state().tip),
+        "state_fingerprint": local::hex(&store.state().fingerprint()),
+        "cumulative_work": local::hex(&store.state().cumulative_work.to_big_endian()),
+        "proof_replay_checked": false,
+        "proof_tail_replay_checked": false,
+        "authenticated_local_restart_checked": true,
+        "local_reward_receipts_checked": checked,
+        "validation_scope": "authenticated-local-restart",
+    }))
+}
+
 #[cfg(test)]
 mod tests;

@@ -258,6 +258,160 @@ fn authenticated_restart_does_not_repeat_committed_proof_verification() {
 }
 
 #[test]
+fn exact_restart_check_requires_a_current_cache_without_any_proof_calls() {
+    let legacy = TestDir::new();
+    populated(&legacy.db());
+    restart_identity(&legacy);
+    let verifier = TestVerifier {
+        reject: true,
+        ..Default::default()
+    };
+    assert!(Store::check_restart_existing(legacy.db(), config(), &verifier).is_err());
+    assert_eq!(verifier.transactions.get(), 0);
+    assert_eq!(verifier.settlements.get(), 0);
+
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let (first, expected) = populated(&dir.db());
+    let checked = Store::check_restart_existing(dir.db(), config(), &verifier).unwrap();
+    assert_eq!(checked.state().fingerprint(), expected);
+    drop(checked);
+    let mut state = State::new(config()).unwrap();
+    state.apply(&first, &TestVerifier::default()).unwrap();
+    let second = candidate(&state, 100_000);
+    state.apply(&second, &TestVerifier::default()).unwrap();
+    let mut bytes = second.encode().unwrap();
+    bytes.extend_from_slice(&state.fingerprint());
+    tamper(&dir.db(), |transaction| {
+        transaction
+            .open_table(BLOCKS)
+            .unwrap()
+            .insert(2, bytes.as_slice())
+            .unwrap();
+        transaction
+            .open_table(META)
+            .unwrap()
+            .insert("head", head(&state).as_slice())
+            .unwrap();
+    });
+    assert!(Store::check_restart_existing(dir.db(), config(), &verifier).is_err());
+    assert_eq!(verifier.transactions.get(), 0);
+    assert_eq!(verifier.settlements.get(), 0);
+}
+
+#[test]
+fn exact_restart_check_rejects_torn_foreign_and_mismatched_records_without_repair() {
+    fn snapshot(path: &Path) -> Hash {
+        let database = Database::open(path).unwrap();
+        let transaction = database.begin_read().unwrap();
+        let mut digest = blake3::Hasher::new();
+        for name in transaction.list_tables().unwrap() {
+            digest.update(name.name().as_bytes());
+        }
+        for definition in [META, resume::RESUME] {
+            for row in transaction.open_table(definition).unwrap().iter().unwrap() {
+                let (key, value) = row.unwrap();
+                digest.update(key.value().as_bytes());
+                digest.update(blake3::hash(value.value()).as_bytes());
+            }
+        }
+        for row in transaction.open_table(BLOCKS).unwrap().iter().unwrap() {
+            let (height, value) = row.unwrap();
+            digest.update(&height.value().to_le_bytes());
+            digest.update(blake3::hash(value.value()).as_bytes());
+        }
+        for row in transaction
+            .open_table(LOCAL_REWARDS)
+            .unwrap()
+            .iter()
+            .unwrap()
+        {
+            let (key, value) = row.unwrap();
+            digest.update(key.value());
+            digest.update(blake3::hash(value.value()).as_bytes());
+        }
+        *digest.finalize().as_bytes()
+    }
+    for kind in 0..3 {
+        let dir = TestDir::new();
+        restart_identity(&dir);
+        populated(&dir.db());
+        if kind == 0 {
+            tamper(&dir.db(), |transaction| {
+                transaction
+                    .open_table(resume::RESUME)
+                    .unwrap()
+                    .remove("seal")
+                    .unwrap();
+            });
+        } else if kind == 1 {
+            let foreign = TestDir::new();
+            restart_identity(&foreign);
+            std::fs::copy(
+                foreign.0.join("native-peer-identity.secret"),
+                dir.0.join("native-peer-identity.secret"),
+            )
+            .unwrap();
+        } else {
+            tamper(&dir.db(), |transaction| {
+                let mut saved = transaction
+                    .open_table(META)
+                    .unwrap()
+                    .get("head")
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_vec();
+                saved[40] ^= 1;
+                transaction
+                    .open_table(META)
+                    .unwrap()
+                    .insert("head", saved.as_slice())
+                    .unwrap();
+            });
+        }
+        let before = snapshot(&dir.db());
+        let verifier = TestVerifier {
+            reject: true,
+            ..Default::default()
+        };
+        assert!(Store::check_restart_existing(dir.db(), config(), &verifier).is_err());
+        assert_eq!(verifier.transactions.get(), 0);
+        assert_eq!(verifier.settlements.get(), 0);
+        assert_eq!(snapshot(&dir.db()), before);
+    }
+}
+
+#[test]
+fn exact_restart_check_refuses_rows_above_the_committed_head_without_verification() {
+    let dir = TestDir::new();
+    restart_identity(&dir);
+    let mut store = Store::open(dir.db(), config(), &TestVerifier::default()).unwrap();
+    for seed in [1, 100_000] {
+        let block = candidate(store.state(), seed);
+        store.append(&block, &TestVerifier::default()).unwrap();
+    }
+    let mut state = store.state().clone();
+    let third = candidate(&state, 1_000_000);
+    state.apply(&third, &TestVerifier::default()).unwrap();
+    let mut bytes = third.encode().unwrap();
+    bytes.extend_from_slice(&state.fingerprint());
+    drop(store);
+    tamper(&dir.db(), |transaction| {
+        let mut rows = transaction.open_table(BLOCKS).unwrap();
+        rows.remove(1).unwrap();
+        rows.insert(3, bytes.as_slice()).unwrap();
+    });
+    let verifier = TestVerifier {
+        reject: true,
+        ..Default::default()
+    };
+    assert!(Store::check_restart_existing(dir.db(), config(), &verifier).is_err());
+    assert_eq!(verifier.transactions.get(), 0);
+    assert_eq!(verifier.settlements.get(), 0);
+}
+
+#[test]
 fn miner_initialization_resumes_existing_history_and_preserves_its_seal() {
     let dir = TestDir::new();
     restart_identity(&dir);

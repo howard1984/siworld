@@ -10,7 +10,7 @@ use siworld_native_node::{
 use std::path::Path;
 fn help() {
     println!(
-        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\ncheckpoint-qualify-service DIRECTORY  Enable service expiry after checkpoint delivery acceptance\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
+        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nrestart-check DIRECTORY --json  Authenticate exact committed restart state, without proof audit\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\ncheckpoint-qualify-service DIRECTORY  Enable service expiry after checkpoint delivery acceptance\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
     );
     #[cfg(feature = "native-p2p")]
     println!(
@@ -56,6 +56,12 @@ fn check_json(args: &[String]) -> Result<bool, String> {
         [command, _] if command == "check" => Ok(false),
         [command, _, flag] if command == "check" && flag == "--json" => Ok(true),
         _ => Err("expected check DIRECTORY [--json]".into()),
+    }
+}
+fn restart_check_arguments(args: &[String]) -> Result<(), String> {
+    match args {
+        [command, _, flag] if command == "restart-check" && flag == "--json" => Ok(()),
+        _ => Err("expected restart-check DIRECTORY --json".into()),
     }
 }
 #[cfg(feature = "native-p2p")]
@@ -386,6 +392,10 @@ fn run() -> Result<(), String> {
                 local::hex(&store.state().tip)
             );
         }
+        "restart-check" => {
+            restart_check_arguments(&args)?;
+            println!("{}", service::restart_check_offline(path)?);
+        }
         "status" | "check" | "audit" => {
             if args[0] == "check" {
                 let as_json = check_json(&args)?;
@@ -694,6 +704,27 @@ mod control_command_tests {
             assert!(check_json(&arguments("check", directory, &extra)).is_err());
         }
         assert!(check_json(&["check".into()]).is_err());
+    }
+
+    #[test]
+    fn restart_check_cli_requires_the_exact_json_flag() {
+        let directory = Path::new("unused");
+        assert!(
+            restart_check_arguments(&arguments("restart-check", directory, &["--json"])).is_ok()
+        );
+        for flags in [
+            vec![],
+            vec!["json"],
+            vec!["--JSON"],
+            vec!["--json", "extra"],
+            vec!["--json", "--json"],
+        ] {
+            assert!(
+                restart_check_arguments(&arguments("restart-check", directory, &flags)).is_err()
+            );
+        }
+        assert!(restart_check_arguments(&["restart-check".into()]).is_err());
+        assert!(restart_check_arguments(&arguments("check", directory, &["--json"])).is_err());
     }
 }
 

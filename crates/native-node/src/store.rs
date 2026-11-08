@@ -58,7 +58,7 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
     ) -> Result<Self, String> {
-        Self::open_inner(path.as_ref(), config, verifier, true, false)
+        Self::open_inner(path.as_ref(), config, verifier, true, false, false)
     }
 
     /// Opens a previously initialized history. Read, validation and production
@@ -69,7 +69,7 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
     ) -> Result<Self, String> {
-        Self::open_inner(path.as_ref(), config, verifier, false, false)
+        Self::open_inner(path.as_ref(), config, verifier, false, false, false)
     }
 
     /// Resume a locally authenticated committed state, or verify a legacy store
@@ -79,7 +79,7 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
     ) -> Result<Self, String> {
-        Self::open_inner(path.as_ref(), config, verifier, false, true)
+        Self::open_inner(path.as_ref(), config, verifier, false, true, false)
     }
 
     /// Explicit miner initialization may create an absent store. Existing
@@ -89,7 +89,18 @@ impl Store {
         config: Config,
         verifier: &impl BlockVerifier,
     ) -> Result<Self, String> {
-        Self::open_inner(path.as_ref(), config, verifier, true, true)
+        Self::open_inner(path.as_ref(), config, verifier, true, true, false)
+    }
+
+    /// Authenticate only an existing exact-head restart record. Never replay
+    /// retained proofs, qualify a legacy store or rewrite an older cache.
+    /// The offline command owner must hold the exclusive service lease.
+    pub(crate) fn check_restart_existing(
+        path: impl AsRef<Path>,
+        config: Config,
+        verifier: &impl BlockVerifier,
+    ) -> Result<Self, String> {
+        Self::open_inner(path.as_ref(), config, verifier, false, true, true)
     }
 
     fn open_inner(
@@ -98,6 +109,7 @@ impl Store {
         verifier: &impl BlockVerifier,
         create_allowed: bool,
         resume_allowed: bool,
+        require_exact_restart: bool,
     ) -> Result<Self, String> {
         config.validate()?;
         let (file, created) = open_regular_file(path, create_allowed)?;
@@ -117,6 +129,35 @@ impl Store {
             sync_parent(path)?;
         }
         let cached = resume::load(&database, path, &config)?;
+        if require_exact_restart {
+            let (state, _) = cached
+                .as_ref()
+                .ok_or("authenticated restart record required")?;
+            let transaction = database
+                .begin_read()
+                .map_err(|_| "restart head unavailable")?;
+            check_metadata(
+                &transaction
+                    .open_table(META)
+                    .map_err(|_| "restart metadata unavailable")?,
+                &config,
+                &head(state),
+            )?;
+            let rows = transaction
+                .open_table(BLOCKS)
+                .map_err(|_| "restart canonical table unavailable")?;
+            if rows
+                .range((
+                    std::ops::Bound::Excluded(state.height),
+                    std::ops::Bound::Unbounded,
+                ))
+                .map_err(|_| "restart canonical bounds unavailable")?
+                .next()
+                .is_some()
+            {
+                return Err("restart canonical record exceeds committed head".into());
+            }
+        }
         let cached_head = cached.as_ref().map(|(state, _)| head(state));
         let base = if resume_allowed && cached.is_some() {
             retention::load_base_sealed(&database, config.clone(), path)?

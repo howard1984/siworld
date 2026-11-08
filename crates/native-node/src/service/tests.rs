@@ -252,6 +252,77 @@ fn offline_check_reports_only_replayed_state_and_integer_receipt_count() {
 }
 
 #[test]
+fn restart_check_offline_authenticates_receipts_and_reports_no_proof_audit() {
+    let parent = Directory::new();
+    let directory = parent.0.join("network");
+    let config = local::initialize(&directory, 0).unwrap();
+    let directory = directory.canonicalize().unwrap();
+    crate::identity::NativeIdentity::initialize(&directory, crate::p2p::Binding::new(&config))
+        .unwrap();
+    let mut store = Store::open(
+        directory.join("chain.redb"),
+        config,
+        &crate::fixtures::TestVerifier,
+    )
+    .unwrap();
+    let produced = crate::producer::production_fixture(store.state(), 410_000);
+    let id = produced.block.id().unwrap();
+    store
+        .save_reward_receipt(&id, &produced.reward_secret)
+        .unwrap();
+    store
+        .append_produced(
+            &produced.block,
+            &produced.reward_secret,
+            &crate::fixtures::TestVerifier,
+        )
+        .unwrap();
+    let state = store.state().clone();
+    drop(store);
+    let checked = restart_check_offline(&directory).unwrap();
+    assert_eq!(checked["schema"], 1);
+    assert_eq!(checked["height"], 1);
+    assert_eq!(checked["tip"], local::hex(&state.tip));
+    assert_eq!(
+        checked["state_fingerprint"],
+        local::hex(&state.fingerprint())
+    );
+    assert_eq!(
+        checked["cumulative_work"],
+        local::hex(&state.cumulative_work.to_big_endian())
+    );
+    assert_eq!(checked["proof_replay_checked"], false);
+    assert_eq!(checked["proof_tail_replay_checked"], false);
+    assert_eq!(checked["authenticated_local_restart_checked"], true);
+    assert_eq!(checked["local_reward_receipts_checked"], 1);
+    assert_eq!(checked["validation_scope"], "authenticated-local-restart");
+    // This fixture's proofs are not native proofs: a full audit must reject it.
+    assert!(check_offline(&directory).is_err());
+    std::fs::remove_file(directory.join(format!("reward-{}.secret", local::hex(&id)))).unwrap();
+    assert!(restart_check_offline(&directory).is_err());
+}
+
+#[test]
+fn restart_check_offline_refuses_an_active_service_lease_and_missing_cache() {
+    let parent = Directory::new();
+    let directory = parent.0.join("network");
+    let config = local::initialize(&directory, 0).unwrap();
+    drop(
+        Store::open(
+            directory.join("chain.redb"),
+            config,
+            &crate::fixtures::TestVerifier,
+        )
+        .unwrap(),
+    );
+    assert!(restart_check_offline(&directory).is_err());
+    let lease = Lease::acquire(&directory).unwrap();
+    let error = restart_check_offline(&directory).unwrap_err();
+    assert!(error.contains("holds the engineering lease"));
+    drop(lease);
+}
+
+#[test]
 fn offline_check_preserves_the_strict_legacy_receipt_scope() {
     let parent = Directory::new();
     let directory = parent.0.join("network");

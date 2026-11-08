@@ -393,6 +393,16 @@ head, canonical anchor, ownership index and existing private reward receipts.
 Only blocks after an older authenticated restart record undergo proof verification.
 An unchanged head preserves its existing restart record without rewriting it.
 
+`restart-check DIRECTORY --json` takes the exclusive service lease and authenticates
+an existing restart record at the exact committed head, including configuration,
+identity seals, canonical anchors, ownership rows and actual local reward receipts.
+A missing, stale, torn or foreign record is rejected; this command never qualifies
+legacy history, advances a proof tail or repairs a record. Its JSON distinguishes
+`authenticated_local_restart_checked: true` and
+`validation_scope: "authenticated-local-restart"` from the unchanged full audit:
+both `proof_replay_checked` and `proof_tail_replay_checked` are false. Height, tip,
+state fingerprint and cumulative work identify the authenticated commit.
+
 Malformed, incomplete, foreign or incompatible restart records fail closed. An
 absent record requires retained-proof audit before qualification; this legacy
 migration cost is separate from a subsequent normal restart. An explicit
