@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod export;
+mod recovery;
 use export::PublicExport;
 
 const MAX_REQUEST: usize = MAX_ENVELOPE_BYTES + SIDECAR_BYTES;
@@ -43,6 +44,8 @@ pub struct Gateway {
     cache: PathBuf,
     indexed: usize,
     ids: Vec<Hash>,
+    recovery_started: bool,
+    recovery: Option<recovery::RestartIndex>,
     packets: std::collections::BTreeMap<Hash, Hash>,
 }
 impl Gateway {
@@ -110,6 +113,8 @@ impl Gateway {
             cache: path.into(),
             indexed: 0,
             ids: Vec::new(),
+            recovery_started: false,
+            recovery: None,
             packets: std::collections::BTreeMap::new(),
         })
     }
@@ -205,6 +210,8 @@ impl Gateway {
             cache,
             indexed: 0,
             ids: Vec::new(),
+            recovery_started: false,
+            recovery: None,
             packets: std::collections::BTreeMap::new(),
         })
     }
@@ -221,6 +228,9 @@ impl Gateway {
         // at most one canonical anchor lookup, one new ID and one compact record.
         // Read requests never perform additional canonical history generation.
         let result: Result<(), String> = (|| {
+            if self.recover_index(node)? {
+                return Ok(());
+            }
             self.index_step(node)?;
             if self.indexed < self.ids.len() {
                 self.compact(node, self.indexed)?;
@@ -253,6 +263,55 @@ impl Gateway {
                 .unwrap_or(node.state().config.genesis_id())
                 == node.state().tip
     }
+    /// Authenticate one cached compact per owner turn instead of decoding old proofs.
+    fn recover_index<V: BlockVerifier>(&mut self, node: &Node<V>) -> Result<bool, String> {
+        if !self.recovery_started {
+            self.recovery_started = true;
+            if self.export.is_some()
+                && let Some(candidate) =
+                    recovery::load(&self.cache, &node.state().config, node.state().height)
+            {
+                if node.store().public_block_id(candidate.ids.len() as u64)?
+                    == *candidate.ids.last().unwrap()
+                {
+                    self.recovery = Some(candidate);
+                }
+                return Ok(true);
+            }
+        }
+        let Some(mut candidate) = self.recovery.take() else {
+            return Ok(false);
+        };
+        let at = candidate.verified;
+        let expected_parent = if at == 0 {
+            node.state().config.genesis_id()
+        } else {
+            candidate.ids[at - 1]
+        };
+        let Ok(Some((_, compact))) = self.cached_record(candidate.ids[at]) else {
+            return Ok(true);
+        };
+        if compact.block.network != node.state().config.network
+            || compact.block.height != at as u64 + 1
+            || compact.block.parent != expected_parent
+        {
+            return Ok(true);
+        }
+        candidate.verified += 1;
+        if candidate.verified == candidate.ids.len() {
+            // The canonical owner may have reorganized during the bounded warmup.
+            if candidate.ids.len() as u64 <= node.state().height
+                && node.store().public_block_id(candidate.ids.len() as u64)?
+                    == *candidate.ids.last().unwrap()
+            {
+                self.indexed = candidate.ids.len();
+                self.ids = candidate.ids;
+            }
+        } else {
+            self.recovery = Some(candidate);
+        }
+        Ok(true)
+    }
     fn index_step<V: BlockVerifier>(&mut self, node: &Node<V>) -> Result<(), String> {
         if node.state().height > 1_000_000 {
             return Err("Engineering wallet index height limit.".into());
@@ -278,26 +337,21 @@ impl Gateway {
         Ok(())
     }
     fn cached_compact(&self, at: usize) -> Result<Option<Vec<u8>>, String> {
-        let id = self.ids[at];
+        Ok(self.cached_record(self.ids[at])?.map(|(bytes, _)| bytes))
+    }
+    fn cached_record(
+        &self,
+        id: Hash,
+    ) -> Result<Option<(Vec<u8>, crate::compact::CompactBlock)>, String> {
         let path = self.cache.join(format!("{}.bin", crate::local::hex(&id)));
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err("Compact archive metadata unavailable.".into()),
+        let Some(bytes) = recovery::read_private(&path, MAX_RESPONSE)? else {
+            return Ok(None);
         };
-        if !metadata.is_file()
-            || metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.permissions().mode() & 0o777 != 0o600
-            || metadata.len() > MAX_RESPONSE as u64
-        {
-            return Err("Compact archive record invalid.".into());
-        }
-        let bytes = std::fs::read(&path).map_err(|_| "Compact archive unreadable.")?;
         let record = crate::compact::CompactBlock::decode(&bytes)?;
         if record.id != id {
             return Err("Compact archive identity mismatch.".into());
         }
-        Ok(Some(bytes))
+        Ok(Some((bytes, record)))
     }
     fn compact<V: BlockVerifier>(&self, node: &Node<V>, at: usize) -> Result<Vec<u8>, String> {
         if let Some(bytes) = self.cached_compact(at)? {

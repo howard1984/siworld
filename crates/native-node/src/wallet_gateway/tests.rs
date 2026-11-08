@@ -78,6 +78,220 @@ fn cold_index_and_queued_public_reads_share_one_bounded_owner_turn() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn complete_public_export(node: &mut Node<TestVerifier>, public: &Path) {
+    let mut gateway = Gateway::export_only(public).unwrap();
+    for _ in 0..=node.state().height {
+        gateway.export.as_mut().unwrap().allow_next();
+        gateway.poll(node);
+    }
+    assert_eq!(gateway.indexed as u64, node.state().height);
+}
+
+#[test]
+fn restart_export_reuses_a_linked_complete_prefix_before_indexing_the_tail() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([41; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 4, 1500);
+    complete_public_export(&mut node, &public);
+    let old = std::fs::read(public.join("chain.json")).unwrap();
+    append_blocks(&mut node, 1, 700_000);
+    let mut restarted = Gateway::export_only(&public).unwrap();
+    restarted.poll(&mut node);
+    assert!(
+        restarted.ids.is_empty(),
+        "an anchor alone cannot trust the index"
+    );
+    for at in 0..4 {
+        restarted.poll(&mut node);
+        assert_eq!(std::fs::read(public.join("chain.json")).unwrap(), old);
+        assert_eq!(restarted.ids.len(), if at == 3 { 4 } else { 0 });
+    }
+    restarted.poll(&mut node);
+    let published: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    assert_eq!(published["height"], 5);
+    assert_eq!(published["tip"], crate::local::hex(&node.state().tip));
+    drop(restarted);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_export_rejects_forged_middle_ids_even_with_the_correct_tip() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([42; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 3, 1500);
+    complete_public_export(&mut node, &public);
+    let mut forged: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    forged["ids"][1] = forged["ids"][0].clone();
+    std::fs::write(
+        public.join("chain.json"),
+        serde_json::to_vec(&forged).unwrap(),
+    )
+    .unwrap();
+    let mut restarted = Gateway::export_only(&public).unwrap();
+    for _ in 0..3 {
+        restarted.poll(&mut node);
+    }
+    assert!(
+        restarted.ids.is_empty(),
+        "a broken compact chain must not become the canonical index"
+    );
+    for _ in 0..4 {
+        restarted.poll(&mut node);
+    }
+    let published: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    assert_ne!(published["ids"], forged["ids"]);
+    assert_eq!(published["tip"], crate::local::hex(&node.state().tip));
+    drop(restarted);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_export_rechecks_the_canonical_anchor_after_a_reorganization() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([43; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config.clone(), &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 3, 1500);
+    complete_public_export(&mut node, &public);
+    let old = std::fs::read(public.join("chain.json")).unwrap();
+    let mut restarted = Gateway::export_only(&public).unwrap();
+    restarted.poll(&mut node);
+    restarted.poll(&mut node);
+    let store = Store::open(root.join("fork.redb"), config, &TestVerifier).unwrap();
+    let mut fork = Node::new(store, TestVerifier);
+    append_blocks(&mut fork, 3, 600_000);
+    restarted.poll(&mut fork);
+    restarted.poll(&mut fork);
+    assert!(
+        restarted.ids.is_empty(),
+        "the initial anchor cannot survive a reorg"
+    );
+    assert_eq!(std::fs::read(public.join("chain.json")).unwrap(), old);
+    for _ in 0..4 {
+        restarted.poll(&mut fork);
+    }
+    let published: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    assert_eq!(published["tip"], crate::local::hex(&fork.state().tip));
+    drop(restarted);
+    drop(node);
+    drop(fork);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_export_missing_compact_falls_back_without_publishing_a_partial_prefix() {
+    let root = root();
+    let public = directory(&root, "public", 0o700);
+    let config = Config::development([44; 32], 0).unwrap();
+    let store = Store::open(root.join("chain.redb"), config, &TestVerifier).unwrap();
+    let mut node = Node::new(store, TestVerifier);
+    append_blocks(&mut node, 3, 1500);
+    complete_public_export(&mut node, &public);
+    let old = std::fs::read(public.join("chain.json")).unwrap();
+    let first = node.store().public_block_id(1).unwrap();
+    std::fs::remove_file(public.join(format!("{}.bin", crate::local::hex(&first)))).unwrap();
+    let mut restarted = Gateway::export_only(&public).unwrap();
+    restarted.poll(&mut node);
+    restarted.poll(&mut node);
+    assert!(restarted.ids.is_empty());
+    assert_eq!(std::fs::read(public.join("chain.json")).unwrap(), old);
+    append_blocks(&mut node, 1, 700_000);
+    for _ in 0..5 {
+        restarted.poll(&mut node);
+    }
+    let published: Value =
+        serde_json::from_slice(&std::fs::read(public.join("chain.json")).unwrap()).unwrap();
+    assert_eq!(published["height"], 4);
+    assert!(
+        public
+            .join(format!("{}.bin", crate::local::hex(&first)))
+            .is_file()
+    );
+    drop(restarted);
+    drop(node);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_archive_reads_reject_links_public_permissions_and_oversized_files() {
+    let root = root();
+    let file = root.join("record");
+    std::fs::write(&file, [1, 2, 3]).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        recovery::read_private(&file, 3).unwrap(),
+        Some(vec![1, 2, 3])
+    );
+    assert!(recovery::read_private(&file, 2).is_err());
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&file, &link).unwrap();
+    assert!(recovery::read_private(&link, 3).is_err());
+    std::fs::remove_file(&link).unwrap();
+    std::fs::hard_link(&file, &link).unwrap();
+    assert!(recovery::read_private(&file, 3).is_err());
+    std::fs::remove_file(&link).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(recovery::read_private(&file, 3).is_err());
+    assert!(recovery::read_private(&root, 3).is_err());
+    assert_eq!(recovery::read_private(&link, 3).unwrap(), None);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_snapshot_hints_require_exact_network_shape_and_bounded_height() {
+    let root = root();
+    let config = Config::development([45; 32], 0).unwrap();
+    let path = root.join("chain.json");
+    let id = crate::local::hex(&[0xab; 32]);
+    let valid = json!({
+        "version": 1, "network": crate::local::hex(&config.network),
+        "genesis": crate::local::hex(&config.genesis_id()),
+        "height": 1, "tip": id, "ids": [id]
+    });
+    let save = |value: &Value| {
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    };
+    save(&valid);
+    let candidate = recovery::load(&root, &config, 1).unwrap();
+    assert_eq!(candidate.ids, vec![[0xab; 32]]);
+    assert_eq!(
+        candidate.verified, 0,
+        "a snapshot remains an untrusted hint"
+    );
+    assert!(recovery::load(&root, &config, 0).is_none());
+    for (key, value) in [
+        ("version", json!(2)),
+        ("network", json!(crate::local::hex(&[0; 32]))),
+        ("genesis", json!(crate::local::hex(&[0; 32]))),
+        ("height", json!(0)),
+        ("height", json!(2)),
+        ("height", json!(1_000_001)),
+        ("tip", json!(crate::local::hex(&[0; 32]))),
+        ("ids", json!([id.to_uppercase()])),
+        ("extra", json!(true)),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[key] = value;
+        save(&invalid);
+        assert!(recovery::load(&root, &config, 1_000_001).is_none(), "{key}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn cold_export_accepts_queued_submission_without_waiting_for_history() {
     use native::{
