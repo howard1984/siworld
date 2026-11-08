@@ -342,6 +342,7 @@ fn waiting_worker(
             sync_goal: None,
             sync_more: true,
             sync_complete: false,
+            pull_fingerprint: None,
             peer,
             token,
             cancel,
@@ -899,6 +900,7 @@ fn cancelled_queued_apply_cannot_import_after_the_caller_has_left() {
             sync_goal: None,
             sync_more: true,
             sync_complete: false,
+            pull_fingerprint: None,
             peer: Some(peer_id),
             token: Some(token),
             cancel: cancel.clone(),
@@ -909,6 +911,7 @@ fn cancelled_queued_apply_cannot_import_after_the_caller_has_left() {
         },
     );
     let base = owner.state().tip_snapshot().selector;
+    owner_sync_command(&mut owner, |reply| Command::Pull { id, reply }).unwrap();
     let (begin_send, begin_receive) = mpsc::sync_channel(1);
     owner
         .driver
@@ -1386,4 +1389,134 @@ fn live_fixture_admission_rejects_mining_hello_before_owner_authentication() {
     until(&mut provider, &mut fixture, |a, _| a.driver.failures > 0);
     assert_eq!(provider.driver.connections, 0);
     assert_eq!(provider.driver.scheduler.status().established, 0);
+}
+
+fn owner_sync_command<T>(
+    endpoint: &mut Endpoint,
+    make: impl FnOnce(Answer<T>) -> Command,
+) -> Result<T, runtime::Error> {
+    let (reply, receive) = mpsc::sync_channel(1);
+    let charged = ChargedCommand {
+        command: make(reply),
+        _reservation: endpoint.driver.budget.reserve(COMMAND_BYTES).unwrap(),
+    };
+    endpoint
+        .driver
+        .handle(endpoint.node.as_mut().unwrap(), charged)
+        .unwrap();
+    receive.recv_timeout(Duration::from_secs(1)).unwrap()
+}
+
+fn owner_sync_begin(
+    endpoint: &mut Endpoint,
+    id: u64,
+    base: crate::wire::Snapshot,
+    count: u16,
+) -> Result<(), runtime::Error> {
+    owner_sync_command(endpoint, |reply| Command::Begin {
+        id,
+        meta: ReplyMeta {
+            ancestor: base,
+            after: base,
+            count,
+            more: false,
+        },
+        reply,
+    })
+}
+
+fn owner_sync_apply(
+    endpoint: &mut Endpoint,
+    id: u64,
+    base: crate::wire::Snapshot,
+    blocks: Vec<crate::wire::Block>,
+) -> Result<bool, runtime::Error> {
+    let guards = blocks
+        .iter()
+        .map(|block| {
+            endpoint
+                .driver
+                .budget
+                .reserve(block.encoded_len().unwrap() + crate::wire::MAX_ENVELOPE_BYTES + 65536)
+                .unwrap()
+        })
+        .collect();
+    owner_sync_command(endpoint, |reply| Command::Apply {
+        id,
+        batch: Batch {
+            ancestor: base,
+            after: base,
+            blocks,
+            more: false,
+        },
+        guards,
+        reply,
+    })
+}
+
+#[test]
+fn stale_sync_metadata_after_owner_advance_retries_before_staging() {
+    let (mut owner, _peer, id, _release) = retiring_inbound_pair();
+    let old_base = owner.state().tip_snapshot().selector;
+    owner_sync_command(&mut owner, |reply| Command::Pull { id, reply }).unwrap();
+    owner.append(600_000);
+    let advanced = owner.state().fingerprint();
+    assert!(matches!(
+        owner_sync_begin(&mut owner, id, old_base, 1),
+        Err(runtime::Error::Transport(p2p::Error::Unavailable))
+    ));
+    assert_eq!(owner.state().fingerprint(), advanced);
+    assert_eq!(owner.driver.scheduler.status().disabled, 0);
+    assert!(!owner.driver.workers[&id].sync_complete);
+
+    // A fresh request can still import a completely validated extension.
+    let base = owner.state().tip_snapshot().selector;
+    let block = candidate(owner.state(), 800_000);
+    let expected = block.id().unwrap();
+    owner_sync_command(&mut owner, |reply| Command::Pull { id, reply }).unwrap();
+    owner_sync_begin(&mut owner, id, base, 1).unwrap();
+    owner_sync_apply(&mut owner, id, base, vec![block]).unwrap();
+    assert_eq!(owner.state().height, 2);
+    assert_eq!(owner.state().tip, expected);
+}
+
+#[test]
+fn same_epoch_competing_branch_retains_full_proof_validation() {
+    let (mut owner, _peer, id, _release) = retiring_inbound_pair();
+    let mut alternative = owner.state().clone();
+    let base = alternative.tip_snapshot().selector;
+    owner.append(1_000_000);
+    let before = owner.state().fingerprint();
+    let first = candidate(&alternative, 2_000_000);
+    alternative.apply(&first, &TestVerifier).unwrap();
+    let second = candidate(&alternative, 3_000_000);
+    alternative.apply(&second, &TestVerifier).unwrap();
+    let mut invalid = second.clone();
+    invalid.transactions[0].proof = vec![2];
+
+    owner_sync_command(&mut owner, |reply| Command::Pull { id, reply }).unwrap();
+    owner_sync_begin(&mut owner, id, base, 2).unwrap();
+    assert!(matches!(
+        owner_sync_apply(&mut owner, id, base, vec![first.clone(), invalid]),
+        Err(runtime::Error::Chain(crate::chain::ChainError::Invalid(_)))
+    ));
+    assert_eq!(owner.state().fingerprint(), before);
+
+    owner_sync_command(&mut owner, |reply| Command::Pull { id, reply }).unwrap();
+    owner_sync_begin(&mut owner, id, base, 2).unwrap();
+    owner_sync_apply(&mut owner, id, base, vec![first, second]).unwrap();
+    assert_eq!(owner.state().fingerprint(), alternative.fingerprint());
+}
+
+#[test]
+fn synchronization_metadata_without_an_owned_pull_is_retryable() {
+    let (mut owner, _peer, id, _release) = retiring_inbound_pair();
+    let base = owner.state().tip_snapshot().selector;
+    let before = owner.state().fingerprint();
+    assert!(matches!(
+        owner_sync_begin(&mut owner, id, base, 1),
+        Err(runtime::Error::Transport(p2p::Error::Unavailable))
+    ));
+    assert_eq!(owner.state().fingerprint(), before);
+    assert_eq!(owner.driver.scheduler.status().disabled, 0);
 }

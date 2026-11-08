@@ -345,6 +345,7 @@ struct Worker {
     sync_goal: Option<u64>,
     sync_more: bool,
     sync_complete: bool,
+    pull_fingerprint: Option<Hash>,
     _reservation: Reservation,
 }
 struct PendingAuthentication {
@@ -555,6 +556,7 @@ impl Driver {
                 sync_goal: None,
                 sync_more: true,
                 sync_complete: false,
+                pull_fingerprint: None,
                 _reservation: reservation,
             },
         );
@@ -901,13 +903,28 @@ impl Driver {
                 }
             }
             Command::Pull { id, reply } => {
-                let result = self.active(id).and_then(|w| {
-                    node.resident_sync_request(w.peer.expect("authenticated peer"), &w.sync)
+                let result = self.active_mut(id).and_then(|w| {
+                    let request =
+                        node.resident_sync_request(w.peer.expect("authenticated peer"), &w.sync)?;
+                    w.pull_fingerprint = Some(node.state().fingerprint());
+                    Ok(request)
                 });
                 let _ = reply.send(result);
             }
             Command::Begin { id, meta, reply } => {
                 let result = self.active_mut(id).and_then(|w| {
+                    // A different owner command can advance the canonical head
+                    // while this locator request is in flight. Retry from a new
+                    // locator before staging proofs against that obsolete view.
+                    // Genuine competing branches from a current request still
+                    // use the unchanged complete branch validation path.
+                    if w.pull_fingerprint.take() != Some(node.state().fingerprint()) {
+                        w.sync.clear();
+                        w.sync_goal = None;
+                        w.sync_more = true;
+                        w.sync_complete = false;
+                        return Err(unavailable());
+                    }
                     node.resident_begin_batch(
                         w.peer.expect("authenticated peer"),
                         &mut w.sync,
