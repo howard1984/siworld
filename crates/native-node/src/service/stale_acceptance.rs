@@ -91,6 +91,53 @@ fn rows(value: &Value) -> Result<&Vec<Value>, String> {
         .as_array()
         .ok_or_else(|| "eligible_proof_evidence_required".into())
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeScope {
+    StateCycle,
+    ProofDeletion,
+}
+impl ProbeScope {
+    fn from_evidence(value: &Value) -> Result<Self, String> {
+        Ok(if rows(value)?.len() >= 5 {
+            Self::ProofDeletion
+        } else {
+            Self::StateCycle
+        })
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::StateCycle => "state_cycle_only",
+            Self::ProofDeletion => "state_cycle_and_proof_deletion",
+        }
+    }
+    fn evidence(self, value: &Value) -> Result<&Vec<Value>, String> {
+        match self {
+            Self::ProofDeletion => rows(value),
+            Self::StateCycle => value["retained_rows"]
+                .as_array()
+                .ok_or_else(|| "retained_proof_evidence_required".into()),
+        }
+    }
+    fn accepts_deleted(self, phase: Phase, deleted: u64) -> bool {
+        if self == Self::ProofDeletion && matches!(phase, Phase::Fresh | Phase::Resume) {
+            deleted > 0
+        } else {
+            deleted == 0
+        }
+    }
+    fn completed_status(self) -> &'static str {
+        match self {
+            Self::StateCycle => "state_cycle_passed",
+            Self::ProofDeletion => "passed",
+        }
+    }
+    fn deletion_status(self) -> &'static str {
+        match self {
+            Self::StateCycle => "pending_real_24h_eligible_backlog",
+            Self::ProofDeletion => "passed",
+        }
+    }
+}
 fn stale_ready(elapsed: u64, fresh_elapsed: u64, wall: u64, issued: u64) -> bool {
     elapsed
         .checked_sub(fresh_elapsed)
@@ -108,6 +155,7 @@ pub(super) struct Acceptance {
     manifest_identity: (u64, u64),
     started: Instant,
     phase: Phase,
+    scope: ProbeScope,
     fresh_elapsed: u64,
     fresh_issued: u64,
     fresh_sequence: u64,
@@ -199,6 +247,7 @@ impl Acceptance {
             manifest_identity,
             started: Instant::now(),
             phase: Phase::Fresh,
+            scope: ProbeScope::StateCycle,
             fresh_elapsed: 0,
             fresh_issued: 0,
             fresh_sequence: 0,
@@ -237,15 +286,14 @@ impl Acceptance {
             .ok_or("actual_certificate_required")?;
         let sequence = certificate.statement.sequence;
         let issued = certificate.statement.issued_unix_seconds;
-        let positive = self.phase != Phase::Stale;
         match self.phase {
             Phase::Fresh => {
-                if elapsed < SERVICE_RETENTION_SECONDS
-                    || rows(&before)?.len() < 5
+                self.scope = ProbeScope::from_evidence(&before)?;
+                if self.scope.evidence(&before)?.is_empty()
                     || metrics["pruning_paused"] != false
                     || !metrics["alert"].is_null()
                 {
-                    return Err("fresh_real_24h_eligible_backlog_and_certificate_required".into());
+                    return Err("fresh_real_retained_proof_and_certificate_required".into());
                 }
                 node.resident_checkpoint_qualify(now)?;
             }
@@ -256,7 +304,7 @@ impl Acceptance {
                     || metrics["alert"] != "checkpoint_stale"
                     || node.store().storage_metrics()?["expiry_state"] != "checkpoint_stale"
                     || before["height"].as_u64() <= self.fresh_state["height"].as_u64()
-                    || !rows(&before)?.contains(&self.reserved)
+                    || !self.scope.evidence(&before)?.contains(&self.reserved)
                 {
                     return Err(
                         "real_stale_age_new_validated_head_and_preserved_proof_required".into(),
@@ -267,34 +315,41 @@ impl Acceptance {
                 if sequence <= self.fresh_sequence
                     || metrics["pruning_paused"] != false
                     || !metrics["alert"].is_null()
-                    || !rows(&before)?.contains(&self.reserved)
+                    || !self.scope.evidence(&before)?.contains(&self.reserved)
                 {
                     return Err("new_real_certificate_and_reserved_proof_required".into());
                 }
             }
             _ => return Err("probe_sequence_complete_or_failed".into()),
         }
-        let deleted = node.maintain_storage(now, true)?;
+        let deleted = match self.scope {
+            ProbeScope::ProofDeletion => node.maintain_storage(now, true)?,
+            ProbeScope::StateCycle => node.observe_storage_finality(now)?,
+        };
         let after = node.store().stale_acceptance_rows(now, true)?;
         if state_evidence(&before) != state_evidence(&after)
-            || (positive && deleted == 0)
-            || (!positive && deleted != 0)
-            || (!positive && !rows(&after)?.contains(&self.reserved))
+            || !self.scope.accepts_deleted(self.phase, deleted)
+            || (self.scope == ProbeScope::StateCycle
+                && self.scope.evidence(&before)? != self.scope.evidence(&after)?)
+            || (self.phase == Phase::Stale
+                && !self.scope.evidence(&after)?.contains(&self.reserved))
         {
             return Err("bounded_probe_or_permanent_state_invariant_failed".into());
         }
         if self.phase == Phase::Fresh {
-            self.reserved = rows(&after)?
+            self.reserved = self
+                .scope
+                .evidence(&after)?
                 .first()
                 .cloned()
-                .ok_or("fresh_probe_must_preserve_eligible_proof")?;
+                .ok_or("fresh_probe_must_preserve_retained_proof")?;
             self.fresh_state = state_evidence(&after);
             self.fresh_elapsed = elapsed;
             self.fresh_sequence = sequence;
             self.fresh_issued = issued;
         }
         Ok(
-            json!({"phase":self.phase.name(),"outcome":"passed","before":before,"after":after,
+            json!({"phase":self.phase.name(),"outcome":"passed","acceptance_scope":self.scope.name(),"before":before,"after":after,
             "deleted_proof_blocks":deleted,"permanent_state_unchanged":true,"reward_index_unchanged":true,
             "certificate_sha256":local::hex(&Sha256::digest(certificate.encode()?)),
             "certificate_sequence":sequence,"certificate_issued_unix_seconds":issued,
@@ -352,7 +407,9 @@ impl Acceptance {
         if export {
             let eligible = node.store().stale_acceptance_rows(now, false).ok();
             let receipt = json!({"schema":1,"run_id":self.run_id,"manifest_sha256":self.manifest_sha256,
-                "specimen_id":self.specimen_id,"status":if self.phase==Phase::Complete {"passed"} else if self.phase==Phase::Failed {"failed"} else {"pending"},
+                "specimen_id":self.specimen_id,"status":if self.phase==Phase::Complete {self.scope.completed_status()} else if self.phase==Phase::Failed {"failed"} else {"pending"},
+                "acceptance_scope":self.scope.name(),
+                "proof_deletion_acceptance":if self.phase==Phase::Complete {self.scope.deletion_status()} else {"pending"},
                 "next_probe":self.phase.name(),"elapsed_monotonic_seconds":self.started.elapsed().as_secs(),
                 "observed_unix_seconds":now,"eligible_proof_evidence":eligible,"results":self.results,
                 "service_retention_seconds":SERVICE_RETENTION_SECONDS,"checkpoint_max_age_seconds":AGE_SECONDS,
@@ -401,6 +458,44 @@ pub fn request(directory: &Path, expected_run: &str, phase: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_scope_uses_real_eligible_backlog_instead_of_process_uptime() {
+        for count in [0, 1, 4] {
+            let evidence = json!({"eligible_rows":vec![Value::Null;count]});
+            assert_eq!(
+                ProbeScope::from_evidence(&evidence).unwrap(),
+                ProbeScope::StateCycle
+            );
+        }
+        let evidence = json!({"eligible_rows":vec![Value::Null;5]});
+        assert_eq!(
+            ProbeScope::from_evidence(&evidence).unwrap(),
+            ProbeScope::ProofDeletion
+        );
+        assert!(ProbeScope::from_evidence(&json!({})).is_err());
+    }
+    #[test]
+    fn state_cycle_cannot_delete_or_claim_complete_deletion_acceptance() {
+        for phase in [Phase::Fresh, Phase::Stale, Phase::Resume] {
+            assert!(ProbeScope::StateCycle.accepts_deleted(phase, 0));
+            assert!(!ProbeScope::StateCycle.accepts_deleted(phase, 1));
+        }
+        assert_eq!(
+            ProbeScope::StateCycle.completed_status(),
+            "state_cycle_passed"
+        );
+        assert_eq!(
+            ProbeScope::StateCycle.deletion_status(),
+            "pending_real_24h_eligible_backlog"
+        );
+        assert!(!ProbeScope::ProofDeletion.accepts_deleted(Phase::Fresh, 0));
+        assert!(!ProbeScope::ProofDeletion.accepts_deleted(Phase::Resume, 0));
+        assert!(!ProbeScope::ProofDeletion.accepts_deleted(Phase::Stale, 1));
+        assert!(ProbeScope::ProofDeletion.accepts_deleted(Phase::Fresh, 1));
+        assert!(ProbeScope::ProofDeletion.accepts_deleted(Phase::Resume, 1));
+        assert!(ProbeScope::ProofDeletion.accepts_deleted(Phase::Stale, 0));
+        assert_eq!(ProbeScope::ProofDeletion.completed_status(), "passed");
+    }
     #[test]
     fn stale_probe_requires_real_elapsed_and_issue_age() {
         assert!(!stale_ready(1_700, 500, 20_000, 10_000));

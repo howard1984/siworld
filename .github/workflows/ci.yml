@@ -389,6 +389,12 @@ jobs:
           cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway --all-targets -- -D warnings
       - name: Native protocol, transition, persistence and audit rejection tests
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway
+      - name: Isolated checkpoint alarm scope and retention preservation
+        run: |
+          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib service::stale_acceptance::tests::
+          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib store::retention_tests::acceptance_finality_observation_preserves_backlog_until_explicit_bounded_probe -- --exact
+          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib checkpoint_stale_runtime::tests::
+          cargo check --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --bin siworld-checkpoint-stale-runtime
       - name: Actual fixed-profile transaction and settlement mutation rejection
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib proofs::tests::fixed_profiles_roundtrip_rejects_context_and_body_mutation -- --ignored --exact
       - name: Bounded parallel verification with real proof and context rejection

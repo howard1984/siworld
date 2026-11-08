@@ -1101,6 +1101,37 @@ impl Store {
 
 #[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
 impl Store {
+    pub(crate) fn isolated_stale_storage_probe(
+        &mut self,
+        roster: &Roster,
+        now: u64,
+        verifier: &impl BlockVerifier,
+        qualify: bool,
+    ) -> Result<Value, String> {
+        if !self.state.config.fixture
+            || checkpoint_auth::release_roster(Binding::new(&self.state.config))?.is_some()
+            || self.storage_role()? != Some(Role::Validator)
+        {
+            return Err("isolated_fixture_validator_required".into());
+        }
+        if qualify {
+            self.qualify_service_checkpoint_delivery(roster, now)?;
+        }
+        let (paused, reason) = match self.service_checkpoint_gate(Some(roster), now)? {
+            ServiceGate::Ready(_) => (false, "ready"),
+            ServiceGate::Paused(reason) => (true, reason),
+        };
+        let state = self.state.fingerprint();
+        let deleted = self.expire_proofs_with_roster(now, true, verifier, Some(roster))?;
+        if self.state.fingerprint() != state {
+            return Err("isolated_storage_probe_changed_permanent_state".into());
+        }
+        Ok(
+            json!({"pruning_paused":paused,"reason":reason,"deleted_proof_blocks":deleted,
+            "permanent_state_unchanged":true,"height":self.state.height}),
+        )
+    }
+
     /// Read-only, bounded evidence for the isolated age acceptance executable.
     /// Eligibility ignores only the shortened stale alarm, never the actual
     /// service retention, rollback, authenticated checkpoint, or proof bounds.
@@ -1138,6 +1169,7 @@ impl Store {
             return Err("nonproducing_fixture_required".into());
         }
         let mut eligible = Vec::new();
+        let mut retained = Vec::new();
         let last = chain::finalized_height(self.state.height)
             .min(certificate.statement.height)
             .min(base.height.saturating_add(8));
@@ -1151,7 +1183,7 @@ impl Store {
             if observed.len() != 48 {
                 return Err("invalid_probe_finality".into());
             }
-            let block_id = observed[..32]
+            let block_id: crate::wire::Hash = observed[..32]
                 .try_into()
                 .map_err(|_| "invalid_probe_block")?;
             let time = u64::from_le_bytes(observed[32..40].try_into().expect("checked row"));
@@ -1161,6 +1193,16 @@ impl Store {
                 storage_policy::SERVICE_RETENTION_SECONDS.saturating_sub(now.saturating_sub(time))
             };
             minimum_remaining_seconds = minimum_remaining_seconds.max(remaining);
+            let row = blocks
+                .get(height)
+                .map_err(|_| "probe_blocks_failed")?
+                .ok_or("probe_block_missing")?;
+            if split_record(row.value())?.0.starts_with(b"SWLC0001") {
+                return Err("eligible_full_proof_required".into());
+            }
+            let evidence = json!({"height":height,"block_id":crate::local::hex(&block_id),
+                "row_blake3":digest_rows.then(|| blake3::hash(row.value()).to_hex().to_string())});
+            retained.push(evidence.clone());
             if storage_policy::expired_with_local_blocks(
                 Role::Validator,
                 height,
@@ -1183,20 +1225,10 @@ impl Store {
             {
                 break;
             }
-            let row = blocks
-                .get(height)
-                .map_err(|_| "probe_blocks_failed")?
-                .ok_or("probe_block_missing")?;
-            if split_record(row.value())?.0.starts_with(b"SWLC0001") {
-                return Err("eligible_full_proof_required".into());
-            }
-            eligible.push(
-                json!({"height":height,"block_id":crate::local::hex(&block_id),
-                "row_blake3":digest_rows.then(|| blake3::hash(row.value()).to_hex().to_string())}),
-            );
+            eligible.push(evidence);
         }
         Ok(
-            json!({"eligible_rows":eligible,"sample_limit":8,"proof_row_hashes_included":digest_rows,
+            json!({"eligible_rows":eligible,"retained_rows":retained,"sample_limit":8,"proof_row_hashes_included":digest_rows,
             "minimum_remaining_retention_seconds":minimum_remaining_seconds,
             "local_reward_index_count":reward_count,"height":self.state.height,
             "tip":crate::local::hex(&self.state.tip),

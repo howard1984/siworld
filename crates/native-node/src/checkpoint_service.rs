@@ -213,6 +213,21 @@ impl Coordinator {
             alert: None,
         })
     }
+    #[cfg(all(feature = "checkpoint-stale-acceptance", unix))]
+    pub(crate) fn isolated_stale_runtime(
+        config: &crate::state::Config,
+        roster: Roster,
+    ) -> Result<Self, String> {
+        if !config.fixture
+            || roster.binding() != Binding::new(config)
+            || auth::release_roster(Binding::new(config))?.is_some()
+        {
+            return Err("isolated_fixture_checkpoint_roster_required".into());
+        }
+        let mut value = Self::new(roster, None)?;
+        value.pruning = crate::storage_policy::CheckpointPruning::shortened_for_acceptance(1200)?;
+        Ok(value)
+    }
     #[cfg(test)]
     pub(crate) fn for_test(directory: &Path, roster: Roster) -> Result<Self, String> {
         let mut value = Self::new(roster, None)?;

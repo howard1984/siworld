@@ -77,6 +77,17 @@ pub(crate) struct OwnedRelay {
 }
 
 impl<V: BlockVerifier> Node<V> {
+    #[cfg(all(feature = "checkpoint-stale-acceptance", unix))]
+    pub(crate) fn isolated_stale_storage_probe(
+        &mut self,
+        roster: &crate::engineering_checkpoint::Roster,
+        now: u64,
+        qualify: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.store
+            .isolated_stale_storage_probe(roster, now, &self.verifier, qualify)
+    }
+
     pub(crate) fn resident_checkpoint_qualify(&mut self, now: u64) -> Result<(), String> {
         let roster =
             crate::engineering_checkpoint::release_roster(p2p::Binding::new(&self.state().config))?

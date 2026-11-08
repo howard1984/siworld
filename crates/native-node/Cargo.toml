@@ -31,6 +31,11 @@ checkpoint-rejection-acceptance = []
 checkpoint-stale-acceptance = []
 
 [[bin]]
+name = "siworld-checkpoint-stale-runtime"
+path = "src/bin/siworld-checkpoint-stale-runtime.rs"
+required-features = ["native-p2p", "checkpoint-stale-acceptance"]
+
+[[bin]]
 name = "siworld-checkpoint-rejection-acceptance"
 path = "src/bin/siworld-checkpoint-rejection-acceptance.rs"
 required-features = ["checkpoint-rejection-acceptance"]

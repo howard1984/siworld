@@ -5,6 +5,8 @@
 pub mod checkpoint_rejection_acceptance;
 #[cfg(feature = "native-p2p")]
 pub(crate) mod checkpoint_service;
+#[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+pub mod checkpoint_stale_runtime;
 pub mod engineering_checkpoint;
 pub mod engineering_genesis;
 pub mod fund_spend;

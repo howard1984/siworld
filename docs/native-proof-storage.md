@@ -155,15 +155,35 @@ The existing resident owner and authenticated P2P continue verifying blocks and
 receiving real release certificates. Routine maintenance records finality while
 preserving all proof rows. `checkpoint-stale-probe DIRECTORY EXPECTED_RUN_ID
 fresh|stale|resume` writes one private request per phase; it cannot overwrite or
-repeat a request. The fresh probe requires one full observed day and at least
-five eligible retained proofs, then runs one normal bounded expiry batch. The
-stale probe requires both actual elapsed and publication ages above 1,200
+repeat a request. The fresh probe uses persisted, conservatively observed
+finality age rather than process uptime. At least five eligible retained proofs
+select the proof-deletion scope and one normal bounded expiry batch. Without
+that backlog, the state-cycle-only scope records finality without deleting any
+proofs, even if some become eligible during the cycle. The stale probe requires
+both actual elapsed and publication ages above 1,200
 seconds, a subsequently validated head, the stale alarm, and an unchanged
 reserved proof row. A genuinely newer accepted certificate permits a positive
 resume probe. Each probe preserves permanent state and the nonproducing local
-reward index. Private receipts distinguish pending, failed, and completed probes.
+reward index. Private receipts identify the scope. A completed state-only cycle
+reports `state_cycle_passed` and `pending_real_24h_eligible_backlog` for proof
+deletion; it cannot qualify production pruning or replace real retention and
+deletion acceptance. Only the proof-deletion scope can report full `passed`.
 No production signer outage, shortened retention window, or synthetic clock is
 part of this route.
+
+The separate `siworld-checkpoint-stale-runtime ABSENT_DIRECTORY` executable is
+available only with `native-p2p` and `checkpoint-stale-acceptance` on Unix. It
+creates a new random fixture network, synthetic canonical history, and three
+ephemeral ML-DSA-65 authorities; any two sign its local certificates. It opens
+no existing chain or network connection. The process exercises the actual
+coordinator and store gate, waits at least 1,201 real monotonic and wall-clock
+seconds without another publication, and then issues a newer certificate to
+observe recovery. Its receipt labels synthetic proof verification and
+state-cycle-only scope separately from real-network and 24-hour deletion
+acceptance. The temporary signing and node keys are deleted when it finishes;
+public evidence and synthetic storage remain in the output directory. Production
+authorities, publication cadence, retention policy, and default builds are
+unchanged.
 
 The authentication component rejects missing, duplicate, unknown and invalid
 signatures, wrong context, future publications and cursor rollback/equivocation.
