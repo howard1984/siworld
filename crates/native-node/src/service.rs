@@ -33,6 +33,11 @@ pub mod network;
 #[cfg(feature = "native-p2p")]
 pub use checkpoint_control::{request_checkpoint_qualification, request_checkpoint_signing};
 
+#[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+mod stale_acceptance;
+#[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+pub use stale_acceptance::request as request_checkpoint_stale_probe;
+
 pub const LEASE_FILE: &str = "service.lock";
 pub const STATUS_FILE: &str = "service-status.json";
 pub const OBSERVATION_TARGET_MS: u64 = 86_400_000;
@@ -42,6 +47,7 @@ const MAX_CLOCK_DRIFT_MS: u64 = 30_000;
 const POW_ITERATIONS: u64 = 64;
 
 pub(super) fn configure_storage_startup(store: &mut Store) -> Result<(), String> {
+    let pruning = crate::storage_policy::CheckpointPruning::from_environment()?;
     let role = std::env::var("SIWORLD_STORAGE_ROLE").ok();
     let blocks = std::env::var("SIWORLD_STORAGE_KEEP_BLOCKS").ok();
     if let Some(policy) =
@@ -52,6 +58,7 @@ pub(super) fn configure_storage_startup(store: &mut Store) -> Result<(), String>
             store.configure_local_proof_blocks(blocks)?;
         }
     }
+    store.configure_checkpoint_pruning(pruning);
     Ok(())
 }
 
@@ -1330,5 +1337,98 @@ pub fn restart_check_offline(directory: &Path) -> Result<Value, String> {
     }))
 }
 
+/// Expire and compact an idle local-role store from its exact authenticated
+/// restart record. Missing or stale records fail without historical replay.
+/// This command never qualifies legacy state or changes service-node policy.
+pub fn storage_maintain_resume_offline(
+    directory: &Path,
+    role: crate::storage_policy::Role,
+    blocks: u64,
+) -> Result<Value, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock precedes epoch")?
+        .as_secs();
+    let verifier = NativeVerifier::new()?;
+    storage_maintain_resume_with_verifier(directory, role, blocks, now, &verifier)
+}
+
+fn storage_maintain_resume_with_verifier(
+    directory: &Path,
+    role: crate::storage_policy::Role,
+    blocks: u64,
+    now: u64,
+    verifier: &impl crate::state::BlockVerifier,
+) -> Result<Value, String> {
+    if role.serves_historical_proofs() || blocks < crate::storage_policy::MIN_LOCAL_PROOF_BLOCKS {
+        return Err(
+            "resume maintenance requires miner or ordinary role and at least 24 blocks".into(),
+        );
+    }
+    let _lease = Lease::acquire(directory)?;
+    let mut store = Store::check_restart_existing(
+        directory.join("chain.redb"),
+        local::load(directory)?,
+        verifier,
+    )?;
+    let head = |store: &Store| {
+        json!({
+            "height": store.state().height,
+            "tip": local::hex(&store.state().tip),
+            "state_fingerprint": local::hex(&store.state().fingerprint()),
+            "cumulative_work": local::hex(&store.state().cumulative_work.to_big_endian()),
+        })
+    };
+    if store
+        .storage_role()?
+        .is_some_and(crate::storage_policy::Role::serves_historical_proofs)
+    {
+        return Err("resume maintenance cannot migrate a service-node storage policy".into());
+    }
+    let before_head = head(&store);
+    let before = store.storage_metrics()?;
+    let before_rewards = store.verify_local_rewards()?;
+    store.configure_storage(role)?;
+    store.configure_local_proof_blocks(blocks)?;
+    let mut expired = 0u64;
+    loop {
+        let count = store.expire_proofs(now, true, verifier)?;
+        expired = expired
+            .checked_add(count)
+            .ok_or("expired proof count overflow")?;
+        if count == 0 {
+            break;
+        }
+    }
+    // The existing compaction audit reconstructs permanent public effects and
+    // fully verifies every proof remaining after the local expiry boundary.
+    let compacted = store.compact_expired_storage(verifier)?;
+    let checked_rewards = store.verify_local_rewards()?;
+    let after_head = head(&store);
+    if after_head != before_head || checked_rewards != before_rewards {
+        return Err(
+            "maintained storage state or indexed rewards differ; preserve the store".into(),
+        );
+    }
+    Ok(json!({
+        "schema": 1,
+        "validation_scope": "authenticated-restart-and-retained-proof-tail",
+        "authenticated_restart_only": true,
+        "historical_prefix_proof_replay_checked": false,
+        "proof_tail_replay_checked": true,
+        "permanent_prefix_replay_checked": true,
+        "local_reward_receipts_checked": checked_rewards,
+        "reward_replay_verified": true,
+        "before_head": before_head,
+        "after_head": after_head,
+        "before": before,
+        "after": store.storage_metrics()?,
+        "expired_blocks": expired,
+        "compacted": compacted,
+    }))
+}
+
+#[cfg(test)]
+mod storage_maintenance_tests;
 #[cfg(test)]
 mod tests;

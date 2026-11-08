@@ -49,6 +49,7 @@ pub struct Store {
     path: std::path::PathBuf,
     storage_base: Option<State>,
     retention_clock_started: bool,
+    checkpoint_pruning: crate::storage_policy::CheckpointPruning,
     resume_cache: Option<resume::Context>,
 }
 
@@ -190,6 +191,7 @@ impl Store {
             path: path.to_owned(),
             storage_base,
             retention_clock_started: false,
+            checkpoint_pruning: crate::storage_policy::CheckpointPruning::default(),
             resume_cache,
         };
         if store.has_local_reward_index()? {
@@ -209,6 +211,18 @@ impl Store {
 
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    pub(crate) fn configure_checkpoint_pruning(
+        &mut self,
+        policy: crate::storage_policy::CheckpointPruning,
+    ) {
+        self.checkpoint_pruning = policy;
+    }
+
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn checkpoint_pruning(&self) -> crate::storage_policy::CheckpointPruning {
+        self.checkpoint_pruning
     }
 
     fn persist_resume(&mut self) -> Result<(), String> {

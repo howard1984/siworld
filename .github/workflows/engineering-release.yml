@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v1.*-eng.*']
   workflow_dispatch:
+    inputs:
+      checkpoint_stale_acceptance:
+        description: Build an isolated checkpoint acceptance package
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -14,6 +19,10 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+    env:
+      CHECKPOINT_ACCEPTANCE: ${{ github.event_name == 'workflow_dispatch' && inputs.checkpoint_stale_acceptance && 'true' || 'false' }}
+      PACKAGE_ROOT: ${{ github.event_name == 'workflow_dispatch' && inputs.checkpoint_stale_acceptance && 'engineering-checkpoint-acceptance' || 'engineering-release' }}
+      PACKAGE_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.checkpoint_stale_acceptance && 'siworld-checkpoint-acceptance-linux-x86_64' || 'siworld-linux-x86_64' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -25,9 +34,13 @@ jobs:
           workspaces: crates/native-node
       - name: Build guarded node, miner and wallet CLI
         run: |
-          python3 scripts/build-native-runtime.py --engineering-network --output .local/engineering-release
-          .local/engineering-release/bin/siworld-native-node --check-cpu
-          .local/engineering-release/bin/siworld-native-node --help
+          acceptance_args=()
+          if [ "$CHECKPOINT_ACCEPTANCE" = true ]; then
+            acceptance_args+=(--checkpoint-stale-acceptance)
+          fi
+          python3 scripts/build-native-runtime.py --engineering-network "${acceptance_args[@]}" --output ".local/$PACKAGE_ROOT"
+          ".local/$PACKAGE_ROOT/bin/siworld-native-node" --check-cpu
+          ".local/$PACKAGE_ROOT/bin/siworld-native-node" --help
       - name: Record source and package digests
         env:
           RELEASE_REF: ${{ github.ref_name }}
@@ -36,35 +49,39 @@ jobs:
           python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
-          root = Path('.local/engineering-release')
+          root = Path('.local') / os.environ['PACKAGE_ROOT']
           def digest(path):
               return hashlib.sha256(path.read_bytes()).hexdigest()
           commit = os.environ['SOURCE_COMMIT']
           ref = os.environ['RELEASE_REF']
           version = ref if ref.startswith('v1.') else 'v1.0.0-eng.' + str(int(commit[:12], 16))
+          features = json.loads((root / 'build-receipt.json').read_text())['worker_build_receipt']['cargo_features']
+          acceptance = 'checkpoint-stale-acceptance' in features
+          assert acceptance == (os.environ['CHECKPOINT_ACCEPTANCE'] == 'true')
           manifest = {'schema': 1, 'version': version,
               'source_commit': os.environ['SOURCE_COMMIT'],
               'worker_sha256': digest(root / 'libexec/siworld-native-node'),
               'checkpoint_key_sha256': digest(root / 'libexec/siworld-checkpoint-key'),
               'restart_qualify_sha256': digest(root / 'libexec/siworld-restart-qualify'),
-              'roles': ['bootstrap', 'validator', 'miner', 'wallet-cli'],
-              'cargo_features': ['native-p2p', 'wallet-light-gateway'],
+              'roles': ['checkpoint-acceptance'] if acceptance else ['bootstrap', 'validator', 'miner', 'wallet-cli'],
+              'cargo_features': features,
+              'checkpoint_acceptance_only': acceptance,
               'network_class': 'resettable-engineering'}
           (root / 'release-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
           files = sorted(p for p in root.rglob('*') if p.is_file())
           (root / 'SHA256SUMS').write_text(''.join(digest(p) + '  ' + str(p.relative_to(root)) + '\n' for p in files))
           PY
           mkdir -p .local/release-assets
-          tar -czf .local/release-assets/siworld-linux-x86_64.tar.gz -C .local engineering-release
+          tar -czf ".local/release-assets/$PACKAGE_NAME.tar.gz" -C .local "$PACKAGE_ROOT"
           cd .local/release-assets
-          sha256sum siworld-linux-x86_64.tar.gz > SHA256SUMS
+          sha256sum "$PACKAGE_NAME.tar.gz" > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: engineering-linux-x86_64
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.checkpoint_stale_acceptance && 'engineering-checkpoint-acceptance-linux-x86_64' || 'engineering-linux-x86_64' }}
           path: .local/release-assets/*
           retention-days: 14
       - name: Publish tagged engineering assets
-        if: startsWith(github.ref, 'refs/tags/v1.')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v1.') && env.CHECKPOINT_ACCEPTANCE != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}

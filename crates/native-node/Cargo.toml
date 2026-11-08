@@ -27,6 +27,8 @@ peer-qualification = ["native-p2p"]
 wallet-light-gateway = []
 # Explicit offline acceptance target, excluded from production packaging.
 checkpoint-rejection-acceptance = []
+# Explicit real-time pruning-alarm acceptance build; excluded from production packaging.
+checkpoint-stale-acceptance = []
 
 [[bin]]
 name = "siworld-checkpoint-rejection-acceptance"

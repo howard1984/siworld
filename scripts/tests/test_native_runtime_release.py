@@ -55,6 +55,15 @@ def compile_guard(command, **kwargs):
 
 
 class NativeRuntimeReleaseTests(unittest.TestCase):
+    def test_acceptance_capabilities_require_an_explicit_engineering_build(self):
+        self.assertEqual(NATIVE.build_features(False, False), [])
+        self.assertEqual(NATIVE.build_features(True, False),
+                         ['native-p2p', 'wallet-light-gateway'])
+        self.assertEqual(NATIVE.build_features(True, True),
+                         ['native-p2p', 'wallet-light-gateway', 'checkpoint-stale-acceptance'])
+        with self.assertRaisesRegex(ValueError, 'engineering network'):
+            NATIVE.build_features(False, True)
+
     def test_restart_qualification_worker_is_guarded_and_bound(self):
         with tempfile.TemporaryDirectory() as directory:
             worker = worker_at(directory)

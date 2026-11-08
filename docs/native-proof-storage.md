@@ -74,6 +74,12 @@ checks the resulting accepted state. Neither command should run against a live
 owner. `storage-maintain DIRECTORY miner|ordinary BLOCKS` performs verified
 open, configuration, bounded expiry batches, compaction and reward verification
 in one exclusive session instead of reopening the complete history for each batch.
+`storage-maintain-resume DIRECTORY miner|ordinary BLOCKS` requires an authenticated
+seal at the exact committed head and checks indexed rewards before policy changes.
+It refuses missing or mismatched restart evidence without falling back to a full
+historical proof replay. Compaction still verifies every retained proof and checks
+that the accepted state and indexed rewards remain unchanged. Service roles are
+not admitted through this command.
 Expiry allows page reuse but does not promise that the physical file
 shrinks. Offline compaction may need additional free disk space and can take a
 long time; preserve the store on any error.
@@ -120,6 +126,44 @@ issuance and burn totals, locked rewards and schedule, and asset registry.
 Checkpoint height is a multiple of 72 with at least 24 confirmations.
 Publication is due every six hours. An 18-hour publication age limit controls
 pruning eligibility, never block verification.
+
+An explicit `checkpoint-stale-acceptance` build permits a process-local
+`SIWORLD_CHECKPOINT_STALE_SECONDS` override between 1,200 and 64,800 seconds for
+an isolated acceptance instance. The default remains 64,800 seconds; production
+builds reject this override. The coordinator's pruning alarm and the store's
+service proof-deletion and qualification gates use the same configured policy.
+The effective value is exported as `checkpoint_max_age_seconds`. It is not
+persisted, supplied by peers, or used for certificate validity, checkpoint
+bootstrap eligibility, the six-hour publication schedule, or proof windows.
+A shortened acceptance threshold still requires a genuinely newer publication
+to resume pruning; it does not create an additional publication within the same
+six-hour sequence. Real-time acceptance evidence must identify the build,
+configuration, elapsed time, and distinct publications used.
+
+On Unix, a build with both `native-p2p` and `checkpoint-stale-acceptance`
+supports a separately registered nonmining outbound validator specimen. A private
+`checkpoint-stale-acceptance.json` manifest pins its directory identity, public
+peer identity, network/genesis/verifier, exact executable/configuration/peer
+configuration digests, and 1,200-second local threshold. The environment value
+`SIWORLD_CHECKPOINT_STALE_ACCEPTANCE` must equal the manifest SHA-256. Authority
+material, an inbound listener, mining, external transport identity reuse, wallet
+gateway activation, a previously qualified specimen, and inherited probe state
+are rejected. A shortened age in the resident acceptance build requires this
+explicit binding.
+
+The existing resident owner and authenticated P2P continue verifying blocks and
+receiving real release certificates. Routine maintenance records finality while
+preserving all proof rows. `checkpoint-stale-probe DIRECTORY EXPECTED_RUN_ID
+fresh|stale|resume` writes one private request per phase; it cannot overwrite or
+repeat a request. The fresh probe requires one full observed day and at least
+five eligible retained proofs, then runs one normal bounded expiry batch. The
+stale probe requires both actual elapsed and publication ages above 1,200
+seconds, a subsequently validated head, the stale alarm, and an unchanged
+reserved proof row. A genuinely newer accepted certificate permits a positive
+resume probe. Each probe preserves permanent state and the nonproducing local
+reward index. Private receipts distinguish pending, failed, and completed probes.
+No production signer outage, shortened retention window, or synthetic clock is
+part of this route.
 
 The authentication component rejects missing, duplicate, unknown and invalid
 signatures, wrong context, future publications and cursor rollback/equivocation.

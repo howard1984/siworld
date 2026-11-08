@@ -7,9 +7,72 @@ pub const SERVICE_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const CHECKPOINT_PUBLICATION_SECONDS: u64 = 6 * 60 * 60;
 pub const LOCAL_PROOF_BLOCKS: u64 = 96;
 pub const MIN_LOCAL_PROOF_BLOCKS: u64 = 24;
-pub const CHECKPOINT_MAX_AGE_SECONDS: u64 = 18 * 60 * 60;
+pub const CHECKPOINT_MAX_AGE_SECONDS: u64 = crate::engineering_checkpoint::MAX_AGE_SECONDS;
 /// Capacity estimate at a five-minute target, not an expiration condition.
 pub const NOMINAL_SERVICE_PROOF_BLOCKS: u64 = 312;
+
+/// Process-local checkpoint age for service proof deletion and its alarm.
+/// Certificate validity, catchup eligibility, and publication cadence are
+/// unchanged. Production builds reject an environment override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointPruning {
+    max_age_seconds: u64,
+}
+impl Default for CheckpointPruning {
+    fn default() -> Self {
+        Self {
+            max_age_seconds: CHECKPOINT_MAX_AGE_SECONDS,
+        }
+    }
+}
+impl CheckpointPruning {
+    pub fn from_override(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        #[cfg(not(feature = "checkpoint-stale-acceptance"))]
+        {
+            let _ = value;
+            Err("checkpoint age override requires the explicit acceptance build".into())
+        }
+        #[cfg(feature = "checkpoint-stale-acceptance")]
+        {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("checkpoint age override requires unsigned integer seconds".into());
+            }
+            let seconds = value
+                .parse::<u64>()
+                .map_err(|_| "invalid checkpoint age override")?;
+            Self::shortened_for_acceptance(seconds)
+        }
+    }
+    pub(crate) fn from_environment() -> Result<Self, String> {
+        let value = match std::env::var("SIWORLD_CHECKPOINT_STALE_SECONDS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err("invalid checkpoint age override encoding".into());
+            }
+        };
+        Self::from_override(value.as_deref())
+    }
+    #[cfg(any(test, feature = "checkpoint-stale-acceptance"))]
+    pub(crate) fn shortened_for_acceptance(seconds: u64) -> Result<Self, String> {
+        if !(1200..=CHECKPOINT_MAX_AGE_SECONDS).contains(&seconds) {
+            return Err("checkpoint age override must be between 1200 and 64800 seconds".into());
+        }
+        Ok(Self {
+            max_age_seconds: seconds,
+        })
+    }
+    pub fn max_age_seconds(self) -> u64 {
+        self.max_age_seconds
+    }
+    pub fn fresh(self, issued_unix_seconds: u64, now: u64) -> bool {
+        now.checked_sub(issued_unix_seconds)
+            .is_some_and(|age| age <= self.max_age_seconds)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {

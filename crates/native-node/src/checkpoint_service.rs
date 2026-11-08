@@ -156,11 +156,16 @@ pub(crate) struct Coordinator {
     #[cfg(feature = "native-p2p")]
     catchup: Option<Catchup>,
     signing_paused: bool,
+    pruning: crate::storage_policy::CheckpointPruning,
     pub(crate) alert: Option<&'static str>,
 }
 #[cfg(feature = "native-p2p")]
 impl Coordinator {
-    pub(crate) fn load(directory: &Path, binding: Binding) -> Result<Option<Self>, String> {
+    pub(crate) fn load(
+        directory: &Path,
+        binding: Binding,
+        pruning: crate::storage_policy::CheckpointPruning,
+    ) -> Result<Option<Self>, String> {
         let Some(roster) = auth::release_roster(binding)? else {
             return Ok(None);
         };
@@ -178,6 +183,7 @@ impl Coordinator {
         };
         let mut value = Self::new(roster, authority)?;
         value.directory = directory.to_owned();
+        value.pruning = pruning;
         Ok(Some(value))
     }
     fn new(roster: Roster, authority: Option<Authority>) -> Result<Self, String> {
@@ -203,6 +209,7 @@ impl Coordinator {
             download_owner: None,
             catchup: None,
             signing_paused: false,
+            pruning: crate::storage_policy::CheckpointPruning::default(),
             alert: None,
         })
     }
@@ -727,11 +734,17 @@ impl Coordinator {
             .accepted
             .as_ref()
             .and_then(|c| now.checked_sub(c.statement.issued_unix_seconds));
+        let pruning_paused = self.accepted.as_ref().is_none_or(|certificate| {
+            !self
+                .pruning
+                .fresh(certificate.statement.issued_unix_seconds, now)
+        });
         serde_json::json!({"enabled":true,"authority":self.signer.is_some(),"signing_paused":self.signing_paused,
             "summary_building":self.build.is_some(),"catchup":self.catchup.as_ref().map(Catchup::metrics),"latest_height":self.accepted.as_ref().map(|c|c.statement.height),
             "latest_sequence":self.accepted.as_ref().map(|c|c.statement.sequence),"age_seconds":age,
-            "pruning_paused":age.is_none_or(|age|age>auth::MAX_AGE_SECONDS),
-            "alert":self.alert.or_else(|| age.is_none_or(|age|age>auth::MAX_AGE_SECONDS).then_some("checkpoint_stale"))})
+            "checkpoint_max_age_seconds":self.pruning.max_age_seconds(),
+            "pruning_paused":pruning_paused,
+            "alert":self.alert.or_else(|| pruning_paused.then_some("checkpoint_stale"))})
     }
 }
 
@@ -885,6 +898,24 @@ mod coordination_tests {
             ca.metrics(21_600 + auth::MAX_AGE_SECONDS + 1)["pruning_paused"],
             true
         );
+        assert_eq!(ca.metrics(22_801)["checkpoint_max_age_seconds"], 64_800);
+        assert_eq!(ca.metrics(22_801)["pruning_paused"], false);
+        let shortened =
+            crate::storage_policy::CheckpointPruning::shortened_for_acceptance(1200).unwrap();
+        ca.pruning = shortened;
+        cb.pruning = shortened;
+        assert_eq!(ca.metrics(22_800)["pruning_paused"], false);
+        assert_eq!(ca.metrics(22_801)["checkpoint_max_age_seconds"], 1200);
+        assert_eq!(ca.metrics(22_801)["pruning_paused"], true);
+        assert_eq!(ca.metrics(22_801)["alert"], "checkpoint_stale");
+        // The local pruning alarm does not expire an authenticated bootstrap
+        // certificate or change the six-hour signing schedule.
+        assert!(
+            first_certificate
+                .authenticate(&roster, None, 22_801)
+                .unwrap()
+                .pruning_fresh(22_801)
+        );
         // A new valid publication automatically clears stale pruning status.
         settle(&mut ca, &mut na, 108_000, |c| {
             c.proposal
@@ -899,6 +930,8 @@ mod coordination_tests {
                 .is_some_and(|p| p.statement.sequence == 5)
         });
         assert_eq!(cb.metrics(108_000)["pruning_paused"], false);
+        assert_eq!(cb.metrics(108_000)["alert"], serde_json::Value::Null);
+        assert_eq!(cb.metrics(109_201)["pruning_paused"], true);
         ca.set_signing_paused(true).unwrap();
         // A valid superseded advertisement must not disconnect a peer during
         // the normal publication transition or roll back accepted state.

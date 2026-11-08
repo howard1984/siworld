@@ -1772,9 +1772,27 @@ pub(super) fn continuous(
         )
         .map_err(|_| "persistent native identity unavailable")?,
     );
+    #[cfg(all(feature = "checkpoint-stale-acceptance", unix))]
+    let mut stale_acceptance = super::stale_acceptance::Acceptance::load(
+        directory,
+        &control.identity,
+        &store,
+        config.listening_enabled(),
+        config.mining_enabled(),
+        config.digest(),
+        identity
+            .descriptor()
+            .map_err(|_| "acceptance_public_identity_unavailable")?
+            .fingerprint(),
+    )?;
+    let checkpoint_pruning = store.checkpoint_pruning();
     let mut node = Node::new(store, verifier);
     let mut driver = Driver::new(identity, config, node.transport_budget())?;
-    driver.checkpoints = crate::checkpoint_service::Coordinator::load(directory, node.binding())?;
+    driver.checkpoints = crate::checkpoint_service::Coordinator::load(
+        directory,
+        node.binding(),
+        checkpoint_pruning,
+    )?;
     let mut checkpoint_poll: Option<Instant> = None;
     #[cfg(all(feature = "wallet-light-gateway", unix))]
     let mut wallet_gateway = crate::wallet_gateway::Gateway::from_environment()?;
@@ -1801,6 +1819,13 @@ pub(super) fn continuous(
                 .is_none_or(|last| last.elapsed() >= storage_maintenance_interval)
             {
                 let now = control.checked_wall()? / 1000;
+                #[cfg(all(feature = "checkpoint-stale-acceptance", unix))]
+                let expired = if stale_acceptance.is_some() {
+                    node.observe_storage_finality(now)?
+                } else {
+                    node.maintain_storage(now, true)?
+                };
+                #[cfg(not(all(feature = "checkpoint-stale-acceptance", unix)))]
                 let expired = node.maintain_storage(now, true)?;
                 storage_maintenance_interval =
                     Duration::from_secs(if expired > 0 { 5 } else { 60 });
@@ -1837,6 +1862,15 @@ pub(super) fn continuous(
                     }
                 }
                 super::checkpoint_control::poll(directory, &control.identity.run_id, &mut node);
+                #[cfg(all(feature = "checkpoint-stale-acceptance", unix))]
+                if let Some(acceptance) = &mut stale_acceptance {
+                    acceptance.poll(
+                        directory,
+                        &mut node,
+                        driver.checkpoints.as_ref(),
+                        control.checked_wall()? / 1000,
+                    );
+                }
                 checkpoint_poll = Some(Instant::now());
             }
             #[cfg(all(feature = "wallet-light-gateway", unix))]

@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn checkpoint_pruning_override_preserves_the_production_default_and_upper_bound() {
+    let default = CheckpointPruning::from_override(None).unwrap();
+    assert_eq!(default.max_age_seconds(), 64_800);
+    assert_eq!(CHECKPOINT_MAX_AGE_SECONDS, 64_800);
+    assert_eq!(crate::engineering_checkpoint::MAX_AGE_SECONDS, 64_800);
+    assert!(default.fresh(21_600, 21_600 + 64_800));
+    assert!(!default.fresh(21_600, 21_600 + 64_801));
+    assert!(!default.fresh(21_600, 21_599));
+    for invalid in ["0", "1199", "64801", "-1", "+1200", "1200.0", " 1200", ""] {
+        assert!(CheckpointPruning::from_override(Some(invalid)).is_err());
+    }
+    let shortened = CheckpointPruning::from_override(Some("1200"));
+    if cfg!(feature = "checkpoint-stale-acceptance") {
+        assert_eq!(shortened.unwrap().max_age_seconds(), 1200);
+    } else {
+        assert!(shortened.is_err());
+    }
+}
+
+#[test]
+fn shortened_checkpoint_pruning_clock_pauses_only_after_the_age_boundary() {
+    let policy = CheckpointPruning::shortened_for_acceptance(1200).unwrap();
+    assert!(policy.fresh(21_600, 22_799));
+    assert!(policy.fresh(21_600, 22_800));
+    assert!(!policy.fresh(21_600, 22_801));
+    assert!(!policy.fresh(21_600, 21_599));
+    assert!(policy.fresh(22_802, 22_802));
+    for invalid in [0, 1199, 64_801, u64::MAX] {
+        assert!(CheckpointPruning::shortened_for_acceptance(invalid).is_err());
+    }
+}
+
+#[test]
 fn startup_policy_requires_explicit_role_and_respects_local_minimum() {
     assert_eq!(StartupPolicy::parse(None, None).unwrap(), None);
     assert!(StartupPolicy::parse(None, Some("96")).is_err());

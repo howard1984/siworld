@@ -351,7 +351,10 @@ impl Store {
             Ok(value) => value,
             Err(_) => return Ok(ServiceGate::Paused("checkpoint_invalid")),
         };
-        if !authenticated.pruning_fresh(now) {
+        if !self
+            .checkpoint_pruning
+            .fresh(authenticated.statement().issued_unix_seconds, now)
+        {
             return Ok(ServiceGate::Paused("checkpoint_stale"));
         }
         let statement = &certificate.statement;
@@ -410,7 +413,9 @@ impl Store {
             .latest_engineering_checkpoint()?
             .ok_or("checkpoint delivery requires an accepted certificate")?;
         let authenticated = certificate.authenticate(roster, None, now)?;
-        if !authenticated.pruning_fresh(now)
+        if !self
+            .checkpoint_pruning
+            .fresh(authenticated.statement().issued_unix_seconds, now)
             || self.canonical_id(certificate.statement.height)? != certificate.statement.block_id
             || certificate
                 .statement
@@ -601,6 +606,25 @@ impl Store {
         _verifier: &impl BlockVerifier,
         roster: Option<&Roster>,
     ) -> Result<u64, String> {
+        self.expire_proofs_controlled(now, clock_certain, _verifier, roster, true)
+    }
+    #[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+    pub(crate) fn observe_proof_finality(
+        &mut self,
+        now: u64,
+        verifier: &impl BlockVerifier,
+    ) -> Result<u64, String> {
+        let roster = checkpoint_auth::release_roster(Binding::new(&self.state.config))?;
+        self.expire_proofs_controlled(now, true, verifier, roster.as_ref(), false)
+    }
+    fn expire_proofs_controlled(
+        &mut self,
+        now: u64,
+        clock_certain: bool,
+        _verifier: &impl BlockVerifier,
+        roster: Option<&Roster>,
+        request_deletion: bool,
+    ) -> Result<u64, String> {
         let Some(role) = self.storage_role()? else {
             return Ok(0);
         };
@@ -618,11 +642,15 @@ impl Store {
         } else {
             None
         };
-        let can_prune = !matches!(service_gate, Some(ServiceGate::Paused(_)));
-        let checkpoint_ceiling = match service_gate {
-            Some(ServiceGate::Ready(boundary)) => boundary.height,
-            Some(ServiceGate::Paused(_)) => 0,
-            None => u64::MAX,
+        let can_prune = request_deletion && !matches!(service_gate, Some(ServiceGate::Paused(_)));
+        let checkpoint_ceiling = if request_deletion {
+            match service_gate {
+                Some(ServiceGate::Ready(boundary)) => boundary.height,
+                Some(ServiceGate::Paused(_)) => 0,
+                None => u64::MAX,
+            }
+        } else {
+            0
         };
         let local_blocks = self
             .local_proof_blocks()?
@@ -1025,6 +1053,7 @@ impl Store {
             "latest_checkpoint_sequence":latest_checkpoint.as_ref().map(|c|c.statement.sequence),
             "last_checkpoint_publication_unix_seconds":latest_checkpoint.as_ref().map(|c|c.statement.issued_unix_seconds),
             "checkpoint_age_seconds":checkpoint_age,
+            "checkpoint_max_age_seconds":self.checkpoint_pruning.max_age_seconds(),
             "checkpoint_pruning_paused":matches!(gate, Some(ServiceGate::Paused(_))),
             "expiry_state":match role {
                 None => "unconfigured",
@@ -1067,5 +1096,112 @@ impl Store {
             return Err("compacted storage state differs; preserve the store".into());
         }
         Ok(changed)
+    }
+}
+
+#[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+impl Store {
+    /// Read-only, bounded evidence for the isolated age acceptance executable.
+    /// Eligibility ignores only the shortened stale alarm, never the actual
+    /// service retention, rollback, authenticated checkpoint, or proof bounds.
+    pub(crate) fn stale_acceptance_rows(
+        &self,
+        now: u64,
+        digest_rows: bool,
+    ) -> Result<Value, String> {
+        if self.storage_role()? != Some(Role::Validator) || !self.retention_clock_started {
+            return Err("active_validator_retention_observation_required".into());
+        }
+        let roster = checkpoint_auth::release_roster(Binding::new(&self.state.config))?
+            .ok_or("release_roster_required")?;
+        let certificate = self
+            .latest_engineering_checkpoint()?
+            .ok_or("accepted_checkpoint_required")?;
+        certificate.authenticate(&roster, None, now)?;
+        if self.canonical_id(certificate.statement.height)? != certificate.statement.block_id {
+            return Err("accepted_checkpoint_not_canonical".into());
+        }
+        let base = self.storage_base.as_ref().ok_or("storage_base_required")?;
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|_| "probe_read_failed")?;
+        let finality = read
+            .open_table(FINALITY)
+            .map_err(|_| "probe_finality_failed")?;
+        let blocks = read.open_table(BLOCKS).map_err(|_| "probe_blocks_failed")?;
+        let rewards = read
+            .open_table(LOCAL_REWARDS)
+            .map_err(|_| "probe_rewards_failed")?;
+        let reward_count = rewards.len().map_err(|_| "probe_rewards_failed")?;
+        if reward_count != 0 {
+            return Err("nonproducing_fixture_required".into());
+        }
+        let mut eligible = Vec::new();
+        let last = chain::finalized_height(self.state.height)
+            .min(certificate.statement.height)
+            .min(base.height.saturating_add(8));
+        let mut minimum_remaining_seconds = 0;
+        for height in base.height.saturating_add(1)..=last {
+            let observed = finality
+                .get(height)
+                .map_err(|_| "probe_finality_failed")?
+                .ok_or("probe_finality_missing")?;
+            let observed = observed.value();
+            if observed.len() != 48 {
+                return Err("invalid_probe_finality".into());
+            }
+            let block_id = observed[..32]
+                .try_into()
+                .map_err(|_| "invalid_probe_block")?;
+            let time = u64::from_le_bytes(observed[32..40].try_into().expect("checked row"));
+            let remaining = if time == 0 {
+                storage_policy::SERVICE_RETENTION_SECONDS
+            } else {
+                storage_policy::SERVICE_RETENTION_SECONDS.saturating_sub(now.saturating_sub(time))
+            };
+            minimum_remaining_seconds = minimum_remaining_seconds.max(remaining);
+            if storage_policy::expired_with_local_blocks(
+                Role::Validator,
+                height,
+                block_id,
+                self.state.height,
+                (time > 0).then_some(FinalityObservation {
+                    block_id,
+                    observed_unix_seconds: time,
+                }),
+                now,
+                true,
+                Some(RecoveryBoundary {
+                    height: certificate.statement.height,
+                    sealed_unix_seconds: certificate.statement.issued_unix_seconds,
+                    tail_complete: true,
+                }),
+                storage_policy::LOCAL_PROOF_BLOCKS,
+            )
+            .is_err()
+            {
+                break;
+            }
+            let row = blocks
+                .get(height)
+                .map_err(|_| "probe_blocks_failed")?
+                .ok_or("probe_block_missing")?;
+            if split_record(row.value())?.0.starts_with(b"SWLC0001") {
+                return Err("eligible_full_proof_required".into());
+            }
+            eligible.push(
+                json!({"height":height,"block_id":crate::local::hex(&block_id),
+                "row_blake3":digest_rows.then(|| blake3::hash(row.value()).to_hex().to_string())}),
+            );
+        }
+        Ok(
+            json!({"eligible_rows":eligible,"sample_limit":8,"proof_row_hashes_included":digest_rows,
+            "minimum_remaining_retention_seconds":minimum_remaining_seconds,
+            "local_reward_index_count":reward_count,"height":self.state.height,
+            "tip":crate::local::hex(&self.state.tip),
+            "state_fingerprint":crate::local::hex(&self.state.fingerprint()),
+            "cumulative_work":crate::local::hex(&self.state.cumulative_work.to_big_endian())}),
+        )
     }
 }

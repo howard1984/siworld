@@ -10,7 +10,7 @@ use siworld_native_node::{
 use std::path::Path;
 fn help() {
     println!(
-        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nrestart-check DIRECTORY --json  Authenticate exact committed restart state, without proof audit\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\ncheckpoint-qualify-service DIRECTORY  Enable service expiry after checkpoint delivery acceptance\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
+        "siworld-native-node: isolated native V1 engineering network\n\ninit DIRECTORY [WORK_BITS]  Create a cheap development fixture\ninit-service DIRECTORY     Create a new ASERT network with initialization-only calibration\ngenesis-id DIRECTORY       Read the validated public full-rules genesis identifier\nidentity-init DIRECTORY    Explicitly create persistent dual peer identities\nidentity-public DIRECTORY  Export the verified public dual-signed descriptor\nconfigure-miner DIRECTORY MODE ADDRESS_FILE  Select voyager/holder and a backed-up wallet address\nrun DIRECTORY              Run continuous native production; requires four proving workers\nstop DIRECTORY [EXPECTED_RUN_ID]  Request run-bound graceful stop and final verification\nservice-status DIRECTORY   Read the private atomic service export\nstatus DIRECTORY           Show exported service status or independently replay an idle store\ncheck DIRECTORY [--json]   Verify local replay base, retained proofs and reward receipts\nrestart-check DIRECTORY --json  Authenticate exact committed restart state, without proof audit\nstorage-role DIRECTORY ROLE  Explicitly select bootstrap|validator|miner|ordinary retention\nstorage-keep-blocks DIRECTORY BLOCKS  Set miner/ordinary proof window (minimum 24)\nstorage-expire DIRECTORY   Apply one bounded offline proof-expiry batch\nstorage-maintain DIRECTORY ROLE BLOCKS  Drain local-role expiry and compact in one verified session\nstorage-maintain-resume DIRECTORY ROLE BLOCKS  Drain local-role expiry from an exact authenticated restart record\nstorage-compact DIRECTORY  Reclaim database pages with the exclusive service lease\ncheckpoint-qualify-service DIRECTORY  Enable service expiry after checkpoint delivery acceptance\naudit DIRECTORY            Independently replay public subsidy and fund-credit counters\nmine DIRECTORY [SLOTS]     Produce and atomically accept one native block (64..576, groups of 16)\n\nRAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2 are required for run.\nA completed 24-hour observation does not automatically stop the service.\nNo reset, implicit role migration, issuance RPC listener, or public-network activation is provided. Peer listening requires the explicit native-p2p engineering feature."
     );
     #[cfg(feature = "native-p2p")]
     println!(
@@ -63,6 +63,26 @@ fn restart_check_arguments(args: &[String]) -> Result<(), String> {
         [command, _, flag] if command == "restart-check" && flag == "--json" => Ok(()),
         _ => Err("expected restart-check DIRECTORY --json".into()),
     }
+}
+fn storage_maintain_resume_arguments(
+    args: &[String],
+) -> Result<siworld_native_node::storage_policy::StartupPolicy, String> {
+    let [command, _, role, blocks] = args else {
+        return Err("expected storage-maintain-resume DIRECTORY miner|ordinary BLOCKS".into());
+    };
+    if command != "storage-maintain-resume"
+        || blocks.is_empty()
+        || !blocks.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("expected storage-maintain-resume DIRECTORY miner|ordinary BLOCKS".into());
+    }
+    let policy =
+        siworld_native_node::storage_policy::StartupPolicy::parse(Some(role), Some(blocks))?
+            .ok_or("explicit storage policy required")?;
+    if policy.role.serves_historical_proofs() {
+        return Err("resume maintenance is limited to miner and ordinary roles".into());
+    }
+    Ok(policy)
 }
 #[cfg(feature = "native-p2p")]
 fn peer_genesis(source: &Path, expected_genesis: &str) -> Result<Config, String> {
@@ -174,6 +194,17 @@ fn run_arguments(args: Vec<String>) -> Result<(), String> {
             store.configure_local_proof_blocks(blocks)?;
             println!("{}", store.storage_metrics()?);
         }
+        "storage-maintain-resume" => {
+            let policy = storage_maintain_resume_arguments(&args)?;
+            println!(
+                "{}",
+                service::storage_maintain_resume_offline(
+                    path,
+                    policy.role,
+                    policy.local_blocks.ok_or("proof window required")?,
+                )?
+            );
+        }
         "storage-maintain" => {
             if args.len() != 4 {
                 return Err("expected storage-maintain DIRECTORY miner|ordinary BLOCKS".into());
@@ -215,6 +246,20 @@ fn run_arguments(args: Vec<String>) -> Result<(), String> {
                 "{}",
                 serde_json::json!({"before":before,"after":store.storage_metrics()?,
                 "expired_blocks":expired,"compacted":compacted,"reward_replay_verified":true})
+            );
+        }
+        #[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+        "checkpoint-stale-probe" => {
+            if args.len() != 4 {
+                return Err(
+                    "expected checkpoint-stale-probe DIRECTORY EXPECTED_RUN_ID fresh|stale|resume"
+                        .into(),
+                );
+            }
+            service::request_checkpoint_stale_probe(path, &args[2], &args[3])?;
+            println!(
+                "{}",
+                serde_json::json!({"schema":1,"requested":true,"run_id":args[2],"phase":args[3]})
             );
         }
         "storage-expire" | "storage-compact" => {
@@ -752,6 +797,49 @@ mod control_command_tests {
             assert!(check_json(&arguments("check", directory, &extra)).is_err());
         }
         assert!(check_json(&["check".into()]).is_err());
+    }
+
+    #[test]
+    fn resume_maintenance_cli_requires_exact_local_role_and_window() {
+        let directory = Path::new("unused");
+        for role in ["miner", "ordinary"] {
+            let policy = storage_maintain_resume_arguments(&arguments(
+                "storage-maintain-resume",
+                directory,
+                &[role, "96"],
+            ))
+            .unwrap();
+            assert_eq!(policy.role.name(), role);
+            assert_eq!(policy.local_blocks, Some(96));
+        }
+        for tail in [
+            vec![],
+            vec!["miner"],
+            vec!["miner", "96", "extra"],
+            vec!["bootstrap", "96"],
+            vec!["validator", "96"],
+            vec!["miner", "23"],
+            vec!["miner", "NaN"],
+            vec!["miner", "+96"],
+            vec!["miner", "18446744073709551616"],
+        ] {
+            assert!(
+                storage_maintain_resume_arguments(&arguments(
+                    "storage-maintain-resume",
+                    directory,
+                    &tail
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            storage_maintain_resume_arguments(&arguments(
+                "storage-maintain",
+                directory,
+                &["miner", "96"]
+            ))
+            .is_err()
+        );
     }
 
     #[test]

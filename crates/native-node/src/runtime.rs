@@ -130,6 +130,11 @@ impl<V: BlockVerifier> Node<V> {
         self.store
             .expire_proofs(unix_seconds, clock_certain, &self.verifier)
     }
+    #[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+    pub(crate) fn observe_storage_finality(&mut self, unix_seconds: u64) -> Result<u64, String> {
+        self.store
+            .observe_proof_finality(unix_seconds, &self.verifier)
+    }
     pub fn mempool(&self) -> &Mempool {
         &self.mempool
     }

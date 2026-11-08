@@ -12,6 +12,14 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def build_features(engineering_network, checkpoint_stale_acceptance):
+    if checkpoint_stale_acceptance and not engineering_network:
+        raise ValueError('Checkpoint acceptance requires an engineering network build')
+    features = ['native-p2p', 'wallet-light-gateway'] if engineering_network else []
+    if checkpoint_stale_acceptance:
+        features.append('checkpoint-stale-acceptance')
+    return features
+
 def package(worker, output, receipt, release):
     if worker.name != 'siworld-native-node' or not worker.is_file() or not os.access(worker, os.X_OK):
         raise ValueError('Expected the native runtime executable')
@@ -69,7 +77,10 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--engineering-network', action='store_true',
                         help='Include the explicit pinned-peer engineering listener')
+    parser.add_argument('--checkpoint-stale-acceptance', action='store_true',
+                        help='Build only for an isolated checkpoint acceptance instance')
     args = parser.parse_args()
+    features = build_features(args.engineering_network, args.checkpoint_stale_acceptance)
     spec = importlib.util.spec_from_file_location('controlled_release', ROOT / 'scripts/build-prover-release.py')
     release = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(release)
@@ -79,7 +90,6 @@ def main():
     if args.output.exists():
         raise ValueError('Refusing to overwrite a release directory')
     manifest = ROOT / 'crates/native-node/Cargo.toml'
-    features = ['native-p2p', 'wallet-light-gateway'] if args.engineering_network else []
     command = ['cargo', 'build', '--release', '--locked', '--manifest-path', str(manifest),
                '--bin', 'siworld-native-node', '--bin', 'siworld-checkpoint-key',
                '--bin', 'siworld-restart-qualify']

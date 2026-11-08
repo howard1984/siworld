@@ -364,6 +364,7 @@ impl Store {
             path: path.to_owned(),
             storage_base: None,
             retention_clock_started: false,
+            checkpoint_pruning: storage_policy::CheckpointPruning::default(),
             resume_cache: None,
         };
         let previous = store.checkpoint_cursor()?;

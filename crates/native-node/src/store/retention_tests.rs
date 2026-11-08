@@ -136,6 +136,7 @@ fn storage_capacity_failure_preserves_state_rewards_and_other_node_progress() {
             path: path.clone(),
             storage_base: base,
             retention_clock_started: false,
+            checkpoint_pruning: crate::storage_policy::CheckpointPruning::default(),
             resume_cache: None,
         };
         let mut next = crate::producer::production_fixture(store.state(), 300_000).block;
@@ -617,4 +618,30 @@ fn nonfixture_service_retains_proofs_until_remote_checkpoint_delivery_is_qualifi
         false
     );
     assert_eq!(store.state().fingerprint(), before);
+}
+
+#[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
+#[test]
+fn acceptance_finality_observation_preserves_backlog_until_explicit_bounded_probe() {
+    let directory = Directory::new();
+    let mut store = directory.open();
+    append(&mut store, 32, 100_000);
+    store.configure_storage(Role::Validator).unwrap();
+    let fingerprint = store.state().fingerprint();
+    let reward = store.miner_reward_view().unwrap();
+    assert_eq!(
+        store.observe_proof_finality(1_000, &TestVerifier).unwrap(),
+        0
+    );
+    let now = 1_000 + SERVICE_RETENTION_SECONDS;
+    assert_eq!(store.observe_proof_finality(now, &TestVerifier).unwrap(), 0);
+    assert!(store.block(1).is_ok());
+    assert_eq!(store.state().fingerprint(), fingerprint);
+    assert_eq!(store.miner_reward_view().unwrap(), reward);
+    let deleted = store.expire_proofs(now, true, &TestVerifier).unwrap();
+    assert!(deleted > 0 && deleted <= 4);
+    assert!(store.block(1).is_err());
+    assert!(store.block(deleted + 1).is_ok());
+    assert_eq!(store.state().fingerprint(), fingerprint);
+    assert_eq!(store.miner_reward_view().unwrap(), reward);
 }

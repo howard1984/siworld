@@ -316,6 +316,7 @@ fn legacy_restart_qualification_failures_preserve_history_and_leave_no_cache() {
             path: path.clone(),
             storage_base: None,
             retention_clock_started: false,
+            checkpoint_pruning: crate::storage_policy::CheckpointPruning::default(),
             resume_cache: None,
         };
         assert_eq!(recovery_snapshot(&inspected), before);
@@ -611,6 +612,17 @@ fn reissued_certificate(
 }
 #[test]
 fn service_pruning_requires_explicit_qualification_and_fresh_quorum_then_resumes() {
+    service_pruning_recovery(storage_policy::CheckpointPruning::default());
+}
+
+#[test]
+fn shortened_checkpoint_pruning_pauses_deletion_and_resumes_without_changing_state() {
+    service_pruning_recovery(
+        storage_policy::CheckpointPruning::shortened_for_acceptance(1200).unwrap(),
+    );
+}
+
+fn service_pruning_recovery(pruning: storage_policy::CheckpointPruning) {
     let history = history();
     let directory = Directory::new();
     NativeIdentity::initialize(&directory.0, Binding::new(&history.config)).unwrap();
@@ -622,6 +634,11 @@ fn service_pruning_requires_explicit_qualification_and_fresh_quorum_then_resumes
         &verifier,
     )
     .unwrap();
+    store.configure_checkpoint_pruning(pruning);
+    assert_eq!(
+        store.storage_metrics().unwrap()["checkpoint_max_age_seconds"],
+        pruning.max_age_seconds()
+    );
     store.configure_storage(Role::Bootstrap).unwrap();
     for block in &history.full {
         store.append(block, &verifier).unwrap();
@@ -665,14 +682,26 @@ fn service_pruning_requires_explicit_qualification_and_fresh_quorum_then_resumes
     );
     assert!(store.block(1).is_err());
     assert!(store.block(5).is_ok());
-    let stale = ready + auth::MAX_AGE_SECONDS + 1;
+    let boundary = ready + pruning.max_age_seconds();
+    assert_eq!(
+        store
+            .expire_proofs_with_roster(boundary, true, &verifier, Some(&roster))
+            .unwrap(),
+        4
+    );
+    let stale = boundary + 1;
     assert_eq!(
         store
             .expire_proofs_with_roster(stale, true, &verifier, Some(&roster))
             .unwrap(),
         0
     );
-    assert!(store.block(5).is_ok());
+    assert!(store.block(9).is_ok());
+    assert!(
+        store
+            .qualify_service_checkpoint_delivery(&roster, stale)
+            .is_err()
+    );
     let (candidate, certificate) = reissued_certificate(history, 3, stale);
     store
         .accept_engineering_checkpoint_cached(&certificate, &roster, stale, &candidate)
@@ -703,6 +732,10 @@ fn service_pruning_requires_explicit_qualification_and_fresh_quorum_then_resumes
     )
     .unwrap();
     assert_eq!(reopened.state().fingerprint(), expected);
+    assert_eq!(
+        reopened.storage_metrics().unwrap()["checkpoint_max_age_seconds"],
+        64_800
+    );
     let transaction = reopened.database.begin_read().unwrap();
     let policy = transaction.open_table(retention::STORAGE).unwrap();
     assert_eq!(
