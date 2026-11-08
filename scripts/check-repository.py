@@ -29,6 +29,7 @@ DOCUMENTS = {
     "v1-native-identity.md", "v1-hybrid-handshake.md", "v1-wallet-storage.md",
     "v1-offline-fund-keys.md",
     "v1-browser-wallet.md", "windows-native-miner.md", "native-proof-storage.md",
+    "checkpoint-rejection-acceptance.md", "checkpoint-rejection-ci.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
