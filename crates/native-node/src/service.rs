@@ -22,6 +22,11 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod transition_admission;
+pub fn checkpoint_transition_check_offline(directory: &Path) -> Result<Value, String> {
+    transition_admission::check(directory)
+}
+
 #[cfg(feature = "native-p2p")]
 mod checkpoint_control;
 #[cfg(feature = "native-p2p")]

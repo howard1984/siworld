@@ -8,6 +8,100 @@ use libcrux_ml_dsa::ml_dsa_65::{self, MLDSA65SigningKey};
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
+pub(crate) struct PublicJournalInventory {
+    pub count: usize,
+    pub maximum_sequence: Option<u64>,
+    pub digest: [u8; 32],
+}
+
+/// Verify every persisted public vote while the caller holds the service lease.
+/// No authority secret is opened, loaded or hashed by this function.
+pub(crate) fn public_journals_before_transition(
+    directory: &Path,
+    roster: &Roster,
+    now: u64,
+    accepted: Option<crate::engineering_checkpoint::Cursor>,
+) -> Result<PublicJournalInventory, String> {
+    fn names(directory: &Path) -> Result<Vec<String>, String> {
+        let mut result = Vec::new();
+        for entry in std::fs::read_dir(directory)
+            .map_err(|_| "checkpoint public journal inventory unavailable")?
+        {
+            let name = entry
+                .map_err(|_| "checkpoint public journal entry unavailable")?
+                .file_name();
+            if !name
+                .to_string_lossy()
+                .starts_with("engineering-checkpoint-vote")
+            {
+                continue;
+            }
+            let name = name
+                .into_string()
+                .map_err(|_| "checkpoint public journal name invalid")?;
+            result.push(name);
+            if result.len() > 65_536 {
+                return Err("checkpoint public journal inventory limit".into());
+            }
+        }
+        result.sort();
+        Ok(result)
+    }
+    let first = roster.admission_first_sequence(now)?;
+    let storage =
+        Storage::open(directory).map_err(|_| "checkpoint public journal directory unavailable")?;
+    let before = names(directory)?;
+    let mut hash = blake3::Hasher::new_derive_key("siworld checkpoint public journal inventory v1");
+    hash.update(&(before.len() as u64).to_le_bytes());
+    let mut maximum_sequence = None;
+    for name in &before {
+        let digits = name
+            .strip_prefix("engineering-checkpoint-vote-")
+            .and_then(|s| s.strip_suffix(".bin"))
+            .filter(|s| s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or("checkpoint public journal name invalid")?;
+        let sequence: u64 = digits
+            .parse()
+            .map_err(|_| "checkpoint journal sequence invalid")?;
+        if sequence == 0 || sequence >= first {
+            return Err("checkpoint public journal reaches the transition sequence".into());
+        }
+        const STATEMENT_BYTES: usize = 624;
+        let bytes = storage
+            .read_exact(name, STATEMENT_BYTES + 1 + 3309)
+            .map_err(|_| "checkpoint public journal is not an exact private regular file")?;
+        let statement =
+            crate::engineering_checkpoint::Statement::decode(&bytes[..STATEMENT_BYTES])?;
+        if statement.sequence != sequence || statement.issued_unix_seconds > now {
+            return Err("checkpoint public journal sequence or publication mismatch".into());
+        }
+        if accepted.is_some_and(|cursor| {
+            cursor.sequence == sequence && cursor.digest != statement.digest()
+        }) {
+            return Err("checkpoint public journal conflicts with the accepted statement".into());
+        }
+        let vote = Vote {
+            signer: bytes[STATEMENT_BYTES],
+            signature: bytes[STATEMENT_BYTES + 1..]
+                .try_into()
+                .map_err(|_| "checkpoint public journal signature shape")?,
+        };
+        roster.verify_vote(&statement, &vote)?;
+        hash.update(name.as_bytes());
+        hash.update(&bytes);
+        maximum_sequence =
+            Some(maximum_sequence.map_or(sequence, |value: u64| value.max(sequence)));
+    }
+    if names(directory)? != before {
+        return Err("checkpoint public journal inventory changed during admission".into());
+    }
+    Ok(PublicJournalInventory {
+        count: before.len(),
+        maximum_sequence,
+        digest: *hash.finalize().as_bytes(),
+    })
+}
+
 const FILE: &str = "engineering-checkpoint-authority.secret";
 const MAGIC: &[u8; 8] = b"SWECA001";
 const RECORD_BYTES: usize = 8 + 96 + 32 + 32;

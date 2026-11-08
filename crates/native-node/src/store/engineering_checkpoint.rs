@@ -291,6 +291,54 @@ impl Store {
             .map(|value| Certificate::decode(value.value()))
             .transpose()
     }
+
+    /// Authenticate the actual accepted row for a first-transition deployment.
+    /// Absence is established by the database read, never by a process version.
+    pub(crate) fn checkpoint_before_transition(
+        &self,
+        roster: &Roster,
+        now: u64,
+    ) -> Result<Option<Cursor>, String> {
+        if roster.binding() != Binding::new(&self.state.config) {
+            return Err("checkpoint transition roster differs from local configuration".into());
+        }
+        let first = roster.admission_first_sequence(now)?;
+        let Some(certificate) = self.latest_engineering_checkpoint()? else {
+            return Ok(None);
+        };
+        let statement = &certificate.statement;
+        if statement.sequence >= first {
+            return Err("accepted checkpoint reaches the transition sequence".into());
+        }
+        certificate.authenticate(roster, None, now)?;
+        if statement
+            .height
+            .checked_add(checkpoint_auth::CONFIRMATIONS)
+            .is_none_or(|height| height > self.state.height)
+            || self.canonical_id(statement.height)? != statement.block_id
+        {
+            return Err("accepted checkpoint is not confirmed on the local canonical chain".into());
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "checkpoint admission history unavailable")?;
+        let rows = transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "checkpoint admission history unavailable")?;
+        let record = rows
+            .get(statement.height)
+            .map_err(|_| "checkpoint admission anchor unavailable")?
+            .ok_or("checkpoint admission anchor missing")?;
+        if split_record(record.value())?.1 != statement.state_fingerprint {
+            return Err("accepted checkpoint differs from the saved canonical state".into());
+        }
+        Ok(Some(Cursor {
+            sequence: statement.sequence,
+            height: statement.height,
+            digest: statement.digest(),
+        }))
+    }
 }
 
 /// Immutable local canonical-history snapshot for a bounded single background

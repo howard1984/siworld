@@ -76,3 +76,39 @@ with the exact deployed package before reporting the new roster available.
 
 No genesis, block validity, transaction economics, proof circuit, retention
 window or production checkpoint-age policy changes in this transition.
+
+## Offline transition admission
+
+`checkpoint-transition-check DIRECTORY --json` checks the actual local data
+before the compiled transition's first interval. It requires the exclusive
+service lease and an existing authenticated restart record at the exact committed
+head. A legacy database must complete its separately authorized qualification
+before this command; the command never performs qualification or proof replay.
+
+The command authenticates the database's actual accepted certificate under the
+compiled roster and checks its confirmed canonical block and saved state
+fingerprint. An absent certificate is reported only after reading the actual
+table and accepted row. The command also inventories every local public vote
+journal, verifies its exact filename, record shape, binding, pinned signer and
+signature, and computes a BLAKE3 inventory digest. It does not open or hash an
+authority secret. Both the accepted sequence and every journal sequence must
+be strictly below the compiled first sequence. Malformed, foreign, conflicting
+or out-of-range evidence fails without replacing or clearing any record.
+
+A missing compiled transition, active service, missing or stale restart record,
+backward clock movement, or a boundary reached before completion rejects
+admission. The JSON includes the exact head, state fingerprint, work, receipt
+count, accepted cursor or authenticated absence, journal count and maximum,
+inventory digest, compiled first sequence, and start/completion times. Both
+proof-audit flags remain false. A successful check changes no logical database,
+certificate, journal, retention policy or enrollment state; the existing lease
+file is used for exclusion. The existing redb open path may update physical
+header or allocator bookkeeping; whole-file byte identity is not an invariant.
+
+Run this command after any required one-time restart qualification and before
+proof deletion, authority adoption, configuration activation or service start.
+Operational admission must also check that the same verified package and
+compiled cutover are installed everywhere with enough remaining rollout time.
+Failure requires reconciliation; it does not authorize rewriting history.
+Normal `restart-check` remains available after the transition and is separate
+from this first-deployment gate.

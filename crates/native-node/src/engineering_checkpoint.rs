@@ -247,6 +247,17 @@ impl Roster {
             .as_ref()
             .is_some_and(|t| sequence >= t.first_sequence)
     }
+    pub(crate) fn admission_first_sequence(&self, now: u64) -> Result<u64, String> {
+        let first = self
+            .transition
+            .as_ref()
+            .ok_or("checkpoint transition is not release-pinned")?
+            .first_sequence;
+        if now / INTERVAL_SECONDS >= first {
+            return Err("checkpoint transition admission deadline has passed".into());
+        }
+        Ok(first)
+    }
     fn key_for_sequence(
         &self,
         sequence: u64,
@@ -269,7 +280,6 @@ impl Roster {
         self.key_for_sequence(sequence, index)?;
         Ok(index)
     }
-    #[cfg(feature = "native-p2p")]
     pub(crate) fn verify_vote(&self, statement: &Statement, vote: &Vote) -> Result<(), String> {
         if statement.binding != self.binding
             || statement.roster != self.digest_for_sequence(statement.sequence)
