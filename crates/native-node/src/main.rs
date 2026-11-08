@@ -88,6 +88,9 @@ fn peer_genesis(source: &Path, expected_genesis: &str) -> Result<Config, String>
 }
 fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    run_arguments(args)
+}
+fn run_arguments(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() || args == ["--help"] || args == ["-h"] {
         help();
         return Ok(());
@@ -106,7 +109,13 @@ fn run() -> Result<(), String> {
     ) {
         return siworld_native_node::wallet_cli::run(&args[0], &args[1..]);
     }
-    if args.len() < 2 || args.len() > 4 {
+    let maximum_arguments = if cfg!(feature = "native-p2p") && args[0] == "peer-admit-fixture-live"
+    {
+        6
+    } else {
+        4
+    };
+    if args.len() < 2 || args.len() > maximum_arguments {
         return Err("expected command and explicit engineering directory; use --help".into());
     }
     let path = Path::new(&args[1]);
@@ -652,6 +661,45 @@ mod control_command_tests {
             .chain(std::iter::once(directory.to_str().unwrap().to_owned()))
             .chain(extra.iter().map(|value| (*value).to_owned()))
             .collect()
+    }
+
+    #[cfg(feature = "native-p2p")]
+    #[test]
+    fn fixture_admission_cli_reaches_run_bound_service_validation() {
+        let directory = Directory::new();
+        let absent = directory.0.join("absent");
+        let run_id = "a".repeat(64);
+        let fingerprint = "b".repeat(64);
+        assert_eq!(
+            run_arguments(arguments(
+                "peer-admit-fixture-live",
+                &absent,
+                &[&run_id, "fresh-fixture", "descriptor.json", &fingerprint],
+            ))
+            .unwrap_err(),
+            "service directory unavailable"
+        );
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn command_dispatch_rejects_invalid_arity_before_mutation() {
+        let directory = Directory::new();
+        for command in ["peer-admit-fixture-live", "init", "stop", "unknown-command"] {
+            for length in [1, 3, 4, 5, 6, 7] {
+                let mut args = arguments(command, &directory.0, &[]);
+                args.resize(length, "extra".into());
+                let error = run_arguments(args).unwrap_err();
+                if command != "peer-admit-fixture-live" && length > 4 {
+                    assert_eq!(
+                        error,
+                        "expected command and explicit engineering directory; use --help"
+                    );
+                }
+                assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+            }
+        }
     }
 
     #[test]
