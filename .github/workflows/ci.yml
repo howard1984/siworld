@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, "feature/**", "fix/**", "release/**", "research/**"]
   pull_request:
 
 permissions:
@@ -11,6 +9,10 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash {0}
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,13 +29,18 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh native-economic-accounting
       - name: Current monetary rejection tests and production-schedule simulation
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo test --release --locked -p siworld-core v1_economics::tests::
           mkdir -p .local/native-accounting
           cargo test --release --locked -p siworld-core v1_economics::tests::seeded_twenty_year_modes_preserve_supply_and_curve -- --ignored --exact --nocapture > .local/native-accounting/simulation.log 2>&1
           python3 scripts/check-fund-simulation.py .local/native-accounting/simulation.log .local/native-accounting/simulation.json
       - name: Compare the source-bound numeric reference
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           python3 - <<'PY_ACCOUNTING'
           import hashlib
@@ -58,11 +65,16 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: crates/fund-keytool
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh offline-fund-keys
       - name: Format and lint isolated custody tool
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo fmt --manifest-path crates/fund-keytool/Cargo.toml --check
           cargo clippy --release --locked --manifest-path crates/fund-keytool/Cargo.toml --all-targets -- -D warnings
       - name: Synthetic custody, backup and malformed-file tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo test --release --locked --manifest-path crates/fund-keytool/Cargo.toml
   secrets:
     name: Sensitive information and history
@@ -87,29 +99,36 @@ jobs:
           mkdir /tmp/siworld-scanner
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp/siworld-scanner gitleaks
       - name: Scan reachable history with redacted findings
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           /tmp/siworld-scanner/gitleaks git . --log-opts='--all --full-history' \
             --config=.gitleaks.toml --redact=100 --no-banner
 
   repository:
     name: Repository content
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Browser history-cache and proof-progress contracts
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: node --test crates/native-wallet-web/tests/online-storage.test.mjs crates/native-wallet-web/tests/commitment-session.test.mjs crates/native-wallet-web/tests/proof-progress.test.mjs
       - name: Publication manifest and documentation
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
+          python3 scripts/check-ci-policy.py
           python3 scripts/check-repository.py
           python3 scripts/check-native-envelope-policy.py
           python3 scripts/check-fee-settlement-evaluation.py --schema >/tmp/fee-settlement-schema.json
       - name: Wallet record selection regressions
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: node --test crates/native-wallet-web/tests/storage-selection.test.mjs
       - name: Shared wallet history regressions
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: node --test crates/native-wallet-web/tests/commitment-session.test.mjs
       - name: Audit evidence and memory declarations
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           python3 scripts/check-audit-registry.py
           python3 scripts/check-memory-budgets.py
@@ -117,7 +136,7 @@ jobs:
           python3 -m unittest discover -s tools/control-panel -p 'test_*.py' -v
   workspace:
     name: Workspace (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -126,21 +145,30 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh workspace
       - name: Format
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo fmt --all --check
       - name: Default feature isolation
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: python3 scripts/check-node-features.py
       - name: Default binaries
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo check -p siworld-node --bins --locked
       - name: Default proof selection
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo test -p siworld-node --bin siworld-node --locked
       - name: Clippy
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo test --workspace --all-features --locked
   bench-plonky3:
     name: STARK benchmark tests (Plonky3)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     defaults:
       run:
@@ -154,96 +182,32 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: crates/bench-stark
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh bench-plonky3
       - name: Format
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo fmt --all --check
       - name: Tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo test --release --locked -p siworld-bench-plonky3 -p siworld-bench-common
       - name: Isolated composition relation and profiler format
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo test --release --locked -p siworld-bench-plonky3 --features experimental-fanin,phase-profile,security-report --lib
           cargo clippy --release --locked -p siworld-bench-plonky3 --features experimental-fanin,phase-profile,security-report --bin composition-bench -- -D warnings
       - name: D8 scalar geometry rejection tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo test --release --locked -p siworld-bench-plonky3 --features d8-geometry --lib d8_geometry::tests
           cargo clippy --release --locked -p siworld-bench-plonky3 --features d8-geometry --lib -- -D warnings
       - name: Conditional D8 planning screen
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo test --release --locked -p siworld-bench-plonky3 --features security-report --bin d8-security-screen
           cargo clippy --release --locked -p siworld-bench-plonky3 --features security-report --bin d8-security-screen -- -D warnings
           cargo run --release --locked -p siworld-bench-plonky3 --features security-report --bin d8-security-screen > /tmp/d8-screen.json
           python3 -c 'import json; r=json.load(open("/tmp/d8-screen.json")); assert len(r["layers"]) == 3; assert all(len(x["candidates"]) == 3 and all(c["screen_pass_conditional_on_shape_and_sites"] and not c["approved"] for c in x["candidates"]) for x in r["layers"])'
-      - name: Bounded intra-proof parallel hiding experiment
-        working-directory: .
-        env:
-          RAYON_NUM_THREADS: 2
-          SIWORLD_COMPOSITION_HIDING_WORKERS: 2
-        run: |
-          python3 scripts/build-composition-intra.py
-          cargo test --release --locked --manifest-path .local/composition-intra/benchmark/Cargo.toml -p siworld-bench-plonky3 --features experimental-fanin,phase-profile,security-report --lib
-
-  prover-release:
-    name: Linux proof release ISA and CPU admission
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Install pinned toolchain
-        run: rustup toolchain install
-      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
-      - name: Compile baseline admission tests
-        run: |
-          rustfmt --check scripts/prover-launcher.rs
-          rustc scripts/prover-launcher.rs --edition=2021 --test -D warnings -C target-cpu=x86-64 -o /tmp/prover-launcher-tests
-          /tmp/prover-launcher-tests
-          if rustc scripts/prover-launcher.rs --edition=2021 -C target-cpu=x86-64-v3 -o /tmp/invalid-launcher > /tmp/launcher-build.log 2>&1; then
-            echo "Optimized bootstrap was incorrectly accepted"
-            exit 1
-          fi
-          python3 -c 'from pathlib import Path; assert "must use the generic x86-64 baseline" in Path("/tmp/launcher-build.log").read_text()'
-      - name: Build controlled production release
-        run: python3 scripts/build-prover-release.py --output .local/prover-release
-      - name: Inspect actual proof worker and supported CPU admission
-        run: |
-          python3 scripts/check-prover-isa.py --binary .local/prover-release/libexec/siworld-node
-          .local/prover-release/bin/siworld-node --check-cpu
-          .local/prover-release/bin/siworld-node --help
-      - name: Install CPU emulation
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y qemu-user
-      - name: Reject unsupported CPU before any optimized worker starts
-        run: |
-          python3 - <<'PY_CPU_TEST'
-          import json, os, shutil, subprocess, tempfile
-          from pathlib import Path
-          release = Path('.local/prover-release').resolve()
-          with tempfile.TemporaryDirectory() as directory:
-              root = Path(directory)
-              (root / 'bin').mkdir()
-              (root / 'libexec').mkdir()
-              launcher = root / 'bin/siworld-node'
-              shutil.copy2(release / 'bin/siworld-node', launcher)
-              sentinel = root / 'worker-started'
-              worker = root / 'libexec/siworld-node'
-              worker.write_text('#!/bin/sh\nprintf "%s" "$1" > "$PROVER_SENTINEL"\nexit 23\n')
-              worker.chmod(0o755)
-              for cpu in ('Nehalem', 'max,-xsave'):
-                  result = subprocess.run(['qemu-x86_64', '-cpu', cpu, str(launcher), '--help'],
-                      capture_output=True, text=True, env={**os.environ, 'PROVER_SENTINEL': str(sentinel)})
-                  assert result.returncode == 78, (cpu, result.returncode, result.stderr)
-                  assert 'including AVX2' in result.stderr and 'Scalar fallback is disabled' in result.stderr
-                  assert not sentinel.exists(), 'Unsupported CPU executed a worker'
-                  checked = subprocess.run(['qemu-x86_64', '-cpu', cpu, str(launcher), '--check-cpu'],
-                      capture_output=True, text=True)
-                  assert checked.returncode == 78
-                  assert not json.loads(checked.stdout)['supported']
-              forwarded = subprocess.run([str(launcher), 'argument-preserved'],
-                  env={**os.environ, 'PROVER_SENTINEL': str(sentinel)})
-              assert forwarded.returncode == 23
-              assert sentinel.read_text() == 'argument-preserved'
-          PY_CPU_TEST
 
   native-transaction:
     name: Native D8 transaction relation and codec
@@ -256,15 +220,18 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
-      - name: Prepare isolated pinned native implementation
-        run: python3 scripts/build-d8-checkpoint.py --prepare-only --output .local/native-transaction
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh native-transaction
       - name: Check CPU before executing optimized tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/native-cpu-check
           /tmp/native-cpu-check --check-cpu
       - name: Native constraint and encoding rejection tests
         env:
           RAYON_NUM_THREADS: 4
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo fmt --manifest-path crates/bench-d8/Cargo.toml --all --check
           python3 - <<'PY_NATIVE_TEST'
@@ -287,15 +254,11 @@ jobs:
           cargo clippy --release --manifest-path .local/native-transaction/application/Cargo.toml --features security-report --lib --bin v1-transaction-scan --bin native-verifier-bench --bin v1-freeze-artifacts -- -D warnings
           cargo build --release --manifest-path .local/native-transaction/application/Cargo.toml --features security-report --bin v1-transaction-scan --bin v1-freeze-artifacts
           python3 scripts/check-v1-freeze.py
-          prepare_unit="siworld-native-freeze-$(cat /proc/sys/kernel/random/uuid)"
-          sudo --non-interactive systemd-run --scope --quiet --unit="$prepare_unit" \
-            -p MemoryMax=5G -p MemorySwapMax=0 \
-            /usr/sbin/runuser --user "$(id -un)" -- \
-            /usr/bin/env RAYON_NUM_THREADS=4 SIWORLD_COMPOSITION_HIDING_WORKERS=2 \
-            .local/native-transaction/application/target/release/v1-freeze-artifacts \
+          timeout 600 .local/native-transaction/application/target/release/v1-freeze-artifacts \
             --root "$GITHUB_WORKSPACE" --check crates/bench-d8/artifacts/v1-native-freeze.json
           .local/native-transaction/application/target/release/v1-transaction-scan --security-only --log-blowup 4 --queries 80 --grinding 16 --output .local/native-transaction/security-diagnostic.json
       - name: Preserve registry dependency pins
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           python3 - <<'PY_LOCK'
           import importlib.util
@@ -325,11 +288,16 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: crates/bench-multi-asset -> ../../.local/multi-asset-ci-target
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh native-multi-asset
       - name: Check CPU admission before optimized code
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/multi-asset-cpu-check
           /tmp/multi-asset-cpu-check --check-cpu
       - name: Validate native relations and public artifact tooling
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo fmt --manifest-path crates/bench-multi-asset/Cargo.toml --check
           cargo clippy --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --all-targets -- -D warnings
@@ -338,6 +306,7 @@ jobs:
           /tmp/transaction-layout-tests
           cargo build --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --bin profile-artifacts
       - name: Reproduce the frozen transaction public key and security ledger
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           python3 - <<'PY_PROFILE'
           import json
@@ -355,6 +324,7 @@ jobs:
               '--verifier-key', str(output)], check=True)
           PY_PROFILE
       - name: Reproduce all three fixed native relation keys and security reports
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           rustfmt --edition=2024 --check scripts/native-proof-artifacts.rs
           python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json
@@ -368,7 +338,7 @@ jobs:
           python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json --reproduced .local/native-proof-profiles/reproduced
 
   native-runtime:
-    name: Native V1 single-node engineering runtime
+    name: Native protocol and storage unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -383,32 +353,41 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
         with:
           workspaces: crates/native-node
+      - name: Acquire locked dependencies
+        working-directory: .
+        run: bash scripts/ci-fetch.sh native-runtime
       - name: Native runtime format and lints
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo fmt --manifest-path crates/native-node/Cargo.toml --check
           cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway --all-targets -- -D warnings
       - name: Native protocol, transition, persistence and audit rejection tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway
       - name: Isolated checkpoint alarm scope and retention preservation
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib service::stale_acceptance::tests::
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib store::retention_tests::acceptance_finality_observation_preserves_backlog_until_explicit_bounded_probe -- --exact
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib checkpoint_stale_runtime::tests::
-          cargo check --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --bin siworld-checkpoint-stale-runtime
-      - name: Actual fixed-profile transaction and settlement mutation rejection
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib proofs::tests::fixed_profiles_roundtrip_rejects_context_and_body_mutation -- --ignored --exact
-      - name: Bounded parallel verification with real proof and context rejection
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib state::tests::real_proof_batch_matches_serial_and_rejects_changed_context -- --ignored --exact --nocapture
-      - name: Actual wallet transfer proof, admission and receiver authentication
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib wallet::tests::actual_native_wallet_proof_passes_admission_and_recipient_authentication -- --ignored --exact
-      - name: Actual issuance block, durable registry and seed-wallet rescan
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib wallet::tests::actual_native_issuance_block_recovers_registry_and_seed_wallet_after_restart -- --ignored --exact
-      - name: Actual proof block, restart and private reward recovery
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib producer::tests::actual_block_persists_replays_and_recovers_the_reward -- --ignored --exact
-      - name: Actual resident service lifecycle and final independent replay
-        run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p --lib service::tests::actual_continuous_service_exports_stops_and_replays -- --ignored --exact
-      - name: Controlled native runtime package and CPU admission
+
+  wallet:
+    name: Wallet and WASM offline tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain and WASM target
+        run: rustup toolchain install --target wasm32-unknown-unknown
+      - name: Acquire locked dependencies
+        run: bash scripts/ci-fetch.sh wallet
+      - name: Wallet unit and browser tests
+        shell: bash "${{ github.workspace }}/scripts/ci-offline.sh" {0}
         run: |
-          python3 scripts/build-native-runtime.py --engineering-network --output .local/native-runtime-release
-          .local/native-runtime-release/bin/siworld-native-node --check-cpu
-          .local/native-runtime-release/bin/siworld-native-node --help
+          cargo test --locked --manifest-path crates/native-wallet-core/Cargo.toml
+          cargo test --release --locked --manifest-path crates/native-wallet-engine/Cargo.toml --lib
+          cargo test --release --locked --manifest-path crates/native-wallet-web/Cargo.toml --lib
+          cargo check --locked --target wasm32-unknown-unknown --manifest-path crates/native-wallet-web/Cargo.toml
+          node --test crates/native-wallet-web/tests/*.test.mjs

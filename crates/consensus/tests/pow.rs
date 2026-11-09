@@ -9,6 +9,17 @@ use siworld_core::params::{ChainParams, MEDIAN_TIME_PAST_WINDOW};
 use siworld_core::{Block, Digest};
 use siworld_state::ChainState;
 
+// Rejection tests need both accepted and rejected work at minimum hash cost.
+fn params() -> ChainParams {
+    let mut target = [0xff; 32];
+    target[0] = 0x7f;
+    ChainParams {
+        pow_iterations: 2,
+        genesis_target: target,
+        ..common::params()
+    }
+}
+
 fn snapshot(state: &ChainState) -> (siworld_core::Roots, Digest, u64, Vec<u64>) {
     (
         state.roots(),
@@ -71,7 +82,7 @@ fn work_above_target_is_rejected_and_state_is_unchanged() {
     let (state, _) = genesis(&p, &[]);
     let mut block = build(&state, &p, &[], 1).unwrap();
     let seed = block.header.pow_seed();
-    block.header.nonce = (0..)
+    block.header.nonce = (0..4096)
         .find(|&n| !meets_target(&pow_hash(&seed, n, p.pow_iterations), &block.header.target))
         .unwrap();
     let mut node = chain(&p, state);
@@ -88,7 +99,7 @@ fn work_is_computed_with_the_chain_iteration_count() {
     let mut block = build(&state, &p, &[], 1).unwrap();
     let seed = block.header.pow_seed();
     let cheap = 1;
-    block.header.nonce = (0..)
+    block.header.nonce = (0..4096)
         .find(|&n| {
             meets_target(&pow_hash(&seed, n, cheap), &block.header.target)
                 && !meets_target(&pow_hash(&seed, n, p.pow_iterations), &block.header.target)

@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class EconomicsWorkflowDispatchTests(unittest.TestCase):
     def workflow(self):
-        return (ROOT / '.github/workflows/v1-economic-regressions.yml').read_text()
+        return (ROOT / 'scripts/tests/fixtures/retired-workflows/v1-economic-regressions.yml').read_text()
 
     def step(self, title):
         return self.workflow().split('      - name: ' + title + '\n')[1].split('      - name:', 1)[0]

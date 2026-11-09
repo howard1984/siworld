@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == test ]]; then
+ shift
+ exec python3 "$GITHUB_WORKSPACE/scripts/ci-test.py" "$@"
+fi
+command="$1"; shift
+if [[ "$command" == fmt || "$command" == --version || "$command" == -V || "$command" == version ]]; then
+ exec "${SIWORLD_REAL_CARGO:?}" "$command" "$@"
+fi
+if [[ " $* " == *" --offline "* ]]; then
+ exec "${SIWORLD_REAL_CARGO:?}" "$command" "$@"
+fi
+exec "${SIWORLD_REAL_CARGO:?}" "$command" --offline "$@"

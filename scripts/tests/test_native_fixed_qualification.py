@@ -68,7 +68,7 @@ class FixedQualificationTests(unittest.TestCase):
         self.assertEqual(row['collector_diagnostic']['stage'], 'result-read')
 
     def test_minimum_workflow_probes_scope_before_build(self):
-        workflow = (ROOT / '.github/workflows/native-fixed-qualification.yml').read_text()
+        workflow = (ROOT / 'scripts/tests/fixtures/retired-workflows/native-fixed-qualification.yml').read_text()
         self.assertIn('--smoke-scope', workflow)
         self.assertLess(workflow.index('--smoke-scope'), workflow.index('Install the repository toolchain'))
 

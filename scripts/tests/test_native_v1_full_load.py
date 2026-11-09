@@ -258,7 +258,7 @@ class NativeFullLoadTests(unittest.TestCase):
                 self.assertNotIn(temporary, path.read_text())
 
     def test_workflow_keeps_failure_artifacts_and_uses_only_isolated_locked_application(self):
-        text = (ROOT / '.github/workflows/native-v1-full-load.yml').read_text()
+        text = (ROOT / 'scripts/tests/fixtures/retired-workflows/native-v1-full-load.yml').read_text()
         self.assertIn('runs-on: ubuntu-24.04', text)
         self.assertIn('RAYON_NUM_THREADS: 4', text)
         self.assertIn('persist-credentials: false', text)

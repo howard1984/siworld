@@ -30,7 +30,7 @@ DOCUMENTS = {
     "v1-offline-fund-keys.md",
     "v1-browser-wallet.md", "windows-native-miner.md", "native-proof-storage.md",
     "checkpoint-rejection-acceptance.md", "checkpoint-rejection-ci.md",
-    "engineering-checkpoint-roster-transition.md",
+    "engineering-checkpoint-roster-transition.md", "offline-validation.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
@@ -117,6 +117,10 @@ def allowed(path):
                 "scripts/settlement-full-load.rs",
                 "crates/bench-stark/patches/recursion-d8-w24.patch"}:
         return True
+    if name in {"scripts/ci-offline.sh", "scripts/ci-fetch.sh", "scripts/ci-bin/cargo"}:
+        return True
+    if path.parts[:4] == ("scripts", "tests", "fixtures", "retired-workflows"):
+        return len(path.parts) == 5 and path.suffix == ".yml"
     if path.parts[0] == "scripts":
         return path.suffix == ".py" and (len(path.parts) == 2 or (len(path.parts) == 3 and path.parts[1] == "tests"))
     if path.parts[0] == "tools":

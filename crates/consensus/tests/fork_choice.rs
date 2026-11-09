@@ -12,6 +12,17 @@ use siworld_core::{Block, Digest};
 use siworld_crypto::SpendKey;
 use siworld_state::ChainState;
 
+// Work-comparison fixtures require a wider margin than the default unit target.
+fn params() -> ChainParams {
+    let mut target = [0xff; 32];
+    target[0] = 0x0f;
+    ChainParams {
+        pow_iterations: 1,
+        genesis_target: target,
+        ..common::params()
+    }
+}
+
 const SIP: u64 = ATOMS_PER_SIP;
 
 fn alice() -> SpendKey {
@@ -60,7 +71,7 @@ fn extend(
 
 #[test]
 fn block_work_is_the_expected_hashes_for_its_target() {
-    let p = params();
+    let p = ChainParams::devnet();
     // Devnet genesis target 0x0fff…ff: one nonce in 16 succeeds.
     assert_eq!(block_work(&p.genesis_target), 16u64.into());
     assert_eq!(block_work(&[0xff; 32]), 1u64.into());
@@ -169,7 +180,7 @@ fn invalid_side_block_leaves_the_node_unchanged() {
 
     let mut no_work = rival[1].clone();
     let seed = no_work.header.pow_seed();
-    no_work.header.nonce = (0..)
+    no_work.header.nonce = (0..4096)
         .find(|n| {
             !meets_target(
                 &pow_hash(&seed, *n, p.pow_iterations),

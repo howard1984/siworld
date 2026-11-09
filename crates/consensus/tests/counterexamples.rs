@@ -6,7 +6,7 @@ mod common;
 use common::*;
 use siworld_circuits::{AggregateError, InputWitness, MockProver, RelationError};
 use siworld_consensus::{
-    assemble_body, check_proof, mine, next_target, transition, BlockError, BuildError,
+    assemble_body, check_proof, mine_some, next_target, transition, BlockError, BuildError,
 };
 use siworld_core::params::ChainParams;
 use siworld_core::{Block, ContainerProof, Digest, Header, Nullifier};
@@ -86,7 +86,7 @@ fn forced_block(
         body_root: body.hash(),
         container_size: p.container_size,
     };
-    assert!(mine(&mut header, p.pow_iterations));
+    assert_eq!(mine_some(&mut header, p.pow_iterations, 4096), Some(true));
     Block {
         header,
         body,
@@ -130,7 +130,7 @@ fn unchecked_block(
         body_root: body.hash(),
         container_size: p.container_size,
     };
-    assert!(mine(&mut header, p.pow_iterations));
+    assert_eq!(mine_some(&mut header, p.pow_iterations, 4096), Some(true));
     Block {
         header,
         body,

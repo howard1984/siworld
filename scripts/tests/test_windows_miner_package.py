@@ -92,36 +92,24 @@ class PeTests(unittest.TestCase):
 
 class ProvenanceTests(unittest.TestCase):
     def setUp(self):
-        self.environment = {
-            'GITHUB_ACTIONS': 'true', 'RUNNER_OS': 'Windows', 'RUNNER_ARCH': 'X64',
-            'RUNNER_ENVIRONMENT': 'github-hosted', 'GITHUB_REPOSITORY': 'siworld-labs/siworld',
-            'SIWORLD_WINDOWS_RUNNER_LABEL': 'windows-latest',
-            'GITHUB_SHA': 'a' * 40, 'GITHUB_WORKFLOW_SHA': 'b' * 40,
-            'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '2',
-            'GITHUB_WORKFLOW_REF': 'siworld-labs/siworld/.github/workflows/windows-miner.yml@refs/heads/feature/miner',
-            'GITHUB_SERVER_URL': 'https://github.com', 'ImageOS': 'win25', 'ImageVersion': '20261101.1',
-        }
+        self.environment = {}
 
-    def test_native_actions_provenance(self):
-        with patch.object(builder.sys, 'platform', 'win32'):
-            result = builder.ci_context(self.environment)
-        self.assertEqual(result['run_url'], 'https://github.com/siworld-labs/siworld/actions/runs/123/attempts/2')
-        self.assertEqual(result['workflow_sha'], 'b' * 40)
+    def test_local_build_provenance(self):
+        for host, method in [('darwin', 'cargo-xwin-msvc'), ('win32', 'native-msvc')]:
+            with patch.object(builder.sys, 'platform', host):
+                result = builder.local_context({})
+                self.assertEqual(result['method'], method)
+                self.assertFalse(result['ci'])
 
-    def test_rejects_development_and_incomplete_contexts(self):
-        for platform in ['darwin', 'linux']:
-            with patch.object(builder.sys, 'platform', platform), self.assertRaises(ValueError):
-                builder.ci_context(self.environment)
-        for key in self.environment:
-            environment = self.environment.copy()
-            del environment[key]
-            with self.subTest(key=key), patch.object(builder.sys, 'platform', 'win32'), self.assertRaises(ValueError):
-                builder.ci_context(environment)
+    def test_rejects_hosted_execution(self):
+        for key in ('CI', 'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'RUNNER_ENVIRONMENT'):
+            with patch.object(builder.sys, 'platform', 'darwin'), self.assertRaises(ValueError):
+                builder.local_context({key: 'true'})
 
     def test_rejects_toolchain_overrides(self):
-        for key in ['CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER']:
-            with self.subTest(key=key), patch.object(builder.sys, 'platform', 'win32'), self.assertRaises(ValueError):
-                builder.ci_context({**self.environment, key: 'unreviewed'})
+        for key in ('CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
+            with patch.object(builder.sys, 'platform', 'darwin'), self.assertRaises(ValueError):
+                builder.local_context({key: 'unreviewed'})
 
     def test_rejects_dirty_or_mismatched_checkout(self):
         answers = [str(builder.ROOT) + '\n', 'a' * 40 + '\n', b' M Cargo.lock\n']
@@ -163,7 +151,7 @@ class ProvenanceTests(unittest.TestCase):
                     patch.object(builder, 'build', side_effect=fake_build), \
                     patch.object(builder.subprocess, 'check_output', side_effect=output), \
                     patch.object(builder.subprocess, 'run') as run:
-                archive = builder.package(root / 'output')
+                archive = builder.package(root / 'output', 'a' * 40)
             record = json.loads((archive.parent / 'provenance.json').read_text())
             self.assertEqual(record['archive']['sha256'], hashlib.sha256(archive.read_bytes()).hexdigest())
             self.assertEqual(record['source_revision'], 'a' * 40)
@@ -171,7 +159,7 @@ class ProvenanceTests(unittest.TestCase):
                 prefix = 'siworld-miner-windows-x86_64/'
                 info = package.read(prefix + 'build-info.json')
                 self.assertEqual(record['build_info_sha256'], hashlib.sha256(info).hexdigest())
-                self.assertEqual(json.loads(info)['ci'], record['ci'])
+                self.assertEqual(json.loads(info)['build'], record['build'])
                 for line in package.read(prefix + 'SHA256SUMS').decode().splitlines():
                     checksum, name = line.split('  ', 1)
                     self.assertEqual(checksum, hashlib.sha256(package.read(prefix + name)).hexdigest())

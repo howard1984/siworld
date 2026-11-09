@@ -287,7 +287,7 @@ class NativeWalletGateTests(unittest.TestCase):
                 self.assertEqual(GATE.main(args), 1)
 
     def test_workflow_reports_always_and_uploads_only_explicit_public_files(self):
-        text = (ROOT / '.github/workflows/native-wallet-roundtrip.yml').read_text()
+        text = (ROOT / 'scripts/tests/fixtures/retired-workflows/native-wallet-roundtrip.yml').read_text()
         run = text.index('id: roundtrip')
         prepare = text.index('scripts/native-wallet-gate-report.py prepare', run)
         timeout = text.index('timeout --signal=TERM', prepare)

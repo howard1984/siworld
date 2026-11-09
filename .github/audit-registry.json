@@ -111,7 +111,7 @@
         "tools/control-panel/memory_trend.py",
         "docs/memory-budgets.md",
         "scripts/measure-native-cgroup.py",
-        ".github/workflows/d8-native-cgroup.yml"
+        "scripts/tests/fixtures/retired-workflows/d8-native-cgroup.yml"
       ],
       "report": null,
       "accepted_commit": null,

@@ -239,7 +239,7 @@ class SettlementAdmissionTests(unittest.TestCase):
 
 class QualificationWorkflowTests(unittest.TestCase):
     def test_both_roles_are_checked_and_cpu_os_guard_precedes_optimized_builds(self):
-        workflow = (ROOT / '.github/workflows/native-fixed-qualification.yml').read_text()
+        workflow = (ROOT / 'scripts/tests/fixtures/retired-workflows/native-fixed-qualification.yml').read_text()
         self.assertIn('role: [validator, miner]', workflow)
         self.assertIn('HARDWARE_PROFILE: minimum-${{ matrix.role }}', workflow)
         self.assertNotIn('epyc7763', workflow)

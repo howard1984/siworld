@@ -26,7 +26,13 @@ pub fn key(tag: u64) -> SpendKey {
 }
 
 pub fn params() -> ChainParams {
-    ChainParams::devnet()
+    let mut target = [0xff; 32];
+    target[0] = 0x7f; // Minimum-cost fixture supporting both valid and invalid work.
+    ChainParams {
+        pow_iterations: 1,
+        genesis_target: target,
+        ..ChainParams::devnet()
+    }
 }
 
 /// The development fund's test signing key for `account`.
@@ -47,7 +53,7 @@ pub fn params_with_dev_fund() -> ChainParams {
             direct: dev_fund_key(DevAccount::Direct).verifying_key().0,
             lock: dev_fund_key(DevAccount::Lock).verifying_key().0,
         }),
-        ..ChainParams::devnet()
+        ..params()
     }
 }
 
@@ -290,7 +296,10 @@ pub fn next_timestamp(state: &ChainState, params: &ChainParams) -> u64 {
 /// Re-mines a header after a test edits it, so the edit reaches the check after PoW.
 pub fn reseal(header: &mut siworld_core::Header, params: &ChainParams) {
     header.nonce = 0;
-    assert!(siworld_consensus::mine(header, params.pow_iterations));
+    assert_eq!(
+        siworld_consensus::mine_some(header, params.pow_iterations, 4096),
+        Some(true)
+    );
 }
 
 pub fn chain(params: &ChainParams, state: ChainState) -> Chain<MockVerifier> {

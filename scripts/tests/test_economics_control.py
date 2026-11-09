@@ -67,7 +67,7 @@ class EconomicsControlTests(unittest.TestCase):
             F.HARDWARE.qualify_hardware_profile(hardware, 'epyc9v45-control')
 
     def workflow(self):
-        return (ROOT / '.github/workflows/v1-economics.yml').read_text()
+        return (ROOT / 'scripts/tests/fixtures/retired-workflows/v1-economics.yml').read_text()
 
     def test_workflow_requires_baseline_on_pr_and_gates_selected_key_exports(self):
         workflow = self.workflow()

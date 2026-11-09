@@ -340,15 +340,12 @@ mod tests {
             body_root: Digest([4; 32]),
             container_size: 4,
         };
-        assert!(mine(&mut h, p.pow_iterations));
-        let work = pow_hash(&h.pow_seed(), h.nonce, p.pow_iterations);
+        assert_eq!(mine_some(&mut h, 1, 4096), Some(true));
+        let work = pow_hash(&h.pow_seed(), h.nonce, 1);
         assert!(meets_target(&work, &h.target));
         // Every earlier nonce failed: the search is deterministic.
         for n in 0..h.nonce {
-            assert!(!meets_target(
-                &pow_hash(&h.pow_seed(), n, p.pow_iterations),
-                &h.target
-            ));
+            assert!(!meets_target(&pow_hash(&h.pow_seed(), n, 1), &h.target));
         }
         let mut impossible = h;
         impossible.target = [0; 32];
@@ -359,12 +356,14 @@ mod tests {
         let mut parts = h;
         parts.nonce = 0;
         let mut runs = 0;
-        let found = loop {
+        let mut found = false;
+        for _ in 0..2048 {
             runs += 1;
-            if let Some(found) = mine_some(&mut parts, p.pow_iterations, 2) {
-                break found;
+            if let Some(result) = mine_some(&mut parts, 1, 2) {
+                found = result;
+                break;
             }
-        };
+        }
         assert!(found);
         assert_eq!(parts.nonce, h.nonce);
         assert_eq!(runs, h.nonce / 2 + 1);
