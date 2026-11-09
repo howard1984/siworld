@@ -12,8 +12,7 @@
     "post-quantum-cryptography"
   ],
   "pinned_repositories": [
-    "siworld-labs/siworld",
-    "siworld-labs/Plonky3-recursion"
+    "howard1984/siworld"
   ],
   "navigation": [
     {

@@ -19,7 +19,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = 'd3d15b2b5d1325fb38ebc8979c1cae04b761e71f'
-URL = 'https://github.com/siworld-labs/Plonky3-recursion'
+URL = 'https://github.com/howard1984/siworld'
 BASE_PIN = '3a69ba61f713c8400b14eb3d8f0e52caa13512c7'
 UPSTREAM_URL = 'https://github.com/Plonky3/Plonky3-recursion'
 PATCH = ROOT / 'crates/bench-stark/patches/recursion-d8-w24.patch'

@@ -9,7 +9,7 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 license = "GPL-3.0-only"
-repository = "https://github.com/siworld-labs/siworld"
+repository = "https://github.com/howard1984/siworld"
 
 [workspace.dependencies]
 # Plonky3: p3-recursion currently tracks only 0.9.0-rc.2, so everything is pinned to it.

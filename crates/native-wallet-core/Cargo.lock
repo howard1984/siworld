@@ -1124,7 +1124,7 @@ dependencies = [
 [[package]]
 name = "p3-circuit"
 version = "0.1.0"
-source = "git+https://github.com/siworld-labs/Plonky3-recursion?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+source = "git+https://github.com/howard1984/siworld?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 dependencies = [
  "hashbrown",
  "itertools 0.15.0",
@@ -1155,7 +1155,7 @@ dependencies = [
 [[package]]
 name = "p3-circuit-prover"
 version = "0.1.0"
-source = "git+https://github.com/siworld-labs/Plonky3-recursion?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+source = "git+https://github.com/howard1984/siworld?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 dependencies = [
  "hashbrown",
  "p3-air",
@@ -1467,7 +1467,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon-circuit-cols"
 version = "0.1.0"
-source = "git+https://github.com/siworld-labs/Plonky3-recursion?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+source = "git+https://github.com/howard1984/siworld?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 
 [[package]]
 name = "p3-poseidon1"
@@ -1500,7 +1500,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon1-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/siworld-labs/Plonky3-recursion?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+source = "git+https://github.com/howard1984/siworld?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 dependencies = [
  "p3-air",
  "p3-baby-bear",
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "p3-poseidon2-circuit-air"
 version = "0.1.0"
-source = "git+https://github.com/siworld-labs/Plonky3-recursion?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+source = "git+https://github.com/howard1984/siworld?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 dependencies = [
  "p3-air",
  "p3-baby-bear",
@@ -1575,7 +1575,7 @@ dependencies = [
 [[package]]
 name = "p3-recursion"
 version = "0.1.0"
-source = "git+https://github.com/siworld-labs/Plonky3-recursion?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+source = "git+https://github.com/howard1984/siworld?rev=d3d15b2b5d1325fb38ebc8979c1cae04b761e71f#d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 dependencies = [
  "blake3",
  "hashbrown",

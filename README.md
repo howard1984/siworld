@@ -1,6 +1,6 @@
 # SIWORLD — post-quantum private payments (in development)
 
-[![CI](https://github.com/siworld-labs/siworld/actions/workflows/ci.yml/badge.svg)](https://github.com/siworld-labs/siworld/actions/workflows/ci.yml)
+[![CI](https://github.com/howard1984/siworld/actions/workflows/ci.yml/badge.svg)](https://github.com/howard1984/siworld/actions/workflows/ci.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 
 Rust implementation and research for shielded multi-asset payments with native

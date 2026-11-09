@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 license = "GPL-3.0-only"
-repository = "https://github.com/siworld-labs/siworld"
+repository = "https://github.com/howard1984/siworld"
 description = "Offline ML-DSA-65 development-fund key custody"
 
 [dependencies]

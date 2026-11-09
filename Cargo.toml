@@ -19,7 +19,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 license = "GPL-3.0-only"
-repository = "https://github.com/siworld-labs/siworld"
+repository = "https://github.com/howard1984/siworld"
 
 [workspace.dependencies]
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "zeroize"] }

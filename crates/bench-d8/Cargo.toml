@@ -10,7 +10,7 @@ version = "0.0.0"
 edition = "2024"
 publish = false
 license = "GPL-3.0-only"
-repository = "https://github.com/siworld-labs/siworld"
+repository = "https://github.com/howard1984/siworld"
 
 [workspace.dependencies]
 # Plonky3: p3-recursion currently tracks only 0.9.0-rc.2, so everything is pinned to it.
@@ -28,9 +28,9 @@ p3-commit = "=0.9.0-rc.2"
 p3-dft = "=0.9.0-rc.2"
 p3-fri = "=0.9.0-rc.2"
 p3-merkle-tree = "=0.9.0-rc.2"
-p3-circuit-prover = { git = "https://github.com/siworld-labs/Plonky3-recursion", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f" }
-p3-recursion = { git = "https://github.com/siworld-labs/Plonky3-recursion", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f" }
-p3-circuit = { git = "https://github.com/siworld-labs/Plonky3-recursion", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f" }
+p3-circuit-prover = { git = "https://github.com/howard1984/siworld", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f" }
+p3-recursion = { git = "https://github.com/howard1984/siworld", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f" }
+p3-circuit = { git = "https://github.com/howard1984/siworld", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f" }
 rand = { version = "0.10.3", default-features = false, features = ["std_rng", "sys_rng"] }
 p3-maybe-rayon = "=0.9.0-rc.2"
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }

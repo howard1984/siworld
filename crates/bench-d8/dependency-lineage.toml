@@ -1,7 +1,7 @@
 schema = 1
 version = "d8-w24-review-v1"
 source_mode = "fixed-fork-revision"
-source_url = "https://github.com/siworld-labs/Plonky3-recursion"
+source_url = "https://github.com/howard1984/siworld"
 source_revision = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
 upstream_url = "https://github.com/Plonky3/Plonky3-recursion"
 base_revision = "3a69ba61f713c8400b14eb3d8f0e52caa13512c7"

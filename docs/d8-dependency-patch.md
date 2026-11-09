@@ -28,7 +28,7 @@ Two complete revisions separate upstream-neutral APIs from compatibility:
 | Native suite | `cb50fe9bb2dcd76fc7de1b71d0cd3f099eb235db` | Experimental suite, batch work, typed bounded hiding workers |
 | Downstream compatibility | `d3d15b2b5d1325fb38ebc8979c1cae04b761e71f` | Same APIs plus bounded downstream environment compatibility; no-std serial behavior preserved |
 
-The source is distributed at [the project fork](https://github.com/siworld-labs/Plonky3-recursion).
+The exact dependency history is retained in the `dependencies/plonky3-recursion` branch of [the project repository](https://github.com/howard1984/siworld/tree/dependencies/plonky3-recursion). Cargo and the source-lineage adapter continue to select the fixed revision and verify its tree; the transport location does not change the dependency source.
 The source patch, base revision and complete dependency lock graph remain pinned
 together in `crates/bench-d8/dependency-lineage.toml`. Cargo uses the full
 downstream revision rather than a mutable branch name. The build checks its
