@@ -143,3 +143,18 @@ setup/prove/verify process cannot establish a verifier-memory bound. These
 remaining measurements may revise local operational policies without changing
 the frozen proof parameters. They and independent review precede activation,
 not recording the proof-parameter freeze.
+
+## Historical measurement source identities
+
+The measured dependency commit and tree remain unchanged after repository
+relocation. Frozen measurement JSON files retain their original source hashes.
+`scripts/frozen-source-relocations.py` lists exact before/after hashes for the
+two Cargo manifests, their lockfiles, the dependency-fetch URL and the offline
+source-check adapters. An exception requires both exact source bytes and the
+fixed dependency revision, tree and patch. Other changed bytes fail closed;
+no Rust AIR/runtime source, proof parameter or registry package version has
+an exception. This compatibility check is not a new performance measurement.
+
+Retired workflow source inputs remain inert fixtures. Their three historical
+path aliases are resolved for Git source comparisons only; they are not active
+workflows. The active CI executes validation in an isolated network namespace.

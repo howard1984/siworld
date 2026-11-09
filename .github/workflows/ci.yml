@@ -387,7 +387,7 @@ jobs:
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo test --locked --manifest-path crates/native-wallet-core/Cargo.toml
-          cargo test --release --locked --manifest-path crates/native-wallet-engine/Cargo.toml --lib
+          cargo test --release --locked --manifest-path crates/native-wallet-engine/Cargo.toml
           cargo test --release --locked --manifest-path crates/native-wallet-web/Cargo.toml --lib
           cargo check --locked --target wasm32-unknown-unknown --manifest-path crates/native-wallet-web/Cargo.toml
           node --test crates/native-wallet-web/tests/*.test.mjs

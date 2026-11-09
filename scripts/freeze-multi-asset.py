@@ -56,6 +56,7 @@ def module(filename):
 
 MEASUREMENT = module('measure-multi-asset.py')
 HARDWARE = module('measure-proof-cgroup.py')
+RELOCATIONS = module('frozen-source-relocations.py')
 
 
 def digest(value):
@@ -106,7 +107,9 @@ def measured_source_hashes(root, commit, revision=1):
     try:
         listed = subprocess.check_output(['git', 'ls-tree', '-r', '--name-only', commit],
             cwd=root, stderr=subprocess.DEVNULL).decode().splitlines()
-        measured = {name for name in listed if measured_path(name, revision)}
+        recorded = {name: path for name, path in RELOCATIONS.canonical_sources(listed).items()
+                    if measured_path(name, revision)}
+        measured = set(recorded)
         current = set(source_paths(root, revision))
         # Only these offline tools may be added after the measurement commit.
         allowed_new = OFFLINE_TOOLS - measured
@@ -114,10 +117,10 @@ def measured_source_hashes(root, commit, revision=1):
             raise ValueError('Runtime/build source set differs from measured commit')
         result = {}
         for name in sorted(measured):
-            data = subprocess.check_output(['git', 'show', commit + ':' + name],
+            data = subprocess.check_output(['git', 'show', commit + ':' + recorded[name]],
                 cwd=root, stderr=subprocess.DEVNULL)
             expected = hashlib.sha256(data).hexdigest()
-            if hashlib.sha256(source_bytes(root, name)).hexdigest() != expected:
+            if not RELOCATIONS.matches(root, name, source_bytes(root, name), expected):
                 raise ValueError('Runtime/build source differs from measured commit')
             result[name] = expected
         return result
@@ -133,7 +136,7 @@ def validate_measured_sources(value, root, revision=1):
     if set(measured) != current - (OFFLINE_TOOLS - set(measured)):
         raise ValueError('Measured runtime/build source boundary changed')
     for name, expected in measured.items():
-        if hashlib.sha256(source_bytes(root, name)).hexdigest() != digest(expected):
+        if not RELOCATIONS.matches(root, name, source_bytes(root, name), digest(expected)):
             raise ValueError('Runtime/build source differs from frozen measurement')
 
 
@@ -339,11 +342,11 @@ def validate_wallet_fast(value, root=ROOT):
             or value.get('dependency_revision') != DEPENDENCY_REVISION):
         raise ValueError('Invalid multi-asset engineering profile identity')
     validate_measured_sources(value, root)
-    if value.get('source_sha256') != source_hashes(root):
+    if not RELOCATIONS.mapping_matches(root, value.get('source_sha256'), source_paths(root), source_bytes):
         raise ValueError('Frozen implementation or source boundary changed')
     if value.get('air_source_sha256') != relation_hash(root):
         raise ValueError('Frozen AIR relation identity changed')
-    if value.get('dependencies_sha256') != hashlib.sha256(source_bytes(root, 'crates/bench-multi-asset/Cargo.lock')).hexdigest():
+    if not RELOCATIONS.matches(root, 'crates/bench-multi-asset/Cargo.lock', source_bytes(root, 'crates/bench-multi-asset/Cargo.lock'), value.get('dependencies_sha256')):
         raise ValueError('Frozen dependency lock changed')
     profiles = value['profiles']
     if len(profiles) != 8 or {(row['coordinate']['log_blowup'], row['coordinate']['grinding']) for row in profiles} != set(GRID):
@@ -649,10 +652,10 @@ def validate_economics(value, root=ROOT):
            for key, wanted in expected.items()):
         raise ValueError('Invalid economic engineering profile identity or policy')
     validate_measured_sources(value, root, revision=2)
-    if value['source_sha256'] != source_hashes(root, revision=2):
+    if not RELOCATIONS.mapping_matches(root, value['source_sha256'], source_paths(root, revision=2), source_bytes):
         raise ValueError('Frozen economic source boundary changed')
     if (value['air_source_sha256'] != relation_hash(root)
-            or value['dependencies_sha256'] != hashlib.sha256(source_bytes(root, 'crates/bench-multi-asset/Cargo.lock')).hexdigest()):
+            or not RELOCATIONS.matches(root, 'crates/bench-multi-asset/Cargo.lock', source_bytes(root, 'crates/bench-multi-asset/Cargo.lock'), value['dependencies_sha256'])):
         raise ValueError('Frozen economic relation or dependency changed')
     commit = value.get('measured_source_commit')
     if not isinstance(commit, str) or not re.fullmatch('[a-f0-9]{40}', commit):

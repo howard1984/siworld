@@ -1,10 +1,14 @@
 """Validate engineering-frozen V1 sources, public verifier keys and resource policy."""
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location('frozen_source_relocations', ROOT / 'scripts/frozen-source-relocations.py')
+RELOCATIONS = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(RELOCATIONS)
 DEFAULT = Path('crates/bench-d8/artifacts/v1-native-freeze.json')
 PARAMETERS = dict(log_blowup=8, num_queries=36, query_pow_bits=20,
                   commit_pow_bits=0, batch_pow_bits=20, max_log_arity=1,
@@ -40,7 +44,7 @@ def validate(value, root=ROOT):
         path = root / name
         if not path.resolve().is_relative_to(root.resolve()) or path.is_symlink():
             raise ValueError('source escapes fixed root')
-        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        if not RELOCATIONS.matches(root, name, path.read_bytes(), expected):
             raise ValueError('frozen source changed: ' + name)
     envelope = value.get('envelope', {})
     for name, expected in dict(version=1, prefix_bytes=1899, max_bytes=526187,
