@@ -133,10 +133,7 @@ fn run() -> Result<i32, String> {
     }
     let missing = missing_features(&cpu_features());
     if !missing.is_empty() {
-        return Err(format!(
-            "CPU \u{4e0d}\u{53d7}\u{652f}\u{6301} / {}",
-            rejection_message(&missing)
-        ));
+        return Err(rejection_message(&missing));
     }
     if args.as_slice() == [OsString::from("--check-cpu")] {
         println!("CPU admission passed: x86-64-v3");
@@ -155,7 +152,7 @@ fn run() -> Result<i32, String> {
             .get()
             < 4
         {
-            return Err("CPU \u{4e0d}\u{8db3} / At least 4 logical CPUs are required".into());
+            return Err("At least 4 logical CPUs are required".into());
         }
         if args.as_slice() == [OsString::from("--check-hardware")] {
             println!("Hardware admission passed");

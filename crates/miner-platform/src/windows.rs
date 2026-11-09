@@ -646,6 +646,17 @@ mod adversarial_tests {
 /// and redirected stdout/stderr. Intended for the interactive backup view.
 pub struct Console(File);
 impl Console {
+    pub fn columns(&self) -> Option<usize> {
+        // SAFETY: the owned console handle and fully sized output stay live.
+        unsafe {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = zeroed();
+            if GetConsoleScreenBufferInfo(self.0.as_raw_handle(), &mut info) == 0 {
+                return None;
+            }
+            usize::try_from((info.srWindow.Right - info.srWindow.Left + 1).min(info.dwSize.X)).ok()
+        }
+    }
+
     pub fn open() -> Result<Self, String> {
         let file = std::fs::OpenOptions::new()
             .read(true)

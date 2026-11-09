@@ -67,14 +67,83 @@ fn hidden(prompt: &str, maximum: usize) -> Result<Zeroizing<String>, String> {
     Ok(value)
 }
 fn prompt(text: &str, maximum: usize) -> Result<String, String> {
-    Ok(hidden(text, maximum)?.to_string())
+    eprint!("{text}");
+    std::io::stderr()
+        .flush()
+        .map_err(|_| "Console unavailable")?;
+    let mut input = String::new();
+    let mut reader = std::io::stdin().lock().take(maximum as u64 + 2);
+    if std::io::BufRead::read_line(&mut reader, &mut input)
+        .map_err(|_| "Console input unavailable")?
+        == 0
+    {
+        return Err("Console input closed".into());
+    }
+    let input = input.trim();
+    if input.len() > maximum {
+        return Err("Input exceeds its byte limit".into());
+    }
+    Ok(input.to_owned())
+}
+
+struct ActivityLine {
+    console: Option<platform::Console>,
+    occupied: usize,
+    frame: u64,
+}
+impl ActivityLine {
+    fn new() -> Self {
+        Self {
+            console: std::io::stderr()
+                .is_terminal()
+                .then(platform::Console::open)
+                .and_then(Result::ok),
+            occupied: 0,
+            frame: 0,
+        }
+    }
+    fn clear(&mut self) {
+        if let Some(tty) = &mut self.console {
+            let width = tty
+                .columns()
+                .unwrap_or(0)
+                .saturating_sub(1)
+                .min(self.occupied);
+            if width > 0 {
+                let _ = write!(tty, "\r{:width$}\r", "");
+                let _ = tty.flush();
+            }
+        }
+        self.occupied = 0;
+    }
+    fn draw(&mut self, value: Option<&Value>, now: u64, stopping: bool) {
+        let width = self
+            .console
+            .as_ref()
+            .and_then(platform::Console::columns)
+            .unwrap_or(0);
+        if width < 50 {
+            self.clear();
+            return;
+        }
+        let text = siworld_miner_cli::activity(value, now, self.frame, stopping);
+        self.frame = self.frame.wrapping_add(1);
+        let width = text.len().max(self.occupied).min(width - 1);
+        if let Some(tty) = &mut self.console {
+            let _ = write!(tty, "\r{:<width$.width$}", text);
+            let _ = tty.flush();
+        }
+        self.occupied = width;
+    }
+}
+impl Drop for ActivityLine {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 fn console() -> Result<platform::Console, String> {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return Err(
-            "\u{9996}\u{6b21}\u{8bbe}\u{7f6e}\u{9700}\u{8981}\u{53ef}\u{4fe1}\u{4ea4}\u{4e92}\u{7ec8}\u{7aef} / First setup requires an interactive trusted terminal"
-                .into(),
-        );
+        return Err("First setup requires an interactive trusted terminal".into());
     }
     platform::Console::open()
 }
@@ -111,9 +180,7 @@ fn hardware() -> Result<(), String> {
         .map_err(|_| "CPU count unavailable")?
         .get();
     if cpus < 4 {
-        return Err(
-            "CPU \u{4e0d}\u{8db3}：\u{81f3}\u{5c11}\u{9700}\u{8981} 4 \u{4e2a}\u{903b}\u{8f91}\u{5904}\u{7406}\u{5668} / At least 4 logical CPUs are required".into(),
-        );
+        return Err("At least 4 logical CPUs are required".into());
     }
     Ok(())
 }
@@ -252,58 +319,39 @@ fn new_address(
         .try_exists()
         .map_err(|_| "Existing wallet directory unavailable")?
     {
-        let password = hidden(
-            "\u{89e3}\u{9501}\u{5df2}\u{6709}\u{672c}\u{673a}\u{94b1}\u{5305} / Unlock saved local wallet: ",
-            1024,
-        )?;
+        let password = hidden("Unlock saved local wallet: ", 1024)?;
         let wallet = WalletVault::open(&root.join("wallet"), network, &password)?;
         let address = wallet.keys()?.address();
         let mut bytes = [0u8; 1232];
         bytes[..48].copy_from_slice(&native::codec::encode_digest(&address.owner()));
         bytes[48..].copy_from_slice(address.encapsulation_key());
-        writeln!(tty,"\u{5df2}\u{6062}\u{590d}\u{5df2}\u{6709}\u{5730}\u{5740}\u{ff0c}\u{4e0d}\u{4f1a}\u{751f}\u{6210}\u{6216}\u{8986}\u{76d6}\u{94b1}\u{5305} / Reusing saved address; no wallet is generated or overwritten.").map_err(|_|"Console unavailable")?;
+        writeln!(
+            tty,
+            "Reusing saved address; no wallet is generated or overwritten."
+        )
+        .map_err(|_| "Console unavailable")?;
         return Ok(bytes);
     }
-    let password = hidden(
-        "\u{8bbe}\u{7f6e}\u{94b1}\u{5305}\u{5bc6}\u{7801}\u{ff08}\u{81f3}\u{5c11}12\u{5b57}\u{8282}\u{ff09} / New wallet password (12+ bytes): ",
-        1024,
-    )?;
+    let password = hidden("New wallet password (12+ bytes): ", 1024)?;
     if password.len() < 12 {
         return Err("Wallet password requires at least 12 UTF-8 bytes".into());
     }
-    if *password
-        != *hidden(
-            "\u{786e}\u{8ba4}\u{5bc6}\u{7801} / Confirm password: ",
-            1024,
-        )?
-    {
+    if *password != *hidden("Confirm password: ", 1024)? {
         return Err("Wallet passwords do not match".into());
     }
     let pending = PendingWallet::generate(network, 0)?;
     {
         let words = pending.recovery_words();
-        writeln!(tty,"\n\u{79bb}\u{7ebf}\u{8bb0}\u{5f55}\u{4ee5}\u{4e0b}24\u{8bcd}\u{ff0c}\u{7981}\u{6b62}\u{53d1}\u{9001}\u{7ed9}\u{4efb}\u{4f55}\u{4eba}\u{3002}\nRecord these 24 words offline; never send them to anyone.\nRecovery version: 1 | Account: 0 | Network: {}\n\n{}\n", local::hex(&network), words.expose()).map_err(|_| "Private backup view unavailable")?;
+        writeln!(tty,"\n\nRecord these 24 words offline; never send them to anyone.\nRecovery version: 1 | Account: 0 | Network: {}\n\n{}\n", local::hex(&network), words.expose()).map_err(|_| "Private backup view unavailable")?;
         tty.flush()
             .map_err(|_| "Private backup view flush failed")?;
-        hidden(
-            "\u{8bb0}\u{5f55}\u{5b8c}\u{6210}\u{540e}\u{6309}\u{56de}\u{8f66} / Press Enter after recording: ",
-            0,
-        )?;
+        hidden("Press Enter after recording: ", 0)?;
         platform::clear_console()?;
     }
     let positions = pending.backup_challenge();
-    let a = hidden(
-        &format!("\u{5907}\u{4efd}\u{8bcd} / Backup word {}: ", positions[0]),
-        32,
-    )?;
-    let b = hidden(
-        &format!("\u{5907}\u{4efd}\u{8bcd} / Backup word {}: ", positions[1]),
-        32,
-    )?;
-    let c = hidden(
-        &format!("\u{5907}\u{4efd}\u{8bcd} / Backup word {}: ", positions[2]),
-        32,
-    )?;
+    let a = hidden(&format!("Backup word {}: ", positions[0]), 32)?;
+    let b = hidden(&format!("Backup word {}: ", positions[1]), 32)?;
+    let c = hidden(&format!("Backup word {}: ", positions[2]), 32)?;
     let confirmed = pending.confirm_backup([&a, &b, &c])?;
     let wallet = confirmed.create(&root.join("wallet"), &password)?;
     let address = wallet.keys()?.address();
@@ -320,67 +368,47 @@ fn new_address(
 fn wizard(root: &Path, directory: &Path) -> Result<(), String> {
     let mut tty = console()?;
     let mut wizard = Wizard::default();
-    writeln!(tty,"SIWORLD | Windows native CLI | \u{5de5}\u{7a0b}\u{7f51} / Engineering network\nReward mode has no default. Holder includes long locks; Voyager uses its current protocol allocation.").map_err(|_|"Console unavailable")?;
+    writeln!(tty,"SIWORLD | Windows native CLI | Engineering network\nReward mode has no default. Holder includes long locks; Voyager uses its current protocol allocation.").map_err(|_|"Console unavailable")?;
     let mode = loop {
-        let value = prompt(
-            "\u{9009}\u{62e9} holder \u{6216} voyager / Select holder or voyager: ",
-            16,
-        )?;
+        let value = prompt(siworld_miner_cli::MODE_PROMPT, 16)?;
         match wizard.mode(&value) {
-            Ok(()) => break value,
+            Ok(()) => break siworld_miner_cli::mode_choice(&value)?,
             Err(error) => eprintln!("{error}"),
         }
     };
-    let mode = RewardMode::from_name(&mode).map_err(|e| e.to_string())?;
+    let mode = RewardMode::from_name(mode).map_err(|e| e.to_string())?;
     let network = local::load(directory)?.network;
     let address = loop {
-        match prompt(
-            "\u{8f93}\u{5165} new \u{6216} existing / Type new or existing address: ",
-            16,
-        )?
-        .as_str()
-        {
-            "new" => break new_address(root, network, &mut tty)?,
-            "existing" => {
-                let text = hidden(
-                    "\u{7c98}\u{8d34}\u{5b8c}\u{6574}\u{6536}\u{6b3e}\u{5730}\u{5740} / Paste full receiving address: ",
-                    4096,
-                )?;
+        match siworld_miner_cli::address_choice(&prompt(siworld_miner_cli::ADDRESS_PROMPT, 16)?) {
+            Ok("new") => break new_address(root, network, &mut tty)?,
+            Ok("existing") => {
+                let text = hidden("Paste full receiving address: ", 4096)?;
                 match address::resolve(&text, network, None) {
                     Ok(address) => break address,
                     Err(error) => {
-                        eprintln!(
-                            "\u{5730}\u{5740}\u{65e0}\u{6548}\u{6216}\u{7f51}\u{7edc}\u{4e0d}\u{7b26} / Invalid address or network: {error}"
-                        )
+                        eprintln!("Invalid address or network: {error}")
                     }
                 }
             }
-            _ => {
-                eprintln!("\u{8bf7}\u{9009}\u{62e9} new \u{6216} existing / Choose new or existing")
-            }
+            Err(error) => eprintln!("{error}"),
+            _ => unreachable!("validated address selection"),
         }
     };
     wizard.address_validated()?;
     loop {
-        let input = prompt(
-            "\u{786e}\u{8ba4}\u{79bb}\u{7ebf}\u{5907}\u{4efd}\u{ff0c}\u{8f93}\u{5165} BACKEDUP / Confirm offline backup; type BACKEDUP: ",
-            16,
-        )?;
+        let input = prompt(siworld_miner_cli::BACKUP_PROMPT, 16)?;
         if wizard.acknowledge(&input).is_ok() {
             break;
         }
-        eprintln!("\u{5fc5}\u{987b}\u{8f93}\u{5165} BACKEDUP / Type BACKEDUP exactly");
+        eprintln!("Choose 1 only after verifying your offline wallet backup");
     }
-    writeln!(tty,"\nMode: {} | SIP | Outbound-only | 4 proving workers\nData: %LOCALAPPDATA%\\SIWORLD\n\u{9996}\u{6b21}\u{540c}\u{6b65}\u{53ef}\u{80fd}\u{8f83}\u{957f}\u{ff1b}\u{672a}\u{5b8c}\u{6210}\u{8ba4}\u{8bc1}\u{548c}\u{540c}\u{6b65}\u{524d}\u{4e0d}\u{4f1a}\u{5f00}\u{59cb}PoW\u{3002}\nInitial verification can take time; PoW waits for authenticated synchronization.\nThe bootstrap operator must separately pin pairing-public.json; no wallet secrets are required.",mode.name()).map_err(|_|"Console unavailable")?;
+    writeln!(tty,"\nMode: {} | SIP | Outbound-only | 4 proving workers\nData: %LOCALAPPDATA%\\SIWORLD\n\nInitial verification can take time; PoW waits for authenticated synchronization.\nThe bootstrap operator must separately pin pairing-public.json; no wallet secrets are required.",mode.name()).map_err(|_|"Console unavailable")?;
     loop {
-        let input = prompt(
-            "\u{542f}\u{52a8}\u{6316}\u{77ff}\u{8bf7}\u{8f93}\u{5165} START / Type START to start mining: ",
-            16,
-        )?;
+        let input = prompt(siworld_miner_cli::START_PROMPT, 16)?;
         if wizard.acknowledge(&input).is_ok() {
             break;
         }
-        eprintln!("\u{5fc5}\u{987b}\u{8f93}\u{5165} START / Type START exactly");
+        eprintln!("Choose 1 to start; Enter alone does not start the miner");
     }
     let owner = native::codec::decode_digest(
         address[..48]
@@ -441,17 +469,19 @@ fn monitor(directory: &Path) -> Result<(), String> {
             .map_err(|_| "Miner worker could not start")?;
     let mut rate = Hashrate::default();
     let mut stopping = false;
-    let mut last_render = Instant::now();
+    let mut last_render = Instant::now() - Duration::from_secs(5);
+    let mut activity = ActivityLine::new();
+    let mut latest: Option<Value> = None;
+    let mut last_text = String::new();
     let mut run_id: Option<String> = None;
-    eprintln!(
-        "\u{6b63}\u{5728}\u{540c}\u{6b65} / Synchronizing. Ctrl+C requests a clean stop; keep this terminal open."
-    );
+    eprintln!("Synchronizing. Ctrl+C requests a clean stop; keep this terminal open.");
     let outcome = (|| -> Result<(), String> {
         loop {
             if let Some(status) = child
                 .try_wait()
                 .map_err(|_| "Worker process observation failed")?
             {
+                activity.clear();
                 rate.reset();
                 if !status.success() {
                     return Err("Miner exited with an error; preserve %LOCALAPPDATA%\\SIWORLD for diagnosis".into());
@@ -462,9 +492,7 @@ fn monitor(directory: &Path) -> Result<(), String> {
                 {
                     return Err("Worker exited without a verified stopped result".into());
                 }
-                eprintln!(
-                    "\u{5df2}\u{5e72}\u{51c0}\u{505c}\u{6b62}\u{ff1b}\u{6570}\u{636e}\u{548c}\u{5956}\u{52b1}\u{4fdd}\u{7559} / Cleanly stopped; data and rewards retained."
-                );
+                eprintln!("Cleanly stopped; data and rewards retained.");
                 return Ok(());
             }
             if let Ok(status) = service::exported_status(directory) {
@@ -484,45 +512,68 @@ fn monitor(directory: &Path) -> Result<(), String> {
             {
                 match stop(directory, run) {
                     Ok(()) => {
+                        activity.clear();
                         stopping = true;
                         rate.reset();
                         eprintln!(
-                            "\u{6b63}\u{5728}\u{5e72}\u{51c0}\u{505c}\u{6b62}\u{ff1b}\u{7b49}\u{5f85}\u{5f53}\u{524d}\u{8bc1}\u{660e}\u{548c}\u{6700}\u{7ec8}\u{9a8c}\u{8bc1}\u{3002}\nClean stop pending; waiting for current proof and final verification. Do not start another instance."
+                            "\nClean stop pending; waiting for current proof and final verification. Do not start another instance."
                         );
                     }
-                    Err(error) => eprintln!("Stop request pending: {error}"),
+                    Err(error) => {
+                        activity.clear();
+                        eprintln!("Stop request pending: {error}");
+                    }
                 }
             }
             if last_render.elapsed() >= Duration::from_secs(5) {
                 let observation =
                     read_json(&directory.join("miner-private-status.json"), 65_536, true);
                 match observation {
-                    Ok(value) if value["run_id"].as_str() == run_id.as_deref() && !stopping => {
+                    Ok(value)
+                        if run_id.is_some()
+                            && value["run_id"].as_str() == run_id.as_deref()
+                            && !stopping =>
+                    {
                         let time = now().unwrap_or(u64::MAX);
                         let measured = rate.observe(&value, time);
                         match siworld_miner_cli::render(&value, measured, time) {
-                            Ok(text) => eprint!("{text}"),
+                            Ok(text) => {
+                                if text != last_text {
+                                    activity.clear();
+                                    eprint!("{text}");
+                                    last_text = text;
+                                }
+                                latest = Some(value);
+                            }
                             Err(_) => {
-                                eprintln!("Private reward status unavailable; no balance inferred.")
+                                latest = None;
+                                activity.clear();
+                                eprintln!(
+                                    "Private reward status unavailable; no balance inferred."
+                                );
                             }
                         }
                     }
                     _ => {
+                        latest = None;
                         rate.reset();
-                        eprintln!(
-                            "\u{5f53}\u{524d}\u{72b6}\u{6001}\u{5f85}\u{9a8c}\u{8bc1} / Current status unavailable; replay, peer synchronization or clean stop may still be in progress."
-                        );
+                        let text = "Current status unavailable; replay, peer synchronization or clean stop may still be in progress.";
+                        if last_text != text && !stopping {
+                            activity.clear();
+                            eprintln!("{text}");
+                            last_text = text.to_owned();
+                        }
                     }
                 }
                 last_render = Instant::now();
             }
+            activity.draw(latest.as_ref(), now().unwrap_or(u64::MAX), stopping);
             std::thread::sleep(Duration::from_millis(200));
         }
     })();
     if outcome.is_err() && child.try_wait().ok().flatten().is_none() {
-        eprintln!(
-            "\u{524d}\u{53f0}\u{89c2}\u{5bdf}\u{5931}\u{8d25}\u{ff1b}\u{6b63}\u{5728}\u{8bf7}\u{6c42}\u{5e72}\u{51c0}\u{505c}\u{6b62} / Frontend observation failed; requesting a clean stop."
-        );
+        activity.clear();
+        eprintln!("Frontend observation failed; requesting a clean stop.");
         loop {
             if let Ok(Some(_)) = child.try_wait() {
                 break;

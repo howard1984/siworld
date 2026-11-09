@@ -3,6 +3,29 @@
 use serde_json::Value;
 
 pub const HELP: &str = include_str!("../help.txt");
+pub const MODE_PROMPT: &str = "\nReward mode (no default):\n  1) Holder - includes long-term reward locks\n  2) Voyager - uses the current Voyager allocation\nChoose 1 or 2: ";
+pub const ADDRESS_PROMPT: &str = "\nReceiving address:\n  1) Create or unlock a local wallet\n  2) Use an existing full receiving address\nChoose 1 or 2: ";
+pub const BACKUP_PROMPT: &str =
+    "\nOffline backup:\n  1) I have verified my wallet backup\nChoose 1 to confirm: ";
+pub const START_PROMPT: &str =
+    "\n  1) Start connecting and synchronizing, then mine when ready\nChoose 1 to start: ";
+pub const PAIRING_HELP: &str = "No authenticated connection; mining has not started.\nGive only %LOCALAPPDATA%\\SIWORLD\\pairing-public.json to the bootstrap operator for approval.\nKeep wallet files private. Pairing and network connectivity must both be ready.\n";
+
+pub fn mode_choice(input: &str) -> Result<&'static str, String> {
+    match input.trim() {
+        "1" | "holder" => Ok("holder"),
+        "2" | "voyager" => Ok("voyager"),
+        _ => Err("Choose 1 for Holder or 2 for Voyager; there is no default".into()),
+    }
+}
+
+pub fn address_choice(input: &str) -> Result<&'static str, String> {
+    match input.trim() {
+        "1" | "new" => Ok("new"),
+        "2" | "existing" => Ok("existing"),
+        _ => Err("Choose 1 for a local wallet or 2 for an existing address".into()),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
@@ -25,7 +48,7 @@ impl Wizard {
         self.step
     }
     pub fn mode(&mut self, mode: &str) -> Result<(), String> {
-        if self.step != Step::Mode || !matches!(mode, "holder" | "voyager") {
+        if self.step != Step::Mode || mode_choice(mode).is_err() {
             return Err("Explicit holder or voyager selection required".into());
         }
         self.step = Step::Address;
@@ -40,12 +63,48 @@ impl Wizard {
     }
     pub fn acknowledge(&mut self, input: &str) -> Result<(), String> {
         match (self.step, input) {
-            (Step::Backup, "BACKEDUP") => self.step = Step::Start,
-            (Step::Start, "START") => self.step = Step::Running,
+            (Step::Backup, "1" | "BACKEDUP") => self.step = Step::Start,
+            (Step::Start, "1" | "START") => self.step = Step::Running,
             _ => return Err("Confirmation did not match the current step".into()),
         }
         Ok(())
     }
+}
+
+/// Activity is an elapsed animation, never a progress or hashrate estimate.
+pub fn activity(value: Option<&Value>, now: u64, frame: u64, stopping: bool) -> String {
+    if stopping {
+        return format!(
+            "[{}] Stopping safely; keep this window open",
+            activity_mark(frame)
+        );
+    }
+    let Some(value) = value else {
+        return format!(
+            "[{}] Waiting for current worker status",
+            activity_mark(frame)
+        );
+    };
+    let Some(updated) = value["updated_unix_ms"].as_u64() else {
+        return "[!] Current status unavailable".into();
+    };
+    if now.saturating_sub(updated) > 15_000 || updated > now.saturating_add(1000) {
+        return "[!] Status stale; current activity unknown".into();
+    }
+    let label = match value["phase"].as_str() {
+        Some("waiting_for_authenticated_peers") => "Waiting for peer approval or connectivity",
+        Some("synchronizing") => "Synchronizing and verifying blocks",
+        Some("checkpoint_catchup") => "Downloading and verifying checkpoint data",
+        Some("template_preparation") => "Preparing a mining template and proof",
+        Some("pow_search") => "Searching proof of work",
+        Some("stopped") => return "[+] Cleanly stopped".into(),
+        _ => return "[?] Current activity unknown".into(),
+    };
+    format!("[{}] {label}", activity_mark(frame))
+}
+
+fn activity_mark(frame: u64) -> &'static str {
+    ["|", "/", "-", "\\"][(frame % 4) as usize]
 }
 
 pub fn amount(text: &Value) -> Result<String, String> {
@@ -115,33 +174,30 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         .as_u64()
         .ok_or("Missing observation time")?;
     if now.saturating_sub(updated) > 15_000 || updated > now.saturating_add(1000) {
-        return Ok("\u{72b6}\u{6001}\u{8fc7}\u{671f} / Status stale: current mining state and hashrate unavailable; last height is historical.\n".into());
+        return Ok("Status stale: current mining state and hashrate unavailable; last height is historical.\n".into());
     }
     let phase = match value["phase"].as_str() {
-        Some("waiting_for_authenticated_peers") => {
-            "\u{7b49}\u{5f85}\u{8ba4}\u{8bc1}\u{8fde}\u{63a5} / Waiting for authenticated peers"
-        }
-        Some("synchronizing") => {
-            "\u{540c}\u{6b65}\u{9a8c}\u{8bc1}\u{4e2d} / Synchronizing and verifying"
-        }
-        Some("checkpoint_catchup") => {
-            "\u{4ece}\u{68c0}\u{67e5}\u{70b9}\u{8ffd}\u{8d76}\u{4e2d} / Catching up from checkpoint"
-        }
-        Some("pow_search") => "PoW \u{641c}\u{7d22} / PoW search",
-        Some("stopped") => "\u{5df2}\u{5e72}\u{51c0}\u{505c}\u{6b62} / Cleanly stopped",
-        Some("template_preparation") => {
-            "\u{6a21}\u{677f}\u{4e0e}\u{8bc1}\u{660e}\u{51c6}\u{5907} / Template and proof preparation"
-        }
-        _ => "\u{72b6}\u{6001}\u{672a}\u{77e5} / Unknown state",
+        Some("waiting_for_authenticated_peers") => "Waiting for authenticated peers",
+        Some("synchronizing") => "Synchronizing and verifying",
+        Some("checkpoint_catchup") => "Catching up from checkpoint",
+        Some("pow_search") => "PoW search",
+        Some("stopped") => "Cleanly stopped",
+        Some("template_preparation") => "Template and proof preparation",
+        _ => "Unknown state",
     };
     let rate = rate
         .map(|n| format!("{}.{:03} H/s", n / 1000, n % 1000))
-        .unwrap_or_else(|| "\u{4e0d}\u{53ef}\u{7528} / unavailable".into());
+        .unwrap_or_else(|| "unavailable".into());
     let goal = value["batch_goal_unverified"]
         .as_u64()
         .map(|n| format!("{n} (peer hint; pending verification)"))
         .unwrap_or_else(|| "unknown; no completion estimate".into());
     let rewards = &value["rewards"];
+    let pairing = if value["phase"] == "waiting_for_authenticated_peers" {
+        PAIRING_HELP
+    } else {
+        ""
+    };
     let catchup = if value["phase"] == "checkpoint_catchup" {
         let progress = &value["checkpoint_catchup"];
         let estimate = progress["eta_seconds"]
@@ -156,7 +212,7 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         String::new()
     };
     Ok(format!(
-        "\n{phase}\n{catchup}\u{5df2}\u{9a8c}\u{8bc1}\u{9ad8}\u{5ea6} / Verified height: {} | Current batch goal: {goal}\n\u{8ba4}\u{8bc1}\u{8fde}\u{63a5} / Authenticated peers: {} | \u{6709}\u{6548}\u{7b97}\u{529b} / Effective hashrate: {rate}\n\u{4e3b}\u{94fe}\u{5df2}\u{6316}\u{533a}\u{5757} / Main-chain mined blocks: {} | Detached: {}\n\u{7d2f}\u{8ba1}\u{6210}\u{719f}\u{5956}\u{52b1} / Cumulative mature earned: {}\n\u{5f85}\u{6210}\u{719f}\u{5956}\u{52b1} / Pending maturity: {}\n\u{957f}\u{671f}\u{9501}\u{5b9a} / Long-term locked: {} | Next unlock height: {}\nRewards are cumulative earnings, not an unspent wallet balance. Candidates are not credited.\n",
+        "\n{phase}\n{pairing}{catchup}Verified height: {} | Current batch goal: {goal}\nAuthenticated peers: {} | Effective hashrate: {rate}\nMain-chain mined blocks: {} | Detached: {}\nCumulative mature earned: {}\nPending maturity: {}\nLong-term locked: {} | Next unlock height: {}\nRewards are cumulative earnings, not an unspent wallet balance. Candidates are not credited.\n",
         value["height"],
         value["authenticated_peers"],
         rewards["accepted_blocks"],
@@ -174,6 +230,73 @@ mod tests {
     use serde_json::json;
     fn sample(run: &str, elapsed: u64, attempts: u64) -> Value {
         json!({"run_id":run,"updated_unix_ms":100_000,"elapsed_monotonic_ms":elapsed,"pow_attempts":attempts})
+    }
+    #[test]
+    fn numbered_choices_require_explicit_selection_at_each_step() {
+        for invalid in ["", " ", "0", "3", "holder voyager"] {
+            assert!(mode_choice(invalid).is_err());
+            assert!(address_choice(invalid).is_err());
+        }
+        for (selection, mode) in [("1", "holder"), ("2", "voyager")] {
+            assert_eq!(mode_choice(selection).unwrap(), mode);
+            let mut wizard = Wizard::default();
+            assert!(wizard.acknowledge("1").is_err());
+            wizard.mode(selection).unwrap();
+            assert!(wizard.acknowledge("1").is_err());
+            wizard.address_validated().unwrap();
+            assert!(wizard.acknowledge("").is_err());
+            wizard.acknowledge("1").unwrap();
+            assert_eq!(wizard.step(), Step::Start);
+            assert!(wizard.acknowledge("").is_err());
+            wizard.acknowledge("1").unwrap();
+            assert_eq!(wizard.step(), Step::Running);
+        }
+        assert_eq!(address_choice("1").unwrap(), "new");
+        assert_eq!(address_choice("2").unwrap(), "existing");
+        assert_eq!(mode_choice(" 2 ").unwrap(), "voyager");
+        assert_eq!(address_choice("existing").unwrap(), "existing");
+    }
+    #[test]
+    fn activity_distinguishes_waiting_mining_stale_and_stopped_states() {
+        let mut value =
+            json!({"updated_unix_ms":100_000,"phase":"waiting_for_authenticated_peers"});
+        assert_ne!(
+            activity(Some(&value), 100_000, 0, false),
+            activity(Some(&value), 100_000, 1, false)
+        );
+        assert!(activity(Some(&value), 100_000, 0, false).contains("approval or connectivity"));
+        assert!(!activity(Some(&value), 100_000, 0, false).contains("Searching"));
+        value["phase"] = json!("pow_search");
+        assert!(activity(Some(&value), 100_000, 0, false).contains("Searching proof"));
+        assert_eq!(
+            activity(Some(&value), 116_000, 0, false),
+            activity(Some(&value), 116_000, 1, false)
+        );
+        assert!(activity(Some(&value), 116_000, 0, false).contains("stale"));
+        value["phase"] = json!("stopped");
+        assert_eq!(
+            activity(Some(&value), 100_000, 0, false),
+            "[+] Cleanly stopped"
+        );
+        assert!(activity(Some(&value), 100_000, 0, true).contains("Stopping safely"));
+        assert!(activity(None, 100_000, 0, false).contains("Waiting for current worker status"));
+    }
+    #[test]
+    fn waiting_display_is_english_and_identifies_the_public_pairing_file() {
+        let value = json!({
+            "updated_unix_ms":100_000,"phase":"waiting_for_authenticated_peers","height":0,
+            "authenticated_peers":0,
+            "rewards":{"accepted_blocks":0,"detached_blocks":0,"mature_earned_atoms":"0",
+                "pending_atoms":"0","long_locked_atoms":"0","next_unlock_height":null}
+        });
+        let output = render(&value, None, 100_000).unwrap();
+        assert!(output.is_ascii());
+        assert!(output.contains("pairing-public.json"));
+        assert!(output.contains("mining has not started"));
+        for text in [MODE_PROMPT, ADDRESS_PROMPT, BACKUP_PROMPT, START_PROMPT] {
+            assert!(text.is_ascii());
+            assert!(text.contains("1)"));
+        }
     }
     #[test]
     fn no_default_mode_or_out_of_order_confirmation() {
