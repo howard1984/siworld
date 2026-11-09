@@ -26,7 +26,7 @@ def main():
         if not re.search(r'^        run:', block, flags=re.M):
             continue
         name = block.splitlines()[0].removeprefix('name: ')
-        if name not in safe_setup and 'shell: bash --noprofile --norc -c \'exec bash "$GITHUB_WORKSPACE/scripts/ci-offline.sh" "$1"\' -- {0}' not in block:
+        if name not in safe_setup and 'shell: bash --noprofile --norc -c "exec bash \\"$GITHUB_WORKSPACE/scripts/ci-offline.sh\\" \\"$1\\"" -- {0}' not in block:
             raise SystemExit('Validation command lacks mandatory network isolation')
     print('Active workflow contains isolated offline validation only.')
 
