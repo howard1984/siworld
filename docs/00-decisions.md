@@ -526,13 +526,23 @@ insertion. The verified-pool policy is 512 MiB/2,048 entries, 16 MiB/64 entries
 per opaque peer and at most 4,096 peer identities. These logical limits do not
 supply isolated workers, ingress queues or a process-memory guarantee.
 
+Miner ingress does not require operator registration or a miner allowlist.
+An inbound miner presents its signed, network-bound descriptor before the
+unchanged hybrid TLS handshake. Descriptor possession signatures do not grant a
+session: TLS certificate verification, Ed25519 and ML-DSA transcript signatures,
+exporter binding and the native Miner Hello must all succeed. The service keeps
+only bounded temporary scheduling state and releases it after socket closure.
+Outbound bootstrap destinations remain independently pinned. A presented miner
+identity grants no checkpoint-signing or local control authority. Legacy pinned
+peer routing remains supported; public miner routing requires a service upgrade.
+
 The authenticated-stream interface binds network, genesis and frozen verifier
 manifest, with bounded framing and declared peer roles, full-proof batches and exact-proof
 compact recovery. Sync attempts pin peer/base/ancestor/continuation and retain
-budget reservations until adoption or discard. There is no production hybrid
-authenticator or enabled listening service. A reviewed X25519 + ML-KEM,
-Ed25519 + ML-DSA provider, authenticated record protection, actual-listener
-failure tests and Dandelion++ remain required before network activation.
+budget reservations until adoption or discard. The opt-in engineering driver
+uses X25519 + ML-KEM, Ed25519 + ML-DSA and authenticated record protection.
+Independent transport review and Dandelion++ remain requirements before
+main-network activation.
 
 Block encoding v4 and compact encoding v3 include bounded signed issuance
 records and the fixed three-note native proof. The trusted transport identity

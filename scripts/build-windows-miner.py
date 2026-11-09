@@ -69,7 +69,7 @@ def package(output, expected_commit):
     if output.exists():
         raise SystemExit('Output must be a new directory; existing artifacts are preserved')
     output.mkdir(parents=True)
-    # Reuse source-bound release dependencies from the same CI job's tests.
+    # Reuse source-bound release dependencies from local validation.
     worker_target = Path(os.environ.get('CARGO_TARGET_DIR', output / 'worker-target')).resolve()
     launcher_target = output / 'launcher-target'
     build('crates/miner-cli/Cargo.toml', worker_target,
@@ -114,10 +114,10 @@ def package(output, expected_commit):
     }, indent=2) + '\n', encoding='utf-8')
     (folder / 'release-notes.md').write_text(
         '# Windows native miner engineering package\n\n'
-        'Foreground PowerShell/CMD onboarding with explicit reward mode, recipient, BACKEDUP and START gates. '
+        'English numbered console menus select reward mode and recipient, confirm wallet backup and start. '
         'The miner uses authenticated outbound connections and current-user local storage. '
         'No service, inbound listener, firewall rule or automatic update is installed.\n\n'
-        'This package is unsigned. A trusted engineering-network bundle and mutual peer pairing are required. '
+        'This package is unsigned. A trusted engineering-network bundle is required; miner registration is not. '
         'Real Windows 10/11 hardware compatibility, Defender/SmartScreen behavior, sustained mining and rewards '
         'remain subject to physical-machine acceptance. Synthetic CI transport tests do not qualify proof throughput.\n', encoding='utf-8')
     # PE inspection is host-independent. Cross-built executables run only on Windows.

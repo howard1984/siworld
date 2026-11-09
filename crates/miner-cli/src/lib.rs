@@ -9,7 +9,7 @@ pub const BACKUP_PROMPT: &str =
     "\nOffline backup:\n  1) I have verified my wallet backup\nChoose 1 to confirm: ";
 pub const START_PROMPT: &str =
     "\n  1) Start connecting and synchronizing, then mine when ready\nChoose 1 to start: ";
-pub const PAIRING_HELP: &str = "No authenticated connection; mining has not started.\nGive only %LOCALAPPDATA%\\SIWORLD\\pairing-public.json to the bootstrap operator for approval.\nKeep wallet files private. Pairing and network connectivity must both be ready.\n";
+pub const CONNECTION_HELP: &str = "Not connected; mining has not started.\nCheck your network connection and bundled bootstrap configuration.\nMining starts after the chain has synchronized and been verified.\n";
 
 pub fn mode_choice(input: &str) -> Result<&'static str, String> {
     match input.trim() {
@@ -92,7 +92,7 @@ pub fn activity(value: Option<&Value>, now: u64, frame: u64, stopping: bool) -> 
         return "[!] Status stale; current activity unknown".into();
     }
     let label = match value["phase"].as_str() {
-        Some("waiting_for_authenticated_peers") => "Waiting for peer approval or connectivity",
+        Some("waiting_for_authenticated_peers") => "Waiting for connection",
         Some("synchronizing") => "Synchronizing and verifying blocks",
         Some("checkpoint_catchup") => "Downloading and verifying checkpoint data",
         Some("template_preparation") => "Preparing a mining template and proof",
@@ -177,7 +177,7 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         return Ok("Status stale: current mining state and hashrate unavailable; last height is historical.\n".into());
     }
     let phase = match value["phase"].as_str() {
-        Some("waiting_for_authenticated_peers") => "Waiting for authenticated peers",
+        Some("waiting_for_authenticated_peers") => "Waiting for connection",
         Some("synchronizing") => "Synchronizing and verifying",
         Some("checkpoint_catchup") => "Catching up from checkpoint",
         Some("pow_search") => "PoW search",
@@ -193,8 +193,8 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         .map(|n| format!("{n} (peer hint; pending verification)"))
         .unwrap_or_else(|| "unknown; no completion estimate".into());
     let rewards = &value["rewards"];
-    let pairing = if value["phase"] == "waiting_for_authenticated_peers" {
-        PAIRING_HELP
+    let connection = if value["phase"] == "waiting_for_authenticated_peers" {
+        CONNECTION_HELP
     } else {
         ""
     };
@@ -212,9 +212,8 @@ pub fn render(value: &Value, rate: Option<u128>, now: u64) -> Result<String, Str
         String::new()
     };
     Ok(format!(
-        "\n{phase}\n{pairing}{catchup}Verified height: {} | Current batch goal: {goal}\nAuthenticated peers: {} | Effective hashrate: {rate}\nMain-chain mined blocks: {} | Detached: {}\nCumulative mature earned: {}\nPending maturity: {}\nLong-term locked: {} | Next unlock height: {}\nRewards are cumulative earnings, not an unspent wallet balance. Candidates are not credited.\n",
+        "\n{phase}\n{connection}{catchup}Verified height: {} | Current batch goal: {goal}\nEffective hashrate: {rate}\nMain-chain mined blocks: {} | Detached: {}\nCumulative mature earned: {}\nPending maturity: {}\nLong-term locked: {} | Next unlock height: {}\nRewards are cumulative earnings, not an unspent wallet balance. Candidates are not credited.\n",
         value["height"],
-        value["authenticated_peers"],
         rewards["accepted_blocks"],
         rewards["detached_blocks"],
         amount(&rewards["mature_earned_atoms"])?,
@@ -264,7 +263,7 @@ mod tests {
             activity(Some(&value), 100_000, 0, false),
             activity(Some(&value), 100_000, 1, false)
         );
-        assert!(activity(Some(&value), 100_000, 0, false).contains("approval or connectivity"));
+        assert!(activity(Some(&value), 100_000, 0, false).contains("Waiting for connection"));
         assert!(!activity(Some(&value), 100_000, 0, false).contains("Searching"));
         value["phase"] = json!("pow_search");
         assert!(activity(Some(&value), 100_000, 0, false).contains("Searching proof"));
@@ -282,7 +281,7 @@ mod tests {
         assert!(activity(None, 100_000, 0, false).contains("Waiting for current worker status"));
     }
     #[test]
-    fn waiting_display_is_english_and_identifies_the_public_pairing_file() {
+    fn waiting_display_is_english_without_registration_or_connection_counts() {
         let value = json!({
             "updated_unix_ms":100_000,"phase":"waiting_for_authenticated_peers","height":0,
             "authenticated_peers":0,
@@ -291,7 +290,9 @@ mod tests {
         });
         let output = render(&value, None, 100_000).unwrap();
         assert!(output.is_ascii());
-        assert!(output.contains("pairing-public.json"));
+        assert!(!output.contains("pairing-public.json"));
+        assert!(!output.contains("Authenticated peers"));
+        assert!(!output.contains("approval"));
         assert!(output.contains("mining has not started"));
         for text in [MODE_PROMPT, ADDRESS_PROMPT, BACKUP_PROMPT, START_PROMPT] {
             assert!(text.is_ascii());

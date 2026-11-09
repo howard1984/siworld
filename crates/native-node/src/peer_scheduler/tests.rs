@@ -1,5 +1,35 @@
 use super::*;
 
+#[cfg(feature = "native-p2p")]
+#[test]
+fn transient_inbound_identity_is_bounded_and_released_after_socket_closure() {
+    let budget = Budget::new(1024 * 1024);
+    let mut scheduler = Scheduler::new([1; 32], &[[2; 32]], budget.clone(), 0).unwrap();
+    let available = budget.available().unwrap();
+    scheduler.admit_inbound([3; 32], 0).unwrap();
+    assert_eq!(budget.available().unwrap(), available - PEER_BYTES);
+    let attempt = scheduler
+        .begin([3; 32], Direction::Inbound, 0)
+        .unwrap()
+        .token;
+    scheduler.authenticated(attempt, 1).unwrap();
+    assert_eq!(scheduler.forget_inbound([3; 32]), Err(Error::Duplicate));
+    assert_eq!(
+        scheduler.forget_inbound([2; 32]),
+        Err(Error::InvalidIdentity)
+    );
+    scheduler.closed(attempt, Failure::Unavailable, 2).unwrap();
+    scheduler.forget_inbound([3; 32]).unwrap();
+    assert_eq!(budget.available().unwrap(), available);
+    assert_eq!(scheduler.status().configured, 1);
+    for value in 4..=MAX_PEERS as u8 + 4 {
+        scheduler.admit_inbound([value; 32], 2).unwrap();
+        scheduler.forget_inbound([value; 32]).unwrap();
+    }
+    assert_eq!(budget.available().unwrap(), available);
+    assert_eq!(scheduler.status().configured, 1);
+}
+
 fn scheduler() -> Scheduler {
     Scheduler::new([1; 32], &[[2; 32], [3; 32]], Budget::new(1024 * 1024), 0).unwrap()
 }

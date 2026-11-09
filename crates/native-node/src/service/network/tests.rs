@@ -147,6 +147,112 @@ fn connect_pair(a: &mut Endpoint, b: &mut Endpoint) {
     });
 }
 
+#[test]
+fn unregistered_miner_syncs_and_relays_blocks_without_operator_files() {
+    let mut provider = Endpoint::new();
+    let mut miner = Endpoint::new();
+    miner.follow(&provider);
+    miner.driver.listener = None;
+    miner.driver.role = Role::Miner;
+    provider.append(910_000);
+    until(&mut provider, &mut miner, |a, b| {
+        a.driver.connections == 1 && b.state().height == 1
+    });
+    assert_eq!(provider.state().fingerprint(), miner.state().fingerprint());
+    assert!(provider.driver.peers.is_empty());
+    assert!(provider.driver.fixture.is_none());
+    assert!(provider.driver.public_miners.contains(&miner.driver.local));
+    assert!(!std::fs::read_dir(&provider.directory.0).unwrap().any(|p| {
+        let p = p.unwrap();
+        p.file_name().to_string_lossy().starts_with("peer-") || p.file_name() == "peers.json"
+    }));
+    miner.append(920_000);
+    until(&mut provider, &mut miner, |a, b| {
+        a.state().height == 2 && a.state().fingerprint() == b.state().fingerprint()
+    });
+    miner.driver.shutdown().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !provider.driver.public_miners.is_empty() {
+        assert!(Instant::now() < deadline);
+        provider.tick();
+        std::thread::sleep(POLL);
+    }
+    assert_eq!(provider.driver.scheduler.status().configured, 0);
+}
+
+#[test]
+fn public_route_rejects_forged_signature_foreign_network_and_wrong_fingerprint() {
+    for fault in 0..3 {
+        let mut provider = Endpoint::new();
+        let mut peer = Endpoint::new();
+        let mut bytes = peer.driver.identity.descriptor().unwrap().encode();
+        let mut fingerprint = peer.driver.local;
+        match fault {
+            0 => bytes[2150] ^= 1,
+            1 => bytes[6] ^= 1,
+            _ => fingerprint[0] ^= 1,
+        }
+        let mut socket = TcpStream::connect(provider.address()).unwrap();
+        socket.write_all(MINER_ROUTE_MAGIC).unwrap();
+        socket.write_all(&fingerprint).unwrap();
+        socket.write_all(&bytes).unwrap();
+        until(&mut provider, &mut peer, |a, _| a.driver.failures > 0);
+        assert_eq!(provider.driver.connections, 0);
+        assert_eq!(provider.driver.scheduler.status().configured, 0);
+        assert_eq!(provider.state().height, 0);
+    }
+}
+
+#[test]
+fn a_signed_public_descriptor_without_the_tls_handshake_grants_no_admission() {
+    let mut provider = Endpoint::new();
+    let mut peer = Endpoint::new();
+    let bytes = peer.driver.identity.descriptor().unwrap().encode();
+    let mut socket = TcpStream::connect(provider.address()).unwrap();
+    socket.write_all(MINER_ROUTE_MAGIC).unwrap();
+    socket.write_all(&peer.driver.local).unwrap();
+    socket.write_all(&bytes).unwrap();
+    socket.write_all(b"invalid TLS record").unwrap();
+    socket.shutdown(std::net::Shutdown::Write).unwrap();
+    until(&mut provider, &mut peer, |a, _| a.driver.failures > 0);
+    assert_eq!(provider.driver.connections, 0);
+    assert!(provider.driver.public_miners.is_empty());
+    assert_eq!(provider.driver.scheduler.status().configured, 0);
+}
+
+#[test]
+fn unregistered_validator_cannot_use_public_miner_ingress() {
+    let mut provider = Endpoint::new();
+    let peer = Endpoint::new();
+    let expected_provider = expected(&provider.driver.identity);
+    let identity = peer.driver.identity.clone();
+    let address = provider.address();
+    let join = std::thread::spawn(move || {
+        let mut socket = TcpStream::connect(address).unwrap();
+        let descriptor = identity.descriptor().unwrap();
+        socket.write_all(MINER_ROUTE_MAGIC).unwrap();
+        socket.write_all(&descriptor.fingerprint()).unwrap();
+        socket.write_all(&descriptor.encode()).unwrap();
+        let budget = Budget::default();
+        let admission = AdmissionContext::new(
+            expected_provider,
+            ConnectionRole::Initiator,
+            Cancellation::default(),
+        );
+        let mut auth = p2p::NativeTlsAuthenticator::new(identity, budget.clone());
+        let _ = p2p::establish_socket(socket, &mut auth, &admission, Role::Validator, budget);
+    });
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while provider.driver.failures == 0 {
+        assert!(Instant::now() < deadline);
+        provider.tick();
+        std::thread::sleep(POLL);
+    }
+    join.join().unwrap();
+    assert_eq!(provider.driver.connections, 0);
+    assert!(provider.driver.public_miners.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn unavailable_checkpoint_observation_does_not_interrupt_canonical_validation() {
@@ -387,6 +493,47 @@ fn retiring_inbound_pair() -> (Endpoint, Endpoint, u64, SyncSender<()>) {
     (receiver, sender, id, release)
 }
 
+#[test]
+fn public_miner_capacity_preserves_configured_peer_slots() {
+    let mut provider = Endpoint::new();
+    let configured = Endpoint::new();
+    provider.follow(&configured);
+    let mut releases = Vec::new();
+    for value in 1..=MAX_PUBLIC_MINERS as u8 {
+        let (id, release) = waiting_worker(&mut provider, None, None);
+        releases.push(release);
+        assert!(matches!(
+            provider.driver.admit_authenticated(id, [value; 32], true),
+            Ok(Admission::Established)
+        ));
+    }
+    let (id, release) = waiting_worker(&mut provider, None, None);
+    releases.push(release);
+    assert!(
+        provider
+            .driver
+            .admit_authenticated(id, [99; 32], true)
+            .is_err()
+    );
+    assert_eq!(provider.driver.public_miners.len(), MAX_PUBLIC_MINERS);
+    let start = provider
+        .driver
+        .scheduler
+        .begin(
+            configured.driver.local,
+            Direction::Outbound,
+            provider.driver.now(),
+        )
+        .unwrap();
+    provider
+        .driver
+        .scheduler
+        .closed(start.token, Failure::Unavailable, provider.driver.now())
+        .unwrap();
+    provider.driver.shutdown().unwrap();
+    assert_eq!(provider.driver.scheduler.status().configured, 1);
+}
+
 fn submit_authenticated(
     endpoint: &mut Endpoint,
     id: u64,
@@ -394,7 +541,12 @@ fn submit_authenticated(
 ) -> Receiver<Result<(), runtime::Error>> {
     let (reply, receive) = mpsc::sync_channel(1);
     let charged = ChargedCommand {
-        command: Command::Authenticated { id, peer, reply },
+        command: Command::Authenticated {
+            id,
+            peer,
+            unregistered_miner: false,
+            reply,
+        },
         _reservation: endpoint.driver.budget.reserve(COMMAND_BYTES).unwrap(),
     };
     endpoint
@@ -822,17 +974,17 @@ fn public_resident_status_contains_only_aggregate_connection_health() {
 }
 
 #[test]
-fn sixteenth_stalled_inbound_is_charged_and_seventeenth_is_closed_without_a_worker() {
+fn stalled_inbound_capacity_preserves_outbound_slots_and_charges_actual_workers() {
     let mut node = Endpoint::new();
     let baseline = node.driver.budget.available().unwrap();
-    let mut sockets: Vec<_> = (0..MAX_WORKERS + 1)
+    let mut sockets: Vec<_> = (0..MAX_INBOUND_WORKERS + 1)
         .map(|_| TcpStream::connect(node.address()).unwrap())
         .collect();
     for _ in 0..5 {
         node.tick();
     }
-    assert_eq!(node.driver.workers.len(), MAX_WORKERS);
-    assert_eq!(node.driver.status(false)["workers"], MAX_WORKERS);
+    assert_eq!(node.driver.workers.len(), MAX_INBOUND_WORKERS);
+    assert_eq!(node.driver.status(false)["workers"], MAX_INBOUND_WORKERS);
     assert_eq!(node.driver.connections, 0);
     assert!(
         node.driver
@@ -841,7 +993,10 @@ fn sixteenth_stalled_inbound_is_charged_and_seventeenth_is_closed_without_a_work
             .all(|worker| worker.peer.is_none() && worker.token.is_none())
     );
     let charged = baseline - node.driver.budget.available().unwrap();
-    assert_eq!(charged, MAX_WORKERS * (WORKER_STACK + RELAY_TRACKING_BYTES));
+    assert_eq!(
+        charged,
+        MAX_INBOUND_WORKERS * (WORKER_STACK + RELAY_TRACKING_BYTES)
+    );
     let mut excess = sockets.pop().unwrap();
     excess
         .set_read_timeout(Some(Duration::from_secs(1)))

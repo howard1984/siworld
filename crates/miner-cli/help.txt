@@ -8,7 +8,7 @@ siworld-miner.exe --status
 Requires Windows 10/11 x86_64 with x86-64-v3, 4 logical CPUs and 30 GiB OS-visible RAM.
 Data: %LOCALAPPDATA%\SIWORLD. No inbound listener or firewall rule is created.
 Choose 1/2 for Holder/Voyager and local/existing address; confirm backup and start with 1.
-Only pairing-public.json is shared for bootstrap approval; never share wallet files.
+No miner registration or operator approval is required. Keep wallet files private.
 The activity animation requires an interactive console at least 50 columns wide.
 Use Ctrl+C and wait for a verified clean stop. No Windows service is installed.
 The unsigned engineering package is not a qualified public-network release.

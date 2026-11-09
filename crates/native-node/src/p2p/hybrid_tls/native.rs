@@ -30,8 +30,8 @@ const IO_SLICE: Duration = Duration::from_millis(20);
 const TLS_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_CONNECTION_AGE: Duration = Duration::from_secs(50 * 60);
 
-/// An independently pinned transport. Listener routing must select the peer
-/// from a local allowlist before constructing the original AdmissionContext.
+/// The expected identity is fixed before TLS. Bootstrap destinations are pinned;
+/// public miner ingress supplies a signed descriptor without operator registration.
 pub struct NativeTlsAuthenticator {
     identity: Arc<NativeIdentity>,
     budget: Budget,

@@ -30,7 +30,11 @@ fn expected_peer_requires_the_pinned_descriptor_and_network_context() {
     let expected = test_support::expected(binding(), [11; 32]);
     let other = test_support::expected(binding(), [12; 32]);
     assert!(matches!(
-        ExpectedPeer::from_pinned_descriptor(binding(), other.descriptor().clone(), expected.pin,),
+        ExpectedPeer::from_pinned_descriptor(
+            binding(),
+            other.descriptor().clone(),
+            expected.pin.unwrap(),
+        ),
         Err(Error::InvalidProtocol)
     ));
     let mut different = binding();
@@ -39,10 +43,42 @@ fn expected_peer_requires_the_pinned_descriptor_and_network_context() {
         ExpectedPeer::from_pinned_descriptor(
             different,
             expected.descriptor().clone(),
-            expected.pin,
+            expected.pin.unwrap(),
         ),
         Err(Error::InvalidProtocol)
     ));
+}
+
+#[cfg(feature = "native-p2p")]
+#[test]
+fn unregistered_identity_is_inbound_only_and_preserves_peer_binding() {
+    let original = test_support::expected(binding(), [31; 32]);
+    let descriptor = original.descriptor().clone();
+    let peer = ExpectedPeer::from_presented_descriptor(binding(), descriptor.clone()).unwrap();
+    assert!(!peer.independently_pinned());
+    assert_eq!(peer.fingerprint(), original.fingerprint());
+    let outbound = AdmissionContext::new(
+        peer.clone(),
+        ConnectionRole::Initiator,
+        Cancellation::default(),
+    );
+    assert_eq!(outbound.check(), Err(Error::InvalidProtocol));
+    let inbound = AdmissionContext::new(peer, ConnectionRole::Responder, Cancellation::default());
+    assert!(inbound.check().is_ok());
+    let foreign = test_support::expected(binding(), [32; 32]);
+    assert!(
+        Authenticated::from_verified_provider(
+            Cursor::new(Vec::<u8>::new()),
+            &inbound,
+            ConnectionRole::Responder,
+            foreign.descriptor(),
+            test_support::parameters(),
+        )
+        .is_err()
+    );
+    let mut other_binding = binding();
+    other_binding.network[0] ^= 1;
+    assert!(ExpectedPeer::from_presented_descriptor(other_binding, descriptor).is_err());
 }
 
 #[test]

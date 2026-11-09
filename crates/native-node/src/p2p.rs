@@ -252,13 +252,13 @@ impl Cancellation {
     }
 }
 
-/// Full public identity and its independently authenticated pin. Receiving a
-/// self-signed descriptor on the connection is not independent authentication.
+/// Expected cryptographic identity. Outbound destinations require an independent
+/// pin; an inbound miner may instead present a signed, network-bound descriptor.
 #[derive(Clone, Debug)]
 pub struct ExpectedPeer {
     binding: Binding,
     descriptor: Descriptor,
-    pin: PeerPin,
+    pin: Option<PeerPin>,
 }
 impl ExpectedPeer {
     pub fn from_pinned_descriptor(
@@ -274,20 +274,39 @@ impl ExpectedPeer {
         Ok(Self {
             binding,
             descriptor,
-            pin,
+            pin: Some(pin),
         })
+    }
+    /// Possession is still verified by the complete hybrid handshake. This
+    /// grants no checkpoint-signing or control-plane authority.
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn from_presented_descriptor(
+        binding: Binding,
+        descriptor: Descriptor,
+    ) -> Result<Self, Error> {
+        if descriptor.binding() != binding {
+            return Err(Error::InvalidProtocol);
+        }
+        Ok(Self {
+            binding,
+            descriptor,
+            pin: None,
+        })
+    }
+    pub(crate) fn independently_pinned(&self) -> bool {
+        self.pin.is_some()
     }
     pub fn descriptor(&self) -> &Descriptor {
         &self.descriptor
     }
     pub fn fingerprint(&self) -> Hash {
-        self.pin.fingerprint()
+        self.descriptor.fingerprint()
     }
 }
 
 /// Immutable expected identity, connection role and one provider-to-Hello
-/// admission budget. The caller obtains the peer configuration before dialing
-/// or accepting; the provider cannot replace it with a received descriptor.
+/// admission budget. The caller fixes the expected identity before TLS; the
+/// provider cannot replace it. Unregistered identities are inbound-only.
 #[derive(Clone)]
 pub struct AdmissionContext {
     expected: ExpectedPeer,
@@ -330,6 +349,9 @@ impl AdmissionContext {
         &self.deadline.cancellation
     }
     pub fn check(&self) -> Result<(), Error> {
+        if !self.expected.independently_pinned() && self.role != ConnectionRole::Responder {
+            return Err(Error::InvalidProtocol);
+        }
         self.deadline.check().map_err(io_error)
     }
     fn same_attempt(&self, other: &Self) -> bool {
@@ -474,7 +496,7 @@ impl Hello {
     }
 }
 /// Capability produced only inside this crate after a reviewed provider verifies
-/// pinned hybrid identity, transcript and both key confirmations. The opt-in
+/// hybrid identity, transcript and both key confirmations. The opt-in
 /// engineering provider owns record authentication, sequence numbers,
 /// connection limits and secret cleanup.
 pub struct Authenticated<S> {
@@ -499,11 +521,16 @@ impl<S> Authenticated<S> {
         if observed_role != admission.role || observed_peer.binding() != admission.binding() {
             return Err(Error::InvalidProtocol);
         }
-        admission
-            .expected
-            .pin
-            .verify(observed_peer)
-            .map_err(|_| Error::InvalidProtocol)?;
+        if observed_peer.fingerprint() != admission.expected.fingerprint()
+            || observed_peer.ed25519_public() != admission.expected.descriptor.ed25519_public()
+            || observed_peer.ml_dsa_public() != admission.expected.descriptor.ml_dsa_public()
+        {
+            return Err(Error::InvalidProtocol);
+        }
+        if let Some(pin) = &admission.expected.pin {
+            pin.verify(observed_peer)
+                .map_err(|_| Error::InvalidProtocol)?;
+        }
         admission.check()?;
         Ok(Self {
             channel,
@@ -516,7 +543,7 @@ impl<S> Authenticated<S> {
 pub trait HybridAuthenticator {
     type Channel: Read + Write;
     /// Must complete X25519+ML-KEM and Ed25519+ML-DSA authentication by the
-    /// context's role, independently pinned full descriptor and original
+    /// context's role, fixed expected full descriptor and original
     /// absolute deadline, with no classical fallback. Provider state must fit
     /// HANDSHAKE_BYTES. It must interrupt blocked I/O on deadline/cancellation;
     /// a cooperative flag or a wrapper cannot preempt blocked I/O by itself.

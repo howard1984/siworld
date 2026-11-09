@@ -172,6 +172,12 @@ impl Scheduler {
     /// replacing configured peers, restarting attempts or releasing budgets.
     #[cfg(feature = "native-p2p")]
     pub(crate) fn admit_fixture(&mut self, peer: Hash, now: u64) -> Result<(), Error> {
+        self.admit_inbound(peer, now)
+    }
+    /// Add an inbound identity only after the cryptographic handshake succeeds.
+    /// The driver never supplies an outbound endpoint for these temporary peers.
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn admit_inbound(&mut self, peer: Hash, now: u64) -> Result<(), Error> {
         self.clock(now)?;
         if self.stopped {
             return Err(Error::Stopped);
@@ -194,6 +200,26 @@ impl Scheduler {
                 _admission: Some(reservation),
             },
         );
+        Ok(())
+    }
+    /// Release temporary identity state only after every owned socket is closed.
+    #[cfg(feature = "native-p2p")]
+    pub(crate) fn forget_inbound(&mut self, peer: Hash) -> Result<(), Error> {
+        if self
+            .attempts
+            .values()
+            .any(|attempt| attempt.token.peer == peer)
+        {
+            return Err(Error::Duplicate);
+        }
+        if self
+            .peers
+            .get(&peer)
+            .is_none_or(|entry| entry._admission.is_none())
+        {
+            return Err(Error::InvalidIdentity);
+        }
+        self.peers.remove(&peer);
         Ok(())
     }
     fn clock(&mut self, now: u64) -> Result<(), Error> {

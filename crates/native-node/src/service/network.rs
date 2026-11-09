@@ -1,4 +1,4 @@
-//! Opt-in, pinned engineering networking with a single canonical-state owner.
+//! Engineering networking with pinned bootstrap destinations and open miner ingress.
 //! Socket workers own framing only. Bounded, charged messages cross into the
 //! owner; no worker can open a store or hold its lock while waiting on a peer.
 use super::*;
@@ -21,7 +21,9 @@ const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_WORKERS: usize = 16;
 const COMMAND_SLOTS: usize = 32;
 const COMMAND_BYTES: usize = 8192;
-const WORKER_STACK: usize = 1024 * 1024;
+const WORKER_STACK: usize = 2 * 1024 * 1024;
+const MAX_PUBLIC_MINERS: usize = MAX_WORKERS / 2;
+const MAX_INBOUND_WORKERS: usize = MAX_WORKERS - 2;
 const RELAY_TRACKING_BYTES: usize = 256 * 1024;
 const PRODUCER_JOB_BYTES: usize = 256 * 1024 * 1024;
 const PRODUCER_TOTAL_BYTES: usize = 2 * PRODUCER_JOB_BYTES;
@@ -29,6 +31,7 @@ const POLL: Duration = Duration::from_millis(20);
 const CYCLE: Duration = Duration::from_secs(1);
 const EXCHANGE: Duration = Duration::from_secs(180);
 const ROUTE_MAGIC: &[u8; 4] = b"SWP2";
+const MINER_ROUTE_MAGIC: &[u8; 4] = b"SWP3";
 
 #[derive(Clone)]
 struct Peer {
@@ -266,6 +269,7 @@ enum Command {
     Authenticated {
         id: u64,
         peer: Hash,
+        unregistered_miner: bool,
         reply: Answer<()>,
     },
     Pull {
@@ -350,6 +354,7 @@ struct Worker {
 }
 struct PendingAuthentication {
     id: u64,
+    unregistered_miner: bool,
     reply: Answer<()>,
     deadline: u64,
     _reservation: Reservation,
@@ -363,6 +368,7 @@ struct Driver {
     identity: Arc<NativeIdentity>,
     local: Hash,
     peers: Arc<BTreeMap<Hash, Peer>>,
+    public_miners: BTreeSet<Hash>,
     fixture: Option<super::fixture_control::FixtureAdmission>,
     budget: Budget,
     scheduler: Scheduler,
@@ -415,6 +421,7 @@ impl Driver {
             identity,
             local,
             peers: config.peers,
+            public_miners: BTreeSet::new(),
             fixture: None,
             budget,
             scheduler,
@@ -578,6 +585,11 @@ impl Driver {
                 self.scheduler
                     .closed(token, failure, self.now())
                     .map_err(|_| "peer closure state mismatch")?;
+                if self.public_miners.contains(&token.peer())
+                    && self.scheduler.forget_inbound(token.peer()).is_ok()
+                {
+                    self.public_miners.remove(&token.peer());
+                }
             }
             self.failures = self.failures.saturating_add(1);
         }
@@ -595,7 +607,7 @@ impl Driver {
                 break;
             };
             match listener.accept() {
-                Ok((socket, _)) if self.workers.len() < MAX_WORKERS => {
+                Ok((socket, _)) if self.workers.len() < MAX_INBOUND_WORKERS => {
                     self.spawn(Some(socket), None, None)?;
                 }
                 Ok(_) => (),
@@ -642,15 +654,22 @@ impl Driver {
         }
         Ok(())
     }
-    fn admit_authenticated(&mut self, id: u64, peer: Hash) -> Result<Admission, runtime::Error> {
+    fn admit_authenticated(
+        &mut self,
+        id: u64,
+        peer: Hash,
+        unregistered_miner: bool,
+    ) -> Result<Admission, runtime::Error> {
         let worker = self.workers.get(&id).ok_or_else(unavailable)?;
+        let known = self.peers.contains_key(&peer)
+            || self
+                .fixture
+                .as_ref()
+                .is_some_and(|f| f.expected(peer).is_some());
         if worker.cancel.is_cancelled()
             || worker.join.is_finished()
-            || !(self.peers.contains_key(&peer)
-                || self
-                    .fixture
-                    .as_ref()
-                    .is_some_and(|f| f.expected(peer).is_some()))
+            || peer == self.local
+            || (!known && !(unregistered_miner && self.listener.is_some()))
         {
             return Err(unavailable());
         }
@@ -660,17 +679,31 @@ impl Driver {
             }
             token
         } else {
-            // Only fully authenticated inbound sessions can affect scheduling
-            // for a configured identity. A retiring worker still owns its
-            // established slot until poll joins it and applies normal backoff.
+            // A public miner reaches this point only after signed descriptor,
+            // full hybrid TLS, exporter binding and native Miner Hello checks.
+            let added = !known && !self.public_miners.contains(&peer);
+            if added && self.public_miners.len() >= MAX_PUBLIC_MINERS {
+                return Err(unavailable());
+            }
+            if added {
+                self.scheduler
+                    .admit_inbound(peer, self.now())
+                    .map_err(|_| unavailable())?;
+                self.public_miners.insert(peer);
+            }
             let start = match self.scheduler.begin(peer, Direction::Inbound, self.now()) {
                 Ok(start) => start,
                 Err(peer_scheduler::Error::Duplicate | peer_scheduler::Error::Backoff)
-                    if self.local > peer =>
+                    if self.local > peer || self.public_miners.contains(&peer) =>
                 {
                     return Ok(Admission::Waiting);
                 }
-                Err(_) => return Err(unavailable()),
+                Err(_) => {
+                    if added && self.scheduler.forget_inbound(peer).is_ok() {
+                        self.public_miners.remove(&peer);
+                    }
+                    return Err(unavailable());
+                }
             };
             if let Some(old) = start.cancel {
                 self.cancel_attempt(old);
@@ -694,7 +727,7 @@ impl Driver {
             let result = if self.now() >= pending.deadline {
                 Err(unavailable())
             } else {
-                self.admit_authenticated(pending.id, peer)
+                self.admit_authenticated(pending.id, peer, pending.unregistered_miner)
             };
             match result {
                 Ok(Admission::Waiting) => {
@@ -864,7 +897,12 @@ impl Driver {
                 });
                 let _ = reply.send(result);
             }
-            Command::Authenticated { id, peer, reply } => {
+            Command::Authenticated {
+                id,
+                peer,
+                unregistered_miner,
+                reply,
+            } => {
                 if self.pending_authentication.contains_key(&peer)
                     || self
                         .pending_authentication
@@ -874,7 +912,7 @@ impl Driver {
                     let _ = reply.send(Err(unavailable()));
                     return Ok(());
                 }
-                match self.admit_authenticated(id, peer) {
+                match self.admit_authenticated(id, peer, unregistered_miner) {
                     Ok(Admission::Waiting) if self.pending_authentication.len() < MAX_WORKERS => {
                         let deadline = self.now().checked_add(peer_scheduler::ADMISSION_MS);
                         if let Some(deadline) = deadline {
@@ -882,6 +920,7 @@ impl Driver {
                                 peer,
                                 PendingAuthentication {
                                     id,
+                                    unregistered_miner,
                                     reply,
                                     deadline,
                                     _reservation: charge,
@@ -1007,6 +1046,11 @@ impl Driver {
         // remains able to enqueue or consume a reply after the joins above.
         // Release those packet/command guards before the final offline replay.
         self.pending_authentication.clear();
+        for peer in std::mem::take(&mut self.public_miners) {
+            self.scheduler
+                .forget_inbound(peer)
+                .map_err(|_| "public miner shutdown cleanup mismatch")?;
+        }
         while self.rx.try_recv().is_ok() {}
         Ok(())
     }
@@ -1054,14 +1098,33 @@ fn connection(
         .and_then(|_| socket.set_write_timeout(Some(POLL)))
         .map_err(|_| unavailable())?;
     let mut route = [0; 36];
+    let mut presented = None;
     let peer = if let Some(peer) = peer {
-        route[..4].copy_from_slice(ROUTE_MAGIC);
+        let open_miner = role == Role::Miner;
+        route[..4].copy_from_slice(if open_miner {
+            MINER_ROUTE_MAGIC
+        } else {
+            ROUTE_MAGIC
+        });
         route[4..].copy_from_slice(&local);
         route_io(&mut socket, &mut route, true, accepted, &cancel)?;
+        if open_miner {
+            let mut descriptor = identity.descriptor().map_err(|_| invalid())?.encode();
+            route_io(&mut socket, &mut descriptor, true, accepted, &cancel)?;
+        }
         peer
     } else {
         route_io(&mut socket, &mut route, false, accepted, &cancel)?;
-        if &route[..4] != ROUTE_MAGIC {
+        if &route[..4] == MINER_ROUTE_MAGIC {
+            let mut bytes = [0; crate::identity::DESCRIPTOR_BYTES];
+            route_io(&mut socket, &mut bytes, false, accepted, &cancel)?;
+            let binding = identity.descriptor().map_err(|_| invalid())?.binding();
+            let descriptor = Descriptor::decode(&bytes, &binding).map_err(|_| invalid())?;
+            if route[4..] != descriptor.fingerprint() || descriptor.fingerprint() == local {
+                return Err(invalid());
+            }
+            presented = Some(descriptor);
+        } else if &route[..4] != ROUTE_MAGIC {
             return Err(invalid());
         }
         route[4..].try_into().expect("fixed route hint")
@@ -1070,7 +1133,14 @@ fn connection(
         .get(&peer)
         .map(|p| p.expected.clone())
         .or_else(|| fixture.as_ref().and_then(|f| f.expected(peer)))
+        .or_else(|| {
+            presented.map(|descriptor| {
+                ExpectedPeer::from_presented_descriptor(descriptor.binding(), descriptor)
+                    .expect("decoded descriptor binding")
+            })
+        })
         .ok_or_else(invalid)?;
+    let unregistered_miner = !expected.independently_pinned();
     let admission = AdmissionContext::new_started(
         expected,
         if initiator {
@@ -1083,16 +1153,21 @@ fn connection(
     );
     let mut auth = p2p::NativeTlsAuthenticator::new(identity, budget.clone());
     let mut session = p2p::establish_socket(socket, &mut auth, &admission, role, budget.clone())?;
+    if unregistered_miner && session.role() != Role::Miner {
+        return Err(invalid());
+    }
     if !peers.contains_key(&peer)
         && !fixture
             .as_ref()
             .is_some_and(|f| f.permits_role(peer, session.role()))
+        && !unregistered_miner
     {
         return Err(invalid());
     }
     call(&tx, &budget, &cancel, |reply| Command::Authenticated {
         id,
         peer,
+        unregistered_miner,
         reply,
     })?;
     let mut request = 0u64;
@@ -1439,7 +1514,7 @@ fn relay_receive<S: Read + Write>(
 }
 fn route_io(
     socket: &mut TcpStream,
-    route: &mut [u8; 36],
+    route: &mut [u8],
     write: bool,
     accepted: Instant,
     cancel: &Cancellation,

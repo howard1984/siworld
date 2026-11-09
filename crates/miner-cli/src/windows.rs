@@ -402,7 +402,7 @@ fn wizard(root: &Path, directory: &Path) -> Result<(), String> {
         }
         eprintln!("Choose 1 only after verifying your offline wallet backup");
     }
-    writeln!(tty,"\nMode: {} | SIP | Outbound-only | 4 proving workers\nData: %LOCALAPPDATA%\\SIWORLD\n\nInitial verification can take time; PoW waits for authenticated synchronization.\nThe bootstrap operator must separately pin pairing-public.json; no wallet secrets are required.",mode.name()).map_err(|_|"Console unavailable")?;
+    writeln!(tty,"\nMode: {} | SIP | Outbound-only | 4 proving workers\nData: %LOCALAPPDATA%\\SIWORLD\n\nInitial verification can take time; mining starts after connection and chain verification.\nThe miner connects automatically using the bundled network configuration.",mode.name()).map_err(|_|"Console unavailable")?;
     loop {
         let input = prompt(siworld_miner_cli::START_PROMPT, 16)?;
         if wizard.acknowledge(&input).is_ok() {
