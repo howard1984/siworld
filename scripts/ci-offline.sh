@@ -11,7 +11,7 @@ exec sudo -n unshare --net -- bash -c '
  ip link set lo up
  [[ "$(ip -o link show | wc -l)" -eq 1 && -z "$(ip route show)" && -z "$(ip -6 route show default)" ]]
  target_env=(); if [[ -n "$target" ]]; then target_env+=("CARGO_TARGET_DIR=$target"); fi
- exec setpriv --reuid "$uid" --regid "$gid" --init-groups --no-new-privs -- \
+ exec setpriv --reuid "$uid" --regid "$gid" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
  env -i HOME="$task_home" PATH="$root/scripts/ci-bin:$task_path" \
  CARGO_HOME="$task_home/.cargo" RUSTUP_HOME="$task_home/.rustup" \
  CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=always SIWORLD_REAL_CARGO="$real_cargo" \
