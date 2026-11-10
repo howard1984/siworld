@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SIWORLD internal receive backup</title><link rel="stylesheet" href="style.css"></head><body>
+<main><header><p>SIWORLD · INTERNAL ENGINEERING NETWORK</p><h1>Receive address and encrypted backup</h1>
+<p>This local tool creates account 0 on one pinned internal network. The genesis is not sealed. It does not check balances or send payments.</p></header>
+<dl><dt>Network</dt><dd id="network"></dd><dt>Account / recovery boundary</dt><dd>0 / block 0 (offline; no chain request)</dd></dl>
+<p id="status" role="status" aria-live="polite">Checking the local core…</p>
+<div class="actions"><button id="create" disabled>Create a new receive account</button><button id="open" disabled>Open encrypted backup</button><button id="lock" disabled>Clear session</button></div>
+<section id="recovery" hidden><h2>Write down all 24 recovery words privately</h2><p>Keep the network identifier and account 0 with your words. Never paste them into a chat or send a screenshot of this section.</p><ol id="words"></ol><button id="written">I wrote down my recovery words</button></section>
+<form id="seal" autocomplete="off" hidden><h2>Confirm your backup and encrypt it</h2><div id="answers"></div>
+<label>Backup password <input id="password" type="password" autocomplete="new-password" maxlength="1024" required></label>
+<label>Repeat password <input id="repeat" type="password" autocomplete="new-password" maxlength="1024" required></label><button type="submit">Encrypt backup</button></form>
+<section id="download" hidden><h2>Save and verify the original encrypted file</h2><p>Download the file, then open that same file and enter its password. The receive address appears after this verification.</p><button id="save">Download encrypted backup</button><button id="verify">Open saved file to verify</button></section>
+<form id="unlock" autocomplete="off" hidden><h2>Verify encrypted backup</h2><label>Original backup password <input id="unlock-password" type="password" autocomplete="current-password" maxlength="1024" required></label><button type="submit">Verify locally</button></form>
+<input id="file" type="file" accept=".json,application/json" hidden>
+<section id="receiving" hidden><h2>Complete public receive address</h2><textarea id="address" readonly rows="8" spellcheck="false" aria-label="Complete public receive address"></textarea><button id="copy">Copy full public address</button><p>Only this public address may be shared. Keep the encrypted backup and password separately.</p></section>
+</main><script type="module" src="app.mjs"></script></body></html>
