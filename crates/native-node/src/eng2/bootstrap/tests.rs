@@ -130,7 +130,7 @@ fn retained_offer_canonical_prefix_and_signer_epoch_invalidate_lookup_and_pins()
     use super::leases::Registry;
     use std::{sync::Arc, time::Instant};
     let (genesis, _, _) = framing_fixture();
-    let mut provider = transport_fixture();
+    let mut provider = transport_fixture_tag(7);
     provider.manifest.tip_height = 120;
     provider.manifest.tip_id = [9; 32];
     provider.manifest.bundle = *blake3::hash(&provider.manifest.prefix().unwrap()).as_bytes();
