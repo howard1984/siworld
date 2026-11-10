@@ -80,7 +80,7 @@ def explorer_projection(value, index):
     for key in ('issued_atoms', 'burned_atoms', 'holder_pool_atoms', 'locked_reward_atoms', 'circulating_estimate_atoms'): atoms(economics[key])
     if type(economics['unlock_schedule_complete']) is not bool:
         raise ValueError('Invalid public explorer schedule coverage.')
-    for name, limit, fields in [('unlock_schedule', 64, 'height atoms'), ('funds', 16, 'index entitled_atoms released_atoms spent_atoms')]:
+    for name, limit, fields in [('unlock_schedule', 64, 'height atoms'), ('funds', 32, 'index entitled_atoms released_atoms spent_atoms')]:
         if type(economics[name]) is not list or len(economics[name]) > limit:
             raise ValueError('Public explorer aggregate limit.')
         for row in economics[name]: exact(row, fields)

@@ -68,7 +68,7 @@ atoms. Values are formatted with integer arithmetic.
 | Block, at most 101 | `height`, `hash`, `parent_hash`, `timestamp`, `target`, `slots_including_padding`, `reward_mode`, `work` |
 | Economics | `issued_atoms`, `burned_atoms`, `holder_pool_atoms`, `locked_reward_atoms`, `unlock_schedule`, `unlock_schedule_complete`, `funds`, `circulating_estimate_atoms` |
 | Unlock, next at most 64 | `height`, `atoms` |
-| Fund, at most 16 | `index`, `entitled_atoms`, `released_atoms`, `spent_atoms` |
+| Fund, at most 32 | `index`, `entitled_atoms`, `released_atoms`, `spent_atoms` |
 | Checkpoint, nullable | `height`, `hash`, `issued_unix_seconds`, `roster`, `signer_indices` |
 | Governance | `current_signers`, `fee_address`, `fund_addresses`, `changes` |
 

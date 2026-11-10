@@ -61,6 +61,15 @@ class ExplorerTests(unittest.TestCase):
                 m.explorer_projection(candidate, self.index)
 
     def test_identity_malformed_amounts_and_unbounded_samples_are_rejected(self):
+        complete = copy.deepcopy(self.value)
+        complete['economics']['funds'] = [
+            {'index': index, 'entitled_atoms': '2', 'released_atoms': '1', 'spent_atoms': '0'}
+            for index in range(32)]
+        self.assertEqual(len(m.explorer_projection(complete, self.index)['economics']['funds']), 32)
+        complete['economics']['funds'].append(
+            {'index': 32, 'entitled_atoms': '2', 'released_atoms': '1', 'spent_atoms': '0'})
+        with self.assertRaises(ValueError):
+            m.explorer_projection(complete, self.index)
         for key, bad in [('network', '33' * 32), ('height', True), ('published_unix_seconds', {}), ('blocks', [{}] * 102)]:
             candidate = copy.deepcopy(self.value)
             candidate[key] = bad
