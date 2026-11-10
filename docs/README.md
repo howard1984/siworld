@@ -22,7 +22,12 @@ outstanding.
 The separately versioned [engineering-network-2 requirements](eng2-protocol.md)
 define activation profiles, execution commitments, confidential fees, fund claims
 and governance. Automatic synchronization and offline QR signing are deferred
-features, not evidence of a deployed public-testnet runtime.
+features, not evidence of a deployed public-testnet runtime. The explicit
+[signed state import](engineering-signed-state-import.md) specification describes
+genesis-derived governance authorization, native tail verification and
+non-replacing admission. [Public history receipts](eng2-wallet-history.md) retain
+header-authenticated public records without claiming historical proof replay or
+completed browser-wallet synchronization.
 
 ## Proof implementation and measurement
 

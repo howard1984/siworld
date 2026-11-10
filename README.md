@@ -42,6 +42,16 @@ fees, public governed issuance fees, monthly fund releases and management
 governance. They describe a separate activation target; existing V1 proof measurements do not qualify its changed
 settlement relation or establish its network acceptance.
 
+The internal `LegacyMiner` profile retains the existing ordinary transaction
+fee rule. Public governed asset issuance fees use the active dedicated fee
+destination. The revised confidential ordinary-fee relation remains a separate
+candidate until its privacy qualification passes. The explicit
+[signed state importer](docs/engineering-signed-state-import.md) and
+[authenticated public history](docs/eng2-wallet-history.md) do not establish a
+completed fresh-node join. The versioned store currently retains complete
+proof-bearing bodies; proof expiry and compaction are not connected to this
+runtime.
+
 ## Native V1 design
 
 - **One transaction shape:** two inputs and three outputs, private 32-byte
