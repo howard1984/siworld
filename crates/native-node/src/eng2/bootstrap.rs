@@ -18,6 +18,7 @@ pub const MAX_MANIFEST_BYTES: usize = FIXED + MAX_CHECKPOINT_PACKET_BYTES + 32;
 pub const MAX_CHUNK_BYTES: usize = p2p::MAX_CONTROL_BYTES - 160;
 const _: () = assert!(MAX_MANIFEST_BYTES < p2p::MAX_CONTROL_BYTES - 1);
 pub mod cache;
+pub mod client;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Descriptor {

@@ -102,13 +102,29 @@ synthetic payloads through an actual hybrid session followed by all three round
 phases. Complete native import over that transport, public client entry-point
 integration and Windows real-machine acceptance remain separate pending gates.
 
+The cold-client library acquires one header or artifact request per finite
+ordinary round. It reconstructs complete verified header candidates, compares
+their actual cumulative work and then pins one checkpoint bundle. The download
+cursor advances over durable completed objects without rescanning the entire
+prefix on every chunk. Resuming a candidate scans its stored header prefix once;
+that prefix must be contiguous. Download completion grants no accepted Store.
+Native signed verification and checked installation remain mandatory. The
+result separates logical verification bytes and local cache rereads; encrypted
+stream volume must still be obtained from the session counters. Public launch
+commands and mining-readiness attachment are not supplied by this library.
+
 ## New-database installation
 
 The owner separately prepares a dedicated canonical directory, its matching
 genesis file and existing peer identity. On supported Unix systems installation
 requires that directory to be owned by the current user with mode `0700`.
 This API never initializes, copies, rotates or exports identities. Windows
-installation and resident command-line wiring are not implemented here.
+installation uses the current-user checked directory and regular-file APIs,
+closes its candidate before nonreplace promotion, then authenticates a reopened
+canonical database under a checked file-identity pin. Any ambiguity after
+promotion returns `DurabilityUnconfirmed`; it grants no overwrite or retry.
+Resident command-line admission wiring and Windows real-machine acceptance
+remain pending.
 
 The installer refuses an existing canonical database and creates only a new
 `checkpoint-import.redb` candidate. It rereads every source row and checks its

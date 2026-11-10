@@ -188,6 +188,54 @@ impl Quarantine {
     pub fn local_reread_bytes(&self) -> u64 {
         self.local_reread_bytes
     }
+    /// Recover the next acquisition position without treating cached headers as
+    /// verified work or an admitted head. This scan runs once on client reopen.
+    pub(super) fn next_header(&self) -> Result<u64, String> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "bootstrap header progress unavailable")?;
+        let table = transaction
+            .open_table(HEADERS)
+            .map_err(|_| "bootstrap header table unavailable")?;
+        let mut next = 1u64;
+        for row in table
+            .iter()
+            .map_err(|_| "bootstrap header progress unreadable")?
+        {
+            let (height, bytes) = row.map_err(|_| "bootstrap cached header unreadable")?;
+            if height.value() != next || next > self.manifest.tip_height {
+                return Err("bootstrap cached header range is not contiguous".into());
+            }
+            let header = Header::decode(bytes.value(), &self.manifest.network)
+                .map_err(|_| "bootstrap cached header malformed")?;
+            if header.height != next {
+                return Err("bootstrap cached header index differs".into());
+            }
+            next += 1;
+        }
+        Ok(next)
+    }
+    pub(super) fn progress_at(&self, height: u64) -> Result<Option<(u64, u64)>, String> {
+        if height > self.manifest.tip_height {
+            return Err("bootstrap progress height exceeds selected history".into());
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "bootstrap progress unavailable")?;
+        let table = transaction
+            .open_table(OBJECTS)
+            .map_err(|_| "bootstrap progress table unavailable")?;
+        table
+            .get(height)
+            .map_err(|_| "bootstrap progress unreadable")?
+            .map(|row| {
+                let progress = Progress::decode(row.value())?;
+                Ok((progress.received, progress.descriptor.length))
+            })
+            .transpose()
+    }
     pub fn put_header(&self, header: &Header) -> Result<(), String> {
         if header.network != self.manifest.network
             || header.height == 0
@@ -230,7 +278,7 @@ impl Quarantine {
         let charge = usize::try_from(self.manifest.tip_height)
             .ok()
             .and_then(|count| count.checked_mul(std::mem::size_of::<Header>()))
-            .and_then(|bytes| bytes.checked_mul(3))
+            .and_then(|bytes| bytes.checked_mul(8))
             .ok_or("bootstrap header memory overflow")?;
         let reservation = self
             .budget

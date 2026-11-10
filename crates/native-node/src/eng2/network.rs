@@ -323,7 +323,10 @@ pub fn initiate_bootstrap<S: Read + Write, O: Owner, T>(
         peer,
         sequence,
         remaining: limits.requests() - 1,
-        deadline: p2p::Deadline::new(std::time::Duration::from_secs(10)),
+        // Full native bodies use the ordinary transport's 180-second cap.
+        // A shorter outer cap would discard an otherwise valid completed body
+        // on slow outbound links and make every resumed attempt start over.
+        deadline: p2p::Deadline::new(std::time::Duration::from_secs(180)),
     })?;
     let local = with_owner(owner, |o| o.head())?;
     let notice = sequence.next()?;
