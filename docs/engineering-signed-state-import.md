@@ -96,6 +96,11 @@ identity, signing host or readiness status. Provider hashes identify transfer
 bytes and grant no authority. Actual encrypted stream counters include hybrid
 handshake and record framing; they are distinct from artifact bytes, importer
 verification bytes and local rereads. They are not TCP or Ethernet measurements.
+Before directory or database mutation, create and reopen require the complete
+header payload plus declared snapshot to fit the checked logical byte cap.
+Every later object remains subject to the cumulative payload bound. This cap
+measures logical payload bytes; redb metadata, pages and retained allocation
+overhead require a separate physical disk budget.
 
 Bounded tests exercise malformed framing, interrupted quarantine resume and
 synthetic payloads through an actual hybrid session followed by all three round

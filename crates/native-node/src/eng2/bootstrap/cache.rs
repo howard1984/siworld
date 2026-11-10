@@ -38,6 +38,18 @@ impl Policy {
         bytes[12..].copy_from_slice(&(self.max_body_bytes as u64).to_le_bytes());
         bytes
     }
+    fn check_manifest(self, manifest: &Manifest) -> Result<(), String> {
+        self.check()?;
+        let minimum = manifest
+            .tip_height
+            .checked_mul(crate::eng2::header::HEADER_BYTES as u64)
+            .and_then(|bytes| bytes.checked_add(manifest.snapshot.length))
+            .ok_or("bootstrap minimum payload byte overflow")?;
+        if manifest.tip_height == 0 || manifest.snapshot.length == 0 || minimum > self.max_bytes {
+            return Err("bootstrap headers and snapshot exceed logical payload budget".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy)]
 struct Progress {
@@ -93,7 +105,8 @@ impl Quarantine {
         policy: Policy,
         budget: p2p::Budget,
     ) -> Result<Self, String> {
-        policy.check()?;
+        policy.check_manifest(&manifest)?;
+        let encoded_manifest = manifest.encode()?;
         let cache_reservation = budget
             .reserve(16 * 1024 * 1024)
             .map_err(|_| "bootstrap quarantine cache memory unavailable")?;
@@ -108,7 +121,7 @@ impl Quarantine {
         transaction
             .open_table(META)
             .map_err(|_| "bootstrap quarantine metadata unavailable")?
-            .insert("manifest", manifest.encode()?.as_slice())
+            .insert("manifest", encoded_manifest.as_slice())
             .map_err(|_| "bootstrap manifest write failed")?;
         transaction
             .open_table(META)
@@ -143,7 +156,8 @@ impl Quarantine {
         policy: Policy,
         budget: p2p::Budget,
     ) -> Result<Self, String> {
-        policy.check()?;
+        policy.check_manifest(&manifest)?;
+        let encoded_manifest = manifest.encode()?;
         let cache_reservation = budget
             .reserve(16 * 1024 * 1024)
             .map_err(|_| "bootstrap quarantine cache memory unavailable")?;
@@ -160,7 +174,7 @@ impl Quarantine {
                 .map_err(|_| "bootstrap manifest unreadable")?
                 .ok_or("bootstrap manifest missing")?
                 .value()
-                != manifest.encode()?
+                != encoded_manifest
                 || meta
                     .get("policy")
                     .map_err(|_| "bootstrap policy unreadable")?
@@ -838,6 +852,43 @@ mod tests {
             max_chunks_per_object: 8,
             max_body_bytes: 1024,
         }
+    }
+    #[test]
+    fn minimum_payload_and_malformed_bounds_reject_before_filesystem_mutation() {
+        let (_, _, manifest) = crate::eng2::bootstrap::tests::framing_fixture();
+        let minimum = manifest.tip_height * crate::eng2::header::HEADER_BYTES as u64
+            + manifest.snapshot.length;
+        let budget = p2p::Budget::new(32 * 1024 * 1024);
+        let directory = Directory::new();
+        let mut exact = policy();
+        exact.max_bytes = minimum;
+        let mut small = exact;
+        small.max_bytes -= 1;
+        assert!(Quarantine::create(&directory.0, manifest.clone(), small, budget.clone()).is_err());
+        assert!(!directory.0.exists());
+        drop(Quarantine::create(&directory.0, manifest.clone(), exact, budget.clone()).unwrap());
+        assert!(Quarantine::reopen(&directory.0, manifest.clone(), small, budget.clone()).is_err());
+        drop(Quarantine::reopen(&directory.0, manifest.clone(), exact, budget.clone()).unwrap());
+
+        for (height, length) in [(u64::MAX, 1), (1, u64::MAX), (0, 7), (96, 0)] {
+            let absent = Directory::new();
+            let mut malformed = manifest.clone();
+            malformed.tip_height = height;
+            malformed.snapshot.length = length;
+            assert!(
+                Quarantine::create(&absent.0, malformed.clone(), policy(), budget.clone()).is_err()
+            );
+            assert!(!absent.0.exists());
+            assert!(Quarantine::reopen(&directory.0, malformed, policy(), budget.clone()).is_err());
+        }
+        // Binding validation must also precede directory creation, even when
+        // the arithmetic lower bound is plausible and fits the payload cap.
+        let absent = Directory::new();
+        let mut changed = manifest.clone();
+        changed.tip_id[0] ^= 1;
+        assert!(Quarantine::create(&absent.0, changed, policy(), budget.clone()).is_err());
+        assert!(!absent.0.exists());
+        drop(Quarantine::reopen(&directory.0, manifest, exact, budget).unwrap());
     }
     #[test]
     fn durable_partial_resume_rejects_wrong_order_and_changed_bundle_without_any_admission() {
