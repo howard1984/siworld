@@ -5,7 +5,7 @@ use std::{fs, os::unix::fs::symlink};
 
 // This helper creates only temporary synthetic unit fixtures, never a runtime
 // key initialization path. No seed is placed in assertions, output or arguments.
-fn key_fixture(path: &Path, store: &Store, slot: u8, seed: u8) {
+pub(super) fn key_fixture(path: &Path, store: &Store, slot: u8, seed: u8) {
     use std::io::Write;
     let mut bytes = Zeroizing::new(Vec::new());
     bytes.extend_from_slice(KEY_MAGIC);

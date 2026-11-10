@@ -113,16 +113,24 @@ impl ExistingSigner {
     fn check_current(&self, store: &Store) -> Result<(), String> {
         store.ensure_exportable()?;
         let engine = store.engine();
-        if engine.state().network() != self.network
-            || engine.genesis().id() != self.genesis
-            || engine.genesis().rules_commitment() != self.rules
-            || engine
-                .state()
-                .governance()
-                .active_roster()
-                .keys()
-                .get(usize::from(self.slot))
-                != Some(&self.public)
+        self.check_authorization(
+            engine.state().network(),
+            engine.genesis().id(),
+            engine.genesis().rules_commitment(),
+            engine.state().governance().active_roster(),
+        )
+    }
+    fn check_authorization(
+        &self,
+        network: Hash,
+        genesis: Hash,
+        rules: Hash,
+        roster: &ActiveRoster,
+    ) -> Result<(), String> {
+        if network != self.network
+            || genesis != self.genesis
+            || rules != self.rules
+            || roster.keys().get(usize::from(self.slot)) != Some(&self.public)
         {
             return Err("eng2 signer is not authorized in the current local roster".into());
         }
@@ -134,6 +142,8 @@ pub enum Alarm {
     Unavailable,
     Stale,
     SignerNotCurrent,
+    WaitingForPeerHead,
+    CurrentQuorumConflict,
 }
 impl Alarm {
     pub fn code(self) -> &'static str {
@@ -141,7 +151,74 @@ impl Alarm {
             Self::Unavailable => "checkpoint_unavailable",
             Self::Stale => "checkpoint_stale",
             Self::SignerNotCurrent => "checkpoint_signer_not_current",
+            Self::WaitingForPeerHead => "checkpoint_signing_waiting_for_current_peer_tip",
+            Self::CurrentQuorumConflict => "checkpoint_current_quorum_conflict",
         }
+    }
+}
+// Only the resident entry point can construct the production readiness gate.
+// Public observation never accepts an asserted boolean or a caller-made permit.
+struct SigningGuard<'a> {
+    #[cfg(feature = "eng2-runtime")]
+    _network: crate::eng2::resident::peers::CheckpointReady<'a>,
+    #[cfg(not(feature = "eng2-runtime"))]
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+trait SigningReadiness {
+    fn guard(&self, store: &Store) -> Result<SigningGuard<'_>, Alarm>;
+    fn alarm(&self, store: &Store) -> Option<Alarm> {
+        self.guard(store).err()
+    }
+}
+fn with_signing_readiness<T>(
+    store: &Store,
+    readiness: Option<&dyn SigningReadiness>,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let Some(gate) = readiness else {
+        return Ok(None);
+    };
+    let Ok(_guard) = gate.guard(store) else {
+        return Ok(None);
+    };
+    action().map(Some)
+}
+#[cfg(feature = "eng2-runtime")]
+struct ResidentSigningReadiness<'a> {
+    head: (Hash, Hash, Hash, u64, Hash, Hash),
+    network: &'a crate::eng2::resident::peers::NetworkStatus,
+    observer: &'a crate::eng2::checkpoint_observer::Observer,
+}
+#[cfg(feature = "eng2-runtime")]
+impl ResidentSigningReadiness<'_> {
+    fn head(store: &Store) -> Result<(Hash, Hash, Hash, u64, Hash, Hash), String> {
+        store.ensure_exportable()?;
+        let engine = store.engine();
+        let state = engine.state();
+        Ok((
+            state.network(),
+            engine.genesis().id(),
+            engine.genesis().rules_commitment(),
+            state.height(),
+            state.tip(),
+            state.governance().active_roster().digest(state.network()),
+        ))
+    }
+}
+#[cfg(feature = "eng2-runtime")]
+impl SigningReadiness for ResidentSigningReadiness<'_> {
+    fn guard(&self, store: &Store) -> Result<SigningGuard<'_>, Alarm> {
+        if Self::head(store).ok().as_ref() != Some(&self.head) {
+            return Err(Alarm::Unavailable);
+        }
+        if self.observer.conflicted() {
+            return Err(Alarm::CurrentQuorumConflict);
+        }
+        let guard = self
+            .network
+            .checkpoint_ready((self.head.3, self.head.4))
+            .map_err(|_| Alarm::WaitingForPeerHead)?;
+        Ok(SigningGuard { _network: guard })
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,11 +334,40 @@ impl Host {
         self.wallet_paused = result.is_err();
         result.map(Some)
     }
+    /// Observe public messages and publish accepted data without creating a new
+    /// proposal or signature. An existing key alone grants no network readiness.
+    pub fn tick(&mut self, store: &Store, now: u64, incoming: &[Incoming]) -> Result<Tick, String> {
+        self.tick_inner(store, now, incoming, None)
+    }
+    /// Called while the resident owns the canonical Store lock and observer
+    /// guard, in owner -> observer -> network order. Readiness is checked again
+    /// at each new proposal/signature; no reusable permit escapes this call.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn tick_resident(
+        &mut self,
+        store: &Store,
+        now: u64,
+        incoming: &[Incoming],
+        network: &crate::eng2::resident::peers::NetworkStatus,
+        observer: &crate::eng2::checkpoint_observer::Observer,
+    ) -> Result<Tick, String> {
+        let readiness = ResidentSigningReadiness {
+            head: ResidentSigningReadiness::head(store)?,
+            network,
+            observer,
+        };
+        self.tick_inner(store, now, incoming, Some(&readiness))
+    }
     /// Work is bounded to at most three messages, one local vote, one certificate
     /// and one current projection. No waiting, mining or proof replay occurs.
     /// The driver archives every positive 72-block boundary after durable append.
-    /// Tick never repeats that state scan or retries an already accepted block.
-    pub fn tick(&mut self, store: &Store, now: u64, incoming: &[Incoming]) -> Result<Tick, String> {
+    fn tick_inner(
+        &mut self,
+        store: &Store,
+        now: u64,
+        incoming: &[Incoming],
+        readiness: Option<&dyn SigningReadiness>,
+    ) -> Result<Tick, String> {
         store.ensure_exportable()?;
         if incoming.len() > MAX_MESSAGES_PER_TICK
             || now >= (1u64 << 53)
@@ -399,7 +505,10 @@ impl Host {
             && current_signer
             && self.signer.as_ref().is_some_and(|s| s.slot == 0)
         {
-            self.pending = self.export.prepare_checkpoint(store, self.limits)?;
+            self.pending = with_signing_readiness(store, readiness, || {
+                self.export.prepare_checkpoint(store, self.limits)
+            })?
+            .flatten();
         }
         if let Some(pending) = &self.pending
             && current_signer
@@ -414,18 +523,19 @@ impl Host {
                 .ok_or("checkpoint signer disappeared")?;
             let slot = usize::from(signer.slot);
             if self.votes[slot].is_none() {
-                let mut random = Zeroizing::new([0; 32]);
-                getrandom::fill(random.as_mut())
-                    .map_err(|_| "checkpoint signing entropy unavailable")?;
-                let vote = self.export.sign_vote(
-                    store,
-                    pending,
-                    signer.slot,
-                    &signer.key,
-                    *random,
-                    self.limits,
-                )?;
-                self.votes[slot] = Some(vote);
+                self.votes[slot] = with_signing_readiness(store, readiness, || {
+                    let mut random = Zeroizing::new([0; 32]);
+                    getrandom::fill(random.as_mut())
+                        .map_err(|_| "checkpoint signing entropy unavailable")?;
+                    self.export.sign_vote(
+                        store,
+                        pending,
+                        signer.slot,
+                        &signer.key,
+                        *random,
+                        self.limits,
+                    )
+                })?;
             }
         }
         let available = self
@@ -457,10 +567,17 @@ impl Host {
             self.votes = std::array::from_fn(|_| None);
         }
         let paused = self.export.pruning_paused(now)?;
+        let signing_alarm = self.signer.as_ref().and_then(|_| {
+            readiness.map_or(Some(Alarm::WaitingForPeerHead), |gate| gate.alarm(store))
+        });
         let alarm = if self.signer.is_some() && !current_signer {
             Some(Alarm::SignerNotCurrent)
+        } else if signing_alarm == Some(Alarm::CurrentQuorumConflict) {
+            signing_alarm
         } else if self.export.latest_height().is_none() {
             Some(Alarm::Unavailable)
+        } else if signing_alarm.is_some() {
+            signing_alarm
         } else if paused {
             Some(Alarm::Stale)
         } else {
@@ -540,6 +657,8 @@ impl Host {
         Ok(())
     }
 }
+#[cfg(all(test, feature = "eng2-runtime"))]
+mod readiness_tests;
 #[cfg(test)]
 mod tests;
 

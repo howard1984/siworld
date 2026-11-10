@@ -285,3 +285,17 @@ fn current_quorum_for_competing_authorization_latches_without_trusting_its_witne
     assert_eq!(observer.error(), Some(Error::Conflict));
     assert_eq!(observer.observed_height(), None);
 }
+
+// Construct the latched state through actual synthetic quorum verification.
+// This helper is compiled only with the unit-test module.
+pub(crate) fn synthetic_current_conflict() -> Observer {
+    let fixture = fixture();
+    let mut statement = fixture.statement.clone();
+    statement.checkpoint_block[0] ^= 1;
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &certified(&fixture, statement)),
+        Err(Error::Conflict)
+    );
+    observer
+}

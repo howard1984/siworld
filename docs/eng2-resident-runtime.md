@@ -66,6 +66,52 @@ completed bidirectional round must also show that the selected peer's available
 extension was exhausted. An exact full batch requires another round. Readiness
 expires after 30 seconds without a completed round and is revoked on disconnect.
 
+## Checkpoint signing readiness
+
+The checkpoint host can observe incoming messages and publish accepted public
+state while signing is paused. Its public `tick` entry point never creates a
+new proposal or signature. The resident signing entry point additionally
+requires a completed authenticated peer round whose block pull recorded the
+exact current local height and block identity under the canonical owner lock.
+Later checkpoint and transaction phases carry that checked head unchanged; a
+concurrent local advance invalidates it until another pull checks the new head.
+Only independently pinned configuration peers provide this evidence; an open
+inbound miner cannot establish or block signing readiness. At least one pinned
+peer must be connected, and every connected pinned reference must have a fresh
+completed round recording that same local head. This proves that the node
+exhausted the peer's advertised extension at that observation; a peer may
+advertise an older verified prefix or advance after the round. It does not prove
+that all peers currently have one identical tip or that no unknown higher-work
+fork exists.
+
+An initiator revokes its evidence before sending a new round; a responder does
+so when the first actual authenticated request arrives, preserving evidence
+while idle between rounds. Falling behind, expiry after 30 seconds, losing all
+pinned references, or a latched current-quorum conflict prevents new proposals
+and votes. Previously published certificates, incoming data processing and
+wallet exports remain available.
+
+The canonical owner lock protects the head and current governance state. Signing
+also holds the observer guard and network evidence guard in that order, so a
+head transition or disconnected session cannot leave a reusable signing permit.
+No socket operation or proof replay runs under the signing guard. Each signature
+still requires the derived key in the exact slot of the locally executed active
+roster; network readiness cannot override that authorization.
+
+A roster change included at height H activates at H + 24. The authorization
+header's active roster signs the checkpoint, which is the greatest positive
+multiple of 72 at least 24 blocks behind that header. The older snapshot may
+therefore contain the previous roster. It describes the state being certified;
+signing authority comes from the authorization header. The certificate binds both header identities and
+the authorization roster digest. Removed keys cannot sign for the new epoch.
+
+The current `bind-checkpoint` materials command checks only the initial genesis
+roster and deliberately retains that restriction. Preparing a later replacement
+requires a separate explicit candidate-binding operation before operational
+rollover is supported; the runtime must still authorize that candidate against
+its independently executed active roster. Existing initial keys and records do
+not need regeneration or rebinding.
+
 ## Explicit signed bootstrap
 
 `bootstrap-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID`

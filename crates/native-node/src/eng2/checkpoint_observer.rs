@@ -280,4 +280,4 @@ fn evaluate(view: &impl View, incoming: &Incoming) -> Result<Outcome, Error> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -28,7 +28,7 @@ mod mailbox;
 mod operations;
 #[cfg(unix)]
 pub use operations::{result as operations_result, submit as submit_operations};
-mod peers;
+pub(crate) mod peers;
 mod production;
 #[cfg(unix)]
 pub(crate) mod submission;
@@ -428,7 +428,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let shared = Arc::new(Shared {
         owner: Arc::new(Mutex::new(driver)),
         cancel: p2p::Cancellation::default(),
-        network: Arc::new(peers::NetworkStatus::default()),
+        network: Arc::new(peers::NetworkStatus::new(
+            config.peers.iter().map(|peer| peer.expected.fingerprint()),
+        )),
         production: Mutex::new(ProductionStatus {
             phase: "starting",
             ..Default::default()
@@ -540,8 +542,20 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                         .owner
                         .lock()
                         .map_err(|_| "resident owner lock poisoned")?;
-                    match checkpoint_host.tick(owner.store(), unix_ms()? / 1000, &incoming.messages)
-                    {
+                    let tick = {
+                        let observer = shared
+                            .checkpoint_observer
+                            .lock()
+                            .map_err(|_| "checkpoint observer lock poisoned")?;
+                        checkpoint_host.tick_resident(
+                            owner.store(),
+                            unix_ms()? / 1000,
+                            &incoming.messages,
+                            &shared.network,
+                            &observer,
+                        )
+                    };
+                    match tick {
                         Ok(tick) => {
                             shared.mailbox.acknowledge(&incoming)?;
                             shared.mailbox.publish(&tick.messages())?;

@@ -94,6 +94,13 @@ impl Sequence {
 pub struct Round {
     pub accepted: u16,
     pub served_bodies: u16,
+    /// Local head checked under the owner lock against the peer's advertised
+    /// tip or known prefix. A full pull batch carries no exhausted-tip evidence.
+    pub checked_head: Option<(u64, Hash)>,
+}
+struct Pulled {
+    accepted: u16,
+    checked_head: Option<(u64, Hash)>,
 }
 
 /// Run on the initiator side of a connection; retain the sequence across rounds.
@@ -105,7 +112,7 @@ pub fn initiate<S: Read + Write, O: Owner>(
 ) -> Result<Round, Error> {
     limits.check()?;
     let remote = peer.fetch_tip(sequence.next()?)?;
-    let accepted = pull(peer, owner, sequence, remote, limits)?;
+    let pulled = pull(peer, owner, sequence, remote, limits)?;
     let local = with_owner(owner, |o| o.head())?;
     let notice = sequence.next()?;
     peer.advertise_tip(notice, local.0, local.1)?;
@@ -117,8 +124,9 @@ pub fn initiate<S: Read + Write, O: Owner>(
                 return Err(Error::Protocol);
             }
             return Ok(Round {
-                accepted,
+                accepted: pulled.accepted,
                 served_bodies: served,
+                checked_head: pulled.checked_head,
             });
         }
         served += serve(peer, owner, request, message)?;
@@ -134,16 +142,32 @@ pub fn respond<S: Read + Write, O: Owner>(
     sequence: &mut Sequence,
     limits: Limits,
 ) -> Result<Round, Error> {
+    respond_with_round_start(peer, owner, sequence, limits, || Ok(()))
+}
+/// Notify the resident only after the first actual authenticated request has
+/// arrived. Idle responders retain completed-round evidence until its expiry.
+pub(crate) fn respond_with_round_start<S: Read + Write, O: Owner>(
+    peer: &mut Peer<S>,
+    owner: &Arc<Mutex<O>>,
+    sequence: &mut Sequence,
+    limits: Limits,
+    on_round_started: impl FnOnce() -> Result<(), String>,
+) -> Result<Round, Error> {
     limits.check()?;
+    let mut started = Some(on_round_started);
     let mut served = 0;
     for _ in 0..limits.requests() {
         let (request, message) = peer.receive_request()?;
+        if let Some(notify) = started.take() {
+            notify().map_err(Error::Owner)?;
+        }
         if let Request::Tip { height, id } = message {
-            let accepted = pull(peer, owner, sequence, (height, id), limits)?;
+            let pulled = pull(peer, owner, sequence, (height, id), limits)?;
             peer.finish_round(request)?;
             return Ok(Round {
-                accepted,
+                accepted: pulled.accepted,
                 served_bodies: served,
+                checked_head: pulled.checked_head,
             });
         }
         if message == Request::RoundDone {
@@ -159,29 +183,39 @@ fn pull<S: Read + Write, O: Owner>(
     sequence: &mut Sequence,
     remote: (u64, Hash),
     limits: Limits,
-) -> Result<u16, Error> {
+) -> Result<Pulled, Error> {
     let mut accepted = 0;
     while accepted < limits.blocks {
-        let local = with_owner(owner, |o| o.head())?;
-        if local.0 == remote.0 {
-            if local.1 != remote.1 {
-                return Err(Error::ForkUnsupported);
+        // Bind the reported head and the remote-prefix comparison in one
+        // owner critical section. Later phases cannot relabel this evidence.
+        let (local, caught_up) = with_owner(owner, |o| {
+            let local = o.head()?;
+            if local.0 < remote.0 {
+                return Ok(Ok((local, false)));
             }
-            break;
-        }
-        if local.0 > remote.0 {
-            let known = if remote.0 == 0 {
-                peer.genesis_id()
+            let known = if local.0 == remote.0 {
+                Ok(local.1)
+            } else if remote.0 == 0 {
+                Ok(peer.genesis_id())
             } else {
-                with_owner(owner, |o| o.header(remote.0))?
-                    .ok_or(Error::Unavailable)?
-                    .id()
-                    .map_err(|_| Error::Protocol)?
+                match o.header(remote.0)? {
+                    Some(header) => header.id().map_err(|_| Error::Protocol),
+                    None => Err(Error::Unavailable),
+                }
             };
-            if known != remote.1 {
-                return Err(Error::ForkUnsupported);
-            }
-            break;
+            Ok(known.and_then(|id| {
+                if id != remote.1 {
+                    Err(Error::ForkUnsupported)
+                } else {
+                    Ok((local, true))
+                }
+            }))
+        })??;
+        if caught_up {
+            return Ok(Pulled {
+                accepted,
+                checked_head: Some(local),
+            });
         }
         let next = local.0.checked_add(1).ok_or(Error::Protocol)?;
         let header = peer
@@ -201,7 +235,10 @@ fn pull<S: Read + Write, O: Owner>(
         drop(received);
         accepted += 1;
     }
-    Ok(accepted)
+    Ok(Pulled {
+        accepted,
+        checked_head: None,
+    })
 }
 fn serve<S: Read + Write, O: Owner>(
     peer: &mut Peer<S>,
@@ -355,6 +392,7 @@ pub fn initiate_bootstrap<S: Read + Write, O: Owner, T>(
                 Round {
                     accepted: 0,
                     served_bodies: served,
+                    checked_head: None,
                 },
                 result,
             ));
@@ -531,6 +569,103 @@ mod tests {
         );
         assert_eq!(budget.available().unwrap(), before);
         (result, remote)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn idle_responder_preserves_evidence_until_the_first_actual_request_and_complete_round() {
+        use crate::eng2::resident::peers::NetworkStatus;
+        let (mut client_peer, mut server_peer, _) = peers();
+        let owner = Arc::new(Mutex::new(fixture(0)));
+        let head = owner.lock().unwrap().head().unwrap();
+        let network = Arc::new(NetworkStatus::new([[1; 32]]));
+        let _connection = network.connected([1; 32]).unwrap();
+        network.round([1; 32], 0, Some(head)).unwrap();
+        let reference = network.clone();
+        let (idle, awaiting) = std::sync::mpsc::channel();
+        let (started, revoked) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            idle.send(()).unwrap();
+            let round = respond_with_round_start(
+                &mut server_peer,
+                &owner,
+                &mut Sequence::default(),
+                Limits::default(),
+                || {
+                    reference.begin_round([1; 32])?;
+                    started.send(()).unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            reference
+                .round([1; 32], round.accepted, round.checked_head)
+                .unwrap();
+        });
+        awaiting
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(network.checkpoint_ready(head).is_ok());
+        assert_eq!(client_peer.fetch_tip(1).unwrap(), head);
+        revoked
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        assert!(network.checkpoint_ready(head).is_err());
+        client_peer.advertise_tip(2, head.0, head.1).unwrap();
+        let (request, done) = client_peer.receive_request().unwrap();
+        assert_eq!(request, 2);
+        assert_eq!(done, Request::RoundDone);
+        worker.join().unwrap();
+        assert!(network.checkpoint_ready(head).is_ok());
+    }
+    #[test]
+    fn completed_round_head_evidence_cannot_follow_a_later_concurrent_owner_advance() {
+        let (mut client_peer, mut server_peer, _) = peers();
+        let client = Arc::new(Mutex::new(fixture(0)));
+        let old = client.lock().unwrap().head().unwrap();
+        let advance = client.clone();
+        let server = Arc::new(Mutex::new(fixture(0)));
+        let worker = std::thread::spawn(move || {
+            let (request, message) = server_peer.receive_request().unwrap();
+            serve(&mut server_peer, &server, request, message).unwrap();
+            let (request, message) = server_peer.receive_request().unwrap();
+            assert!(matches!(message, Request::Tip { .. }));
+            // The client completed its pull and advertised the old local head.
+            // Another owner may now advance during the remaining round phases.
+            *advance.lock().unwrap() = fixture(1);
+            server_peer.finish_round(request).unwrap();
+        });
+        let round = initiate(
+            &mut client_peer,
+            &client,
+            &mut Sequence::default(),
+            Limits::default(),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(round.accepted, 0);
+        assert_eq!(round.checked_head, Some(old));
+        assert_ne!(
+            round.checked_head,
+            Some(client.lock().unwrap().head().unwrap())
+        );
+    }
+    #[test]
+    fn exhausted_pull_evidence_identifies_local_head_not_a_claimed_equal_peer_tip() {
+        let (mut peer, _, _) = peers();
+        let local = Arc::new(Mutex::new(fixture(1)));
+        let current = local.lock().unwrap().head().unwrap();
+        let remote_genesis = peer.genesis_id();
+        let pulled = pull(
+            &mut peer,
+            &local,
+            &mut Sequence::default(),
+            (0, remote_genesis),
+            Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(pulled.accepted, 0);
+        assert_eq!(pulled.checked_head, Some(current));
+        assert_ne!(current, (0, remote_genesis));
     }
     #[test]
     fn initiator_pulls_in_bounded_rounds_and_releases_frame_ownership() {

@@ -3,7 +3,7 @@
 use super::super::{connector::Connector, network, transport::Peer};
 use super::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{SocketAddr, TcpListener, TcpStream},
     thread::JoinHandle,
 };
@@ -14,6 +14,7 @@ const ROUND_BLOCKS: u16 = 8;
 struct Connection {
     last_round: Option<Instant>,
     caught_up: bool,
+    checkpoint_head: Option<(u64, Hash)>,
 }
 #[derive(Default)]
 struct StatusInner {
@@ -21,8 +22,9 @@ struct StatusInner {
     rounds: u64,
 }
 #[derive(Default)]
-pub(super) struct NetworkStatus {
+pub(crate) struct NetworkStatus {
     inner: Mutex<StatusInner>,
+    checkpoint_references: BTreeSet<Hash>,
 }
 pub(super) struct Snapshot {
     pub connections: usize,
@@ -30,7 +32,7 @@ pub(super) struct Snapshot {
     pub last_round_age_ms: Option<String>,
     pub rounds: u64,
 }
-struct Connected {
+pub(crate) struct Connected {
     status: Arc<NetworkStatus>,
     peer: Hash,
 }
@@ -41,8 +43,19 @@ impl Drop for Connected {
         }
     }
 }
+pub(crate) struct CheckpointReady<'a> {
+    _guard: std::sync::MutexGuard<'a, StatusInner>,
+}
 impl NetworkStatus {
-    fn connected(self: &Arc<Self>, peer: Hash) -> Result<Connected, String> {
+    /// Only independently pinned configuration identities can establish or block
+    /// checkpoint readiness. Open miner ingress supplies no reference evidence.
+    pub(crate) fn new(checkpoint_references: impl IntoIterator<Item = Hash>) -> Self {
+        Self {
+            inner: Mutex::default(),
+            checkpoint_references: checkpoint_references.into_iter().collect(),
+        }
+    }
+    pub(crate) fn connected(self: &Arc<Self>, peer: Hash) -> Result<Connected, String> {
         let mut status = self
             .inner
             .lock()
@@ -55,6 +68,7 @@ impl NetworkStatus {
             Connection {
                 last_round: None,
                 caught_up: false,
+                checkpoint_head: None,
             },
         );
         Ok(Connected {
@@ -62,7 +76,24 @@ impl NetworkStatus {
             peer,
         })
     }
-    fn round(&self, peer: Hash, accepted: u16) -> Result<(), String> {
+    pub(crate) fn begin_round(&self, peer: Hash) -> Result<(), String> {
+        self.inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?
+            .connections
+            .get_mut(&peer)
+            .ok_or("established session disappeared")?
+            .checkpoint_head = None;
+        Ok(())
+    }
+    /// Evidence comes from the block pull's owner critical section, carried
+    /// unchanged through completion of the checkpoint and transaction phases.
+    pub(crate) fn round(
+        &self,
+        peer: Hash,
+        accepted: u16,
+        checked_head: Option<(u64, Hash)>,
+    ) -> Result<(), String> {
         let mut status = self
             .inner
             .lock()
@@ -73,13 +104,46 @@ impl NetworkStatus {
             .ok_or("established session disappeared")?;
         entry.last_round = Some(Instant::now());
         entry.caught_up = accepted < ROUND_BLOCKS;
+        entry.checkpoint_head = if entry.caught_up { checked_head } else { None };
         status.rounds = status
             .rounds
             .checked_add(1)
             .ok_or("connection round counter exhausted")?;
         Ok(())
     }
-    pub fn snapshot(&self) -> Result<Snapshot, String> {
+    /// This guard cannot be created from a caller's asserted readiness boolean.
+    /// Hold it through proposal creation or signing; disconnect and round-start
+    /// updates cannot race between this check and the protected operation.
+    pub(crate) fn checkpoint_ready(
+        &self,
+        head: (u64, Hash),
+    ) -> Result<CheckpointReady<'_>, String> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?;
+        let mut references = guard
+            .connections
+            .iter()
+            .filter(|(peer, _)| self.checkpoint_references.contains(*peer))
+            .map(|(_, connection)| connection)
+            .peekable();
+        if references.peek().is_none()
+            || !references.all(|connection| {
+                connection.checkpoint_head == Some(head)
+                    && connection.caught_up
+                    && connection
+                        .last_round
+                        .is_some_and(|last| last.elapsed() <= READY_FRESHNESS)
+            })
+        {
+            return Err(
+                "checkpoint signer is waiting for a current authenticated peer round".into(),
+            );
+        }
+        Ok(CheckpointReady { _guard: guard })
+    }
+    pub(super) fn snapshot(&self) -> Result<Snapshot, String> {
         let status = self
             .inner
             .lock()
@@ -122,6 +186,7 @@ fn session(
     let mut sequence = network::Sequence::default();
     while !shared.cancel.is_cancelled() {
         let round = if initiator {
+            shared.network.begin_round(fingerprint)?;
             network::initiate(
                 &mut peer,
                 &shared.owner,
@@ -131,13 +196,14 @@ fn session(
                 },
             )
         } else {
-            network::respond(
+            network::respond_with_round_start(
                 &mut peer,
                 &shared.owner,
                 &mut sequence,
                 network::Limits {
                     blocks: ROUND_BLOCKS,
                 },
+                || shared.network.begin_round(fingerprint),
             )
         }
         .map_err(|_| "peer round failed")?;
@@ -150,7 +216,9 @@ fn session(
         .map_err(|_| "transaction peer phase failed")?;
         // Only a complete block → checkpoint → transaction round refreshes
         // networking. A certificate alone can never manufacture readiness.
-        shared.network.round(fingerprint, round.accepted)?;
+        shared
+            .network
+            .round(fingerprint, round.accepted, round.checked_head)?;
         if initiator {
             for _ in 0..10 {
                 if shared.cancel.is_cancelled() {
@@ -418,13 +486,43 @@ pub(super) fn run(
 mod tests {
     use super::*;
     #[test]
+    fn checkpoint_ready_guard_pins_exact_head_and_expires_without_changing_mining_readiness() {
+        let status = Arc::new(NetworkStatus::new([[1; 32]]));
+        let _connection = status.connected([1; 32]).unwrap();
+        let head = (96, [2; 32]);
+        status.round([1; 32], 0, Some(head)).unwrap();
+        {
+            let _guard = status.checkpoint_ready(head).unwrap();
+            assert!(matches!(
+                status.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        }
+        assert!(status.checkpoint_ready((97, [3; 32])).is_err());
+        status.begin_round([1; 32]).unwrap();
+        assert!(status.snapshot().unwrap().ready);
+        assert!(status.checkpoint_ready(head).is_err());
+        status.round([1; 32], 0, Some(head)).unwrap();
+        status
+            .inner
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut(&[1; 32])
+            .unwrap()
+            .last_round = Some(Instant::now() - Duration::from_secs(31));
+        assert!(status.checkpoint_ready(head).is_err());
+        status.round([1; 32], 0, Some(head)).unwrap();
+        assert!(status.checkpoint_ready(head).is_ok());
+    }
+    #[test]
     fn completed_round_readiness_expires_and_is_revoked_on_disconnect() {
         let status = Arc::new(NetworkStatus::default());
         let connection = status.connected([1; 32]).unwrap();
         assert!(!status.snapshot().unwrap().ready);
-        status.round([1; 32], ROUND_BLOCKS).unwrap();
+        status.round([1; 32], ROUND_BLOCKS, None).unwrap();
         assert!(!status.snapshot().unwrap().ready);
-        status.round([1; 32], 0).unwrap();
+        status.round([1; 32], 0, Some((0, [0; 32]))).unwrap();
         assert!(status.snapshot().unwrap().ready);
         status
             .inner
@@ -435,7 +533,7 @@ mod tests {
             .unwrap()
             .last_round = Some(Instant::now() - Duration::from_secs(31));
         assert!(!status.snapshot().unwrap().ready);
-        status.round([1; 32], 0).unwrap();
+        status.round([1; 32], 0, Some((0, [0; 32]))).unwrap();
         drop(connection);
         let snapshot = status.snapshot().unwrap();
         assert_eq!(snapshot.connections, 0);
