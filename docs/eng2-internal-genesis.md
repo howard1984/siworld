@@ -56,13 +56,15 @@ durability. A host must durably save the accepted block and corresponding state
 before exporting unified governance records or reporting durable acceptance.
 
 The optional `eng2-rehearsal` feature provides the offline entry point
-`siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 27 --json`.
+`siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json`.
 It creates real native padding and settlement proofs, uses the versioned reward
 plan, commits complete header/body history with immediate redb durability, scans
 wallet public data under the accepted eng2 identities and attempts a mature
-reward transfer and a private-pipe synthetic fund claim at height 25. Height 26
-consolidates mature rewards; height 27 pays the initial 50 SIP issuance fee to the
-dedicated destination and produces a native three-note asset issuance proof.
+reward transfer and a private-pipe synthetic fund claim at height 26, after a
+padding block at height 25 makes the first reward mature in the accepted parent
+state. Height 27 consolidates mature rewards; height 28 pays the initial 50 SIP
+issuance fee to the dedicated destination and produces a native three-note asset
+issuance proof.
 Signed governance proposal and cancellation records are exported after durable
 publication. A fresh independent engine checks every block's
 eleven-component commitment. These operations are executable acceptance steps;
