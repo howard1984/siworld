@@ -5,18 +5,19 @@ use super::{
     driver::Driver, genesis::Genesis, snapshot::ImportLimits, state_components::Limits,
     store::Store,
 };
-#[cfg(unix)]
 use crate::proofs::NativeProver;
 use crate::{identity::NativeIdentity, p2p, proofs::NativeVerifier, service, wire::Hash};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{
-    fs,
     io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(any(unix, test))]
+use std::fs;
 
 mod config;
 #[cfg(unix)]
@@ -446,7 +447,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let mut sequence = 0u64;
     let mut last_export = Instant::now() - Duration::from_secs(5);
     let mut last_checkpoint = Instant::now() - Duration::from_secs(1);
+    #[cfg(unix)]
     let mut checkpoint_error = None;
+    #[cfg(not(unix))]
+    let checkpoint_error = None;
     let result = (|| {
         while !shared.cancel.is_cancelled() {
             if service::stop_requested(directory, &run.run_id)? {

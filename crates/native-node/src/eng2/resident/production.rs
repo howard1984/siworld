@@ -1,8 +1,6 @@
 //! One bounded native producer; proving and nonce search hold no owner lock.
 
-#[cfg(unix)]
 use super::super::producer::Search;
-#[cfg(unix)]
 fn progress(shared: &Shared, attempts: u64) -> Result<(), String> {
     let mut status = shared
         .production
@@ -17,8 +15,8 @@ fn progress(shared: &Shared, attempts: u64) -> Result<(), String> {
 }
 use super::*;
 use crate::producer::MiningSettings;
+mod request;
 
-#[cfg(unix)]
 fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> Result<(), String> {
     let _charge = shared
         .budget
@@ -87,17 +85,8 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                     .ok_or("native timestamp exhausted")?,
             );
             let head = owner.head()?;
-            let mut submission = shared.operations.as_ref().and_then(|mailbox| {
-                match mailbox.take(&head, &shared.budget) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        mailbox.alarm();
-                        None
-                    }
-                }
-            });
-            let prepared = if let Some(request) = submission.as_mut() {
-                let (operations, issuances) = request.inputs();
+            let mut submission = request::Request::take(shared, &head);
+            let prepared = if let Some((operations, issuances)) = submission.inputs() {
                 match owner.prepare_block_with_operations(
                     crate::pool::MIN_READY,
                     timestamp,
@@ -107,7 +96,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 ) {
                     Ok(value) => value,
                     Err(_) => {
-                        request.fail("preparation_rejected");
+                        submission.fail("preparation_rejected");
                         continue;
                     }
                 }
@@ -119,8 +108,8 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         let proved = match prepared.prove(&prover) {
             Ok(proved) => proved,
             Err(error) => {
-                if let Some(request) = submission.as_mut() {
-                    request.fail("proving_rejected");
+                if submission.is_some() {
+                    submission.fail("proving_rejected");
                     continue;
                 }
                 return Err(error);
@@ -135,16 +124,16 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
             if owner.head()?.id != proved.parent() {
-                if let Some(request) = submission.as_mut() {
-                    request.fail("stale_parent");
+                if submission.is_some() {
+                    submission.fail("stale_parent");
                 }
                 continue;
             }
             match owner.prepare_work(proved) {
                 Ok(work) => work,
                 Err(error) => {
-                    if let Some(request) = submission.as_mut() {
-                        request.fail("engine_rejected");
+                    if submission.is_some() {
+                        submission.fail("engine_rejected");
                         continue;
                     }
                     return Err(error);
@@ -164,8 +153,8 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .id
                 != work.parent()
             {
-                if let Some(request) = submission.as_mut() {
-                    request.fail("stale_parent");
+                if submission.is_some() {
+                    submission.fail("stale_parent");
                 }
                 break;
             }
@@ -192,34 +181,34 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                             .lock()
                             .map_err(|_| "resident owner lock poisoned")?;
                         if shared.checkpoint_conflict()? {
-                            if let Some(request) = submission.as_mut() {
-                                request.fail("checkpoint_current_quorum_conflict");
+                            if submission.is_some() {
+                                submission.fail("checkpoint_current_quorum_conflict");
                             }
                             break;
                         }
                         if owner.head()?.id != block.header.parent {
-                            if let Some(request) = submission.as_mut() {
-                                request.fail("stale_parent");
+                            if submission.is_some() {
+                                submission.fail("stale_parent");
                             }
                             break;
                         }
                         match owner.accept(&block.header, &block.body) {
                             Ok(committed) => committed,
                             Err(error) => {
-                                if let Some(request) = submission.as_mut() {
-                                    request.fail("commit_rejected");
+                                if submission.is_some() {
+                                    submission.fail("commit_rejected");
                                     break;
                                 }
                                 return Err(error);
                             }
                         }
                     };
-                    if let Some(request) = submission.as_mut() {
+                    if submission.is_some() {
                         let owner = shared
                             .owner
                             .lock()
                             .map_err(|_| "resident owner lock poisoned")?;
-                        request.committed(&committed, owner.store());
+                        submission.committed(&committed, owner.store());
                     }
                     // This receipt is private. A write failure is an explicit
                     // production alarm and never relabels the committed block.
@@ -249,13 +238,7 @@ pub(super) fn run(
         .thread_name(|i| format!("eng2-prover-{i}"))
         .build()
         .map_err(|_| "native proving worker pool unavailable")?;
-    #[cfg(unix)]
     let result = workers.install(|| continuous(directory, &settings, &shared));
-    #[cfg(not(unix))]
-    let result: Result<(), String> = {
-        let _ = (directory, settings, workers);
-        Err("resident production is unsupported on this platform".into())
-    };
     if result.is_err() {
         if let Ok(mut status) = shared.production.lock() {
             status.error = Some("native_production_failed");

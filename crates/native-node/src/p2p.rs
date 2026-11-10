@@ -210,7 +210,7 @@ impl Deadline {
             elapsed: None,
         }
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn test_clock(limit: Duration, clock: Arc<std::sync::atomic::AtomicU64>) -> Self {
         let mut deadline = Self::new(limit);
         deadline.elapsed = Some(clock);
@@ -755,7 +755,6 @@ impl<S: Read + Write> Session<S> {
     }
     /// An eng-2 application phase bounds both header and body by the same
     /// absolute deadline and rejects its smaller frame cap before allocation.
-    #[cfg(unix)]
     pub(crate) fn receive_eng2_application_before(
         &mut self,
         deadline: &Deadline,
