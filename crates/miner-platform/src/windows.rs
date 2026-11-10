@@ -20,6 +20,9 @@ const ERROR: &str = "Windows private storage ownership, ACL or file identity che
 static STOP: AtomicBool = AtomicBool::new(false);
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
+mod promotion;
+pub use promotion::Promotion;
+
 fn wide(text: &OsStr) -> Result<Vec<u16>, String> {
     let mut out: Vec<u16> = text.encode_wide().collect();
     if out.contains(&0) {
@@ -472,7 +475,7 @@ pub fn stop_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn temporary() -> PathBuf {
+    pub(super) fn temporary() -> PathBuf {
         std::env::temp_dir().join(format!(
             "siworld-win-acl-{}-{}",
             std::process::id(),
@@ -586,7 +589,7 @@ pub fn clear_console() -> Result<(), String> {
 mod adversarial_tests {
     use super::*;
     use std::process::{Command, Stdio};
-    fn temporary() -> PathBuf {
+    pub(super) fn temporary() -> PathBuf {
         std::env::temp_dir().join(format!(
             "siworld-win-boundary-{}-{}",
             std::process::id(),

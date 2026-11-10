@@ -413,9 +413,10 @@ fn unverified_test_capability() -> VerifiedImport {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn canceled_install_and_existing_database_are_non_destructive_without_keys() {
+    #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt;
     let path: PathBuf = std::env::temp_dir()
         .canonicalize()
@@ -428,10 +429,13 @@ fn canceled_install_and_existing_database_are_non_destructive_without_keys() {
             .is_err()
     );
     assert!(!path.exists());
+    #[cfg(unix)]
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(&path)
         .unwrap();
+    #[cfg(windows)]
+    drop(siworld_miner_platform::Directory::create(&path).unwrap());
     std::fs::write(path.join("chain.redb"), b"existing public fixture").unwrap();
     assert!(
         unverified_test_capability()

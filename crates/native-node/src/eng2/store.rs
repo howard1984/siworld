@@ -15,7 +15,9 @@ use crate::{proofs::NativeVerifier, wire::Hash};
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
-use std::{fs::OpenOptions, path::Path};
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+use std::path::Path;
 mod imported;
 mod receipts;
 
@@ -32,6 +34,10 @@ pub(crate) const PERMANENT_RECEIPT_IDS: TableDefinition<u64, &[u8]> =
 
 pub struct Store {
     database: Database,
+    #[cfg(windows)]
+    _directory: siworld_miner_platform::Directory,
+    #[cfg(windows)]
+    file_identity: (u32, u64),
     engine: Engine,
     usable: bool,
     restart: Option<super::restart::Context>,
@@ -41,18 +47,30 @@ pub struct Store {
 impl Store {
     /// Initialize only a new absent file. Existing state is never overwritten.
     pub fn create(path: &Path, genesis: Genesis, limits: Limits) -> Result<Self, String> {
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(windows)]
+        let directory = siworld_miner_platform::Directory::open(
+            path.parent().ok_or("versioned database parent missing")?,
+        )?;
+        #[cfg(windows)]
+        let file =
+            directory.create_file(path.file_name().ok_or("versioned database name missing")?)?;
+        #[cfg(windows)]
+        let file_identity = siworld_miner_platform::file_identity(&file)?;
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .mode(0o600)
+                    .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+            }
             options
-                .mode(0o600)
-                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-        }
-        let file = options
-            .open(path)
-            .map_err(|_| "new versioned database is unavailable or exists")?;
+                .open(path)
+                .map_err(|_| "new versioned database is unavailable or exists")?
+        };
         let backend = redb::backends::FileBackend::new(file)
             .map_err(|_| "versioned database backend unavailable")?;
         let database = Database::builder()
@@ -82,6 +100,10 @@ impl Store {
         crate::store::sync_parent(path)?;
         Ok(Self {
             database,
+            #[cfg(windows)]
+            _directory: directory,
+            #[cfg(windows)]
+            file_identity,
             engine,
             usable: true,
             restart: None,
@@ -103,16 +125,30 @@ impl Store {
         if !metadata.file_type().is_file() || metadata.len() == 0 {
             return Err("existing versioned database is not a nonempty regular file".into());
         }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-        }
-        let file = options
-            .open(path)
-            .map_err(|_| "existing versioned database open failed")?;
+        #[cfg(windows)]
+        let directory = siworld_miner_platform::Directory::open(
+            path.parent().ok_or("versioned database parent missing")?,
+        )?;
+        #[cfg(windows)]
+        let file = directory.open_file(
+            path.file_name().ok_or("versioned database name missing")?,
+            true,
+        )?;
+        #[cfg(windows)]
+        let file_identity = siworld_miner_platform::file_identity(&file)?;
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+            }
+            options
+                .open(path)
+                .map_err(|_| "existing versioned database open failed")?
+        };
         if file
             .metadata()
             .map_err(|_| "versioned file metadata unavailable")?
@@ -191,6 +227,10 @@ impl Store {
             .map_err(|_| "versioned audit compact index durable commit failed")?;
         Ok(Self {
             database,
+            #[cfg(windows)]
+            _directory: directory,
+            #[cfg(windows)]
+            file_identity,
             engine,
             usable: true,
             restart: None,
@@ -213,16 +253,39 @@ impl Store {
         if !metadata.file_type().is_file() || metadata.len() == 0 {
             return Err("invalid existing versioned restart database".into());
         }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
+        #[cfg(windows)]
+        let directory = siworld_miner_platform::Directory::open(
+            path.parent().ok_or("versioned database parent missing")?,
+        )?;
+        #[cfg(windows)]
+        let file = directory.open_file(
+            path.file_name().ok_or("versioned database name missing")?,
+            true,
+        )?;
+        #[cfg(windows)]
+        let file_identity = siworld_miner_platform::file_identity(&file)?;
+        #[cfg(not(windows))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+            }
+            options
+                .open(path)
+                .map_err(|_| "versioned restart database open failed")?
+        };
+        #[cfg(windows)]
+        if file
+            .metadata()
+            .map_err(|_| "versioned restart file metadata unavailable")?
+            .len()
+            == 0
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+            return Err("existing versioned restart database is empty".into());
         }
-        let file = options
-            .open(path)
-            .map_err(|_| "versioned restart database open failed")?;
         let backend = redb::backends::FileBackend::new(file)
             .map_err(|_| "versioned restart backend unavailable")?;
         let mut builder = Database::builder();
@@ -383,6 +446,10 @@ impl Store {
         drop(txn);
         let result = Self {
             database,
+            #[cfg(windows)]
+            _directory: directory,
+            #[cfg(windows)]
+            file_identity,
             engine,
             usable: true,
             restart: Some(super::restart::Context {

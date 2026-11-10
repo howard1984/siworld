@@ -46,7 +46,7 @@ pub struct Input<'a> {
     pub snapshot: &'a [u8],
 }
 
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub(super) struct Row {
     pub digest: Hash,
     pub length: usize,
@@ -56,7 +56,7 @@ pub(super) struct Row {
 /// Constructible only after signed snapshot reconstruction, permanent-history
 /// comparison, complete actual native tail execution and current-roster checks.
 /// This capability still does not mean installation or network readiness.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 pub struct VerifiedImport {
     pub(super) engine: Engine,
     pub(super) headers: Vec<Header>,

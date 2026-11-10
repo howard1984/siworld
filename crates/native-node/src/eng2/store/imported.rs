@@ -1,11 +1,11 @@
 //! Durable installation of an already verified explicit checkpoint import.
 //! Only a new canonical database is admitted; existing data is never replaced.
 use super::*;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::eng2::import::{Installation, Source, VerifiedImport};
 
 use super::{PERMANENT_RECEIPT_IDS as RECEIPT_IDS, PERMANENT_RECEIPTS as RECEIPTS};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const ARTIFACTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eng2-imported-checkpoint-artifacts-v1");
 const MARKER: &str = "signed-checkpoint-import";
@@ -147,7 +147,7 @@ impl Store {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl VerifiedImport {
     /// The owner prepares this dedicated directory and its existing identity
     /// separately. This method never creates, copies, rotates or exports keys.
@@ -158,6 +158,7 @@ impl VerifiedImport {
         source: &mut impl Source,
         canceled: impl Fn() -> bool,
     ) -> Result<Installation, String> {
+        #[cfg(unix)]
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
         let check = || {
             if canceled() {
@@ -167,19 +168,29 @@ impl VerifiedImport {
             }
         };
         check()?;
-        let meta =
-            std::fs::symlink_metadata(directory).map_err(|_| "new import directory unavailable")?;
-        if !directory.is_absolute()
-            || directory
-                .canonicalize()
-                .map_err(|_| "import directory canonicalization failed")?
-                != directory
-            || !meta.file_type().is_dir()
-            || meta.uid() != rustix::process::geteuid().as_raw()
-            || meta.permissions().mode() & 0o777 != 0o700
+        #[cfg(unix)]
         {
-            return Err("checkpoint import requires an owner-only canonical directory".into());
+            let meta = std::fs::symlink_metadata(directory)
+                .map_err(|_| "new import directory unavailable")?;
+            if !directory.is_absolute()
+                || directory
+                    .canonicalize()
+                    .map_err(|_| "import directory canonicalization failed")?
+                    != directory
+                || !meta.file_type().is_dir()
+                || meta.uid() != rustix::process::geteuid().as_raw()
+                || meta.permissions().mode() & 0o777 != 0o700
+            {
+                return Err("checkpoint import requires an owner-only canonical directory".into());
+            }
         }
+        #[cfg(windows)]
+        let root = {
+            if !directory.is_absolute() {
+                return Err("checkpoint import requires an absolute owner-only directory".into());
+            }
+            siworld_miner_platform::Directory::open(directory)?
+        };
         let target = directory.join("chain.redb");
         if std::fs::symlink_metadata(&target).is_ok() {
             return Err("checkpoint import will not replace an existing database".into());
@@ -309,6 +320,49 @@ impl VerifiedImport {
         // Synchronous finalization completes once started, as a normal commit.
         check()?;
         store.enable_authenticated_restart(identity)?;
+        #[cfg(windows)]
+        {
+            let expected_identity = store.file_identity;
+            let expected_height = store.engine.state().height();
+            let expected_tip = store.engine.state().tip();
+            let expected_prefix = store.imported_prefix;
+            let expected_seed = store.import_seed;
+            // Windows checked handles deny delete sharing. Close the sealed
+            // writer before promotion, then authenticate the canonical reopen.
+            drop(store);
+            match root.promote_existing(
+                "checkpoint-import.redb",
+                "chain.redb",
+                expected_identity,
+            )? {
+                siworld_miner_platform::Promotion::DurabilityUnconfirmed => {
+                    Ok(Installation::DurabilityUnconfirmed)
+                }
+                siworld_miner_platform::Promotion::Durable(pin) => {
+                    let admitted = (|| {
+                        let store =
+                            Store::resume_existing(&target, Genesis::decode(&encoded)?, limits)?;
+                        if store.file_identity != expected_identity
+                            || store.engine.state().height() != expected_height
+                            || store.engine.state().tip() != expected_tip
+                            || store.imported_prefix != expected_prefix
+                            || store.import_seed != expected_seed
+                            || store.header(expected_height)?.execution_commitment != final_root
+                        {
+                            return Err("import canonical reopened state differs".to_owned());
+                        }
+                        Ok(store)
+                    })();
+                    // The checked pin spans authenticated reopen and comparison.
+                    // No failure after promotion is returned as retryable input.
+                    drop(pin);
+                    Ok(match admitted {
+                        Ok(store) => Installation::Durable(Box::new(store)),
+                        Err(_) => Installation::DurabilityUnconfirmed,
+                    })
+                }
+            }
+        }
         #[cfg(any(
             target_vendor = "apple",
             target_os = "linux",
@@ -338,6 +392,7 @@ impl VerifiedImport {
             Ok(Installation::Durable(Box::new(store)))
         }
         #[cfg(not(any(
+            windows,
             target_vendor = "apple",
             target_os = "linux",
             target_os = "android",
