@@ -87,11 +87,11 @@ export class Eng2Session {
       controller.signal.throwIfAborted();
       if (head.height === this.metadata.height && head.tip === this.metadata.tip) { this.ready = true; return this.summary(); }
       let extension = false, firstPage = null;
-      const page = async from => {
-        const query = headQuery(head); query.set('from',String(from)); query.set('limit',String(Math.min(128,head.height-from+1)));
+      const page = async (from,target=head,limit=Math.min(128,target.height-from+1)) => {
+        const query = headQuery(target); query.set('from',String(from)); query.set('limit',String(limit));
         const {bytes} = await this.binary(this.base+'/headers?'+query,{limit:65536,signal:signal()});
-        const value = JSON.parse(this.wallet.eng2_header_page(bytes,String(head.height),head.tip));
-        if (value.height !== head.height || value.tip !== head.tip || value.from !== from || !Array.isArray(value.headers) || !value.headers.length || value.headers.length > Math.min(128,head.height-from+1)) throw new Error('Engineering-v2 header page does not reach the requested context.');
+        const value = JSON.parse(this.wallet.eng2_header_page(bytes,String(target.height),target.tip));
+        if (value.height !== target.height || value.tip !== target.tip || value.from !== from || !Array.isArray(value.headers) || !value.headers.length || value.headers.length > limit) throw new Error('Engineering-v2 header page does not reach the requested context.');
         return value;
       };
       if (head.height > this.metadata.height) {
@@ -119,15 +119,22 @@ export class Eng2Session {
       }
       this.wallet.check_eng2_candidate(String(head.height),head.tip);
       const current = eng2Head(await this.json(this.base+'/head',{limit:20000,signal:signal()}),this.config,this.now());
-      if (current.height !== head.height || current.tip !== head.tip) throw new Error('Engineering-v2 head changed during scanning. Previous balance was preserved.');
+      const advanced = current.height !== head.height || current.tip !== head.tip;
+      if (advanced) {
+        if (current.height <= head.height) throw new Error('Engineering-v2 head changed to an incompatible branch. Previous balance was preserved.');
+        const boundary = await page(head.height,current,1);
+        if (boundary.headers[0].height !== head.height || boundary.headers[0].id !== head.tip) throw new Error('Engineering-v2 head no longer extends the verified prefix. Previous balance was preserved.');
+      }
       controller.signal.throwIfAborted();
       const metadata = this.metadataFor(head.height,head.tip);
       await this.persist(metadata,true); persisted = true;
       // Once durable adoption begins, finish the synchronous native commit even
       // if a wallet-selection cancellation arrives during the storage write.
       this.wallet.commit_eng2_candidate(String(head.height),head.tip);
-      this.metadata = metadata; this.ready = true;
-      return {...this.summary(),downloaded_bytes:downloaded};
+      this.metadata = metadata; this.ready = !advanced && !controller.signal.aborted;
+      // Preserve completed native verification across a moving head. The next
+      // owner refresh extends this durable prefix; the new head is still stale.
+      return {...this.summary(),downloaded_bytes:downloaded,catchup_pending:advanced,target_height:current.height,target_tip:current.tip};
     }); } catch (error) {
       this.ready = false; this.wallet.abort_eng2_candidate();
       if (persisted) { this.invalidated = true; throw new Error('Engineering-v2 state was saved. Lock and reopen before continuing.'); }
