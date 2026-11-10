@@ -267,6 +267,26 @@ fn claim_attach(value: &Value) -> Result<Value> {
         "recipient_current_state_verified":false,"state_changed":false,"submitted":false}),
     )
 }
+fn governance_roles(kind: &ActionKind) -> Vec<(&'static str, SignerRole)> {
+    match kind {
+        ActionKind::ProposeDestination { .. } | ActionKind::ProposeIssuanceFee { .. } => {
+            vec![("founder", SignerRole::Founder)]
+        }
+        ActionKind::CancelDestination { .. } | ActionKind::CancelIssuanceFee { .. } => {
+            vec![("revocation", SignerRole::Revocation)]
+        }
+        _ => vec![
+            ("founder", SignerRole::Founder),
+            ("revocation", SignerRole::Revocation),
+        ],
+    }
+}
+fn governance_review_digest(action: &Action, role: SignerRole) -> Result<Hash> {
+    Ok(blake3::derive_key(
+        "siworld eng2 governance action role review v1",
+        &action.signing_bytes(role)?,
+    ))
+}
 fn governance_prepare(value: &Value) -> Result<Value> {
     fields(value, &["operation", "network", "sequence", "action"])?;
     let input = &value["action"];
@@ -348,18 +368,7 @@ fn governance_prepare(value: &Value) -> Result<Value> {
     };
     let bytes = action.unsigned_bytes()?;
     Action::decode_unsigned(&bytes)?;
-    let roles = match action.kind {
-        ActionKind::ProposeDestination { .. } | ActionKind::ProposeIssuanceFee { .. } => {
-            vec![("founder", SignerRole::Founder)]
-        }
-        ActionKind::CancelDestination { .. } | ActionKind::CancelIssuanceFee { .. } => {
-            vec![("revocation", SignerRole::Revocation)]
-        }
-        _ => vec![
-            ("founder", SignerRole::Founder),
-            ("revocation", SignerRole::Revocation),
-        ],
-    };
+    let roles = governance_roles(&action.kind);
     let delay = match action.kind {
         ActionKind::ReplaceCheckpointSigners { .. } => governance::ROSTER_DELAY_BLOCKS,
         ActionKind::CancelDestination { .. }
@@ -369,7 +378,7 @@ fn governance_prepare(value: &Value) -> Result<Value> {
     };
     Ok(
         json!({"request_hex":hex(&bytes),"sequence":action.sequence.to_string(),"required_roles":roles.iter().map(|(name,_)|*name).collect::<Vec<_>>(),
-        "messages":roles.iter().map(|(name,role)|Ok(json!({"role":name,"message_hex":hex(&action.signing_bytes(*role)?)}))).collect::<Result<Vec<_>>>()?,
+        "messages":roles.iter().map(|(name,role)|Ok(json!({"role":name,"message_hex":hex(&action.signing_bytes(*role)?),"review_digest":hex(&governance_review_digest(&action,*role)?)}))).collect::<Result<Vec<_>>>()?,
         "signature_context_hex":hex(governance::SIGNATURE_CONTEXT),"activation_delay_blocks":delay,
         "chain_state_verified":false,"state_changed":false,"submitted":false}),
     )
@@ -442,14 +451,6 @@ pub fn sign_claim(
     expected_authority: [u8; crate::fund_spend::VERIFYING_KEY_BYTES],
     seed: zeroize::Zeroizing<[u8; 32]>,
 ) -> Result<Value> {
-    use libcrux_ml_dsa::ml_dsa_65;
-    use zeroize::{Zeroize, Zeroizing};
-    struct Key(ml_dsa_65::MLDSA65SigningKey);
-    impl Drop for Key {
-        fn drop(&mut self) {
-            self.0.as_mut_slice().zeroize();
-        }
-    }
     let value = canonical(input)?;
     fields(&value, &["operation", "claim_hex", "confirmed_digest"])?;
     require(
@@ -467,19 +468,12 @@ pub fn sign_claim(
             && claim.spend.signature == [0; crate::fund_spend::SIGNATURE_BYTES]
             && fixed::<32>(&value["confirmed_digest"])? == claim_review_digest(&claim),
     )?;
-    let pair = ml_dsa_65::generate_key_pair(*seed);
-    let key = Key(pair.signing_key);
-    require(*pair.verification_key.as_ref() == expected_authority)?;
-    let mut randomness = Zeroizing::new([0; 32]);
-    getrandom::fill(randomness.as_mut()).map_err(|_| "local claim signing entropy unavailable")?;
-    claim.spend.signature = *ml_dsa_65::sign(
-        &key.0,
+    claim.spend.signature = sign_local(
+        seed,
+        expected_authority,
         &claim.signing_message(),
         crate::eng2::fund_claim::SIGNATURE_CONTEXT,
-        *randomness,
-    )
-    .map_err(|_| "local claim signing failed")?
-    .as_ref();
+    )?;
     claim.spend.verify_signed_message(
         expected_network,
         &expected_authority,
@@ -489,5 +483,81 @@ pub fn sign_claim(
     Ok(
         json!({"claim_hex":hex(&claim.encode()),"signature_verified":true,"entitlement_verified":false,
         "recipient_current_state_verified":false,"state_changed":false,"submitted":false}),
+    )
+}
+
+// The private frame selects an already existing local-rehearsal identity. Its
+// expected public key is supplied independently of the imported public request.
+fn sign_local(
+    seed: zeroize::Zeroizing<[u8; 32]>,
+    expected_authority: [u8; governance::PUBLIC_KEY_BYTES],
+    message: &[u8],
+    context: &[u8],
+) -> Result<[u8; governance::SIGNATURE_BYTES]> {
+    use libcrux_ml_dsa::ml_dsa_65;
+    use zeroize::{Zeroize, Zeroizing};
+    struct Key(ml_dsa_65::MLDSA65SigningKey);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            self.0.as_mut_slice().zeroize();
+        }
+    }
+    let pair = ml_dsa_65::generate_key_pair(*seed);
+    let key = Key(pair.signing_key);
+    require(*pair.verification_key.as_ref() == expected_authority)?;
+    let mut randomness = Zeroizing::new([0; 32]);
+    getrandom::fill(randomness.as_mut())
+        .map_err(|_| "local operation signing entropy unavailable")?;
+    Ok(*ml_dsa_65::sign(&key.0, message, context, *randomness)
+        .map_err(|_| "local operation signing failed")?
+        .as_ref())
+}
+/// Headless local-rehearsal signing, not production custody or chain admission.
+/// The review digest binds the full action and role. The independently selected
+/// public key is checked against the private frame; current owner authority and
+/// inclusion remain the responsibility of the shared native block engine.
+pub fn sign_governance(
+    input: &[u8],
+    expected_network: Hash,
+    expected_role: SignerRole,
+    expected_authority: [u8; governance::PUBLIC_KEY_BYTES],
+    seed: zeroize::Zeroizing<[u8; 32]>,
+) -> Result<Value> {
+    use libcrux_ml_dsa::ml_dsa_65;
+    let value = canonical(input)?;
+    fields(&value, &["operation", "request_hex", "confirmed_digest"])?;
+    require(
+        value["operation"] == "governance-sign"
+            && expected_network != [0; 32]
+            && expected_authority != [0; governance::PUBLIC_KEY_BYTES],
+    )?;
+    let action = Action::decode_unsigned(&public_bytes(&value["request_hex"], 8192)?)?;
+    let roles = governance_roles(&action.kind);
+    let (name, role) = roles
+        .iter()
+        .find(|(_, role)| *role == expected_role)
+        .ok_or("selected owner role cannot authorize this action")?;
+    let digest = governance_review_digest(&action, *role)?;
+    require(
+        action.network == expected_network && fixed::<32>(&value["confirmed_digest"])? == digest,
+    )?;
+    let message = action.signing_bytes(*role)?;
+    let signature = sign_local(
+        seed,
+        expected_authority,
+        &message,
+        governance::SIGNATURE_CONTEXT,
+    )?;
+    ml_dsa_65::verify(
+        &ml_dsa_65::MLDSA65VerificationKey::new(expected_authority),
+        &message,
+        governance::SIGNATURE_CONTEXT,
+        &ml_dsa_65::MLDSA65Signature::new(signature),
+    )
+    .map_err(|_| "local governance signature verification failed")?;
+    Ok(
+        json!({"request_hex":hex(&action.unsigned_bytes()?),"role":name,"authority_hex":hex(&expected_authority),
+        "signature_hex":hex(&signature),"review_digest":hex(&digest),"signature_verified":true,
+        "chain_state_verified":false,"state_changed":false,"submitted":false}),
     )
 }

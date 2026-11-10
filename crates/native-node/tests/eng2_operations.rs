@@ -331,3 +331,226 @@ fn issuance_fee_governance_preparation_uses_exact_public_atoms_and_roles() {
         );
     }
 }
+
+fn governance_sign_command(prepared: &Value, role_index: usize) -> Vec<u8> {
+    serde_json::to_vec(
+        &json!({"operation":"governance-sign","request_hex":prepared["request_hex"],
+        "confirmed_digest":prepared["messages"][role_index]["review_digest"]}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn headless_governance_signatures_bind_each_required_role_without_claiming_inclusion() {
+    use siworld_native_node::eng2_operations::{public_bytes, sign_governance};
+    for action in [
+        json!({"type":"propose-issuance-fee","amount_atoms":"4000000000"}),
+        json!({"type":"cancel-issuance-fee","proposal_sequence":"1"}),
+        json!({"type":"propose-destination","target":"fund","member":0,"address_hex":address()}),
+        json!({"type":"cancel-destination","proposal_sequence":"1"}),
+        json!({"type":"rotate-owners","founder_hex":hex(&key(7)),"revocation_hex":hex(&key(8))}),
+        json!({"type":"replace-checkpoint-signers","replacements":[{"slot":0,"key_hex":hex(&key(9))}]}),
+        json!({"type":"cancel-joint","proposal_sequence":"1"}),
+    ] {
+        let prepared = run(
+            json!({"operation":"governance-prepare","network":hex(&[17;32]),
+            "sequence":"9007199254740993","action":action}),
+        )
+        .unwrap();
+        let decoded =
+            Action::decode_unsigned(&public_bytes(&prepared["request_hex"], 8192).unwrap())
+                .unwrap();
+        let mut signatures = Vec::new();
+        if prepared["messages"].as_array().unwrap().len() == 2 {
+            assert_ne!(
+                prepared["messages"][0]["review_digest"],
+                prepared["messages"][1]["review_digest"]
+            );
+            assert!(
+                sign_governance(
+                    &governance_sign_command(&prepared, 0),
+                    [17; 32],
+                    SignerRole::Revocation,
+                    key(2),
+                    zeroize::Zeroizing::new([2; 32])
+                )
+                .is_err()
+            );
+        }
+        for (index, message) in prepared["messages"].as_array().unwrap().iter().enumerate() {
+            let (role, seed) = match message["role"].as_str().unwrap() {
+                "founder" => (SignerRole::Founder, 1),
+                "revocation" => (SignerRole::Revocation, 2),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                public_bytes(&message["review_digest"], 32).unwrap().len(),
+                32
+            );
+            let signed = sign_governance(
+                &governance_sign_command(&prepared, index),
+                [17; 32],
+                role,
+                key(seed),
+                zeroize::Zeroizing::new([seed; 32]),
+            )
+            .unwrap();
+            assert_eq!(signed["role"], message["role"]);
+            assert_eq!(signed["authority_hex"], hex(&key(seed)));
+            assert_eq!(signed["signature_verified"], true);
+            assert_eq!(signed["chain_state_verified"], false);
+            assert_eq!(signed["state_changed"], false);
+            assert_eq!(signed["submitted"], false);
+            let signature = public_bytes(&signed["signature_hex"], 3309)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            ml_dsa_65::verify(
+                &ml_dsa_65::MLDSA65VerificationKey::new(key(seed)),
+                &decoded.signing_bytes(role).unwrap(),
+                SIGNATURE_CONTEXT,
+                &ml_dsa_65::MLDSA65Signature::new(signature),
+            )
+            .unwrap();
+            assert!(
+                ml_dsa_65::verify(
+                    &ml_dsa_65::MLDSA65VerificationKey::new(key(seed)),
+                    &decoded.signing_bytes(role).unwrap(),
+                    siworld_native_node::eng2::fund_claim::SIGNATURE_CONTEXT,
+                    &ml_dsa_65::MLDSA65Signature::new(signature)
+                )
+                .is_err()
+            );
+            signatures.push(json!({"role":signed["role"],"signature_hex":signed["signature_hex"]}));
+        }
+        let wrapped=run(json!({"operation":"governance-wrap","request_hex":prepared["request_hex"],"signatures":signatures})).unwrap();
+        assert_eq!(wrapped["signature_verified"], false);
+        assert_eq!(wrapped["submitted"], false);
+        assert_eq!(
+            SignedAction::decode(&public_bytes(&wrapped["signed_action_hex"], 16384).unwrap())
+                .unwrap()
+                .action,
+            decoded
+        );
+    }
+}
+
+#[test]
+fn headless_governance_rejects_wrong_context_role_identity_and_review() {
+    use siworld_native_node::eng2_operations::sign_governance;
+    let prepared = run(
+        json!({"operation":"governance-prepare","network":hex(&[17;32]),"sequence":"1",
+        "action":{"type":"propose-issuance-fee","amount_atoms":"4000000000"}}),
+    )
+    .unwrap();
+    let bytes = governance_sign_command(&prepared, 0);
+    for (network, role, authority, seed) in [
+        ([18; 32], SignerRole::Founder, key(1), 1),
+        ([17; 32], SignerRole::Revocation, key(2), 2),
+        ([17; 32], SignerRole::Checkpoint(0), key(3), 3),
+        ([17; 32], SignerRole::Founder, key(2), 1),
+        ([17; 32], SignerRole::Founder, key(1), 2),
+    ] {
+        assert!(
+            sign_governance(
+                &bytes,
+                network,
+                role,
+                authority,
+                zeroize::Zeroizing::new([seed; 32])
+            )
+            .is_err()
+        );
+    }
+    let mut wrong: Value = serde_json::from_slice(&bytes).unwrap();
+    wrong["confirmed_digest"] = json!(hex(&[0; 32]));
+    assert!(
+        sign_governance(
+            &serde_json::to_vec(&wrong).unwrap(),
+            [17; 32],
+            SignerRole::Founder,
+            key(1),
+            zeroize::Zeroizing::new([1; 32])
+        )
+        .is_err()
+    );
+    let mut changed = prepared.clone();
+    let mut request =
+        siworld_native_node::eng2_operations::public_bytes(&changed["request_hex"], 8192).unwrap();
+    request[40] ^= 2;
+    changed["request_hex"] = json!(hex(&request));
+    assert!(
+        sign_governance(
+            &governance_sign_command(&changed, 0),
+            [17; 32],
+            SignerRole::Founder,
+            key(1),
+            zeroize::Zeroizing::new([1; 32])
+        )
+        .is_err()
+    );
+    let mut extra: Value = serde_json::from_slice(&bytes).unwrap();
+    extra["seed"] = json!("rejected public field");
+    assert!(
+        sign_governance(
+            &serde_json::to_vec(&extra).unwrap(),
+            [17; 32],
+            SignerRole::Founder,
+            key(1),
+            zeroize::Zeroizing::new([1; 32])
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn real_governance_cli_pipe_keeps_private_framing_and_fixed_errors() {
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+    let prepared = run(
+        json!({"operation":"governance-prepare","network":hex(&[17;32]),"sequence":"1",
+        "action":{"type":"propose-issuance-fee","amount_atoms":"4000000000"}}),
+    )
+    .unwrap();
+    let public = governance_sign_command(&prepared, 0);
+    for case in 0..5 {
+        let mut framed = (public.len() as u32).to_be_bytes().to_vec();
+        framed.extend(&public);
+        framed.extend(if case == 3 { 31u32 } else { 32u32 }.to_be_bytes());
+        framed.extend(if case == 2 { [2; 32] } else { [1; 32] });
+        if case == 1 {
+            framed.push(99);
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_siworld-eng2-operations"))
+            .args([
+                "--sign-governance-pipe",
+                &hex(&[17; 32]),
+                if case == 4 { "checkpoint-0" } else { "founder" },
+                &hex(&key(1)),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let written = child.stdin.take().unwrap().write_all(&framed);
+        if case == 0 {
+            written.unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.success(), case == 0);
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains(&hex(&[1; 32])));
+        assert!(!text.contains(&hex(&[2; 32])));
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], case == 0);
+        if case == 0 {
+            assert_eq!(value["result"]["signature_verified"], true);
+        } else {
+            assert_eq!(value["error"], "public_operation_rejected");
+        }
+    }
+}

@@ -35,7 +35,7 @@ Supported public operations are:
 | --- | --- | --- |
 | `claim-prepare` | `network`, `height`, `member`, `amount_atoms`, `counter`, `destination_hex`, `authority_hex`, `rseed_hex` | Unsigned `claim_hex`, complete signing message/context and `review_digest` |
 | `claim-attach` | Unsigned `claim_hex`, independently selected `authority_hex`, detached `signature_hex` | Canonical claim with its actual ML-DSA-65 signature verified |
-| `governance-prepare` | `network`, `sequence`, `action` | Canonical unsigned request, required roles, complete role-bound signing messages/context and activation delay |
+| `governance-prepare` | `network`, `sequence`, `action` | Canonical unsigned request, required roles, complete role-bound signing messages/context, review digests and activation delay |
 | `governance-wrap` | `request_hex`, ordered `signatures` with `role` and `signature_hex` | Canonical signed-action framing; authentication remains an engine check |
 | `bundle-check` | `network`, `height`, `bundle` | Validated canonical pending-operation framing; signatures remain unverified |
 
@@ -55,20 +55,25 @@ candidate height changes.
 
 ## Internal rehearsal signing
 
-An explicit private-pipe mode signs only a prepared public fund claim:
+Explicit private-pipe modes sign prepared public fund claims or individual
+management authorizations:
 
 ```sh
-crates/native-node/target/debug/siworld-eng2-operations --sign-claim-pipe NETWORK_HEX EXPECTED_AUTHORITY_HEX
+siworld-eng2-operations --sign-claim-pipe NETWORK_HEX EXPECTED_AUTHORITY_HEX
+siworld-eng2-operations --sign-governance-pipe NETWORK_HEX ROLE EXPECTED_AUTHORITY_HEX
 ```
 
-Both arguments are independently selected public genesis identities. Standard
-input must be a private pipe from the local rehearsal harness, with this framing:
+Network and expected authority are independently selected public identities.
+The caller must supply an unrecorded private pipe from the local rehearsal harness.
+The adapter validates frame bounds and EOF, and does not inspect the operating-system
+type of standard input. A regular file or terminal can also provide framed input.
+The framing is:
 
 1. A four-byte big-endian public-command byte length.
 2. Canonical public JSON with exactly `operation:"claim-sign"`, `claim_hex` and
    `confirmed_digest` matching the prepared `review_digest`.
 3. A four-byte big-endian private-input length equal to 32.
-4. The temporary synthetic fund signing seed, followed immediately by EOF.
+4. The existing disposable signing seed, followed immediately by EOF.
 
 The seed is never a JSON field, argument, environment value or output. A
 mismatched network, public key, review digest, private input width or trailing
@@ -83,6 +88,25 @@ separately provisioned temporary synthetic keys. A production encrypted custody
 adapter remains required before using this interface for long-lived fund keys.
 Only fixed public failure JSON is emitted; raw private input and backend errors
 are never printed.
+
+The governance role is `founder` or `revocation`. This mode uses the same bounded
+frames. Its public JSON has exactly
+`operation:"governance-sign"`, `request_hex` and `confirmed_digest`; the digest
+must match the selected role's `messages[].review_digest` from preparation.
+The digest binds the canonical action, including network, full sequence and role.
+The expected public key is selected independently through the command arguments
+and must match the key derived from the private frame. A checkpoint role or an
+owner role inappropriate for the action is rejected. Signing uses operating-system
+entropy and returns an error when entropy is unavailable.
+
+A successful result contains the detached public signature and marks
+`signature_verified:true`, `chain_state_verified:false`, `state_changed:false`
+and `submitted:false`. This verifies only the selected key's signature; active
+owner authority, current sequence and admission remain shared-engine checks.
+Joint actions require separate invocations for both roles before ordered wrapping.
+The wrapper continues to report signatures as unverified against chain state.
+This interface is for existing disposable internal-rehearsal keys, with no key-file
+lookup, encrypted custody, graphical interface or network operation.
 
 ## Governance requests
 
