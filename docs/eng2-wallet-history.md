@@ -47,7 +47,7 @@ this interface. Receipt membership is separate from a pending submission
 acknowledgement.
 
 Receipt envelopes are bounded to 8 MiB plus 327 bytes. Header pages are bounded
-to 24,507 bytes. Construction currently reads a retained canonical body and
+to 24,507 bytes. First construction reads a retained canonical body and
 reserves `3 * body_bytes + 4 * MAX_RECEIPT_BYTES + 65,536` from the node's shared
 memory budget before body allocations. The resulting artifact retains that
 reservation while its bytes remain owned. A large source body can exceed the
@@ -60,6 +60,15 @@ The existing public-file exporter can explicitly publish `wallet-genesis.bin`,
 publication does not assert that every historical artifact is available.
 The transport owner must enforce publication freshness and route only
 independently authenticated public artifacts.
+
+`Store::materialize_permanent_receipt` explicitly materializes one accepted
+height under the same shared budget. It authenticates the immutable context,
+exact canonical header and body length, then durably commits the receipt and its
+digest in one transaction. Repeated materialization is idempotent; conflicting
+or incomplete existing pairs are preserved and rejected. Stored receipts can be
+exported without the original body, with their digest, header binding and body
+length checked on read. This API does not schedule background work or delete
+canonical bodies, proofs or state.
 
 ## Remaining integration
 

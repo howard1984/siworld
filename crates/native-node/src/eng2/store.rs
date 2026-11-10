@@ -17,6 +17,7 @@ use redb::{
 };
 use std::{fs::OpenOptions, path::Path};
 mod imported;
+mod receipts;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("eng2-canonical-meta-v1");
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("eng2-canonical-blocks-v1");
