@@ -6,8 +6,9 @@ pub mod admission;
 pub mod archive;
 pub mod body;
 pub mod certificate;
-#[cfg(unix)]
 pub mod checkpoint_exchange;
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod checkpoint_observer;
 pub mod checkpoint_wire;
 pub mod commitment;
 #[cfg(feature = "native-p2p")]
@@ -36,5 +37,5 @@ pub mod store;
 pub mod transport;
 pub mod wallet_history;
 
-#[cfg(all(unix, feature = "eng2-runtime"))]
+#[cfg(feature = "eng2-runtime")]
 pub(crate) mod transaction_exchange;

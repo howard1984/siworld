@@ -3,7 +3,11 @@ use crate::eng2::{
     body::Policy,
     genesis::{FeeMode, Genesis},
 };
-use std::{collections::BTreeMap, io::Cursor, os::unix::net::UnixStream};
+use std::{
+    collections::BTreeMap,
+    io::Cursor,
+    net::{TcpListener, TcpStream},
+};
 #[derive(Default)]
 struct Model {
     packets: BTreeMap<Hash, Vec<u8>>,
@@ -76,7 +80,10 @@ fn rounds(a: Arc<Mutex<Model>>, b: Arc<Mutex<Model>>, count: usize) {
     // Synthetic payloads test framing/admission ownership only; actual native
     // acceptance is enforced by Driver, not this mock exchange model.
     let genesis = genesis();
-    let (a_socket, b_socket) = UnixStream::pair().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a_socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (b_socket, _) = listener.accept().unwrap();
+    drop(listener);
     for socket in [&a_socket, &b_socket] {
         socket
             .set_read_timeout(Some(Duration::from_secs(3)))

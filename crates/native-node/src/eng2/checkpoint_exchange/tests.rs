@@ -2,13 +2,13 @@ use super::*;
 use crate::eng2::{
     body::Policy,
     certificate::{AuthorizationWitness, Certificate, Statement, Vote},
+    checkpoint_wire::Proposal,
     commitment::{self, Component},
     genesis::{FeeMode, Genesis},
-    runtime_export::host::Proposal,
 };
 use std::{
     io::{self, Cursor},
-    os::unix::net::UnixStream,
+    net::{TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -152,7 +152,10 @@ fn mock_loopback_batches_retain_decoded_shared_budget_through_queue_ownership() 
     let network = g.config().network;
     let outgoing = packets(network);
     let expected = outgoing.clone();
-    let (a, b) = UnixStream::pair().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (b, _) = listener.accept().unwrap();
+    drop(listener);
     for socket in [&a, &b] {
         socket
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -301,7 +304,7 @@ fn phase_deadline_is_not_restarted_for_a_frame_body_or_another_packet() {
         (batch(&outgoing[..2], network), 2000),
     ] {
         let clock = Arc::new(AtomicU64::new(0));
-        let deadline = p2p::Deadline::test_clock(Duration::from_secs(PHASE_SECONDS), clock.clone());
+        let deadline = p2p::Deadline::test_clock(PHASE_TIMEOUT, clock.clone());
         let budget = p2p::Budget::new(1024 * 1024);
         let before = budget.available().unwrap();
         let (mut peer, _) = script(wire, &g, budget.clone(), Some(clock), step);

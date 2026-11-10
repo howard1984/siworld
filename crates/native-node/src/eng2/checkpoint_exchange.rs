@@ -15,7 +15,7 @@ const VERSION: u16 = 1;
 const REQUEST: u64 = 0;
 const BATCH_BYTES: usize = 4;
 const PACKET_PREFIX: usize = 6;
-const PHASE_SECONDS: u64 = 10;
+pub(crate) const PHASE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_GOVERNANCE_BYTES: usize = 131072;
 
 /// This new reservation remains live for the complete decoded message, through
@@ -31,13 +31,7 @@ pub fn initiate<S: Read + Write>(
     outgoing: &[Vec<u8>],
     network: Hash,
 ) -> Result<Vec<OwnedIncoming>, p2p::Error> {
-    exchange(
-        peer,
-        outgoing,
-        network,
-        true,
-        &p2p::Deadline::new(Duration::from_secs(PHASE_SECONDS)),
-    )
+    initiate_before(peer, outgoing, network, &p2p::Deadline::new(PHASE_TIMEOUT))
 }
 /// The responder reads one complete batch before sending its batch. Call only
 /// after the ordinary block-round completion marker has been consumed.
@@ -46,13 +40,25 @@ pub fn respond<S: Read + Write>(
     outgoing: &[Vec<u8>],
     network: Hash,
 ) -> Result<Vec<OwnedIncoming>, p2p::Error> {
-    exchange(
-        peer,
-        outgoing,
-        network,
-        false,
-        &p2p::Deadline::new(Duration::from_secs(PHASE_SECONDS)),
-    )
+    respond_before(peer, outgoing, network, &p2p::Deadline::new(PHASE_TIMEOUT))
+}
+/// Use one caller-owned deadline through exchange and independent validation.
+pub(crate) fn initiate_before<S: Read + Write>(
+    peer: &mut Peer<S>,
+    outgoing: &[Vec<u8>],
+    network: Hash,
+    deadline: &p2p::Deadline,
+) -> Result<Vec<OwnedIncoming>, p2p::Error> {
+    exchange(peer, outgoing, network, true, deadline)
+}
+/// Complete the response within the same caller-owned control-phase deadline.
+pub(crate) fn respond_before<S: Read + Write>(
+    peer: &mut Peer<S>,
+    outgoing: &[Vec<u8>],
+    network: Hash,
+    deadline: &p2p::Deadline,
+) -> Result<Vec<OwnedIncoming>, p2p::Error> {
+    exchange(peer, outgoing, network, false, deadline)
 }
 fn exchange<S: Read + Write>(
     peer: &mut Peer<S>,

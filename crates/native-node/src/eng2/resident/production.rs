@@ -26,7 +26,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         .map_err(|_| "resident production budget unavailable")?;
     let prover = NativeProver::new()?;
     while !shared.cancel.is_cancelled() {
-        if !shared.network.snapshot()?.ready {
+        if !shared.mining_ready()? {
             shared.phase("networking")?;
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -65,7 +65,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             }
             continue;
         }
-        if !shared.network.snapshot()?.ready {
+        if !shared.mining_ready()? {
             continue;
         }
         shared.phase("preparing")?;
@@ -153,7 +153,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         };
         shared.phase("mining")?;
         loop {
-            if shared.cancel.is_cancelled() || !shared.network.snapshot()?.ready {
+            if shared.cancel.is_cancelled() || !shared.mining_ready()? {
                 break;
             }
             if shared
@@ -191,6 +191,12 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                             .owner
                             .lock()
                             .map_err(|_| "resident owner lock poisoned")?;
+                        if shared.checkpoint_conflict()? {
+                            if let Some(request) = submission.as_mut() {
+                                request.fail("checkpoint_current_quorum_conflict");
+                            }
+                            break;
+                        }
                         if owner.head()?.id != block.header.parent {
                             if let Some(request) = submission.as_mut() {
                                 request.fail("stale_parent");

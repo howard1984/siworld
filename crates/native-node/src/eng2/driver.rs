@@ -350,7 +350,7 @@ impl super::network::Owner for Driver {
     }
 }
 
-#[cfg(all(unix, feature = "eng2-runtime"))]
+#[cfg(feature = "eng2-runtime")]
 impl super::transaction_exchange::Owner for Driver {
     fn transaction_ids(&self) -> Vec<Hash> {
         Driver::transaction_ids(self)

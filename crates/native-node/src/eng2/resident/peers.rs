@@ -141,38 +141,16 @@ fn session(
             )
         }
         .map_err(|_| "peer round failed")?;
-        shared.network.round(fingerprint, round.accepted)?;
-        #[cfg(unix)]
-        {
-            let maximum = super::super::runtime_export::host::MAX_CHECKPOINT_PACKET_BYTES;
-            let _phase = shared
-                .budget
-                .reserve(3 * (maximum + 4096))
-                .map_err(|_| "checkpoint control phase budget exhausted")?;
-            let outgoing = shared.mailbox.outgoing()?;
-            let network = shared
-                .owner
-                .lock()
-                .map_err(|_| "resident owner lock poisoned")?
-                .head()?
-                .network;
-            let incoming = if initiator {
-                super::super::checkpoint_exchange::initiate(&mut peer, &outgoing, network)
-            } else {
-                super::super::checkpoint_exchange::respond(&mut peer, &outgoing, network)
-            }
-            .map_err(|_| "checkpoint peer phase failed")?;
-            for item in incoming {
-                shared.mailbox.enqueue(item.message, item.reservation)?;
-            }
-        }
-        #[cfg(unix)]
+        checkpoint_phase(&mut peer, initiator, shared)?;
         if initiator {
             super::super::transaction_exchange::initiate(&mut peer, &shared.owner)
         } else {
             super::super::transaction_exchange::respond(&mut peer, &shared.owner)
         }
         .map_err(|_| "transaction peer phase failed")?;
+        // Only a complete block → checkpoint → transaction round refreshes
+        // networking. A certificate alone can never manufacture readiness.
+        shared.network.round(fingerprint, round.accepted)?;
         if initiator {
             for _ in 0..10 {
                 if shared.cancel.is_cancelled() {
@@ -183,6 +161,81 @@ fn session(
         }
     }
     Ok(())
+}
+fn owner_before<'a>(
+    shared: &'a Shared,
+    deadline: &p2p::Deadline,
+) -> Result<std::sync::MutexGuard<'a, Driver>, String> {
+    loop {
+        deadline
+            .check()
+            .map_err(|_| "checkpoint control phase deadline elapsed")?;
+        match shared.owner.try_lock() {
+            Ok(owner) => {
+                deadline
+                    .check()
+                    .map_err(|_| "checkpoint control phase deadline elapsed")?;
+                return Ok(owner);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(1))
+            }
+            Err(_) => return Err("resident owner lock poisoned".into()),
+        }
+    }
+}
+fn checkpoint_phase(
+    peer: &mut Peer<p2p::NativeTlsChannel>,
+    initiator: bool,
+    shared: &Shared,
+) -> Result<(), String> {
+    use super::super::{
+        checkpoint_exchange,
+        checkpoint_observer::{Error, Outcome},
+    };
+    let deadline = p2p::Deadline::new(checkpoint_exchange::PHASE_TIMEOUT);
+    let maximum = super::super::checkpoint_wire::MAX_CHECKPOINT_PACKET_BYTES;
+    let _phase = shared
+        .budget
+        .reserve(3 * (maximum + 4096))
+        .map_err(|_| "checkpoint control phase budget exhausted")?;
+    #[cfg(unix)]
+    let outgoing = shared.mailbox.outgoing()?;
+    #[cfg(not(unix))]
+    let outgoing = Vec::new();
+    let network = owner_before(shared, &deadline)?.head()?.network;
+    let incoming = if initiator {
+        checkpoint_exchange::initiate_before(peer, &outgoing, network, &deadline)
+    } else {
+        checkpoint_exchange::respond_before(peer, &outgoing, network, &deadline)
+    }
+    .map_err(|_| "checkpoint peer phase failed")?;
+    for item in incoming {
+        let outcome = {
+            // Canonical owner → observer order also protects producer commit:
+            // no block can commit between validating and latching a conflict.
+            let owner = owner_before(shared, &deadline)?;
+            let mut observer = shared
+                .checkpoint_observer
+                .lock()
+                .map_err(|_| "checkpoint observer lock poisoned")?;
+            observer.observe(owner.store(), unix_ms()? / 1000, &item.message)
+        };
+        match outcome {
+            Ok(Outcome::Historical) | Err(Error::Unavailable) => {}
+            Ok(_) => {
+                #[cfg(unix)]
+                shared.mailbox.enqueue(item.message, item.reservation)?;
+            }
+            Err(error) => return Err(error.code().into()),
+        }
+        deadline
+            .check()
+            .map_err(|_| "checkpoint control phase deadline elapsed")?;
+    }
+    deadline
+        .check()
+        .map_err(|_| "checkpoint control phase deadline elapsed".into())
 }
 fn spawn(
     job: Job,

@@ -198,6 +198,7 @@ struct Shared {
     cancel: p2p::Cancellation,
     network: Arc<peers::NetworkStatus>,
     production: Mutex<ProductionStatus>,
+    checkpoint_observer: Mutex<super::checkpoint_observer::Observer>,
     budget: p2p::Budget,
     _pool_charge: p2p::Reservation,
     #[cfg(unix)]
@@ -212,6 +213,16 @@ impl Drop for CancelOnDrop {
     }
 }
 impl Shared {
+    fn checkpoint_conflict(&self) -> Result<bool, String> {
+        Ok(self
+            .checkpoint_observer
+            .lock()
+            .map_err(|_| "checkpoint observer lock poisoned")?
+            .conflicted())
+    }
+    fn mining_ready(&self) -> Result<bool, String> {
+        Ok(self.network.snapshot()?.ready && !self.checkpoint_conflict()?)
+    }
     fn phase(&self, phase: &'static str) -> Result<(), String> {
         self.production
             .lock()
@@ -240,19 +251,27 @@ fn export_status(
         .lock()
         .map_err(|_| "resident status lock poisoned")?;
     let connections = shared.network.snapshot()?;
+    let observer = shared
+        .checkpoint_observer
+        .lock()
+        .map_err(|_| "checkpoint observer lock poisoned")?;
+    let conflict = observer.conflicted();
+    let ready = connections.ready && !conflict;
     service::atomic_json(
         &directory.join(service::STATUS_FILE),
         &json!({
             "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
             "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
             "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
-            "state_available":true,"ready":connections.ready,"sync_status":if connections.ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+            "state_available":true,"ready":ready,"sync_status":if conflict {"checkpoint_current_quorum_conflict"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
             "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
             "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
             "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
             "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
+            "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
+            "checkpoint_observed_height":observer.observed_height(),"checkpoint_conflict":conflict,
             "operations_error":operations_error(shared),
             "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
             "historical_proof_replay":false
@@ -359,6 +378,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             phase: "starting",
             ..Default::default()
         }),
+        checkpoint_observer: Mutex::new(super::checkpoint_observer::Observer::default()),
         budget: budget.clone(),
         _pool_charge: budget
             .reserve(2 * crate::pool::MAX_BYTES)
