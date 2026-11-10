@@ -445,3 +445,5 @@ jobs:
             WALLET_PARITY_OUTPUT="$GITHUB_WORKSPACE/.local/wallet-native-vectors.json" \
             WALLET_PARITY_VAULT="$GITHUB_WORKSPACE/.local/wallet-native-vault.json" \
             node --test crates/native-wallet-web/tests/*.test.mjs
+          node --experimental-vm-modules --test crates/native-wallet-web/offline-receive/protocol.test.mjs crates/native-wallet-web/offline-receive/ui.test.mjs
+          python3 crates/native-wallet-web/offline-receive/prepare_test.py
