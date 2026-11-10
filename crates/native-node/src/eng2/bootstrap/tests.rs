@@ -70,6 +70,7 @@ pub(crate) fn framing_fixture() -> (Genesis, ImportLimits, Manifest) {
     (genesis, limits, manifest)
 }
 /// Deliberately synthetic transport fixture, inaccessible in production builds.
+#[cfg(feature = "eng2-runtime")]
 pub(crate) fn transport_fixture() -> Provider {
     let (_, _, manifest) = framing_fixture();
     let encoded = manifest.encode().unwrap();

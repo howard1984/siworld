@@ -397,6 +397,7 @@ impl Peer<p2p::NativeTlsChannel> {
     }
     /// Retire the authenticated stream before starting a full application cycle
     /// that cannot fit within its unchanged wire, record or lifetime limits.
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn ready_for_cycle(&self) -> bool {
         self.session.ready_for_cycle()
     }
