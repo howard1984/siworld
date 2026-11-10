@@ -7,6 +7,8 @@ use crate::{p2p, wire::Hash};
 pub mod codec;
 use codec::{Context, HEADER_BYTES, ReceiptBlock};
 
+#[cfg(all(test, unix))]
+mod public_fixture;
 #[cfg(test)]
 mod tests;
 
