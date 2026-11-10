@@ -1,7 +1,7 @@
 //! Bounded retained checkpoint messages; authentication and decoding precede enqueue.
 
 use super::*;
-use crate::eng2::runtime_export::host::{Incoming, MAX_MESSAGES_PER_TICK};
+use crate::eng2::checkpoint_wire::{Incoming, MAX_MESSAGES_PER_TICK};
 use std::collections::VecDeque;
 
 const MAX_QUEUED: usize = 24;
@@ -181,7 +181,7 @@ impl CheckpointMailbox {
         if messages.len() > MAX_MESSAGES_PER_TICK {
             return Err("checkpoint outgoing message bound".into());
         }
-        let maximum = super::super::runtime_export::host::MAX_CHECKPOINT_PACKET_BYTES;
+        let maximum = super::super::checkpoint_wire::MAX_CHECKPOINT_PACKET_BYTES;
         let charge = self
             .budget
             .reserve(

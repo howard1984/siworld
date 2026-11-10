@@ -8,6 +8,7 @@ pub mod body;
 pub mod certificate;
 #[cfg(unix)]
 pub mod checkpoint_exchange;
+pub mod checkpoint_wire;
 pub mod commitment;
 #[cfg(feature = "native-p2p")]
 pub mod connector;

@@ -1,7 +1,7 @@
 //! Bounded checkpoint batches after a completed bidirectional block round.
 //! This phase never interrupts a header/body response and never mutates Store.
 use super::{
-    runtime_export::host::{Incoming, MAX_CHECKPOINT_PACKET_BYTES, MAX_MESSAGES_PER_TICK},
+    checkpoint_wire::{Incoming, MAX_CHECKPOINT_PACKET_BYTES, MAX_MESSAGES_PER_TICK},
     transport::Peer,
 };
 use crate::{p2p, wire::Hash};

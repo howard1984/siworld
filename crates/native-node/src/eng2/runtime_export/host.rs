@@ -11,7 +11,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 const KEY_MAGIC: &[u8; 8] = b"SW2KEY01";
 const KEY_BYTES: usize = 8 + 96 + 1 + 32 + 32;
-pub const MAX_MESSAGES_PER_TICK: usize = 3;
+pub use crate::eng2::checkpoint_wire::{
+    Incoming, MAX_CHECKPOINT_PACKET_BYTES, MAX_MESSAGES_PER_TICK, Proposal,
+};
 
 /// Existing synthetic engineering-network key only. This loader has no write
 /// or initialization method, and deliberately does not accept any V1 key file.
@@ -126,23 +128,6 @@ impl ExistingSigner {
         }
         Ok(())
     }
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Proposal {
-    pub statement: Statement,
-    pub witness: AuthorizationWitness,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Incoming {
-    Proposal(Proposal),
-    Vote {
-        statement: Statement,
-        vote: Box<Vote>,
-    },
-    Certified {
-        certificate: Box<Certificate>,
-        witness: AuthorizationWitness,
-    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alarm {
@@ -264,7 +249,7 @@ impl Host {
                         self.limits
                             .chain
                             .max_component_bytes
-                            .min(codec::MAX_GOVERNANCE_BYTES),
+                            .min(crate::eng2::checkpoint_wire::MAX_GOVERNANCE_BYTES),
                     )
                     .map_err(|_| "eng2 incoming checkpoint witness exceeds bounds")?;
             }
@@ -509,4 +494,3 @@ impl Host {
 mod tests;
 
 mod codec;
-pub use codec::MAX_CHECKPOINT_PACKET_BYTES;
