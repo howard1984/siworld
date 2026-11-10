@@ -227,13 +227,13 @@ mod tests {
             .unwrap()
             .address()
     }
-    fn governance(network: Hash, destination: PaymentAddress) -> GovernanceState {
+    fn genesis_governance(network: Hash, destination: PaymentAddress) -> GovernanceState {
         let key = |seed| {
             *ml_dsa_65::generate_key_pair([seed; 32])
                 .verification_key
                 .as_ref()
         };
-        let mut state = GovernanceState::new(
+        GovernanceState::new(
             network,
             key(1),
             key(2),
@@ -241,7 +241,10 @@ mod tests {
             address(network, 31),
             vec![destination, address(network, 32)],
         )
-        .unwrap();
+        .unwrap()
+    }
+    fn governance(network: Hash, destination: PaymentAddress) -> GovernanceState {
+        let mut state = genesis_governance(network, destination);
         state.apply_block(1, &[]).unwrap();
         state
     }
@@ -312,6 +315,214 @@ mod tests {
     }
     fn signed(network: Hash, destination: &PaymentAddress) -> PublicFundClaim {
         signed_with_context(network, destination, EncryptionContext::new(network))
+    }
+
+    fn signed_governance(
+        network: Hash,
+        sequence: u64,
+        kind: crate::eng2_governance::ActionKind,
+        role: crate::eng2_governance::SignerRole,
+    ) -> crate::eng2_governance::SignedAction {
+        use crate::eng2_governance::{self, Action, Authorization, SignedAction, SignerRole};
+        let action = Action {
+            network,
+            sequence,
+            kind,
+        };
+        let seed = match role {
+            SignerRole::Founder => 1,
+            SignerRole::Revocation => 2,
+            _ => panic!("fixture supports only destination owner roles"),
+        };
+        let signature = *ml_dsa_65::sign(
+            &ml_dsa_65::generate_key_pair([seed; 32]).signing_key,
+            &action.signing_bytes(role).unwrap(),
+            eng2_governance::SIGNATURE_CONTEXT,
+            [20; 32],
+        )
+        .unwrap()
+        .as_ref();
+        SignedAction {
+            action,
+            signatures: vec![Authorization { role, signature }],
+        }
+    }
+
+    fn claim_payment(claim: &PublicFundClaim) -> PaymentCiphertext {
+        let bytes = &claim.spend.ciphertext;
+        PaymentCiphertext {
+            kem_ciphertext: bytes[..1088].try_into().unwrap(),
+            body: bytes[1088..1296].try_into().unwrap(),
+            tag: bytes[1296..1312].try_into().unwrap(),
+            view_tag: bytes[1312],
+        }
+    }
+
+    #[test]
+    fn fund_recipient_rotation_preserves_entitlement_counters_and_immutable_authority() {
+        use crate::{
+            eng2_fund::FundLedger,
+            eng2_governance::{self, ActionKind, DestinationTarget, SignerRole},
+            wallet_crypto::RecoverableViewKey,
+        };
+        // Synthetic zero-subsidy intervening heights exercise the real governance,
+        // fund ledger and claim capabilities without proofs or network execution.
+        let network = [1; 32];
+        let config = Config::development(network, 0).unwrap();
+        let authority = config.fund_verifying_keys[0];
+        let owner = address(network, 40).owner();
+        let old_view =
+            RecoverableViewKey::from_seed(owner, zeroize::Zeroizing::new([70; 64])).unwrap();
+        let new_view =
+            RecoverableViewKey::from_seed(owner, zeroize::Zeroizing::new([71; 64])).unwrap();
+        let old = old_view.address();
+        let new = new_view.address();
+        assert_eq!(old.owner(), new.owner());
+        assert_ne!(old.encapsulation_key(), new.encapsulation_key());
+        let mut governance = genesis_governance(network, old.clone());
+        let allocation = config.fund_allocation.clone().unwrap();
+        let mut ledger = FundLedger::new(network, allocation.clone()).unwrap();
+        let mut address_bytes = [0; eng2_governance::ADDRESS_BYTES];
+        address_bytes[..48].copy_from_slice(&encode_digest(&new.owner()));
+        address_bytes[48..].copy_from_slice(new.encapsulation_key());
+        let proposal = signed_governance(
+            network,
+            1,
+            ActionKind::ProposeDestination {
+                target: DestinationTarget::FundMember(0),
+                address: Box::new(address_bytes),
+            },
+            SignerRole::Founder,
+        );
+        let inclusion = governance.apply_block(1, &[proposal]).unwrap();
+        assert_eq!(inclusion.len(), 1);
+        assert_eq!(inclusion[0].included_height, 1);
+        assert_eq!(inclusion[0].effective_height, 4033);
+        ledger.advance(1, 2020).unwrap();
+        let context = EncryptionContext::new(network);
+        for height in 2..=4031 {
+            governance.apply_block(height, &[]).unwrap();
+            ledger.advance(height, 0).unwrap();
+            if height == 25 {
+                let claim = signed_at(network, &old, context, height, 0, 17);
+                AuthorizedFundClaim::verify(&claim, &config, &governance, height)
+                    .unwrap()
+                    .debit(&mut ledger)
+                    .unwrap();
+                let recovered = old_view
+                    .decrypt_payment(
+                        &native::codec::decode_digest(&claim.spend.commitment).unwrap(),
+                        &claim_payment(&claim),
+                        &context,
+                    )
+                    .unwrap();
+                assert_eq!(recovered.value, 17);
+                let commitment = Hasher::new().note_cm(&recovered);
+                assert_eq!(encode_digest(&commitment), claim.spend.commitment);
+                assert!(
+                    new_view
+                        .decrypt_payment(&commitment, &claim_payment(&claim), &context)
+                        .is_err()
+                );
+            }
+        }
+        let mut canceled = governance.clone();
+        let cancel = signed_governance(
+            network,
+            2,
+            ActionKind::CancelDestination {
+                proposal_sequence: 1,
+            },
+            SignerRole::Revocation,
+        );
+        canceled
+            .apply_block(4032, std::slice::from_ref(&cancel))
+            .unwrap();
+        canceled.apply_block(4033, &[]).unwrap();
+        assert_eq!(canceled.active_fund_destination(0).unwrap(), &old);
+        governance.apply_block(4032, &[]).unwrap();
+        ledger.advance(4032, 0).unwrap();
+        assert_eq!(governance.active_fund_destination(0).unwrap(), &old);
+        let before = ledger.balance(0).unwrap();
+        assert_eq!(before.entitlement, 101);
+        assert_eq!(before.direct_unlocked, 50);
+        assert_eq!(before.vesting_unlocked, 0);
+        assert_eq!(before.spent, 17);
+        assert_eq!(before.spend_count, 1);
+        assert_eq!(before.available().unwrap(), 33);
+        let other_member = ledger.balance(1).unwrap();
+        let total = ledger.total_entitlement();
+        let old_claim = signed_at(network, &old, context, 4032, 1, 19);
+        assert!(AuthorizedFundClaim::verify(&old_claim, &config, &governance, 4032).is_ok());
+        let early = signed_at(network, &new, context, 4032, 1, 19);
+        assert!(AuthorizedFundClaim::verify(&early, &config, &governance, 4032).is_err());
+        let pending = governance.clone();
+        assert!(governance.apply_block(4033, &[cancel]).is_err());
+        assert_eq!(governance, pending);
+        governance.apply_block(4033, &[]).unwrap();
+        ledger.advance(4033, 0).unwrap();
+        assert_eq!(governance.active_fund_destination(0).unwrap(), &new);
+        assert_eq!(ledger.balance(0).unwrap(), before);
+        assert_eq!(ledger.balance(1).unwrap(), other_member);
+        assert_eq!(ledger.total_entitlement(), total);
+        assert_eq!(config.fund_verifying_keys[0], authority);
+        let restored_ledger = FundLedger::decode_component(
+            &ledger.canonical_component_bytes().unwrap(),
+            network,
+            &allocation,
+        )
+        .unwrap();
+        assert_eq!(restored_ledger, ledger);
+        ledger = restored_ledger;
+        let restored_governance = GovernanceState::decode_component(
+            &governance.canonical_component_bytes().unwrap(),
+            network,
+        )
+        .unwrap();
+        assert_eq!(restored_governance, governance);
+        let governance = restored_governance;
+        let old_claim = signed_at(network, &old, context, 4033, 1, 19);
+        assert!(AuthorizedFundClaim::verify(&old_claim, &config, &governance, 4033).is_err());
+        assert!(AuthorizedFundClaim::verify(&old_claim, &config, &canceled, 4033).is_ok());
+        let claim = signed_at(network, &new, context, 4033, 1, 19);
+        assert_eq!(claim.spend.verifying_key, authority);
+        assert!(AuthorizedFundClaim::verify(&claim, &config, &canceled, 4033).is_err());
+        let mut wrong_authority = claim.clone();
+        resign(&mut wrong_authority, 84);
+        assert!(AuthorizedFundClaim::verify(&wrong_authority, &config, &governance, 4033).is_err());
+        assert_eq!(ledger.balance(0).unwrap(), before);
+        let output = AuthorizedFundClaim::verify(&claim, &config, &governance, 4033)
+            .unwrap()
+            .debit(&mut ledger)
+            .unwrap();
+        assert_eq!(output.ciphertext(), &claim.spend.ciphertext);
+        let recovered = new_view
+            .decrypt_payment(&output.commitment(), &claim_payment(&claim), &context)
+            .unwrap();
+        assert_eq!(recovered.value, 19);
+        assert_eq!(recovered.owner, new.owner());
+        assert!(
+            old_view
+                .decrypt_payment(&output.commitment(), &claim_payment(&claim), &context)
+                .is_err()
+        );
+        let after = ledger.balance(0).unwrap();
+        assert_eq!(after.entitlement, before.entitlement);
+        assert_eq!(after.direct_unlocked, before.direct_unlocked);
+        assert_eq!(after.vesting_unlocked, before.vesting_unlocked);
+        assert_eq!(after.spent, 36);
+        assert_eq!(after.spend_count, 2);
+        assert_eq!(after.available().unwrap(), 14);
+        assert_eq!(ledger.balance(1).unwrap(), other_member);
+        assert_eq!(ledger.total_entitlement(), total);
+        let after = ledger.clone();
+        assert!(
+            AuthorizedFundClaim::verify(&claim, &config, &governance, 4033)
+                .unwrap()
+                .debit(&mut ledger)
+                .is_err()
+        );
+        assert_eq!(ledger, after);
     }
 
     #[test]
