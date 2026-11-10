@@ -39,6 +39,7 @@ pub mod local {
 pub mod commitment;
 pub mod compact;
 pub mod eng2_history;
+pub mod eng2_light;
 pub mod history;
 pub mod light;
 pub mod ranges;

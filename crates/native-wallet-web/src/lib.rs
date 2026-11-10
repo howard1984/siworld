@@ -154,6 +154,8 @@ pub struct BrowserWallet {
     challenge: Option<[usize; 3]>,
     light: Option<engine::light::LightWallet>,
     candidate: Option<engine::light::LightWallet>,
+    eng2: Option<engine::eng2_light::Eng2LightState>,
+    eng2_candidate: Option<engine::eng2_light::Eng2LightState>,
 }
 #[wasm_bindgen]
 impl BrowserWallet {
@@ -163,6 +165,8 @@ impl BrowserWallet {
             challenge: Some(vault::challenge().map_err(js)?),
             light: None,
             candidate: None,
+            eng2: None,
+            eng2_candidate: None,
         })
     }
     pub fn restore(
@@ -180,6 +184,8 @@ impl BrowserWallet {
             challenge: None,
             light: None,
             candidate: None,
+            eng2: None,
+            eng2_candidate: None,
         })
     }
     pub fn unlock(
@@ -194,6 +200,8 @@ impl BrowserWallet {
             challenge: None,
             light: None,
             candidate: None,
+            eng2: None,
+            eng2_candidate: None,
         })
     }
     pub fn recovery_words(&self) -> Result<String, JsValue> {
@@ -268,6 +276,8 @@ impl BrowserWallet {
             challenge: None,
             light: None,
             candidate: None,
+            eng2: None,
+            eng2_candidate: None,
         })
     }
 
@@ -309,6 +319,11 @@ impl BrowserWallet {
     }
 
     pub fn enable_light(&mut self, rules_hex: &str, genesis: &str) -> Result<String, JsValue> {
+        if self.eng2.is_some() {
+            return Err(js(
+                "Engineering-v2 sessions cannot use legacy light sync.".into()
+            ));
+        }
         if self.challenge.is_some() {
             return Err(js("Confirm your recovery backup first.".into()));
         }
@@ -561,6 +576,11 @@ impl BrowserWallet {
         genesis: &str,
         bytes: &[u8],
     ) -> Result<String, JsValue> {
+        if self.eng2.is_some() {
+            return Err(js(
+                "Engineering-v2 sessions cannot restore a legacy cache.".into()
+            ));
+        }
         let config = history_config(rules_hex, genesis)?;
         if self.challenge.is_some()
             || config.network != self.material.network
@@ -589,6 +609,213 @@ impl BrowserWallet {
         .map_err(js)?;
         self.light = Some(restored);
         self.light_balance()
+    }
+    /// Explicit native-header profile, independent of legacy compact sync.
+    pub fn enable_eng2(&mut self, genesis: &[u8], expected: &str) -> Result<String, JsValue> {
+        if self.challenge.is_some() || self.light.is_some() || self.candidate.is_some() {
+            return Err(js(
+                "A fresh confirmed wallet session is required for eng2 sync.".into(),
+            ));
+        }
+        let state = engine::eng2_light::Eng2LightState::new(
+            genesis,
+            wallet_core::hex_array::<32>(expected).map_err(js)?,
+            Zeroizing::new(*self.material.entropy),
+            self.material.account,
+        )
+        .map_err(js)?;
+        if state.context().config().network != self.material.network
+            || state.context().config().fixture && !cfg!(feature = "browser-fixtures")
+        {
+            return Err(js(
+                "Engineering-v2 wallet network or fixture policy differs.".into(),
+            ));
+        }
+        self.eng2 = Some(state);
+        self.eng2_candidate = None;
+        self.eng2_balance()
+    }
+    pub fn begin_eng2_candidate(&mut self, extension: bool) -> Result<(), JsValue> {
+        let state = self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        self.eng2_candidate = Some(
+            if extension {
+                state.fork(
+                    Zeroizing::new(*self.material.entropy),
+                    self.material.account,
+                )
+            } else {
+                state.fresh(
+                    Zeroizing::new(*self.material.entropy),
+                    self.material.account,
+                )
+            }
+            .map_err(js)?,
+        );
+        Ok(())
+    }
+    /// Decode bounded public header pages. Each header still requires complete
+    /// work verification when its body-authenticated receipt is applied.
+    pub fn eng2_header_page(
+        &self,
+        bytes: &[u8],
+        height: &str,
+        tip: &str,
+    ) -> Result<String, JsValue> {
+        let state = self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        let page = engine::eng2_history::HeaderPage::decode(
+            state.context(),
+            (
+                height
+                    .parse()
+                    .map_err(|_| js("Invalid eng2 head height.".into()))?,
+                wallet_core::hex_array::<32>(tip).map_err(js)?,
+            ),
+            bytes,
+        )
+        .map_err(js)?;
+        let headers = page.headers.iter().map(|header| Ok(json!({"height":header.height,"id":hex(&header.id().map_err(|_| js("Invalid eng2 header identity.".into()))?),"parent":hex(&header.parent),"bytes_hex":hex(&header.encode().map_err(|_| js("Invalid eng2 header encoding.".into()))?)}))).collect::<Result<Vec<_>, JsValue>>()?;
+        Ok(json!({"height":page.accepted_height,"tip":hex(&page.accepted_tip),"from":page.from,"headers":headers}).to_string())
+    }
+    pub fn append_eng2_receipt(
+        &mut self,
+        header: &[u8],
+        receipt: &[u8],
+    ) -> Result<String, JsValue> {
+        let state = self
+            .eng2_candidate
+            .as_mut()
+            .ok_or_else(|| js("No eng2 synchronization candidate.".into()))?;
+        state.append(header, receipt).map_err(js)?;
+        // Candidate note balances never cross the worker boundary as final.
+        Ok(json!({"height":state.height(),"tip":hex(&state.tip()),"committed":false}).to_string())
+    }
+    pub fn check_eng2_candidate(&self, height: &str, tip: &str) -> Result<(), JsValue> {
+        let state = self
+            .eng2_candidate
+            .as_ref()
+            .ok_or_else(|| js("No eng2 synchronization candidate.".into()))?;
+        state
+            .check_head(
+                height
+                    .parse()
+                    .map_err(|_| js("Invalid eng2 head height.".into()))?,
+                wallet_core::hex_array::<32>(tip).map_err(js)?,
+                self.eng2.as_ref(),
+            )
+            .map_err(js)
+    }
+    pub fn commit_eng2_candidate(&mut self, height: &str, tip: &str) -> Result<String, JsValue> {
+        self.check_eng2_candidate(height, tip)?;
+        self.eng2 = self.eng2_candidate.take();
+        self.eng2_balance()
+    }
+    pub fn abort_eng2_candidate(&mut self) {
+        self.eng2_candidate = None;
+    }
+    pub fn eng2_balance(&self) -> Result<String, JsValue> {
+        self.eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .balance_json()
+            .map_err(js)
+    }
+    pub fn eng2_history(&self) -> Result<String, JsValue> {
+        Ok(self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .history_json())
+    }
+    pub fn eng2_cache(&self, candidate: bool) -> Result<Vec<u8>, JsValue> {
+        let state = if candidate {
+            &self.eng2_candidate
+        } else {
+            &self.eng2
+        };
+        let plain = state
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 scan state unavailable.".into()))?
+            .local_cache()
+            .map_err(js)?;
+        self.seal_private(
+            &plain,
+            b"SWE2SC01",
+            "siworld eng2 browser local scan cache key v1",
+            64 * 1024 * 1024,
+        )
+    }
+    pub fn restore_eng2_cache(
+        &mut self,
+        genesis: &[u8],
+        expected: &str,
+        bytes: &[u8],
+    ) -> Result<String, JsValue> {
+        if self.challenge.is_some()
+            || self.light.is_some()
+            || self.candidate.is_some()
+            || self.eng2_candidate.is_some()
+            || self
+                .eng2
+                .as_ref()
+                .is_some_and(|state| state.height() != 0 || !state.wallet().receipts().is_empty())
+        {
+            return Err(js(
+                "A fresh eng2 session is required for local scan restoration.".into(),
+            ));
+        }
+        let plain = self.open_private(
+            bytes,
+            b"SWE2SC01",
+            "siworld eng2 browser local scan cache key v1",
+            64 * 1024 * 1024,
+        )?;
+        let restored = engine::eng2_light::Eng2LightState::open_local(
+            genesis,
+            wallet_core::hex_array::<32>(expected).map_err(js)?,
+            Zeroizing::new(*self.material.entropy),
+            self.material.account,
+            &plain,
+        )
+        .map_err(js)?;
+        if restored.context().config().network != self.material.network
+            || restored.context().config().fixture && !cfg!(feature = "browser-fixtures")
+        {
+            return Err(js(
+                "Engineering-v2 cache network or fixture policy differs.".into(),
+            ));
+        }
+        self.eng2 = Some(restored);
+        self.eng2_balance()
+    }
+    pub fn protect_eng2_local(&self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        if self.eng2.is_none() {
+            return Err(js("Engineering-v2 sync is not initialized.".into()));
+        }
+        self.seal_private(
+            bytes,
+            b"SWE2JL01",
+            "siworld eng2 browser local journal key v1",
+            2_000_000,
+        )
+    }
+    pub fn open_eng2_local(&self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+        if self.eng2.is_none() {
+            return Err(js("Engineering-v2 sync is not initialized.".into()));
+        }
+        Ok(self
+            .open_private(
+                bytes,
+                b"SWE2JL01",
+                "siworld eng2 browser local journal key v1",
+                2_000_000,
+            )?
+            .to_vec())
     }
 }
 
