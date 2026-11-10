@@ -109,6 +109,10 @@ cursor advances over durable completed objects without rescanning the entire
 prefix on every chunk. Resuming a candidate scans its stored header prefix once;
 that prefix must be contiguous. Download completion grants no accepted Store.
 Native signed verification and checked installation remain mandatory. The
+client closes a durably installed candidate and authenticates a canonical
+reopen, comparing selected head, work, header and imported prefix before it
+returns a usable Store. A failure after admission returns only
+`DurabilityUnconfirmed`; it cannot invite an overwrite or automatic retry. The
 result separates logical verification bytes and local cache rereads; encrypted
 stream volume must still be obtained from the session counters. Public launch
 commands and mining-readiness attachment are not supplied by this library.

@@ -12,6 +12,7 @@ use crate::{
         import::{self, Installation},
         network::{BootstrapPull, Error},
         selection::{HeaderRules, VerifiedHeaders},
+        store::Store,
         transport::ChunkRequest,
     },
     wire::Hash,
@@ -289,9 +290,9 @@ impl Client {
         self.advance().map_err(Error::Owner)?;
         self.progress().map_err(Error::Owner)
     }
-    /// A successful result is the existing platform install capability, not a
-    /// readiness claim. Caller must require Durable, sealed reopen and catchup
-    /// before attaching the Store or starting mining. Errors preserve quarantine.
+    /// Durable success additionally requires authenticated canonical reopen.
+    /// This grants no network readiness; the caller must catch up through the
+    /// normal native round before attaching mining. Errors preserve quarantine.
     pub fn verify_and_install(
         mut self,
         genesis: &Genesis,
@@ -333,6 +334,41 @@ impl Client {
                 verified.install(directory, &mut source, canceled)?,
                 verification_bytes,
             )
+        };
+        // Installation has crossed the no-replace boundary. A failed reopen is
+        // never a retryable input error or permission to replace canonical data.
+        let installation = match installation {
+            Installation::DurabilityUnconfirmed => Installation::DurabilityUnconfirmed,
+            Installation::Durable(store) => {
+                drop(store);
+                let reopened = (|| {
+                    let store = Store::resume_existing(
+                        &directory.join("chain.redb"),
+                        Genesis::decode(&genesis_bytes)?,
+                        self.candidate.import_policy.state.chain,
+                    )?;
+                    let pin = self.plan.pin();
+                    let state = store.engine().state();
+                    let expected = self
+                        .plan
+                        .headers()
+                        .header(pin.tip_height)
+                        .ok_or("bootstrap selected final header unavailable")?;
+                    if state.height() != pin.tip_height
+                        || state.tip() != pin.tip_id
+                        || state.chain().cumulative_work != pin.cumulative_work
+                        || store.header(pin.tip_height)? != *expected
+                        || store.imported_checkpoint_height() != Some(pin.anchor_height)
+                    {
+                        return Err("bootstrap authenticated reopened state differs".to_owned());
+                    }
+                    Ok(store)
+                })();
+                match reopened {
+                    Ok(store) => Installation::Durable(Box::new(store)),
+                    Err(_) => Installation::DurabilityUnconfirmed,
+                }
+            }
         };
         Ok(Admission {
             installation,
