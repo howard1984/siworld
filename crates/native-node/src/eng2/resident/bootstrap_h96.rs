@@ -778,9 +778,8 @@ fn qualification() -> Result<(), String> {
             .checked_add(counts.sessions)
             .ok_or("fixture total sessions overflow")?;
     }
-    let report = json!({"version":1,"scope":"owner-local-static-h96-provider-through-cli-signed-bootstrap","source_commit":source_commit,"binary_sha256":binary_hash,
-        "accepted_source_result_sha256":expected_result,"accepted_original_database_sha256":source_before,"accepted_semantic_audit_sha256":semantic_audit_sha256,
-        "provider_public_database_copy":provider_copy,"provider_working_database_sha256_after_close":digest(&provider_database,16*1024*1024*1024)?,
+    let mut report = json!({"version":1,"scope":"owner-local-static-h96-provider-through-cli-signed-bootstrap","source_commit":source_commit,"binary_sha256":binary_hash,
+        "accepted_source_result_sha256":expected_result,
         "fee_mode":"legacy-miner","independent_signer_custody":false,"accepted_height":96,"checkpoint_height":72,"elapsed_ms":started.elapsed().as_millis().to_string(),
         "interrupted_acquisition_ms":first_ms.to_string(),"interrupted_acquisition":metrics(&first_counts)?,"corrupt_acquisition":metrics(&negative_counts)?,"resumed_acquisition":metrics(&final_counts)?,
         "cli_admission":accepted,"native_catchup_encrypted_received_bytes":catchup_bytes.0.to_string(),"native_catchup_encrypted_sent_bytes":catchup_bytes.1.to_string(),"provider":server_metrics,
@@ -789,6 +788,11 @@ fn qualification() -> Result<(), String> {
         "directory_logical_bytes":size.0.to_string(),"directory_allocated_bytes":size.1.to_string(),"directory_measured_before_report":true,"launch_free_disk_bytes":launch_disk.to_string(),"before_native_import_free_disk_bytes":before_import_disk.map(|n|n.to_string()),
         "public_wallet_aggregates":public_aggregates,"checks":{"interrupted_resume":"passed","copied_corruption":"rejected_before_canonical_admission","native_tail":"passed","authenticated_reopen":"passed","all_state_components":"equal","wallet_headers_and_receipts":"equal","normal_native_catchup_round":"passed","ready_and_mining_before_catchup":false,"source_database_unchanged":true},
         "new_test_identities":2,"proof_generation":false,"remaining_gates":["moving-chain retained-offer rollover","independent deployed custody","final confidential genesis","Windows real machine","pruning/compaction","long-offline recovery"]});
+    report["accepted_original_database_sha256"] = json!(source_before);
+    report["accepted_semantic_audit_sha256"] = json!(semantic_audit_sha256);
+    report["provider_public_database_copy"] = provider_copy;
+    report["provider_working_database_sha256_after_close"] =
+        json!(digest(&provider_database, 16 * 1024 * 1024 * 1024)?);
     write(
         &destination.join("encrypted-cli-result.json"),
         &serde_json::to_vec(&report).map_err(|_| "encrypted fixture result encoding failed")?,
