@@ -2,8 +2,10 @@
 
 `siworld-eng2-node` is an explicitly selected engineering entry point. Building
 it requires the owner-operated `eng2-runtime` feature. Development workflows do
-not enable this feature or execute this binary. The resident checkpoint adapter
-currently requires Unix; this entry point does not establish Windows support.
+not enable this feature or execute this binary. Unix supports resident service
+roles. The Windows runtime boundary permits only an outbound miner opened from
+a durable authenticated signed import; Windows package and real-machine
+qualification remain separate requirements.
 
 ## Explicit state and identity
 
@@ -51,6 +53,77 @@ bounded backoff. A live connection alone does not establish readiness: a fresh
 completed bidirectional round must also show that the selected peer's available
 extension was exhausted. An exact full batch requires another round. Readiness
 expires after 30 seconds without a completed round and is revoked on disconnect.
+
+## Explicit signed bootstrap
+
+`bootstrap-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID`
+acquires a signed checkpoint and its complete native proof tail before creating
+canonical state. `resume-signed` uses the same arguments and explicitly reopens
+an existing quarantine. Both commands require an already prepared identity and
+one through four independently pinned service destinations. They use the open
+miner ingress and complete its encrypted hybrid authentication; service
+operators do not register individual miners. The configuration must select
+`miner`, with no listener and no checkpoint signing key. Neither command starts
+mining or creates keys.
+
+The policy file is a bounded regular file with exactly these six fields:
+
+```json
+{
+  "version": 1,
+  "work_floor": "1",
+  "max_headers": 1000,
+  "max_payload_bytes": "2147483648",
+  "max_rounds": 1000,
+  "max_seconds": 3600
+}
+```
+
+These values illustrate the encoding; they are not deployment defaults or a
+recommended work floor. `work_floor` must be an independently selected nonzero
+canonical decimal 512-bit accumulated-work value. `max_payload_bytes` is also a
+canonical decimal string, between 1 and 512 GiB inclusive. Complete header caps
+range from 96 through 1,000,000; round caps from 1 through 1,000,000; elapsed caps
+from 1 through 36,000 seconds. Each ordinary/checkpoint/transaction round counts
+against the shared operation budget. Deadline cancellation reaches the owned
+connection and is checked by the native importer between verification steps;
+synchronous proof verification is not preemptible.
+
+The logical payload cap is divided equally among configured destinations.
+Each candidate's complete header bytes and snapshot are checked before creating
+or reopening quarantine storage; accepted receipt and proof-body chunks remain
+under that candidate's cumulative cap. This bounds logical cached payload, not
+redb physical allocation, process memory, or packet-wire bytes. Operators must
+separately provision space for database overhead, native import and canonical
+installation. Candidate directories remain separate and bind the exact
+manifest, limits and received chunk hashes. Resume rejects a changed offer or
+policy rather than replacing previous bytes. A new bootstrap refuses an
+existing quarantine; both commands refuse an existing canonical or unadmitted
+import database. A failed admission with unconfirmed durability requires
+preserving the directory for inspection, not retrying over it.
+
+Every candidate supplies complete work-verified headers before selection. The
+client compares only the supplied candidate set, rejects equal-work conflicting
+heads and applies the explicit work floor. This does not prove that an unknown
+fork has less work. After selection, the client downloads the state snapshot,
+permanent receipts and the complete native proof tail, verifies the signed
+checkpoint and state transitions, then installs and authenticates a canonical
+reopen. Quarantine headers alone never establish readiness.
+
+Successful output reports `ready: false` and `mining_started: false`, together
+with the admitted height, checkpoint height, verification/reread bytes and
+elapsed time. Encrypted byte counters sum all candidate sessions in that
+invocation, including their hybrid handshakes and framing; they exclude prior
+resume invocations and packet-wire overhead. A subsequent explicit `run`
+requires ordinary native peer catch-up before readiness or proving. On Windows,
+`run` rejects listener, service and checkpoint-signing roles, and refuses a
+store without an authenticated positive checkpoint import boundary. No command
+falls back to the earlier network, initializes an identity or treats an
+unadmitted quarantine as live state.
+
+The encrypted height-96 native-tail transfer and Windows real-machine execution
+remain qualification gates. Source availability and cross-target type checking
+do not establish those results.
 
 ## Production and exports
 
@@ -127,5 +200,5 @@ This does not establish production deployment, a signed checkpoint at height 72
 with 24 confirmations, public-operation inclusion, a usable wallet transaction
 adapter, or fresh-node recovery after pruning. Those require separate
 owner-operated measurements. Unknown competing forks are rejected by this
-linear extension transport; it does not implement automatic snapshot selection
-or reorganization.
+linear extension transport; it does not implement automatic discovery of
+unknown competing forks or reorganization.

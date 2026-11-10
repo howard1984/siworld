@@ -3,7 +3,7 @@
 use siworld_native_node::{eng2::resident, service};
 use std::path::Path;
 
-const HELP: &str = "siworld-eng2-node: explicitly selected engineering network\n\ngenesis-id DIRECTORY\nidentity-public DIRECTORY --expected-genesis ID\ninit-store DIRECTORY --expected-genesis ID\nqualify-restart DIRECTORY --expected-genesis ID\nrestart-check DIRECTORY --expected-genesis ID\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT --expected-genesis ID\nconfigure-miner DIRECTORY holder|voyager ADDRESS_FILE --expected-genesis ID\nrun DIRECTORY PEER_CONFIG --expected-genesis ID\nstatus DIRECTORY\nsubmit-operations DIRECTORY PUBLIC_BUNDLE_FILE RUN_ID PARENT NEXT_HEIGHT --expected-genesis ID\noperations-result DIRECTORY RUN_ID\nstop DIRECTORY EXPECTED_RUN_ID\n\nEvery start loads an existing versioned identity and authenticated committed state.\nNo command creates or regenerates identity/checkpoint keys, migrates V1 state, changes genesis, or falls back to historical replay.\nqualify-restart is a separate explicit native audit of an existing unqualified store.\nProduction requires RAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2.\nThe eng2-runtime feature is an owner-operated build and is excluded from CI build features.";
+const HELP: &str = "siworld-eng2-node: explicitly selected engineering network\n\ngenesis-id DIRECTORY\nidentity-public DIRECTORY --expected-genesis ID\ninit-store DIRECTORY --expected-genesis ID\nqualify-restart DIRECTORY --expected-genesis ID\nrestart-check DIRECTORY --expected-genesis ID\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT --expected-genesis ID\nconfigure-miner DIRECTORY holder|voyager ADDRESS_FILE --expected-genesis ID\nbootstrap-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID\nresume-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID\nrun DIRECTORY PEER_CONFIG --expected-genesis ID\nstatus DIRECTORY\nsubmit-operations DIRECTORY PUBLIC_BUNDLE_FILE RUN_ID PARENT NEXT_HEIGHT --expected-genesis ID\noperations-result DIRECTORY RUN_ID\nstop DIRECTORY EXPECTED_RUN_ID\n\nEvery start loads an existing versioned identity and authenticated committed state.\nNo command creates or regenerates identity/checkpoint keys, migrates V1 state, changes genesis, or falls back to historical replay.\nSigned bootstrap is outbound-only, requires existing independent service pins and explicit resource/work policy, and never starts mining.\nWindows run requires a durable signed import and no listener or checkpoint signing key.\nqualify-restart is a separate explicit native audit of an existing unqualified store.\nProduction requires RAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2.\nThe eng2-runtime feature is an owner-operated build and is excluded from CI build features.";
 
 fn run(args: &[String]) -> Result<(), String> {
     let result = match args {
@@ -64,6 +64,18 @@ fn run(args: &[String]) -> Result<(), String> {
         {
             resident::run(Path::new(directory), Path::new(configuration), expected)?;
             return Ok(());
+        }
+        [command, directory, configuration, policy, flag, expected]
+            if (command == "bootstrap-signed" || command == "resume-signed")
+                && flag == "--expected-genesis" =>
+        {
+            resident::bootstrap_signed(
+                Path::new(directory),
+                Path::new(configuration),
+                Path::new(policy),
+                expected,
+                command == "resume-signed",
+            )?
         }
         [command, directory, file, fingerprint, flag, expected]
             if command == "peer-pin" && flag == "--expected-genesis" =>

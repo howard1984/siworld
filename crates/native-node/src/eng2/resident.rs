@@ -19,7 +19,9 @@ use std::{
 #[cfg(any(unix, test))]
 use std::fs;
 
+mod bootstrap;
 mod config;
+pub use bootstrap::bootstrap_signed;
 #[cfg(unix)]
 mod mailbox;
 #[cfg(unix)]
@@ -319,13 +321,40 @@ fn operations_error(shared: &Shared) -> Option<&'static str> {
     }
 }
 
+fn check_windows_configuration(
+    windows: bool,
+    role: p2p::Role,
+    listening: bool,
+    signing: bool,
+) -> Result<(), String> {
+    if windows && (role != p2p::Role::Miner || listening || signing) {
+        return Err(
+            "Windows resident requires an outbound-only miner without checkpoint signing".into(),
+        );
+    }
+    Ok(())
+}
+fn check_windows_admission(windows: bool, imported: Option<u64>) -> Result<(), String> {
+    if windows
+        && !imported.is_some_and(|height| {
+            height > 0 && height.is_multiple_of(super::runtime_export::CHECKPOINT_INTERVAL)
+        })
+    {
+        return Err(
+            "Windows resident requires a durably imported and authenticated signed checkpoint"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(), String> {
     if std::env::var_os("GITHUB_ACTIONS").is_some()
         || matches!(std::env::var("CI").as_deref(), Ok("true") | Ok("1"))
     {
         return Err("native resident execution requires an owner-operated environment".into());
     }
-    if !cfg!(unix) {
+    if !cfg!(any(unix, windows)) {
         return Err(
             "versioned resident checkpoint transport is not available on this platform".into(),
         );
@@ -337,8 +366,15 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             .map_err(|_| "existing versioned identity unavailable; keys are never regenerated")?,
     );
     let config = config::Configuration::load(directory, configuration, &genesis, &identity)?;
+    check_windows_configuration(
+        cfg!(windows),
+        config.role,
+        config.listen.is_some(),
+        config.checkpoint_key.is_some(),
+    )?;
     let mining = config.mining;
     let listening = config.listen.is_some();
+    #[cfg(unix)]
     let bootstrap_service = matches!(config.role, p2p::Role::Bootstrap | p2p::Role::Validator);
     if mining
         && (std::env::var("RAYON_NUM_THREADS").ok().as_deref() != Some("4")
@@ -357,6 +393,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         Genesis::decode(&genesis.encode()?)?,
         limits().chain,
     )?;
+    check_windows_admission(cfg!(windows), store.imported_checkpoint_height())?;
     let driver = Driver::new(store, NativeVerifier::new()?, limits())?;
     let budget = p2p::Budget::new(MEMORY_BYTES);
     let run = service::RunIdentity::new(
