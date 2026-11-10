@@ -253,6 +253,33 @@ impl Store {
         let directory = path.parent().ok_or("restart parent directory missing")?;
         let identity = crate::identity::NativeIdentity::load(directory, &genesis.peer_binding())
             .map_err(|_| "existing versioned restart identity unavailable")?;
+        Self::resume_with_loaded_identity(path, genesis, limits, identity)
+    }
+    /// Resume only an owner-local public database copy under the already loaded
+    /// fixture identity. Custody remains in its original private directory.
+    #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+    pub(crate) fn resume_qualification_copy(
+        path: &Path,
+        genesis: Genesis,
+        limits: Limits,
+        identity: crate::identity::NativeIdentity,
+    ) -> Result<Self, String> {
+        Self::resume_with_loaded_identity(path, genesis, limits, identity)
+    }
+    fn resume_with_loaded_identity(
+        path: &Path,
+        genesis: Genesis,
+        limits: Limits,
+        identity: crate::identity::NativeIdentity,
+    ) -> Result<Self, String> {
+        if identity
+            .descriptor()
+            .map_err(|_| "versioned restart identity descriptor unavailable")?
+            .binding()
+            != genesis.peer_binding()
+        {
+            return Err("versioned restart identity binding differs".into());
+        }
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|_| "existing versioned restart database unavailable")?;
         if !metadata.file_type().is_file() || metadata.len() == 0 {

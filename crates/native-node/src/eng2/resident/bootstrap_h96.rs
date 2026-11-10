@@ -44,6 +44,54 @@ fn digest(path: &Path, maximum: usize) -> Result<String, String> {
     }
     Ok(crate::local::hex(&hash.finalize()))
 }
+fn copy_public_database(source: &Path, destination: &Path) -> Result<Value, String> {
+    use std::io::Write;
+    let started = Instant::now();
+    let mut input = crate::local::regular_read(source, true, 16 * 1024 * 1024 * 1024)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(destination)
+        .map_err(|_| "new provider public database copy unavailable")?;
+    let mut hash = Sha256::new();
+    let mut copied = 0u64;
+    let mut buffer = [0; 65536];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|_| "provider public database copy read failed")?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|_| "provider public database copy write failed")?;
+        hash.update(&buffer[..count]);
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or("provider public database copy size overflow")?;
+    }
+    output
+        .sync_all()
+        .map_err(|_| "provider public database copy durability failed")?;
+    drop(output);
+    std::fs::File::open(destination.parent().ok_or("provider copy parent missing")?)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|_| "provider public database copy directory durability failed")?;
+    let metadata = destination
+        .symlink_metadata()
+        .map_err(|_| "provider public database copy metadata failed")?;
+    if metadata.len() != copied {
+        return Err("provider public database copy length differs".into());
+    }
+    Ok(
+        json!({"copied_public_file_bytes":copied.to_string(),"initial_logical_bytes":metadata.len().to_string(),
+        "initial_allocated_bytes":(metadata.blocks()*512).to_string(),"elapsed_ms":started.elapsed().as_millis().to_string(),
+        "sha256":crate::local::hex(&hash.finalize()),"custody_copied":false}),
+    )
+}
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let mut output = std::fs::OpenOptions::new()
@@ -461,13 +509,45 @@ fn qualification() -> Result<(), String> {
     let source_directory = source.join("admitted-target");
     let database = source_directory.join("chain.redb");
     let source_before = digest(&database, 16 * 1024 * 1024 * 1024)?;
+    if std::env::var("SIWORLD_ENG2_SOURCE_DATABASE_SHA256").as_deref() != Ok(source_before.as_str())
+    {
+        return Err("reviewed original public database hash differs".into());
+    }
+    let semantic_audit_sha256 = std::env::var("SIWORLD_ENG2_SEMANTIC_AUDIT_SHA256")
+        .map_err(|_| "reviewed accepted semantic-audit lineage required")?;
+    if semantic_audit_sha256.len() != 64
+        || !semantic_audit_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("reviewed semantic-audit digest required".into());
+    }
+    let provider_copy_bytes = database
+        .metadata()
+        .map_err(|_| "accepted public database size unavailable")?
+        .len();
+    let minimum_launch_disk = (45 * GIB)
+        .checked_add(provider_copy_bytes)
+        .ok_or("provider public database copy disk admission overflow")?;
     let launch_disk = free_disk(destination.parent().ok_or("fixture parent missing")?)?;
-    if launch_disk < 45 * GIB {
-        return Err("encrypted fixture launch disk admission refused".into());
+    if launch_disk < minimum_launch_disk {
+        return Err("encrypted fixture launch and provider copy disk admission refused".into());
     }
     mkdir(&destination)?;
     let started = Instant::now();
-    let store = Store::resume_existing(&database, Genesis::decode(&encoded)?, limits().chain)?;
+    let provider_directory = destination.join("provider-working-copy");
+    mkdir(&provider_directory)?;
+    let provider_database = provider_directory.join("chain.redb");
+    let provider_copy = copy_public_database(&database, &provider_database)?;
+    if provider_copy["sha256"] != source_before {
+        return Err("new provider public database copy hash differs".into());
+    }
+    let loaded_identity = NativeIdentity::load(&source_directory, &genesis.peer_binding())
+        .map_err(|_| "existing accepted source test identity unavailable")?;
+    let store = Store::resume_qualification_copy(
+        &provider_database,
+        Genesis::decode(&encoded)?,
+        limits().chain,
+        loaded_identity,
+    )?;
     if store.engine().state().height() != 96
         || crate::local::hex(&store.engine().state().tip()) != result["tip"]
         || store.imported_checkpoint_height() != Some(72)
@@ -699,7 +779,9 @@ fn qualification() -> Result<(), String> {
             .ok_or("fixture total sessions overflow")?;
     }
     let report = json!({"version":1,"scope":"owner-local-static-h96-provider-through-cli-signed-bootstrap","source_commit":source_commit,"binary_sha256":binary_hash,
-        "accepted_source_result_sha256":expected_result,"fee_mode":"legacy-miner","independent_signer_custody":false,"accepted_height":96,"checkpoint_height":72,"elapsed_ms":started.elapsed().as_millis().to_string(),
+        "accepted_source_result_sha256":expected_result,"accepted_original_database_sha256":source_before,"accepted_semantic_audit_sha256":semantic_audit_sha256,
+        "provider_public_database_copy":provider_copy,"provider_working_database_sha256_after_close":digest(&provider_database,16*1024*1024*1024)?,
+        "fee_mode":"legacy-miner","independent_signer_custody":false,"accepted_height":96,"checkpoint_height":72,"elapsed_ms":started.elapsed().as_millis().to_string(),
         "interrupted_acquisition_ms":first_ms.to_string(),"interrupted_acquisition":metrics(&first_counts)?,"corrupt_acquisition":metrics(&negative_counts)?,"resumed_acquisition":metrics(&final_counts)?,
         "cli_admission":accepted,"native_catchup_encrypted_received_bytes":catchup_bytes.0.to_string(),"native_catchup_encrypted_sent_bytes":catchup_bytes.1.to_string(),"provider":server_metrics,
         "total_client_encrypted_received_bytes":total_received.to_string(),"total_client_encrypted_sent_bytes":total_sent.to_string(),"total_client_established_sessions":total_sessions,
