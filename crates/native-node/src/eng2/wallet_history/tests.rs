@@ -514,3 +514,105 @@ fn public_fund_and_issuance_receipts_reuse_existing_decoders_in_native_output_or
             .collect::<Vec<_>>()
     );
 }
+
+fn governance_fixture() -> (Context, Header, Body, Vec<Vec<u8>>) {
+    use crate::eng2_governance::{Action, ActionKind, Authorization, SignedAction, SignerRole};
+    let (_, context, mut header, mut body) = fixture();
+    body.governance = (100..102)
+        .map(|sequence| SignedAction {
+            action: Action {
+                network: body.network,
+                sequence,
+                kind: ActionKind::CancelDestination {
+                    proposal_sequence: sequence - 1,
+                },
+            },
+            signatures: vec![Authorization {
+                role: SignerRole::Revocation,
+                signature: [0xa3; 3309],
+            }],
+        })
+        .collect();
+    header.body_commitment = body.commitment(policy(&context)).unwrap();
+    let records = body
+        .governance
+        .iter()
+        .map(|action| action.encode().unwrap())
+        .collect();
+    (context, header, body, records)
+}
+
+#[test]
+fn public_governance_frames_are_exactly_authenticated_without_authorizing_them() {
+    let (context, header, body, records) = governance_fixture();
+    let bytes = encode(&context, &header, &body);
+    let decoded = ReceiptBlock::decode(&context, &header.encode().unwrap(), &bytes).unwrap();
+    assert_eq!(decoded.governance_records(), records);
+    for (bytes, action) in decoded.governance_records().iter().zip(&body.governance) {
+        assert_eq!(
+            crate::eng2_governance::SignedAction::decode(bytes).unwrap(),
+            *action
+        );
+    }
+    let at = bytes
+        .windows(128)
+        .position(|part| part == [0xa3; 128])
+        .unwrap();
+    let mut changed = bytes;
+    changed[at] ^= 1;
+    assert!(ReceiptBlock::decode(&context, &header.encode().unwrap(), &changed).is_err());
+}
+
+#[test]
+fn valid_body_root_cannot_conceal_governance_disclosure() {
+    let (context, header, body, records) = governance_fixture();
+    let raw = body.encode(policy(&context)).unwrap();
+    let mut preimage = (raw.len() as u64).to_le_bytes().to_vec();
+    preimage.extend_from_slice(&raw);
+    let at =
+        8 + crate::eng2::body::PREFIX_BYTES + (body.rewards.len() + 1) * REWARD_RECORD_BYTES + 4;
+    let end = at + records[0].len();
+    let ranges = [(0, at), (end, preimage.len() - end)];
+    let proof = crate::ranges::RangeProof::create_bound(
+        &preimage,
+        &ranges,
+        codec::BODY_DOMAIN,
+        codec::MAX_BODY_BYTES + 8,
+    )
+    .unwrap();
+    let sparse = crate::ranges::RangeProof::verify_bound(
+        &proof,
+        header.body_commitment,
+        codec::BODY_DOMAIN,
+        codec::MAX_BODY_BYTES + 8,
+    )
+    .unwrap();
+    assert!(sparse.read(at, records[0].len()).is_err());
+    let mut envelope = encode(&context, &header, &body);
+    envelope.truncate(327);
+    envelope.extend(proof);
+    let error = ReceiptBlock::decode(&context, &header.encode().unwrap(), &envelope)
+        .err()
+        .expect("concealed governance must be rejected");
+    assert!(error.contains("concealed"));
+}
+
+#[test]
+fn governance_frame_count_and_byte_limits_are_enforced_before_allocation() {
+    let (context, mut header, body, _) = governance_fixture();
+    let original = body.encode(policy(&context)).unwrap();
+    let length_at =
+        crate::eng2::body::PREFIX_BYTES + (body.rewards.len() + 1) * REWARD_RECORD_BYTES;
+    for length in [0u32, 16385] {
+        let mut raw = original.clone();
+        raw[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
+        header.body_commitment =
+            crate::eng2::header::body_commitment(&raw, codec::MAX_BODY_BYTES).unwrap();
+        assert!(ReceiptBlock::export(&context, &header.encode().unwrap(), &raw).is_err());
+    }
+    let mut raw = original;
+    raw[83] = 33;
+    header.body_commitment =
+        crate::eng2::header::body_commitment(&raw, codec::MAX_BODY_BYTES).unwrap();
+    assert!(ReceiptBlock::export(&context, &header.encode().unwrap(), &raw).is_err());
+}

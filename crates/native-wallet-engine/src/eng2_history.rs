@@ -118,6 +118,7 @@ pub struct ReceiptBlock {
     transactions: Vec<PublicRecord>,
     rewards: Vec<RewardRecord>,
     fund_outputs: Vec<FundSpend>,
+    governance_records: Vec<Vec<u8>>,
     issuances: Vec<IssuanceRecord>,
     reward_mode: RewardMode,
 }
@@ -233,12 +234,13 @@ fn parse(
         }
         fund_outputs.push(spend);
     }
+    let mut governance_records = Vec::with_capacity(governance_count);
     for _ in 0..governance_count {
         let size = r.u32()?;
         if size == 0 || size > MAX_GOVERNANCE_BYTES {
             return Err("wallet governance frame bound".into());
         }
-        r.skip(size)?;
+        governance_records.push(r.take(size)?);
     }
     let mut issuances = Vec::with_capacity(issuances_count);
     let issuance_fixed = crate::issuance::MAX_RECORD_BYTES
@@ -341,6 +343,7 @@ fn parse(
             transactions,
             rewards,
             fund_outputs,
+            governance_records,
             issuances,
             reward_mode: mode,
         },
@@ -364,6 +367,12 @@ impl ReceiptBlock {
     }
     pub fn fund_outputs(&self) -> &[FundSpend] {
         &self.fund_outputs
+    }
+    /// Raw public signed governance frames authenticated by the exact header.
+    /// Callers decode and execute their lineage from independently pinned genesis;
+    /// this portable codec does not validate governance authorization.
+    pub fn governance_records(&self) -> &[Vec<u8>] {
+        &self.governance_records
     }
     pub fn issuances(&self) -> &[IssuanceRecord] {
         &self.issuances

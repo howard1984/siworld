@@ -28,8 +28,12 @@ network connectivity or current state freshness. Header pages supply at most
 128 canonical headers; consumers still verify work, difficulty and continuity.
 
 The public records include every transaction slot, miner rewards, public fund
-outputs and issuance records. Transaction and issuance proof payloads are not
-retained by the decoder. Adjacent BLAKE3 chunks can contain public proof bytes.
+outputs, issuance records and bounded raw signed governance action frames.
+Governance frames are authenticated to the selected header; consumers must decode
+and execute their authorization lineage from independently pinned genesis.
+This codec does not authorize governance actions. Transaction and issuance proof
+payloads are not retained by the decoder. Adjacent BLAKE3 chunks can contain
+public proof bytes.
 Ordinary fee sidecars, wallet secrets, ordinary fee totals and slot
 classifications are not export inputs. The unused all-zero legacy fee-output
 slot is checked and is excluded from commitment-tree outputs.
