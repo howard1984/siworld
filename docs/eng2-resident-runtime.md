@@ -123,8 +123,9 @@ reopen. Quarantine headers alone never establish readiness.
 
 Successful output reports `ready: false` and `mining_started: false`, together
 with the admitted height, checkpoint height, verification/reread bytes and
-elapsed time. Encrypted byte counters sum all candidate sessions in that
-invocation, including retired or failed application streams and their hybrid
+elapsed time. Acquisition, native verification, installation and authenticated
+reopen have separate elapsed-millisecond fields. Encrypted byte counters sum all
+candidate sessions in that invocation, including retired or failed application streams and their hybrid
 handshakes and framing. They exclude handshakes that failed before a session
 was established, prior resume invocations and packet-wire overhead. Connection
 attempt and established-session counts are reported separately. A subsequent explicit `run`

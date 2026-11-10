@@ -21,6 +21,7 @@ use siworld_core::pow::Work;
 use std::{
     io::{Read, Write},
     path::Path,
+    time::Instant,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,6 +199,9 @@ pub struct Admission {
     /// All cache object rereads, including preparation and installation. This
     /// value excludes network I/O and is never reported as downloaded bytes.
     pub local_reread_bytes: u64,
+    pub verification_ms: u128,
+    pub installation_ms: u128,
+    pub authenticated_reopen_ms: u128,
 }
 impl Client {
     pub fn manifest(&self) -> &Manifest {
@@ -314,8 +318,9 @@ impl Client {
             .encode(self.candidate.import_policy.state.chain.max_component_bytes)
             .map_err(|_| "bootstrap witness encoding rejected")?;
         let genesis_bytes = genesis.encode()?;
-        let (installation, verification_bytes) = {
+        let (installation, verification_bytes, verification_ms, installation_ms) = {
             let mut source = self.candidate.cache.source()?;
+            let started = Instant::now();
             let verified = import::verify(
                 import::Input {
                     genesis: &genesis_bytes,
@@ -329,14 +334,20 @@ impl Client {
                 self.candidate.import_policy,
                 &canceled,
             )?;
+            let verification_ms = started.elapsed().as_millis();
             let verification_bytes = verified.verification_bytes();
+            let started = Instant::now();
+            let installation = verified.install(directory, &mut source, canceled)?;
             (
-                verified.install(directory, &mut source, canceled)?,
+                installation,
                 verification_bytes,
+                verification_ms,
+                started.elapsed().as_millis(),
             )
         };
         // Installation has crossed the no-replace boundary. A failed reopen is
         // never a retryable input error or permission to replace canonical data.
+        let reopen_started = Instant::now();
         let installation = match installation {
             Installation::DurabilityUnconfirmed => Installation::DurabilityUnconfirmed,
             Installation::Durable(store) => {
@@ -374,6 +385,9 @@ impl Client {
             installation,
             verification_bytes,
             local_reread_bytes: self.candidate.cache.local_reread_bytes(),
+            verification_ms,
+            installation_ms,
+            authenticated_reopen_ms: reopen_started.elapsed().as_millis(),
         })
     }
 }

@@ -376,6 +376,25 @@ pub fn bootstrap_signed(
     expected: &str,
     resume: bool,
 ) -> Result<Value, String> {
+    bootstrap_signed_observed(
+        directory,
+        configuration,
+        policy_file,
+        expected,
+        resume,
+        Arc::new(Mutex::new(Accounting::default())),
+        |_| Ok(()),
+    )
+}
+fn bootstrap_signed_observed(
+    directory: &Path,
+    configuration: &Path,
+    policy_file: &Path,
+    expected: &str,
+    resume: bool,
+    accounting: Arc<Mutex<Accounting>>,
+    mut observe: impl FnMut(Progress) -> Result<(), String>,
+) -> Result<Value, String> {
     if std::env::var_os("GITHUB_ACTIONS").is_some()
         || matches!(std::env::var("CI").as_deref(), Ok("true") | Ok("1"))
     {
@@ -427,7 +446,6 @@ pub fn bootstrap_signed(
     )
     .map_err(|_| "signed bootstrap connector rejected")?;
     let mut operation = Operation::new(&policy)?;
-    let accounting = Arc::new(Mutex::new(Accounting::default()));
     let mut candidates = Vec::new();
     let mut bundles = Vec::new();
     for (index, destination) in destinations.iter().enumerate() {
@@ -492,7 +510,9 @@ pub fn bootstrap_signed(
     );
     while client.progress()? != Progress::Downloaded {
         session.round(&mut operation, |p| client.pull_step(p))?;
+        observe(client.progress()?)?;
     }
+    let download_elapsed_ms = operation.started.elapsed().as_millis();
     drop(session);
     let counts = accounting
         .lock()
@@ -515,6 +535,8 @@ pub fn bootstrap_signed(
         "height":store.engine().state().height(),"tip":crate::local::hex(&store.engine().state().tip()),
         "checkpoint_height":store.imported_checkpoint_height(),"elapsed_ms":started.elapsed().as_millis().to_string(),"rounds":operation.rounds,
         "verification_bytes":admitted.verification_bytes.to_string(),"local_reread_bytes":admitted.local_reread_bytes.to_string(),
+        "download_elapsed_ms":download_elapsed_ms.to_string(),"native_verification_ms":admitted.verification_ms.to_string(),
+        "installation_ms":admitted.installation_ms.to_string(),"authenticated_reopen_ms":admitted.authenticated_reopen_ms.to_string(),
         "encrypted_received_bytes":received.to_string(),"encrypted_sent_bytes":sent.to_string(),
         "connection_attempts":operation.connections,"authenticated_sessions":authenticated_sessions,
         "network_byte_scope":"all established candidate and retry sessions in this invocation, including hybrid handshake and framing; failed pre-session handshakes, previous invocations and packet-wire bytes excluded"});
@@ -525,6 +547,10 @@ pub fn bootstrap_signed(
 #[cfg(test)]
 #[path = "bootstrap_tests.rs"]
 mod reconnect_tests;
+
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+#[path = "bootstrap_h96.rs"]
+mod native_qualification;
 
 #[cfg(test)]
 mod tests {
