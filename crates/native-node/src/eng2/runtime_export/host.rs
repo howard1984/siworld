@@ -181,6 +181,11 @@ pub struct Host {
     last_status: Option<Status>,
 }
 impl Host {
+    /// The accepted, durably published capability only; pending proposals and
+    /// votes cannot be exposed as signed bootstrap state.
+    pub fn latest_checkpoint(&self) -> Option<&CertifiedCheckpoint> {
+        self.latest.as_ref()
+    }
     /// Explicit opt-in only. `existing_key=None` creates a nonsigning observer;
     /// a missing or invalid requested key is rejected rather than initialized.
     pub fn open(

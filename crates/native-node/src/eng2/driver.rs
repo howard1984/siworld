@@ -84,6 +84,8 @@ pub struct Driver {
     pending: Mempool,
     imports: ImportLimits,
     last_archive_error: Option<String>,
+    bootstrap: Option<std::sync::Arc<super::bootstrap::Provider>>,
+    bootstrap_receipt_height: u64,
 }
 impl Driver {
     /// The caller explicitly creates or resumes the store and loads only the
@@ -111,10 +113,55 @@ impl Driver {
             verifier,
             imports,
             last_archive_error: None,
+            bootstrap: None,
+            bootstrap_receipt_height: 0,
         })
     }
     pub fn store(&self) -> &Store {
         &self.store
+    }
+    /// Explicit service-role maintenance. At most one missing permanent receipt
+    /// is materialized per tick; this preserves bodies and all accepted state.
+    pub fn refresh_bootstrap(
+        &mut self,
+        certified: Option<&super::runtime_export::CertifiedCheckpoint>,
+        budget: &crate::p2p::Budget,
+    ) -> Result<(), String> {
+        let Some(certified) = certified else {
+            self.bootstrap = None;
+            return Ok(());
+        };
+        if let Some(provider) = &self.bootstrap
+            && provider.manifest().certificate == *certified.certificate()
+            && provider.check_current(&self.store).is_ok()
+        {
+            return Ok(());
+        }
+        self.bootstrap = None;
+        certified.check_current(&self.store)?;
+        let anchor = certified.certificate().statement.checkpoint_height;
+        if self.bootstrap_receipt_height < anchor {
+            let height = self.bootstrap_receipt_height + 1;
+            if self.store.permanent_receipt_descriptor(height)?.is_none() {
+                self.store.materialize_permanent_receipt(height, budget)?;
+            }
+            self.bootstrap_receipt_height = height;
+            if height < anchor {
+                return Ok(());
+            }
+        }
+        self.bootstrap = Some(std::sync::Arc::new(super::bootstrap::Provider::capture(
+            &self.store,
+            certified,
+            self.imports,
+            budget,
+        )?));
+        Ok(())
+    }
+    pub fn bootstrap_available(&self) -> bool {
+        self.bootstrap
+            .as_ref()
+            .is_some_and(|provider| provider.check_current(&self.store).is_ok())
     }
     pub fn engine(&self) -> &Engine {
         self.store.engine()
@@ -324,6 +371,31 @@ impl Driver {
 }
 
 impl super::network::Owner for Driver {
+    fn bootstrap_provider(
+        &self,
+    ) -> Result<Option<std::sync::Arc<super::bootstrap::Provider>>, String> {
+        match &self.bootstrap {
+            Some(provider) if provider.check_current(&self.store).is_ok() => {
+                Ok(Some(provider.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+    fn bootstrap_chunk(
+        &self,
+        query: super::transport::ChunkRequest,
+    ) -> Result<Option<super::bootstrap::Chunk>, String> {
+        match &self.bootstrap {
+            Some(provider) => provider.chunk(
+                &self.store,
+                query.bundle,
+                query.object,
+                query.offset,
+                query.maximum as usize,
+            ),
+            None => Ok(None),
+        }
+    }
     fn head(&self) -> Result<(u64, Hash), String> {
         let head = Driver::head(self)?;
         Ok((head.height, head.id))

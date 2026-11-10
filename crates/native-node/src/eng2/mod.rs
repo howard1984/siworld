@@ -5,6 +5,7 @@
 pub mod admission;
 pub mod archive;
 pub mod body;
+pub mod bootstrap;
 pub mod certificate;
 pub mod checkpoint_exchange;
 #[cfg(feature = "eng2-runtime")]

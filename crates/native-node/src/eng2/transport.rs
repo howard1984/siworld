@@ -10,6 +10,8 @@ use super::{
 };
 use crate::{p2p, wire::Hash};
 use std::io::{self, Read, Write};
+mod bootstrap;
+pub use bootstrap::{ChunkRequest, ReceivedChunk, ReceivedManifest};
 
 const TIP: u8 = 1;
 const GET_HEADER: u8 = 2;
@@ -35,6 +37,8 @@ pub enum Request {
     Tip { height: u64, id: Hash },
     Header { height: u64 },
     Body { height: u64, id: Hash },
+    BootstrapManifest,
+    BootstrapChunk(ChunkRequest),
 }
 
 /// The allocation charge lives as long as the decoded body. Moving the body
@@ -123,7 +127,7 @@ impl<S: Read + Write> Peer<S> {
                 height: number(&bytes[1..9]),
                 id: digest(&bytes[9..41]),
             },
-            _ => return Err(p2p::Error::InvalidProtocol),
+            _ => bootstrap::request(&bytes).ok_or(p2p::Error::InvalidProtocol)?,
         };
         Ok((request, message))
     }
@@ -387,6 +391,10 @@ impl<S: Read + Write> Write for ChunkWriter<'_, S> {
 
 #[cfg(feature = "native-p2p")]
 impl Peer<p2p::NativeTlsChannel> {
+    /// Aggregate received/sent encrypted stream bytes, including handshake.
+    pub fn encrypted_stream_bytes(&self) -> (u64, u64) {
+        self.session.encrypted_stream_bytes()
+    }
     /// Authenticate an already accepted or dialed socket. The listener/routing
     /// owner retains endpoint policy and creates the original admission deadline.
     pub fn establish(

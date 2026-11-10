@@ -67,6 +67,41 @@ Its `verification_bytes()` value counts logical input bytes validated once;
 it excludes header acquisition, installation rereads and transport overhead.
 Hosts must measure actual transferred bytes separately.
 
+## Encrypted artifact transport
+
+The ordinary authenticated hybrid session supports a versioned bootstrap offer
+and exact-offset snapshot and permanent-receipt slices. Requests bind the
+request identifier, immutable bundle, object type, receipt height and block
+identity, offset and maximum response length. Every slice fits the existing
+control-frame cap and retains its shared memory reservation. Complete headers
+and full native tail bodies use the ordinary header/body exchanges. Cold-client
+rounds advertise only the owner's actual admitted head, then finish the usual
+reverse pull, checkpoint batch and transaction phase. Download progress never
+becomes an accepted height.
+
+Only explicit bootstrap and validator resident roles enable an offer. Its
+capability can be constructed only from an actual durable Store and a current
+certified checkpoint. Service maintenance materializes at most one missing
+permanent receipt per tick and preserves all full proof bodies. The provider
+holds one bounded snapshot copy; receipt slices are copied under the owner lock
+and sent after releasing it. A changed signer epoch or canonical prefix makes
+the offer unavailable. Publishing a replacement offer can retire the old
+bundle; resumable acquisition requires exactly the same manifest and policy.
+This implementation enables no expiry and establishes no pruning lease.
+
+The quarantine stores chunks and ordered progress atomically, checks retained
+chunk hashes on reopen, rejects changed complete-object hashes and exposes
+bounded local reads to the signed importer. It creates no canonical database,
+identity, signing host or readiness status. Provider hashes identify transfer
+bytes and grant no authority. Actual encrypted stream counters include hybrid
+handshake and record framing; they are distinct from artifact bytes, importer
+verification bytes and local rereads. They are not TCP or Ethernet measurements.
+
+Bounded tests exercise malformed framing, interrupted quarantine resume and
+synthetic payloads through an actual hybrid session followed by all three round
+phases. Complete native import over that transport, public client entry-point
+integration and Windows real-machine acceptance remain separate pending gates.
+
 ## New-database installation
 
 The owner separately prepares a dedicated canonical directory, its matching

@@ -177,8 +177,14 @@ impl NativeTlsChannel {
 }
 
 /// A complete paired exchange must fit before the transport's hard reconnect
-/// limits. No counters, TLS state or socket handles leave this interface.
+/// limits. Aggregate byte totals expose no TLS state or socket handles.
 impl crate::p2p::Session<NativeTlsChannel> {
+    /// Actual encrypted stream I/O, including the hybrid handshake and record
+    /// framing. These aggregate counts are not TCP/Ethernet packet sizes.
+    pub fn encrypted_stream_bytes(&self) -> (u64, u64) {
+        let io = self.channel.stream.get_ref().0;
+        (io.incoming.bytes as u64, io.outgoing.bytes as u64)
+    }
     pub(crate) fn ready_for_cycle(&self) -> bool {
         const CYCLE_WIRE_BYTES: usize = 488 * 1024 * 1024;
         const CYCLE_RECORDS: usize = 65536;

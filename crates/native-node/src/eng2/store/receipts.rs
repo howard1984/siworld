@@ -104,6 +104,71 @@ impl<'a> Checked<'a> {
 }
 
 impl Store {
+    /// Read only a bounded slice of an already materialized receipt. The stored
+    /// digest detects local byte changes; callers still authenticate complete
+    /// receipts against selected headers before using them for admission.
+    pub(crate) fn permanent_receipt_chunk(
+        &self,
+        height: u64,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<Option<crate::eng2::bootstrap::Chunk>, String> {
+        use crate::eng2::bootstrap::{Chunk, Descriptor, MAX_CHUNK_BYTES};
+        use redb::ReadableDatabase;
+        self.ensure_exportable()?;
+        if height == 0 || height > self.engine.state().height() || maximum > MAX_CHUNK_BYTES {
+            return Ok(None);
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "bootstrap receipt transaction unavailable")?;
+        let receipts = match transaction.open_table(PERMANENT_RECEIPTS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(_) => return Err("bootstrap receipt table unavailable".into()),
+        };
+        let Some(bytes) = receipts
+            .get(height)
+            .map_err(|_| "bootstrap receipt read failed")?
+        else {
+            return Ok(None);
+        };
+        let ids = transaction
+            .open_table(PERMANENT_RECEIPT_IDS)
+            .map_err(|_| "bootstrap receipt digest table unavailable")?;
+        let expected = ids
+            .get(height)
+            .map_err(|_| "bootstrap receipt digest read failed")?
+            .ok_or("bootstrap receipt digest missing")?;
+        let bytes = bytes.value();
+        let digest = *blake3::hash(bytes).as_bytes();
+        if bytes.is_empty() || bytes.len() > codec::MAX_RECEIPT_BYTES || expected.value() != digest
+        {
+            return Err("bootstrap receipt stored digest or size differs".into());
+        }
+        let offset =
+            usize::try_from(offset).map_err(|_| "bootstrap receipt offset exceeds range")?;
+        if offset >= bytes.len() {
+            return Ok(None);
+        }
+        let end = offset.saturating_add(maximum).min(bytes.len());
+        Ok(Some(Chunk {
+            descriptor: Descriptor {
+                length: bytes.len() as u64,
+                digest,
+            },
+            bytes: bytes[offset..end].to_vec(),
+        }))
+    }
+    pub(crate) fn permanent_receipt_descriptor(
+        &self,
+        height: u64,
+    ) -> Result<Option<crate::eng2::bootstrap::Descriptor>, String> {
+        Ok(self
+            .permanent_receipt_chunk(height, 0, 0)?
+            .map(|chunk| chunk.descriptor))
+    }
     /// Explicit bounded backfill, also usable immediately after native acceptance.
     /// The accepted Store exporter owns the reservation while buffers are live.
     /// Failure preserves full bodies and never changes chain acceptance or state.

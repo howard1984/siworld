@@ -24,6 +24,16 @@ pub trait Owner: Send {
     fn block_size(&self, height: u64) -> Result<Option<usize>, String>;
     fn block(&self, height: u64) -> Result<(Header, Body), String>;
     fn accept(&mut self, header: &Header, body: &Body) -> Result<(), String>;
+    /// Explicit service capability only. Ordinary and miner owners expose none.
+    fn bootstrap_provider(&self) -> Result<Option<Arc<super::bootstrap::Provider>>, String> {
+        Ok(None)
+    }
+    fn bootstrap_chunk(
+        &self,
+        _query: super::transport::ChunkRequest,
+    ) -> Result<Option<super::bootstrap::Chunk>, String> {
+        Ok(None)
+    }
 }
 #[derive(Debug)]
 pub enum Error {
@@ -195,6 +205,22 @@ fn serve<S: Read + Write, O: Owner>(
     message: Request,
 ) -> Result<u16, Error> {
     match message {
+        Request::BootstrapManifest => {
+            let _charge = peer.reserve_bootstrap(super::bootstrap::MAX_MANIFEST_BYTES + 1)?;
+            let provider = with_owner(owner, |o| o.bootstrap_provider())?;
+            match provider {
+                Some(provider) => peer.send_bootstrap_manifest(request, provider.encoded())?,
+                None => peer.send_bootstrap_missing(request)?,
+            }
+        }
+        Request::BootstrapChunk(query) => {
+            let _charge = peer.reserve_bootstrap(query.maximum as usize + 160)?;
+            let chunk = with_owner(owner, |o| o.bootstrap_chunk(query))?;
+            match chunk {
+                Some(chunk) => peer.send_bootstrap_chunk(request, query, &chunk)?,
+                None => peer.send_bootstrap_missing(request)?,
+            }
+        }
         Request::GetTip => {
             let head = with_owner(owner, |o| o.head())?;
             peer.advertise_tip(request, head.0, head.1)?;
@@ -235,6 +261,91 @@ fn serve<S: Read + Write, O: Owner>(
         Request::Tip { .. } | Request::RoundDone => return Err(Error::Protocol),
     }
     Ok(0)
+}
+
+/// Bounded cold-client requests within the ordinary forward round. Quarantine
+/// progress never changes the local owner or its advertised accepted head.
+pub struct BootstrapPull<'a, S> {
+    peer: &'a mut Peer<S>,
+    sequence: &'a mut Sequence,
+    remaining: usize,
+    deadline: p2p::Deadline,
+}
+impl<S: Read + Write> BootstrapPull<'_, S> {
+    fn request(&mut self) -> Result<u64, Error> {
+        self.deadline.check().map_err(|_| p2p::Error::Unavailable)?;
+        self.remaining = self.remaining.checked_sub(1).ok_or(Error::RequestLimit)?;
+        self.sequence.next()
+    }
+    pub fn manifest(&mut self) -> Result<Option<super::transport::ReceivedManifest>, Error> {
+        let request = self.request()?;
+        Ok(self
+            .peer
+            .fetch_bootstrap_manifest_before(request, &self.deadline)?)
+    }
+    pub fn chunk(
+        &mut self,
+        query: super::transport::ChunkRequest,
+    ) -> Result<Option<super::transport::ReceivedChunk>, Error> {
+        let request = self.request()?;
+        Ok(self
+            .peer
+            .fetch_bootstrap_chunk_before(request, query, &self.deadline)?)
+    }
+    pub fn header(&mut self, height: u64) -> Result<Option<Header>, Error> {
+        let request = self.request()?;
+        let result = self.peer.fetch_header(request, height)?;
+        self.deadline.check().map_err(|_| p2p::Error::Unavailable)?;
+        Ok(result)
+    }
+    pub fn body(
+        &mut self,
+        header: &Header,
+    ) -> Result<Option<super::transport::ReceivedBody>, Error> {
+        let request = self.request()?;
+        let result = self.peer.fetch_body(request, header)?;
+        self.deadline.check().map_err(|_| p2p::Error::Unavailable)?;
+        Ok(result)
+    }
+}
+/// A cold client requests at most the normal forward budget, then advertises
+/// its actual admitted head and serves the reverse pull. The caller must still
+/// run the universal checkpoint/transaction phases after this ordinary round.
+pub fn initiate_bootstrap<S: Read + Write, O: Owner, T>(
+    peer: &mut Peer<S>,
+    owner: &Arc<Mutex<O>>,
+    sequence: &mut Sequence,
+    limits: Limits,
+    pull: impl FnOnce(&mut BootstrapPull<'_, S>) -> Result<T, Error>,
+) -> Result<(Round, T), Error> {
+    limits.check()?;
+    let result = pull(&mut BootstrapPull {
+        peer,
+        sequence,
+        remaining: limits.requests() - 1,
+        deadline: p2p::Deadline::new(std::time::Duration::from_secs(10)),
+    })?;
+    let local = with_owner(owner, |o| o.head())?;
+    let notice = sequence.next()?;
+    peer.advertise_tip(notice, local.0, local.1)?;
+    let mut served = 0;
+    for _ in 0..limits.requests() {
+        let (request, message) = peer.receive_request()?;
+        if message == Request::RoundDone {
+            if request != notice {
+                return Err(Error::Protocol);
+            }
+            return Ok((
+                Round {
+                    accepted: 0,
+                    served_bodies: served,
+                },
+                result,
+            ));
+        }
+        served += serve(peer, owner, request, message)?;
+    }
+    Err(Error::RequestLimit)
 }
 fn with_owner<O: Owner, T>(
     owner: &Arc<Mutex<O>>,

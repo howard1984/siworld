@@ -271,6 +271,7 @@ fn export_status(
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
             "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
+            "signed_bootstrap_available":owner.bootstrap_available(),
             "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
             "checkpoint_observed_height":observer.observed_height(),"checkpoint_conflict":conflict,
             "operations_error":operations_error(shared),
@@ -338,6 +339,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let config = config::Configuration::load(directory, configuration, &genesis, &identity)?;
     let mining = config.mining;
     let listening = config.listen.is_some();
+    let bootstrap_service = matches!(config.role, p2p::Role::Bootstrap | p2p::Role::Validator);
     if mining
         && (std::env::var("RAYON_NUM_THREADS").ok().as_deref() != Some("4")
             || std::env::var("SIWORLD_COMPOSITION_HIDING_WORKERS")
@@ -466,7 +468,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                 #[cfg(unix)]
                 {
                     let incoming = shared.mailbox.drain()?;
-                    let owner = shared
+                    let mut owner = shared
                         .owner
                         .lock()
                         .map_err(|_| "resident owner lock poisoned")?;
@@ -476,6 +478,16 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             shared.mailbox.acknowledge(&incoming)?;
                             shared.mailbox.publish(&tick.messages())?;
                             checkpoint_error = None;
+                            if bootstrap_service
+                                && owner
+                                    .refresh_bootstrap(
+                                        checkpoint_host.latest_checkpoint(),
+                                        &shared.budget,
+                                    )
+                                    .is_err()
+                            {
+                                checkpoint_error = Some("signed_bootstrap_unavailable");
+                            }
                         }
                         Err(_) => {
                             checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable")
