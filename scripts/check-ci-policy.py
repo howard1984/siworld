@@ -15,6 +15,8 @@ def main():
     if active != ['.github/workflows/ci.yml']:
         raise SystemExit('Only the offline validation workflow may be tracked')
     text = (directory / 'ci.yml').read_text()
+    if 'cancel-in-progress: true' not in text or 'needs: changes' not in text or re.search(r'^  push:', text, re.M):
+        raise SystemExit('Path selection, concurrency cancellation and PR-only validation required')
     if any(token in text for token in ('workflow_dispatch:', 'schedule:', 'self-hosted',
             'windows-latest', 'secrets.', 'contents: write', 'actions/upload-artifact',
             'build-windows-miner', 'build-native-runtime', '--check-hardware',

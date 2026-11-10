@@ -18,15 +18,21 @@ class ToolchainSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             rustup = temporary / 'rustup'
-            rustup.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$RUSTUP_TEST_ARGS"\n')
+            rustup.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "$RUSTUP_TEST_ARGS"\n')
             rustup.chmod(0o700)
             output = temporary / 'args'
             env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
-                       RUSTUP_TOOLCHAIN='unrelated-runner-override', RUSTUP_TEST_ARGS=str(output))
+                       RUSTUP_TOOLCHAIN='unrelated-runner-override', RUSTUP_TEST_ARGS=str(output),
+                       GITHUB_PATH=str(temporary / 'github-path'))
             subprocess.run(['bash', '-euo', 'pipefail', '-c', command], cwd=ROOT, env=env, check=True)
             channel = tomllib.loads((ROOT / 'rust-toolchain.toml').read_text())['toolchain']['channel']
             self.assertEqual(output.read_text().splitlines(),
-                             ['toolchain', 'install', channel, '--target', 'wasm32-unknown-unknown'])
+                             ['toolchain', 'install', channel, '--target', 'wasm32-unknown-unknown',
+                              'run', channel, 'cargo', 'install', '--locked', '--version', '0.2.120',
+                              'wasm-bindgen-cli', '--bin', 'wasm-bindgen', '--root',
+                              os.environ['HOME'] + '/.local/siworld-wasm-bindgen'])
+            self.assertEqual((temporary / 'github-path').read_text().strip(),
+                             os.environ['HOME'] + '/.local/siworld-wasm-bindgen/bin')
 
 
 if __name__ == '__main__':

@@ -15,7 +15,7 @@ exec sudo -n unshare --net -- bash -c '
  env -i HOME="$task_home" PATH="$root/scripts/ci-bin:$task_path" \
  CARGO_HOME="$task_home/.cargo" RUSTUP_HOME="$task_home/.rustup" \
  CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=always SIWORLD_REAL_CARGO="$real_cargo" \
- "${target_env[@]}" GITHUB_WORKSPACE="$root" CI=true \
+ "${target_env[@]}" GITHUB_WORKSPACE="$root" CI=true GITHUB_OUTPUT="$9" \
  RAYON_NUM_THREADS=4 SIWORLD_COMPOSITION_HIDING_WORKERS=2 \
  LANG=C.UTF-8 LC_ALL=C.UTF-8 python3 "$root/scripts/ci-fixtures.py" bash --noprofile --norc -eo pipefail "$script"
-' offline-ci "$(id -u)" "$(id -g)" "$HOME" "$PATH" "$root" "$real_cargo" "$1" "${CARGO_TARGET_DIR:-}"
+' offline-ci "$(id -u)" "$(id -g)" "$HOME" "$PATH" "$root" "$real_cargo" "$1" "${CARGO_TARGET_DIR:-}" "${GITHUB_OUTPUT:-}"

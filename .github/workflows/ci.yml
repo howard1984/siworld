@@ -18,7 +18,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Select relevant offline checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      native_economic_accounting: ${{ steps.paths.outputs.native_economic_accounting }}
+      offline_fund_keys: ${{ steps.paths.outputs.offline_fund_keys }}
+      workspace: ${{ steps.paths.outputs.workspace }}
+      bench_plonky3: ${{ steps.paths.outputs.bench_plonky3 }}
+      native_multi_asset: ${{ steps.paths.outputs.native_multi_asset }}
+      native_transaction: ${{ steps.paths.outputs.native_transaction }}
+      native_runtime: ${{ steps.paths.outputs.native_runtime }}
+      wallet: ${{ steps.paths.outputs.wallet }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select changed paths
+        id: paths
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        run: python3 scripts/ci-paths.py '${{ github.event.pull_request.base.sha }}' '${{ github.event.pull_request.head.sha }}'
+
   native-economic-accounting:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_economic_accounting == 'true') }}
     name: Native economic order and per-wallet conservation
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -53,6 +78,8 @@ jobs:
               assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, 'Accounting source differs from the reference'
           PY_ACCOUNTING
   offline-fund-keys:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.offline_fund_keys == 'true') }}
     name: Offline fund key custody
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -135,6 +162,8 @@ jobs:
           python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
           python3 -m unittest discover -s tools/control-panel -p 'test_*.py' -v
   workspace:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.workspace == 'true') }}
     name: Workspace (fmt, clippy, test)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -167,6 +196,8 @@ jobs:
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: cargo test --workspace --all-features --locked
   bench-plonky3:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.bench_plonky3 == 'true') }}
     name: STARK benchmark tests (Plonky3)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -210,6 +241,8 @@ jobs:
           python3 -c 'import json; r=json.load(open("/tmp/d8-screen.json")); assert len(r["layers"]) == 3; assert all(len(x["candidates"]) == 3 and all(c["screen_pass_conditional_on_shape_and_sites"] and not c["approved"] for c in x["candidates"]) for x in r["layers"])'
 
   native-transaction:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_transaction == 'true') }}
     name: Native D8 transaction relation and codec
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -273,6 +306,8 @@ jobs:
           PY_LOCK
 
   native-multi-asset:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_multi_asset == 'true') }}
     name: Native multi-asset relation and frozen transaction profile
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -339,6 +374,8 @@ jobs:
           python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json --reproduced .local/native-proof-profiles/reproduced
 
   native-runtime:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_runtime == 'true') }}
     name: Native protocol and storage unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -373,9 +410,11 @@ jobs:
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib checkpoint_stale_runtime::tests::
 
   wallet:
+    needs: changes
+    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.wallet == 'true') }}
     name: Wallet and WASM offline tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -384,6 +423,8 @@ jobs:
         run: |
           toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
           rustup toolchain install "$toolchain" --target wasm32-unknown-unknown
+          rustup run "$toolchain" cargo install --locked --version 0.2.120 wasm-bindgen-cli --bin wasm-bindgen --root "$HOME/.local/siworld-wasm-bindgen"
+          echo "$HOME/.local/siworld-wasm-bindgen/bin" >> "$GITHUB_PATH"
       - name: Acquire locked dependencies
         run: bash scripts/ci-fetch.sh wallet
       - name: Wallet unit and browser tests
@@ -393,4 +434,5 @@ jobs:
           cargo test --release --locked --manifest-path crates/native-wallet-engine/Cargo.toml
           cargo test --release --locked --manifest-path crates/native-wallet-web/Cargo.toml --lib
           cargo check --locked --target wasm32-unknown-unknown --manifest-path crates/native-wallet-web/Cargo.toml
-          node --test crates/native-wallet-web/tests/*.test.mjs
+          python3 crates/native-wallet-web/build.py --output .local/wallet-ci --target-dir .local/wallet-ci-target
+          WALLET_WEB_OUTPUT="$GITHUB_WORKSPACE/.local/wallet-ci" node --test crates/native-wallet-web/tests/*.test.mjs
