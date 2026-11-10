@@ -20,7 +20,14 @@ fn fee_schedule_uses_the_confirmed_flooring_order_at_every_epoch() {
         assert_eq!(fee_base(height).unwrap(), previous / 10);
         assert_eq!(fee_priority(height).unwrap(), 4 * (previous / 10));
     }
-    assert!(fee_base(0).is_err());
+    // The genesis snapshot uses the first paid-block tier without issuing a reward.
+    assert_eq!(fee_base(0).unwrap(), fee_base(1).unwrap());
+    assert_eq!(fee_priority(0).unwrap(), fee_priority(1).unwrap());
+    let genesis = EconomicState::new([71; 32]).unwrap();
+    assert_eq!(genesis.height(), 0);
+    assert_eq!(genesis.issued(), 0);
+    assert_eq!(genesis.miner_credited(), 0);
+    assert_eq!(genesis.fund_credited(), 0);
 }
 
 #[test]
