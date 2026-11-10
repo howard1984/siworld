@@ -43,7 +43,7 @@ jobs:
 
   native-economic-accounting:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_economic_accounting == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_economic_accounting == 'true') }}
     name: Native economic order and per-wallet conservation
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -79,7 +79,7 @@ jobs:
           PY_ACCOUNTING
   offline-fund-keys:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.offline_fund_keys == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.offline_fund_keys == 'true') }}
     name: Offline fund key custody
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -163,7 +163,7 @@ jobs:
           python3 -m unittest discover -s tools/control-panel -p 'test_*.py' -v
   workspace:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.workspace == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.workspace == 'true') }}
     name: Workspace (fmt, clippy, test)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -197,7 +197,7 @@ jobs:
         run: cargo test --workspace --all-features --locked
   bench-plonky3:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.bench_plonky3 == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.bench_plonky3 == 'true') }}
     name: STARK benchmark tests (Plonky3)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -242,7 +242,7 @@ jobs:
 
   native-transaction:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_transaction == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_transaction == 'true') }}
     name: Native D8 transaction relation and codec
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -307,7 +307,7 @@ jobs:
 
   native-multi-asset:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_multi_asset == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_multi_asset == 'true') }}
     name: Native multi-asset relation and frozen transaction profile
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -375,7 +375,7 @@ jobs:
 
   native-runtime:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.native_runtime == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_runtime == 'true') }}
     name: Native protocol and storage unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -411,7 +411,7 @@ jobs:
 
   wallet:
     needs: changes
-    if: ${{ always() && (needs.changes.result != 'success' || needs.changes.outputs.wallet == 'true') }}
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.wallet == 'true') }}
     name: Wallet and WASM offline tests
     runs-on: ubuntu-24.04
     timeout-minutes: 45
