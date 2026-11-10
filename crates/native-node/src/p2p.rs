@@ -210,7 +210,17 @@ impl Deadline {
             elapsed: None,
         }
     }
-    fn check(&self) -> io::Result<()> {
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_clock(limit: Duration, clock: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        let mut deadline = Self::new(limit);
+        deadline.elapsed = Some(clock);
+        deadline
+    }
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn cancellation(&self) -> &Cancellation {
+        &self.cancellation
+    }
+    pub(crate) fn check(&self) -> io::Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -661,6 +671,16 @@ impl<S: Read + Write> Session<S> {
         self.role
     }
     pub fn send_control(&mut self, kind: u8, request: u64, body: &[u8]) -> Result<(), Error> {
+        self.send_control_before(kind, request, body, &Deadline::new(CONTROL_TIMEOUT))
+    }
+    /// Keep the caller's absolute phase deadline across every write and flush.
+    pub(crate) fn send_control_before(
+        &mut self,
+        kind: u8,
+        request: u64,
+        body: &[u8],
+        deadline: &Deadline,
+    ) -> Result<(), Error> {
         if kind == BLOCK {
             return Err(Error::InvalidProtocol);
         }
@@ -672,7 +692,7 @@ impl<S: Read + Write> Session<S> {
         )?;
         let mut timed = Timed {
             channel: &mut self.channel,
-            deadline: Deadline::new(CONTROL_TIMEOUT),
+            deadline: deadline.clone(),
         };
         timed.write_all(&header).map_err(io_error)?;
         timed.write_all(body).map_err(io_error)?;
@@ -733,6 +753,21 @@ impl<S: Read + Write> Session<S> {
     pub(crate) fn receive_eng2_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
         self.receive_frame(deadline.clone(), Some(&[ENG2_MESSAGE]))
     }
+    /// An eng-2 application phase bounds both header and body by the same
+    /// absolute deadline and rejects its smaller frame cap before allocation.
+    #[cfg(unix)]
+    pub(crate) fn receive_eng2_application_before(
+        &mut self,
+        deadline: &Deadline,
+        maximum: usize,
+    ) -> Result<Packet, Error> {
+        self.receive_frame_policy(
+            deadline.clone(),
+            Some(&[ENG2_MESSAGE]),
+            Some(maximum),
+            false,
+        )
+    }
     /// A paired sync request may follow synchronous proof verification by the
     /// remote owner. Only its header uses the caller's absolute wait bound;
     /// its bounded control body still has the ordinary ten-second deadline.
@@ -767,8 +802,17 @@ impl<S: Read + Write> Session<S> {
     }
     fn receive_frame(
         &mut self,
+        deadline: Deadline,
+        permitted_control: Option<&[u8]>,
+    ) -> Result<Packet, Error> {
+        self.receive_frame_policy(deadline, permitted_control, None, true)
+    }
+    fn receive_frame_policy(
+        &mut self,
         mut deadline: Deadline,
         permitted_control: Option<&[u8]>,
+        maximum: Option<usize>,
+        reset_body_deadline: bool,
     ) -> Result<Packet, Error> {
         let mut header = [0; HEADER_BYTES];
         Timed {
@@ -790,7 +834,10 @@ impl<S: Read + Write> Session<S> {
             return Err(Error::InvalidProtocol);
         }
         frame_header(kind, request, &self.binding.network, length)?;
-        if permitted_control.is_some() {
+        if maximum.is_some_and(|maximum| length > maximum) {
+            return Err(Error::ResourceExhausted);
+        }
+        if permitted_control.is_some() && reset_body_deadline {
             let mut body_deadline = Deadline::new(CONTROL_TIMEOUT);
             body_deadline.cancellation = deadline.cancellation.clone();
             deadline = body_deadline;

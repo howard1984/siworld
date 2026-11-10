@@ -1,8 +1,10 @@
 # Internal engineering genesis
 
-Status: canonical genesis initialization, fee-root selection and a concrete
-in-memory native block engine. This does not start a service, establish durable
-restart behavior or demonstrate a completed native block and wallet rehearsal.
+The genesis and native execution engine provide canonical initialization and
+fee-root selection. The separate [resident runtime](eng2-resident-runtime.md)
+adds explicit networking, durable admission and authenticated local restart.
+Neither entry point establishes a completed production deployment or native
+block and wallet rehearsal merely by being available.
 
 The internal genesis explicitly selects `LegacyMiner` for ordinary transaction
 fees. Their standard and priority amounts and native settlement payment to miner
@@ -68,6 +70,7 @@ their presence is not evidence that a run has passed.
 
 `eng2::store::Store::audit_existing` deliberately verifies the entire retained
 history. It is an audit entry point, not the normal production restart path.
-An authenticated local committed-state resume path and the existing operational
-startup deadline must be qualified separately before service integration. The
-offline log does not activate a listener, live synchronization or a miner daemon.
+The authenticated committed-state restart path is described in the resident
+runtime specification and must be measured on the actual accepted native
+fixture. The offline log does not activate a listener, live synchronization or
+a miner daemon.

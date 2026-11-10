@@ -34,7 +34,7 @@ DOCUMENTS = {
     "eng2-protocol.md", "eng2-anchor-archive.md", "eng2-block-body.md",
     "eng2-incremental-state-roots.md", "eng2-internal-genesis.md",
     "eng2-isolated-sync-staging.md", "eng2-public-fund-claims.md",
-    "eng2-snapshot-import.md", "eng2-operation-files.md",
+    "eng2-snapshot-import.md", "eng2-operation-files.md", "eng2-resident-runtime.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",

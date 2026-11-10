@@ -86,6 +86,10 @@ pub struct Work {
     pow_iterations: u64,
     reward_secret: Zeroizing<Vec<u8>>,
 }
+pub enum Search {
+    Found(ProducedBlock),
+    Pending(Work),
+}
 
 /// Prepare against the current state while the owner is briefly borrowed.
 /// Native settlement proving and nonce search are explicit later operations.
@@ -159,6 +163,9 @@ impl PreparedBlock {
     }
 }
 impl ProvedBlock {
+    pub fn parent(&self) -> Hash {
+        self.parent
+    }
     /// Independently verify the real proof and derive the current execution
     /// template. A changed parent rejects the stale candidate before work.
     pub fn prepare_work(self, engine: &Engine, verifier: &NativeVerifier) -> Result<Work, String> {
@@ -177,9 +184,23 @@ impl ProvedBlock {
     }
 }
 impl Work {
+    pub fn parent(&self) -> Hash {
+        self.header.parent
+    }
+    pub fn next_nonce(&self) -> u64 {
+        self.header.nonce
+    }
     /// Search outside the owner lock. Admission still checks the exact current
     /// parent, all proofs and complete state commitment before durable commit.
-    pub fn mine(mut self, max_attempts: u64) -> Result<ProducedBlock, String> {
+    pub fn mine(self, max_attempts: u64) -> Result<ProducedBlock, String> {
+        match self.search(max_attempts)? {
+            Search::Found(block) => Ok(block),
+            Search::Pending(_) => Err("native production work budget exhausted".into()),
+        }
+    }
+    /// One bounded slice permits resident cancellation, parent refresh and
+    /// progress export between slices without rebuilding a proved template.
+    pub fn search(mut self, max_attempts: u64) -> Result<Search, String> {
         if max_attempts == 0 {
             return Err("production requires a positive work budget".into());
         }
@@ -187,19 +208,21 @@ impl Work {
             .header
             .pow_seed()
             .map_err(|_| "invalid production header")?;
-        for nonce in 0..max_attempts {
+        for _ in 0..max_attempts {
+            let nonce = self.header.nonce;
             if siworld_core::pow::meets_target(
                 &siworld_core::pow::pow_hash(&seed, nonce, self.pow_iterations),
                 &self.header.target,
             ) {
                 self.header.nonce = nonce;
-                return Ok(ProducedBlock {
+                return Ok(Search::Found(ProducedBlock {
                     header: self.header,
                     body: self.body,
                     reward_secret: self.reward_secret,
-                });
+                }));
             }
+            self.header.nonce = nonce.checked_add(1).ok_or("native nonce range exhausted")?;
         }
-        Err("native production work budget exhausted".into())
+        Ok(Search::Pending(self))
     }
 }

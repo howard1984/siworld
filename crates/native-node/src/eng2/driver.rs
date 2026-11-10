@@ -10,6 +10,7 @@ use super::{
     store::Store,
 };
 use crate::{
+    admission::{Mempool, PeerId},
     pool::{Padding, Pool},
     producer::{MiningSettings, PreparedPadding, prepare_padding_witness},
     proofs::NativeVerifier,
@@ -25,10 +26,62 @@ pub struct Head {
     pub work: siworld_core::pow::Work,
 }
 
+/// Native verification is synchronous, so this is a commit deadline rather
+/// than CPU preemption. Late verification never inserts into the pending pool.
+struct TimedAdmission<'a, V> {
+    verifier: &'a V,
+    deadline: &'a crate::p2p::Deadline,
+}
+impl<V: crate::admission::AdmissionVerifier> crate::admission::AdmissionVerifier
+    for TimedAdmission<'_, V>
+{
+    fn verify(
+        &self,
+        public: &native::codec::PublicTransaction,
+        context: &native::codec::ProofContext,
+        fee: &native::multi_asset::Digest,
+        root: &native::multi_asset::Digest,
+        proof: &[u8],
+    ) -> Result<(), crate::admission::VerificationError> {
+        self.deadline
+            .check()
+            .map_err(|_| crate::admission::VerificationError::Unavailable)?;
+        self.verifier.verify(public, context, fee, root, proof)?;
+        self.deadline
+            .check()
+            .map_err(|_| crate::admission::VerificationError::Unavailable)
+    }
+    fn check_commit(&self) -> Result<(), crate::admission::VerificationError> {
+        self.verifier.check_commit()?;
+        self.deadline
+            .check()
+            .map_err(|_| crate::admission::VerificationError::Unavailable)
+    }
+}
+fn transaction_identity(packet: &[u8], network: &Hash) -> Result<(Hash, usize), String> {
+    let prefix: [u8; 4] = packet
+        .get(..4)
+        .ok_or("pending transaction framing rejected")?
+        .try_into()
+        .expect("checked prefix");
+    let length = u32::from_le_bytes(prefix) as usize;
+    if length > crate::wire::MAX_ENVELOPE_BYTES
+        || packet.len() != 4 + length + crate::wire::SIDECAR_BYTES
+    {
+        return Err("pending transaction framing rejected".into());
+    }
+    let id = crate::wire::borrowed_envelope(&packet[4..4 + length], network)
+        .map_err(|_| "pending transaction envelope rejected")?
+        .0
+        .statement_id(network);
+    Ok((id, length))
+}
+
 pub struct Driver {
     store: Store,
     verifier: NativeVerifier,
     padding: Pool,
+    pending: Mempool,
     imports: ImportLimits,
     last_archive_error: Option<String>,
 }
@@ -43,6 +96,17 @@ impl Driver {
         store.ensure_exportable()?;
         Ok(Self {
             padding: Pool::new(store.engine().state().network()),
+            pending: Mempool::with_limits(
+                store.engine().state().network(),
+                crate::admission::Limits {
+                    bytes: crate::pool::MAX_BYTES,
+                    entries: 128,
+                    peer_bytes: 8 * 1024 * 1024,
+                    peer_entries: 16,
+                    peers: 128,
+                },
+            )
+            .map_err(|_| "pending admission limits rejected")?,
             store,
             verifier,
             imports,
@@ -82,6 +146,9 @@ impl Driver {
         let committed = self.store.append(header, body, &self.verifier)?;
         // The pool is created for this immutable network, so pruning cannot
         // fail its context check after a successful append.
+        self.pending
+            .prune(self.store.engine().state().chain())
+            .expect("owner pending network is immutable");
         self.padding
             .prune(self.store.engine().state().chain())
             .expect("owner padding network is immutable");
@@ -92,6 +159,103 @@ impl Driver {
     }
     pub fn last_archive_error(&self) -> Option<&str> {
         self.last_archive_error.as_deref()
+    }
+    /// Pending wallet work is independently verified and retained until its
+    /// inputs become canonical. No fee sidecar is exported in public status.
+    pub fn ready_positions(&self) -> usize {
+        self.padding.len().saturating_add(self.pending.len())
+    }
+    pub fn transaction_ids(&self) -> Vec<Hash> {
+        self.pending.ids()
+    }
+    pub fn has_transaction(&self, id: &Hash) -> bool {
+        self.pending.contains(id)
+    }
+    pub fn transaction_packet(&self, id: &Hash) -> Result<Option<Vec<u8>>, String> {
+        match (self.pending.transaction(id), self.pending.sidecar(id)) {
+            (Some(transaction), Some(sidecar)) => crate::runtime::encode_gossip(
+                transaction,
+                sidecar,
+                &self.store.engine().state().network(),
+            )
+            .map(Some),
+            (None, None) => Ok(None),
+            _ => Err("pending transaction sidecar unavailable".into()),
+        }
+    }
+    pub fn submit_transaction(
+        &mut self,
+        peer: Hash,
+        expected: Hash,
+        packet: &[u8],
+    ) -> Result<Hash, String> {
+        self.submit_transaction_before(
+            peer,
+            expected,
+            packet,
+            &crate::p2p::Deadline::new(std::time::Duration::from_secs(10)),
+        )
+    }
+    fn submit_transaction_before(
+        &mut self,
+        peer: Hash,
+        expected: Hash,
+        packet: &[u8],
+        deadline: &crate::p2p::Deadline,
+    ) -> Result<Hash, String> {
+        deadline
+            .check()
+            .map_err(|_| "pending transaction deadline elapsed")?;
+        self.store.ensure_exportable()?;
+        let network = self.store.engine().state().network();
+        let (id, length) = transaction_identity(packet, &network)?;
+        let envelope = &packet[4..4 + length];
+        if id != expected {
+            return Err("pending transaction identity differs".into());
+        }
+        if self.pending.contains(&id) {
+            let existing = zeroize::Zeroizing::new(
+                self.transaction_packet(&id)?
+                    .ok_or("pending packet unavailable")?,
+            );
+            deadline
+                .check()
+                .map_err(|_| "pending transaction deadline elapsed")?;
+            return if existing.as_slice() == packet {
+                Ok(id)
+            } else {
+                Err("pending retry differs from admitted packet".into())
+            };
+        }
+        self.pending
+            .submit_encoded(
+                self.store.engine().state().chain(),
+                PeerId(peer),
+                envelope,
+                Some(&packet[4 + length..]),
+                &TimedAdmission {
+                    verifier: &self.verifier,
+                    deadline,
+                },
+            )
+            .map_err(|_| "pending transaction admission rejected".into())
+    }
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn submit_local_transaction(
+        &mut self,
+        packet: &[u8],
+        deadline: &crate::p2p::Deadline,
+    ) -> Result<Hash, String> {
+        deadline
+            .check()
+            .map_err(|_| "pending transaction deadline elapsed")?;
+        let network = self.store.engine().state().network();
+        let (id, _) = transaction_identity(packet, &network)?;
+        let peer = blake3::derive_key(
+            "siworld eng2 owner local submission v1",
+            &self.store.engine().genesis().id(),
+        );
+        self.submit_transaction_before(peer, id, packet, deadline)
     }
     pub fn padding_count(&self) -> usize {
         self.padding.len()
@@ -132,9 +296,18 @@ impl Driver {
         issuances: Vec<crate::issuance::IssuanceRecord>,
     ) -> Result<PreparedBlock, String> {
         self.store.ensure_exportable()?;
-        let positions = self
-            .padding
-            .take(self.store.engine().state().chain(), count)?;
+        if !(crate::wire::MIN_SLOTS..=crate::wire::MAX_SLOTS).contains(&count)
+            || !count.is_multiple_of(crate::wire::GROUP)
+        {
+            return Err("production position count rejected".into());
+        }
+        let state = self.store.engine().state().chain();
+        self.padding.prune(state)?;
+        let mut positions = self
+            .pending
+            .select(state, count)
+            .map_err(|_| "pending transaction selection rejected")?;
+        positions.extend(self.padding.take_for_fill(state, count - positions.len())?);
         producer::prepare(
             self.store.engine(),
             positions,
@@ -177,9 +350,109 @@ impl super::network::Owner for Driver {
     }
 }
 
+#[cfg(all(unix, feature = "eng2-runtime"))]
+impl super::transaction_exchange::Owner for Driver {
+    fn transaction_ids(&self) -> Vec<Hash> {
+        Driver::transaction_ids(self)
+    }
+    fn has_transaction(&self, id: &Hash) -> bool {
+        Driver::has_transaction(self, id)
+    }
+    fn transaction_packet(&self, id: &Hash) -> Result<Option<Vec<u8>>, String> {
+        Driver::transaction_packet(self, id)
+    }
+    fn submit_transaction(
+        &mut self,
+        peer: Hash,
+        expected: Hash,
+        packet: &[u8],
+        deadline: &crate::p2p::Deadline,
+    ) -> Result<Hash, String> {
+        self.submit_transaction_before(peer, expected, packet, deadline)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn late_verification_or_final_commit_never_inserts_pending_work() {
+        use crate::admission::{AdmissionVerifier, VerificationError};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        struct Late {
+            clock: Arc<AtomicU64>,
+            after_verify: bool,
+        }
+        impl AdmissionVerifier for Late {
+            fn verify(
+                &self,
+                _: &native::codec::PublicTransaction,
+                _: &native::codec::ProofContext,
+                _: &native::multi_asset::Digest,
+                _: &native::multi_asset::Digest,
+                _: &[u8],
+            ) -> Result<(), VerificationError> {
+                if self.after_verify {
+                    self.clock.store(20_000, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            fn check_commit(&self) -> Result<(), VerificationError> {
+                if !self.after_verify {
+                    self.clock.store(20_000, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+        let state = super::super::snapshot::tests::bootstrap().chain;
+        let mut transaction = crate::fixtures::candidate(&state, 2_500_000)
+            .transactions
+            .remove(0);
+        transaction.record.fee_commit = native::codec::encode_digest(
+            &native::multi_asset::Hasher::new()
+                .fee_commit(0, &[native::multi_asset::F::default(); 8]),
+        );
+        let id = transaction.record.statement_id(&state.config.network);
+        let sidecar = crate::wire::Sidecar {
+            transaction_id: id,
+            fee: 0,
+            blind: [0; 8],
+        }
+        .encode()
+        .unwrap();
+        let envelope = transaction.encode_envelope(&state.config.network).unwrap();
+        for after_verify in [true, false] {
+            let clock = Arc::new(AtomicU64::new(0));
+            let deadline =
+                crate::p2p::Deadline::test_clock(std::time::Duration::from_secs(10), clock.clone());
+            let late = Late {
+                clock: clock.clone(),
+                after_verify,
+            };
+            let mut pool = Mempool::new(state.config.network);
+            assert!(
+                pool.submit_encoded(
+                    &state,
+                    PeerId([7; 32]),
+                    &envelope,
+                    Some(&sidecar),
+                    &TimedAdmission {
+                        verifier: &late,
+                        deadline: &deadline
+                    }
+                )
+                .is_err()
+            );
+            assert_eq!(clock.load(Ordering::Relaxed), 20_000);
+            assert!(pool.is_empty());
+            assert_eq!(pool.bytes(), 0);
+            assert_eq!(pool.peer_count(), 0);
+        }
+    }
     #[test]
     fn resident_owner_rejects_synthetic_native_proofs_without_publication() {
         let initial = super::super::snapshot::tests::bootstrap();
@@ -214,6 +487,80 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let mut pending = crate::fixtures::candidate(owner.engine().state().chain(), 2_500_000)
+            .transactions
+            .remove(0);
+        pending.record.fee_commit = native::codec::encode_digest(
+            &native::multi_asset::Hasher::new()
+                .fee_commit(0, &[native::multi_asset::F::default(); 8]),
+        );
+        let pending_id = pending.record.statement_id(&head.network);
+        let packet = crate::runtime::encode_gossip(
+            &pending,
+            &crate::wire::Sidecar {
+                transaction_id: pending_id,
+                fee: 0,
+                blind: [0; 8],
+            },
+            &head.network,
+        )
+        .unwrap();
+        assert!(
+            owner
+                .submit_transaction([7; 32], [8; 32], &packet)
+                .unwrap_err()
+                .contains("identity differs")
+        );
+        assert!(
+            owner
+                .submit_transaction([7; 32], pending_id, &packet)
+                .is_err()
+        );
+        assert!(owner.transaction_ids().is_empty());
+        assert_eq!(owner.head().unwrap(), head);
+        // Seed only this retry-policy test through an explicit mock verifier.
+        // The real Driver admission above rejected the same synthetic proof.
+        struct Accepted;
+        impl crate::admission::AdmissionVerifier for Accepted {
+            fn verify(
+                &self,
+                _: &native::codec::PublicTransaction,
+                _: &native::codec::ProofContext,
+                _: &native::multi_asset::Digest,
+                _: &native::multi_asset::Digest,
+                _: &[u8],
+            ) -> Result<(), crate::admission::VerificationError> {
+                Ok(())
+            }
+        }
+        let envelope_length = u32::from_le_bytes(packet[..4].try_into().unwrap()) as usize;
+        owner
+            .pending
+            .submit_encoded(
+                owner.store.engine().state().chain(),
+                PeerId([7; 32]),
+                &packet[4..4 + envelope_length],
+                Some(&packet[4 + envelope_length..]),
+                &Accepted,
+            )
+            .unwrap();
+        assert_eq!(
+            owner
+                .submit_transaction([7; 32], pending_id, &packet)
+                .unwrap(),
+            pending_id
+        );
+        let mut different = packet.clone();
+        different[4 + envelope_length - 1] ^= 1;
+        assert!(
+            owner
+                .submit_transaction([7; 32], pending_id, &different)
+                .unwrap_err()
+                .contains("retry differs")
+        );
+        assert_eq!(owner.transaction_ids(), vec![pending_id]);
+        assert_eq!(owner.head().unwrap(), head);
+        owner.pending.remove(&pending_id);
         let old = crate::fixtures::candidate(owner.engine().state().chain(), 2_500_000);
         let body = Body {
             network: old.network,

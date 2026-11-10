@@ -29,6 +29,7 @@ pub(super) struct Context {
     pub identity: NativeIdentity,
     pub leaves: Hash,
     pub spends: Hash,
+    pub index: Hash,
 }
 impl Context {
     pub fn write(
@@ -38,10 +39,11 @@ impl Context {
         bytes: &[u8],
         leaves: Hash,
         spends: Hash,
+        index: Hash,
     ) -> Result<(), String> {
         let seal = self
             .identity
-            .seal_local_storage(digest(genesis, bytes, leaves, spends))
+            .seal_local_storage(digest(genesis, bytes, leaves, spends, index))
             .map_err(|_| "local committed-state seal failed")?;
         let mut table = transaction
             .open_table(CACHE)
@@ -50,6 +52,7 @@ impl Context {
             ("state", bytes),
             ("leaves", leaves.as_slice()),
             ("spends", spends.as_slice()),
+            ("index", index.as_slice()),
             ("seal", seal.as_slice()),
         ] {
             table
@@ -154,7 +157,13 @@ pub(super) fn image(
     }
     Ok(bytes)
 }
-pub(super) fn digest(genesis: &Genesis, bytes: &[u8], leaves: Hash, spends: Hash) -> Hash {
+pub(super) fn digest(
+    genesis: &Genesis,
+    bytes: &[u8],
+    leaves: Hash,
+    spends: Hash,
+    index: Hash,
+) -> Hash {
     let mut hash =
         blake3::Hasher::new_derive_key("siworld eng2 atomically accepted restart state v1");
     hash.update(&genesis.id());
@@ -163,6 +172,7 @@ pub(super) fn digest(genesis: &Genesis, bytes: &[u8], leaves: Hash, spends: Hash
     hash.update(bytes);
     hash.update(&leaves);
     hash.update(&spends);
+    hash.update(&index);
     *hash.finalize().as_bytes()
 }
 struct Reader<'a>(&'a [u8]);

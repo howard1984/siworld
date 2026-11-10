@@ -28,8 +28,20 @@ use native::{
 };
 use p3_field::PrimeCharacteristicRing;
 use serde_json::{Value, json};
-use std::{fs::OpenOptions, io::Write, path::Path, time::Instant};
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    path::Path,
+    time::Instant,
+};
 use zeroize::{Zeroize, Zeroizing};
+
+mod continuation;
+pub use continuation::{check_continuation, continue_run};
+
+const PAYMENT_HEIGHT: u64 = 26;
+const CONSOLIDATION_HEIGHT: u64 = 27;
+const ISSUANCE_HEIGHT: u64 = 28;
 
 fn private_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut options = OpenOptions::new();
@@ -135,7 +147,7 @@ fn operations(
         };
         governance.push(eng2_operations::hex(&signed.encode()?));
     }
-    if height == 25 {
+    if height == PAYMENT_HEIGHT {
         let config = &engine.state().chain().config;
         let authority = config.fund_verifying_keys[0];
         let address = engine.state().governance().active_fund_destination(0)?;
@@ -254,7 +266,31 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
         max_component_bytes: 64 * 1024 * 1024,
     };
     let path = directory.join("chain.redb");
-    let mut store = Store::create(&path, genesis, limits)?;
+    let store = Store::create(&path, genesis, limits)?;
+    execute(
+        directory,
+        blocks,
+        seed,
+        genesis_bytes,
+        store,
+        NativeVerifier::new()?,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    directory: &Path,
+    blocks: u64,
+    seed: Zeroizing<[u8; 32]>,
+    genesis_bytes: Vec<u8>,
+    mut store: Store,
+    verifier: NativeVerifier,
+    prefix: u64,
+) -> Result<Value, String> {
+    let network = store.engine().state().network();
+    let path = directory.join("chain.redb");
+    let limits = store.engine().limits();
     let mut miner = Wallet::from_seed(
         network,
         derive(seed.as_ref(), "siworld eng2 rehearsal payment v1"),
@@ -280,8 +316,6 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
         2,
     )?;
     let started = Instant::now();
-    let verifier = NativeVerifier::new()?;
-    let prover = NativeProver::new()?;
     let mut timings = Vec::new();
     let mut transferred = false;
     let mut last_root = [0; 32];
@@ -289,12 +323,74 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
     let mut fund_claimed = false;
     let mut issued_asset = None;
     let mut issuance_paid = false;
-    for height in 1..=blocks {
+    if prefix > 0 {
+        if prefix != 24 || store.engine().state().height() != prefix {
+            return Err("continuation requires the exact audited 24-block prefix".into());
+        }
+        for height in 1..=prefix {
+            let (header, body) = store.block(height)?;
+            let id = header
+                .id()
+                .map_err(|_| "invalid accepted continuation identity")?;
+            let projection = wallet_projection(&header, &body);
+            for wallet in [
+                &mut miner,
+                &mut recipient,
+                &mut fund_wallet,
+                &mut fee_wallet,
+            ] {
+                wallet.scan_light_data(
+                    store.engine().state().chain(),
+                    std::slice::from_ref(&projection),
+                    &[id],
+                    true,
+                )?;
+            }
+            governance_records += body.governance.len() as u64;
+            last_root = header.execution_commitment;
+            let mut bytes = Vec::new();
+            crate::local::regular_read(
+                &directory.join(format!("block-{height}.json")),
+                true,
+                65536,
+            )?
+            .read_to_end(&mut bytes)
+            .map_err(|_| "continuation receipt read failed")?;
+            let receipt: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "invalid continuation receipt")?;
+            if receipt["height"]
+                .as_str()
+                .and_then(|v| v.parse::<u64>().ok())
+                != Some(height)
+                || receipt["block_id"] != crate::local::hex(&id)
+                || receipt["execution_commitment"] != crate::local::hex(&last_root)
+                || receipt["native_verified"] != true
+                || receipt["durable_committed"] != true
+            {
+                return Err("continuation receipt differs from audited actual header".into());
+            }
+            timings.push(receipt);
+        }
+        if governance_records != 2
+            || store.engine().state().governance().sequence() != 2
+            || store
+                .engine()
+                .state()
+                .governance()
+                .pending_issuance_fee()
+                .is_some()
+            || store.engine().state().governance().issuance_fee_atoms() != 5_000_000_000
+        {
+            return Err("continuation governance differs from cancelled actual proposal".into());
+        }
+    }
+    let prover = NativeProver::new()?;
+    for height in prefix + 1..=blocks {
         let block_started = Instant::now();
         let state = store.engine().state().chain();
         let mut positions = Vec::with_capacity(MIN_SLOTS);
         let mut issuances = Vec::new();
-        if !transferred && height >= 25 {
+        if !transferred && height >= PAYMENT_HEIGHT {
             let note = miner
                 .receipts()
                 .iter()
@@ -302,7 +398,7 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
                     !note.spent
                         && note.note().asset_id == SIP_ASSET_ID
                         && note.note().value > 200_000_000
-                        && note.note().unlock_height <= height
+                        && note.note().unlock_height <= state.height
                 })
                 .ok_or("mature actual miner note is unavailable")?;
             let payment = miner
@@ -330,7 +426,7 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
             });
             transferred = true;
         }
-        if height == 26 || height == 27 {
+        if height == CONSOLIDATION_HEIGHT || height == ISSUANCE_HEIGHT {
             let mut notes: Vec<_> = miner
                 .receipts()
                 .iter()
@@ -338,7 +434,7 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
                     !note.spent
                         && note.note().asset_id == SIP_ASSET_ID
                         && note.note().value > 0
-                        && note.note().unlock_height <= height
+                        && note.note().unlock_height <= state.height
                 })
                 .collect();
             notes.sort_unstable_by_key(|note| std::cmp::Reverse(note.note().value));
@@ -346,7 +442,7 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
                 return Err("two actual mature miner notes are unavailable".into());
             }
             let selected = [Some(notes[0].commitment), Some(notes[1].commitment)];
-            let payment = if height == 26 {
+            let payment = if height == CONSOLIDATION_HEIGHT {
                 let value = notes[0]
                     .note()
                     .value
@@ -479,7 +575,7 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
             true,
         )?;
         last_root = accepted.execution_commitment();
-        if height == 25 {
+        if height == PAYMENT_HEIGHT {
             if store.engine().state().fund().balance(0)?.spent != 1
                 || fund_wallet
                     .balances(height + 1)?
@@ -492,7 +588,7 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
             }
             fund_claimed = true;
         }
-        if height == 27 {
+        if height == ISSUANCE_HEIGHT {
             let asset = issued_asset.ok_or("actual issued asset is unavailable")?;
             if fee_wallet
                 .balances(height + 1)?
@@ -557,12 +653,13 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
         "version":1,"scope":"offline-native-rehearsal","fee_mode":"legacy-miner",
         "genesis_id":crate::local::hex(&audit.engine().genesis().id()),
         "native_proof_blocks":blocks.to_string(),"independently_checked_execution_commitments":checked.to_string(),
-        "durable_reopen_audit":"passed","production_fast_restart":"not_implemented",
+        "durable_reopen_audit":"passed","production_fast_restart":"not_qualified_by_this_rehearsal",
+        "reused_native_proof_blocks":prefix.to_string(),"new_native_proof_blocks":(blocks-prefix).to_string(),
         "wallet_transfer":if transferred { "passed" } else { "pending_maturity" },
         "wallet_transfer_atoms":if transferred { Some("100000000") } else { None },
-        "fund_claim":if fund_claimed {"passed_private_pipe_native_commit"} else {"pending_25_real_proof_blocks"},
+        "fund_claim":if fund_claimed {"passed_private_pipe_native_commit"} else {"pending_26_real_proof_blocks"},
         "unified_governance_records":governance_records.to_string(),
-        "issuance_and_dedicated_fee_payment":if issuance_paid {"passed_50_SIP_and_300_asset_atoms"} else {"pending_27_real_proof_blocks"},
+        "issuance_and_dedicated_fee_payment":if issuance_paid {"passed_50_SIP_and_300_asset_atoms"} else {"pending_28_real_proof_blocks"},
         "tip":crate::local::hex(&final_id),"execution_commitment":crate::local::hex(&last_root),
         "database_bytes":std::fs::metadata(path).map_err(|_| "rehearsal database metadata unavailable")?.len().to_string(),
         "elapsed_ms":started.elapsed().as_millis().to_string(),"blocks":timings,

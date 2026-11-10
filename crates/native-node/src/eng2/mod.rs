@@ -6,6 +6,8 @@ pub mod admission;
 pub mod archive;
 pub mod body;
 pub mod certificate;
+#[cfg(unix)]
+pub mod checkpoint_exchange;
 pub mod commitment;
 #[cfg(feature = "native-p2p")]
 pub mod connector;
@@ -20,6 +22,8 @@ pub mod producer;
 pub mod proof_window;
 #[cfg(feature = "eng2-rehearsal")]
 pub mod rehearsal;
+#[cfg(feature = "eng2-runtime")]
+pub mod resident;
 pub(crate) mod restart;
 pub mod runtime_export;
 pub mod selection;
@@ -28,3 +32,6 @@ pub mod staging;
 pub mod state_components;
 pub mod store;
 pub mod transport;
+
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(crate) mod transaction_exchange;

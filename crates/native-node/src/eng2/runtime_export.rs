@@ -27,6 +27,8 @@ pub const MAX_PROJECTION_BYTES: usize = 131072;
 mod files;
 #[cfg(unix)]
 pub use files::PublicExport;
+#[cfg(unix)]
+pub mod host;
 
 /// The newest eligible actual archive height; no height is synthesized.
 pub fn eligible_checkpoint(head: u64) -> Option<u64> {
@@ -181,6 +183,34 @@ impl PreparedCheckpoint {
         Ok(value)
     }
 
+    /// A peer supplies no historical ledger. Reconstruct the snapshot from this
+    /// node's own actual archive before comparing its complete signed context.
+    pub fn from_proposal(
+        store: &Store,
+        statement: Statement,
+        witness: AuthorizationWitness,
+        limits: ImportLimits,
+    ) -> Result<Self, String> {
+        store.ensure_exportable()?;
+        let header = store.header(statement.checkpoint_height)?;
+        let archived = store.checkpoint_anchor(statement.checkpoint_height, limits)?;
+        let engine = store.engine();
+        let components = archived.canonical_components(
+            Binding {
+                genesis: engine.genesis().id(),
+                rules_commitment: engine.genesis().rules_commitment(),
+                parent: header.parent,
+            },
+            limits.chain,
+        )?;
+        Self::restore(
+            store,
+            statement,
+            witness,
+            super::snapshot::encode_components(&components, limits)?,
+            limits,
+        )
+    }
     /// `anchor` must be the complete actual historical state returned by the
     /// durable archive, never a recent-root selector or current ledger relabel.
     pub fn prepare(
@@ -485,7 +515,7 @@ fn projection_with_blocks(
         Ok(json!({"index":index,"entitled_atoms":balance.entitlement.to_string(),"released_atoms":balance.unlocked().map_err(|_| "invalid public fund release balance")?.to_string(),"spent_atoms":balance.spent.to_string()}))
     }).collect::<Result<Vec<_>,String>>()?;
     let checkpoint = if let Some(certified) = checkpoint {
-        certified.check_current(store)?;
+        certified.prepared.check_prefix(store)?;
         let item = &certified.certificate.statement;
         Some(
             json!({"height":item.checkpoint_height,"hash":crate::local::hex(&item.checkpoint_block),

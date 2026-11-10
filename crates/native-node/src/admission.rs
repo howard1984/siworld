@@ -78,6 +78,11 @@ pub trait AdmissionVerifier {
         root: &Digest,
         proof: &[u8],
     ) -> Result<(), VerificationError>;
+    /// Check local admission availability immediately before the first pool
+    /// mutation. This hook cannot change the proof validity result.
+    fn check_commit(&self) -> Result<(), VerificationError> {
+        Ok(())
+    }
 }
 
 /// The in-process block verifier has no worker resource-result interface.
@@ -327,6 +332,9 @@ impl Mempool {
         // The complete envelope is borrowed until successful verification.
         // A boxed slice discards any upstream Vec capacity before retention.
         let proof = proof.to_vec().into_boxed_slice().into_vec();
+        verifier
+            .check_commit()
+            .map_err(|_| AdmissionError::Unavailable(ResourceReason::Verifier))?;
         self.inputs.extend(inputs);
         self.outputs.extend(outputs);
         let usage = self.peers.entry(peer).or_default();

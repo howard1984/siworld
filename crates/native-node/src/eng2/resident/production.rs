@@ -1,0 +1,265 @@
+//! One bounded native producer; proving and nonce search hold no owner lock.
+
+#[cfg(unix)]
+use super::super::producer::Search;
+#[cfg(unix)]
+fn progress(shared: &Shared, attempts: u64) -> Result<(), String> {
+    let mut status = shared
+        .production
+        .lock()
+        .map_err(|_| "resident status lock poisoned")?;
+    status.pow_attempts = status
+        .pow_attempts
+        .checked_add(attempts)
+        .ok_or("native work counter exhausted")?;
+    status.last_pow = Some(Instant::now());
+    Ok(())
+}
+use super::*;
+use crate::producer::MiningSettings;
+
+#[cfg(unix)]
+fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> Result<(), String> {
+    let _charge = shared
+        .budget
+        .reserve(256 * 1024 * 1024)
+        .map_err(|_| "resident production budget unavailable")?;
+    let prover = NativeProver::new()?;
+    while !shared.cancel.is_cancelled() {
+        if !shared.network.snapshot()?.ready {
+            shared.phase("networking")?;
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        shared.phase("refilling")?;
+        let task = {
+            let mut owner = shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?;
+            if owner.ready_positions() < crate::pool::MIN_READY {
+                owner.prepare_padding()?
+            } else {
+                None
+            }
+        };
+        if let Some(task) = task {
+            let padding = task.prove(&prover)?;
+            if shared.cancel.is_cancelled() {
+                break;
+            }
+            let mut owner = shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?;
+            // A long catch-up can expire the witnessed snapshot while a proof
+            // runs. Such work is discarded, with no fallback or queue reuse.
+            if owner
+                .engine()
+                .state()
+                .chain()
+                .snapshot(padding.transaction.record.snapshot)
+                .is_ok()
+            {
+                owner.insert_padding(padding)?;
+            }
+            continue;
+        }
+        if !shared.network.snapshot()?.ready {
+            continue;
+        }
+        shared.phase("preparing")?;
+        let (prepared, mut submission) = {
+            let mut owner = shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?;
+            if owner.ready_positions() < crate::pool::MIN_READY {
+                continue;
+            }
+            let timestamp = (unix_ms()? / 1000).max(
+                owner
+                    .engine()
+                    .state()
+                    .chain()
+                    .median_time_past()
+                    .checked_add(1)
+                    .ok_or("native timestamp exhausted")?,
+            );
+            let head = owner.head()?;
+            let mut submission = shared.operations.as_ref().and_then(|mailbox| {
+                match mailbox.take(&head, &shared.budget) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        mailbox.alarm();
+                        None
+                    }
+                }
+            });
+            let prepared = if let Some(request) = submission.as_mut() {
+                let (operations, issuances) = request.inputs();
+                match owner.prepare_block_with_operations(
+                    crate::pool::MIN_READY,
+                    timestamp,
+                    settings,
+                    operations,
+                    issuances,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        request.fail("preparation_rejected");
+                        continue;
+                    }
+                }
+            } else {
+                owner.prepare_block(crate::pool::MIN_READY, timestamp, settings)?
+            };
+            (prepared, submission)
+        };
+        let proved = match prepared.prove(&prover) {
+            Ok(proved) => proved,
+            Err(error) => {
+                if let Some(request) = submission.as_mut() {
+                    request.fail("proving_rejected");
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if shared.cancel.is_cancelled() {
+            break;
+        }
+        let mut work = {
+            let owner = shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?;
+            if owner.head()?.id != proved.parent() {
+                if let Some(request) = submission.as_mut() {
+                    request.fail("stale_parent");
+                }
+                continue;
+            }
+            match owner.prepare_work(proved) {
+                Ok(work) => work,
+                Err(error) => {
+                    if let Some(request) = submission.as_mut() {
+                        request.fail("engine_rejected");
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        shared.phase("mining")?;
+        loop {
+            if shared.cancel.is_cancelled() || !shared.network.snapshot()?.ready {
+                break;
+            }
+            if shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?
+                .head()?
+                .id
+                != work.parent()
+            {
+                if let Some(request) = submission.as_mut() {
+                    request.fail("stale_parent");
+                }
+                break;
+            }
+            let before = work.next_nonce();
+            let searched = work.search(256)?;
+            match searched {
+                Search::Pending(next) => {
+                    let attempts = next.next_nonce() - before;
+                    progress(shared, attempts)?;
+                    work = next;
+                }
+                Search::Found(block) => {
+                    let attempts = block
+                        .header
+                        .nonce
+                        .checked_sub(before)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or("native work progress overflow")?;
+                    progress(shared, attempts)?;
+                    shared.phase("committing")?;
+                    let committed = {
+                        let mut owner = shared
+                            .owner
+                            .lock()
+                            .map_err(|_| "resident owner lock poisoned")?;
+                        if owner.head()?.id != block.header.parent {
+                            if let Some(request) = submission.as_mut() {
+                                request.fail("stale_parent");
+                            }
+                            break;
+                        }
+                        match owner.accept(&block.header, &block.body) {
+                            Ok(committed) => committed,
+                            Err(error) => {
+                                if let Some(request) = submission.as_mut() {
+                                    request.fail("commit_rejected");
+                                    break;
+                                }
+                                return Err(error);
+                            }
+                        }
+                    };
+                    if let Some(request) = submission.as_mut() {
+                        let owner = shared
+                            .owner
+                            .lock()
+                            .map_err(|_| "resident owner lock poisoned")?;
+                        request.committed(&committed, owner.store());
+                    }
+                    // This receipt is private. A write failure is an explicit
+                    // production alarm and never relabels the committed block.
+                    crate::local::save_reward(directory, &committed.id(), &block.reward_secret)?;
+                    let mut status = shared
+                        .production
+                        .lock()
+                        .map_err(|_| "resident status lock poisoned")?;
+                    status.blocks = status
+                        .blocks
+                        .checked_add(1)
+                        .ok_or("native mined-block counter exhausted")?;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+pub(super) fn run(
+    directory: &Path,
+    settings: MiningSettings,
+    shared: Arc<Shared>,
+) -> Result<(), String> {
+    let workers = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|i| format!("eng2-prover-{i}"))
+        .build()
+        .map_err(|_| "native proving worker pool unavailable")?;
+    #[cfg(unix)]
+    let result = workers.install(|| continuous(directory, &settings, &shared));
+    #[cfg(not(unix))]
+    let result: Result<(), String> = {
+        let _ = (directory, settings, workers);
+        Err("resident production is unsupported on this platform".into())
+    };
+    if result.is_err() {
+        if let Ok(mut status) = shared.production.lock() {
+            status.error = Some("native_production_failed");
+            status.phase = "networking";
+        }
+        // Keep validating and serving while production is alarmed. No implicit
+        // prover retry, credential change or alternate profile is attempted.
+        while !shared.cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    result
+}

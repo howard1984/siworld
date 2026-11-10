@@ -29,8 +29,15 @@ wallet-light-gateway = []
 checkpoint-rejection-acceptance = []
 # Explicit real-time pruning-alarm acceptance build; excluded from production packaging.
 checkpoint-stale-acceptance = []
-# Offline native block/wallet rehearsal, excluded from production packaging.
+# Owner-operated native block/wallet rehearsal. CI must not select this feature.
 eng2-rehearsal = []
+# Explicit owner-operated resident entry point; excluded from CI build features.
+eng2-runtime = ["native-p2p"]
+
+[[bin]]
+name = "siworld-eng2-node"
+path = "src/bin/siworld-eng2-node.rs"
+required-features = ["eng2-runtime"]
 
 [[bin]]
 name = "siworld-eng2-rehearsal"

@@ -275,6 +275,50 @@ impl<S: Read + Write> Peer<S> {
             .map_err(|_| p2p::Error::InvalidProtocol)?;
         Ok(Some(ReceivedBody { body, reservation }))
     }
+    #[cfg(unix)]
+    pub(crate) fn application_network(&self) -> Hash {
+        self.session.binding().network
+    }
+    #[cfg(unix)]
+    pub(crate) fn reserve_application(
+        &self,
+        length: usize,
+    ) -> Result<p2p::Reservation, p2p::Error> {
+        let bytes = length
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(65_536))
+            .ok_or(p2p::Error::ResourceExhausted)?;
+        self.session.shared_budget().reserve(bytes)
+    }
+    #[cfg(unix)]
+    pub(crate) fn send_application_before(
+        &mut self,
+        request: u64,
+        bytes: &[u8],
+        deadline: &p2p::Deadline,
+    ) -> Result<(), p2p::Error> {
+        self.session
+            .send_control_before(p2p::ENG2_MESSAGE, request, bytes, deadline)
+    }
+    #[cfg(unix)]
+    pub(crate) fn receive_application_before(
+        &mut self,
+        deadline: &p2p::Deadline,
+        maximum: usize,
+    ) -> Result<(u64, Vec<u8>, p2p::Reservation), p2p::Error> {
+        match self
+            .session
+            .receive_eng2_application_before(deadline, maximum)?
+        {
+            p2p::Packet::Control {
+                kind: p2p::ENG2_MESSAGE,
+                request,
+                body,
+                reservation,
+            } => Ok((request, body, reservation)),
+            _ => Err(p2p::Error::InvalidProtocol),
+        }
+    }
     fn send_identity(
         &mut self,
         kind: u8,

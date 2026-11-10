@@ -231,3 +231,36 @@ fn synthetic_candidate_codec_and_vote_journal_are_exact_but_cannot_admit_a_check
             .exists()
     );
 }
+
+#[test]
+fn concurrent_immutable_publications_install_one_complete_record_without_clobbering() {
+    use std::sync::{Arc, Barrier};
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("export");
+    let first = PublicExport::open(&root, &store, limits()).unwrap();
+    let second = PublicExport::open(&root, &store, limits()).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let other = barrier.clone();
+    let left = std::thread::spawn(move || {
+        barrier.wait();
+        first.write_once("raced.bin", b"first complete record")
+    });
+    let right = std::thread::spawn(move || {
+        other.wait();
+        second.write_once("raced.bin", b"second complete record")
+    });
+    let left = left.join().unwrap();
+    let right = right.join().unwrap();
+    assert_ne!(left.is_ok(), right.is_ok());
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let actual = export.read("raced.bin", 64).unwrap();
+    assert!(actual == b"first complete record" || actual == b"second complete record");
+    assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "tmp")
+    }));
+}

@@ -105,6 +105,51 @@ impl PublicExport {
         self.write_once(&name, &encode_candidate(&prepared, limits)?)?;
         Ok(Some(prepared))
     }
+    pub fn latest_height(&self) -> Option<u64> {
+        self.latest.map(|row| row.0)
+    }
+    pub fn last_publication(&self) -> Option<u64> {
+        self.latest.map(|row| row.2)
+    }
+    pub fn resume_candidate(
+        &self,
+        store: &Store,
+        limits: ImportLimits,
+    ) -> Result<Option<PreparedCheckpoint>, String> {
+        self.check_store(store)?;
+        let state = store.engine().state();
+        let Some(height) = eligible_checkpoint(state.height()) else {
+            return Ok(None);
+        };
+        let name = candidate_name(state.governance().active_roster().epoch_sequence, height);
+        self.read_optional(&name, candidate_bound(limits)?)?
+            .map(|bytes| decode_candidate(store, &bytes, limits))
+            .transpose()
+    }
+    pub fn accept_proposal(
+        &self,
+        store: &Store,
+        statement: Statement,
+        witness: AuthorizationWitness,
+        limits: ImportLimits,
+    ) -> Result<PreparedCheckpoint, String> {
+        self.check_store(store)?;
+        let prepared = PreparedCheckpoint::from_proposal(store, statement, witness, limits)?;
+        self.write_once(
+            &candidate_name(
+                prepared.statement.roster_sequence,
+                prepared.statement.checkpoint_height,
+            ),
+            &encode_candidate(&prepared, limits)?,
+        )?;
+        Ok(prepared)
+    }
+    pub(super) fn write_status(&self, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() > 8192 {
+            return Err("checkpoint status exceeds byte bound".into());
+        }
+        self.replace("checkpoint-status-eng2.json", bytes)
+    }
     /// The caller supplies a borrowed protected key. The exact public candidate
     /// and signature are journaled durably before a vote can leave this method.
     pub fn sign_vote(
@@ -424,18 +469,67 @@ impl PublicExport {
                 Err("eng2 immutable public artifact differs".into())
             };
         }
-        let descriptor = openat(
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| "eng2 immutable temporary identity unavailable")?;
+        let temporary = format!("{}.tmp", crate::local::hex(&random));
+        let result: Result<(), String> = (|| {
+            let descriptor = openat(
+                &self.root,
+                temporary.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map_err(|_| "eng2 immutable temporary create failed")?;
+            let mut file = fs::File::from(descriptor);
+            file.write_all(bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "eng2 immutable temporary write failed")?;
+            self.install_immutable(temporary.as_str(), name, bytes)?;
+            fsync(&self.root).map_err(|_| "eng2 immutable public directory sync failed".into())
+        })();
+        // Only this invocation's uninstalled temporary file may be removed.
+        let _ = unlinkat(&self.root, temporary.as_str(), AtFlags::empty());
+        result
+    }
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    fn install_immutable(&self, temporary: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+        match rustix::fs::renameat_with(
+            &self.root,
+            temporary,
             &self.root,
             name,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|_| "eng2 immutable public artifact create failed")?;
-        let mut file = fs::File::from(descriptor);
-        file.write_all(bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "eng2 immutable public artifact write failed")?;
-        fsync(&self.root).map_err(|_| "eng2 public artifact directory sync failed".into())
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            Err(rustix::io::Errno::EXIST) => {
+                if self.read(name, bytes.len())? == bytes {
+                    Ok(())
+                } else {
+                    Err("eng2 concurrent immutable public artifact differs".into())
+                }
+            }
+            Err(_) => Err("eng2 immutable atomic installation failed".into()),
+        }
+    }
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    fn install_immutable(
+        &self,
+        _temporary: &str,
+        _name: &str,
+        _bytes: &[u8],
+    ) -> Result<(), String> {
+        Err("eng2 immutable atomic publication is unsupported on this platform".into())
     }
     fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         // Refuse a symlink, shared file or permission change at the old cursor.

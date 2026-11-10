@@ -19,6 +19,8 @@ use std::{fs::OpenOptions, path::Path};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("eng2-canonical-meta-v1");
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("eng2-canonical-blocks-v1");
+const INDEX: TableDefinition<u64, &[u8]> = TableDefinition::new("eng2-canonical-index-v1");
+const INDEX_BYTES: usize = HEADER_BYTES + 8;
 const ANCHORS: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eng2-committed-anchor-states-v1");
 
@@ -64,6 +66,8 @@ impl Store {
                 .map_err(|_| "versioned head write failed")?;
             txn.open_table(BLOCKS)
                 .map_err(|_| "versioned block table unavailable")?;
+            txn.open_table(INDEX)
+                .map_err(|_| "versioned compact index unavailable")?;
         }
         txn.commit()
             .map_err(|_| "versioned database initialization commit failed")?;
@@ -75,8 +79,9 @@ impl Store {
             restart: None,
         })
     }
-    /// Independently reconstruct every committed block and execution root. A
-    /// malformed, mismatched, empty or incomplete existing file is rejected.
+    /// Independently reconstruct every committed block and execution root and
+    /// rebuild its compact index in the same explicit audit. Malformed,
+    /// mismatched, empty or incomplete existing files are rejected atomically.
     pub fn audit_existing(
         path: &Path,
         genesis: Genesis,
@@ -114,9 +119,11 @@ impl Store {
             .create_with_backend(backend)
             .map_err(|_| "damaged or incompatible versioned database")?;
         let mut engine = Engine::new(genesis, limits)?;
-        let txn = database
-            .begin_read()
+        let mut txn = database
+            .begin_write()
             .map_err(|_| "versioned metadata read failed")?;
+        txn.set_durability(Durability::Immediate)
+            .map_err(|_| "versioned audit durability unavailable")?;
         let meta = txn
             .open_table(META)
             .map_err(|_| "versioned metadata missing")?;
@@ -133,6 +140,9 @@ impl Store {
         let blocks = txn
             .open_table(BLOCKS)
             .map_err(|_| "versioned canonical history missing")?;
+        let mut index = txn
+            .open_table(INDEX)
+            .map_err(|_| "versioned audit compact index unavailable")?;
         let mut commitment = [0; 32];
         for row in blocks.iter().map_err(|_| "versioned history scan failed")? {
             let (height, bytes) = row.map_err(|_| "versioned canonical record unavailable")?;
@@ -142,11 +152,19 @@ impl Store {
             }
             let accepted = engine.apply(&header, &body, verifier)?;
             commitment = accepted.execution_commitment();
+            let compact = compact_record(&header, bytes.value().len() - HEADER_BYTES)?;
+            index
+                .insert(height.value(), compact.as_slice())
+                .map_err(|_| "versioned audit compact index write failed")?;
         }
-        if blocks
+        if index
             .len()
-            .map_err(|_| "versioned record count unavailable")?
+            .map_err(|_| "versioned compact index count unavailable")?
             != engine.state().height()
+            || blocks
+                .len()
+                .map_err(|_| "versioned record count unavailable")?
+                != engine.state().height()
             || meta
                 .get("head")
                 .map_err(|_| "versioned head read failed")?
@@ -156,7 +174,11 @@ impl Store {
         {
             return Err("versioned durable head differs from independent native replay".into());
         }
-        drop(txn);
+        drop(index);
+        drop(blocks);
+        drop(meta);
+        txn.commit()
+            .map_err(|_| "versioned audit compact index durable commit failed")?;
         Ok(Self {
             database,
             engine,
@@ -232,21 +254,20 @@ impl Store {
         {
             return Err("restart canonical count differs".into());
         }
+        let index = txn
+            .open_table(INDEX)
+            .map_err(|_| "restart compact index missing; explicit audit required")?;
+        if index.len().map_err(|_| "restart index count unavailable")? != height {
+            return Err("restart compact index count differs".into());
+        }
         let parent = if height == 0 {
             [0; 32]
         } else {
-            let value = blocks
+            let value = index
                 .get(height)
                 .map_err(|_| "restart tip unavailable")?
                 .ok_or("restart tip missing")?;
-            let header = Header::decode(
-                value
-                    .value()
-                    .get(..HEADER_BYTES)
-                    .ok_or("restart tip truncated")?,
-                &genesis.config().network,
-            )
-            .map_err(|_| "restart tip invalid")?;
+            let (header, _) = decode_compact(value.value(), genesis.config().network)?;
             if header.height != height
                 || header
                     .id()
@@ -265,7 +286,7 @@ impl Store {
         if table
             .len()
             .map_err(|_| "restart record count unavailable")?
-            != 4
+            != 5
         {
             return Err("incomplete authenticated restart record".into());
         }
@@ -291,15 +312,28 @@ impl Store {
         let spends: Hash = read("spends", 32)?
             .try_into()
             .map_err(|_| "restart spend digest width")?;
+        let sealed_index: Hash = read("index", 32)?
+            .try_into()
+            .map_err(|_| "restart compact index digest width")?;
         let seal = read("seal", crate::identity::storage_checkpoint::SEAL_BYTES)?;
         identity
             .descriptor()
             .map_err(|_| "restart descriptor unavailable")?
             .verify_local_storage(
-                super::restart::digest(&genesis, &bytes, leaves, spends),
+                super::restart::digest(&genesis, &bytes, leaves, spends, sealed_index),
                 &seal,
             )
             .map_err(|_| "authenticated restart seal mismatch")?;
+        let index_digest = authenticate_header_prefix(
+            &index,
+            genesis.config().network,
+            genesis.id(),
+            height,
+            head_bytes[8..40].try_into().expect("checked restart tip"),
+        )?;
+        if index_digest != sealed_index {
+            return Err("restart compact index differs from accepted local seal".into());
+        }
         let (leaf_values, leaf_digest) = super::restart::read_rows(
             &txn.open_table(super::restart::LEAVES)
                 .map_err(|_| "restart permanent leaves missing")?,
@@ -341,6 +375,7 @@ impl Store {
                 identity,
                 leaves,
                 spends,
+                index: index_digest,
             }),
         };
         result.ensure_exportable()?;
@@ -426,8 +461,23 @@ impl Store {
             identity,
             leaves,
             spends,
+            index: authenticate_header_prefix(
+                &txn.open_table(INDEX)
+                    .map_err(|_| "restart qualification compact index unavailable")?,
+                self.engine.state().network(),
+                self.engine.genesis().id(),
+                self.engine.state().height(),
+                self.engine.state().tip(),
+            )?,
         };
-        context.write(&txn, self.engine.genesis(), &bytes, leaves, spends)?;
+        context.write(
+            &txn,
+            self.engine.genesis(),
+            &bytes,
+            leaves,
+            spends,
+            context.index,
+        )?;
         self.usable = false;
         txn.commit()
             .map_err(|_| "restart qualification durable commit failed")?;
@@ -451,20 +501,13 @@ impl Store {
         let mut commitment = [0; 32];
         if self.engine.state().height() > 0 {
             let table = txn
-                .open_table(BLOCKS)
+                .open_table(INDEX)
                 .map_err(|_| "versioned export history unavailable")?;
             let value = table
                 .get(self.engine.state().height())
                 .map_err(|_| "versioned export header unavailable")?
                 .ok_or("versioned export header missing")?;
-            let header = Header::decode(
-                value
-                    .value()
-                    .get(..HEADER_BYTES)
-                    .ok_or("truncated versioned export header")?,
-                &self.engine.state().network(),
-            )
-            .map_err(|_| "invalid versioned export header")?;
+            let (header, _) = decode_compact(value.value(), self.engine.state().network())?;
             if header.height != self.engine.state().height()
                 || header
                     .id()
@@ -590,12 +633,32 @@ impl Store {
             .to_vec();
         body.write_to(&mut bytes, self.engine.body_policy())
             .map_err(|_| "versioned body encoding failed")?;
+        let compact = compact_record(header, bytes.len() - HEADER_BYTES)?;
         let mut txn = self
             .database
             .begin_write()
             .map_err(|_| "versioned block transaction unavailable")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "versioned block durability unavailable")?;
+        {
+            let mut index = txn
+                .open_table(INDEX)
+                .map_err(|_| "versioned compact index unavailable")?;
+            if index
+                .len()
+                .map_err(|_| "versioned compact index count unavailable")?
+                != self.engine.state().height()
+                || index
+                    .get(header.height)
+                    .map_err(|_| "versioned compact index lookup failed")?
+                    .is_some()
+            {
+                return Err("versioned compact index differs from accepted parent".into());
+            }
+            index
+                .insert(header.height, compact.as_slice())
+                .map_err(|_| "versioned compact index write failed")?;
+        }
         let mut next_restart = None;
         if let Some(context) = &self.restart {
             let mut leaves = context.leaves;
@@ -637,8 +700,13 @@ impl Store {
                 &staged.restart_image(self.engine.state(), self.engine.limits())?,
                 leaves,
                 spends,
+                index_row_hash(context.index, header.height, &compact),
             )?;
-            next_restart = Some((leaves, spends));
+            next_restart = Some((
+                leaves,
+                spends,
+                index_row_hash(context.index, header.height, &compact),
+            ));
         }
         {
             let mut blocks = txn
@@ -669,16 +737,17 @@ impl Store {
         txn.commit()
             .map_err(|_| "versioned canonical durable commit failed")?;
         let result = self.engine.publish(staged)?;
-        if let (Some(context), Some((leaves, spends))) = (&mut self.restart, next_restart) {
+        if let (Some(context), Some((leaves, spends, index))) = (&mut self.restart, next_restart) {
             context.leaves = leaves;
             context.spends = spends;
+            context.index = index;
         }
         self.usable = true;
         Ok(result)
     }
     /// Return canonical public header/body bytes for explicit independent replay.
     pub fn block(&self, height: u64) -> Result<(Header, Body), String> {
-        self.check_readable()?;
+        let (expected, length) = self.compact(height)?;
         let txn = self
             .database
             .begin_read()
@@ -690,50 +759,48 @@ impl Store {
             .get(height)
             .map_err(|_| "versioned block lookup failed")?
             .ok_or("versioned block missing")?;
+        if value.value().len() != HEADER_BYTES + length
+            || value.value().get(..HEADER_BYTES)
+                != Some(
+                    expected
+                        .encode()
+                        .map_err(|_| "invalid accepted compact header")?
+                        .as_slice(),
+                )
+        {
+            return Err("versioned body record differs from accepted compact index".into());
+        }
         decode(&self.engine, value.value())
     }
     /// Read only the fixed-width persisted header, without allocating a body.
     pub fn header(&self, height: u64) -> Result<Header, String> {
+        self.compact(height).map(|(header, _)| header)
+    }
+    fn compact(&self, height: u64) -> Result<(Header, usize), String> {
         self.check_readable()?;
+        if height == 0 || height > self.engine.state().height() {
+            return Err("versioned compact index height is not accepted".into());
+        }
         let txn = self
             .database
             .begin_read()
             .map_err(|_| "versioned header read unavailable")?;
         let table = txn
-            .open_table(BLOCKS)
+            .open_table(INDEX)
             .map_err(|_| "versioned header table unavailable")?;
         let value = table
             .get(height)
             .map_err(|_| "versioned header lookup failed")?
             .ok_or("versioned header missing")?;
-        Header::decode(
-            value
-                .value()
-                .get(..HEADER_BYTES)
-                .ok_or("truncated versioned header")?,
-            &self.engine.state().network(),
-        )
-        .map_err(|_| "invalid versioned persisted header".into())
+        let compact = decode_compact(value.value(), self.engine.state().network())?;
+        if compact.0.height != height || compact.1 > self.engine.body_policy().max_body_bytes {
+            return Err("invalid accepted compact index context or body bound".into());
+        }
+        Ok(compact)
     }
     /// Size the persisted body before callers reserve memory for decoding.
     pub fn block_size(&self, height: u64) -> Result<usize, String> {
-        self.check_readable()?;
-        let txn = self
-            .database
-            .begin_read()
-            .map_err(|_| "versioned body size unavailable")?;
-        let table = txn
-            .open_table(BLOCKS)
-            .map_err(|_| "versioned body size table unavailable")?;
-        let value = table
-            .get(height)
-            .map_err(|_| "versioned body size lookup failed")?
-            .ok_or("versioned body missing")?;
-        value
-            .value()
-            .len()
-            .checked_sub(HEADER_BYTES)
-            .ok_or_else(|| "truncated versioned persisted body".into())
+        self.compact(height).map(|(_, length)| length)
     }
     fn check_readable(&self) -> Result<(), String> {
         if self.usable {
@@ -750,6 +817,75 @@ fn head(engine: &Engine, commitment: Hash) -> Vec<u8> {
     bytes.extend_from_slice(&commitment);
     bytes
 }
+fn compact_record(header: &Header, body_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut compact = header
+        .encode()
+        .map_err(|_| "invalid compact header")?
+        .to_vec();
+    compact.extend_from_slice(
+        &u64::try_from(body_bytes)
+            .map_err(|_| "body size overflow")?
+            .to_le_bytes(),
+    );
+    Ok(compact)
+}
+fn decode_compact(bytes: &[u8], network: Hash) -> Result<(Header, usize), String> {
+    if bytes.len() != INDEX_BYTES {
+        return Err("invalid compact index width".into());
+    }
+    let header =
+        Header::decode(&bytes[..HEADER_BYTES], &network).map_err(|_| "invalid compact header")?;
+    let length = usize::try_from(u64::from_le_bytes(
+        bytes[HEADER_BYTES..]
+            .try_into()
+            .expect("checked compact index"),
+    ))
+    .map_err(|_| "compact body length overflow")?;
+    if length == 0 {
+        return Err("empty compact body length".into());
+    }
+    Ok((header, length))
+}
+fn index_row_hash(previous: Hash, height: u64, bytes: &[u8]) -> Hash {
+    let mut digest = blake3::Hasher::new_derive_key("siworld eng2 local accepted compact index v1");
+    digest.update(&previous);
+    digest.update(&height.to_le_bytes());
+    digest.update(bytes);
+    *digest.finalize().as_bytes()
+}
+/// Read only the separate fixed-width compact index, authenticate ancestry
+/// from genesis to the sealed tip, and bind every recorded body length.
+fn authenticate_header_prefix(
+    index: &impl ReadableTable<u64, &'static [u8]>,
+    network: Hash,
+    genesis: Hash,
+    height: u64,
+    tip: Hash,
+) -> Result<Hash, String> {
+    if index.len().map_err(|_| "restart index count unavailable")? != height {
+        return Err("restart compact index count differs".into());
+    }
+    let mut expected = genesis;
+    let mut digest = [0; 32];
+    for height in 1..=height {
+        let record = index
+            .get(height)
+            .map_err(|_| "restart header prefix lookup failed")?
+            .ok_or("restart header prefix missing")?;
+        let (header, _) = decode_compact(record.value(), network)?;
+        if header.height != height || header.parent != expected {
+            return Err("restart accepted header prefix differs from sealed tip".into());
+        }
+        expected = header
+            .id()
+            .map_err(|_| "restart header prefix identity invalid")?;
+        digest = index_row_hash(digest, height, record.value());
+    }
+    if expected != tip {
+        return Err("restart accepted header prefix differs from sealed tip".into());
+    }
+    Ok(digest)
+}
 fn decode(engine: &Engine, bytes: &[u8]) -> Result<(Header, Body), String> {
     let header = Header::decode(
         bytes
@@ -764,6 +900,9 @@ fn decode(engine: &Engine, bytes: &[u8]) -> Result<(Header, Body), String> {
         header.height,
         engine.body_policy(),
     )?;
+    if body.commitment(engine.body_policy())? != header.body_commitment {
+        return Err("persisted canonical body differs from accepted header".into());
+    }
     Ok((header, body))
 }
 
@@ -794,6 +933,309 @@ mod tests {
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         directory
+    }
+    #[test]
+    fn restart_header_authentication_rejects_an_older_substituted_header_without_reading_proofs() {
+        let directory = private_directory("header-prefix");
+        let database = Database::create(directory.join("headers.redb")).unwrap();
+        let mut first = Header {
+            network: [1; 32],
+            height: 1,
+            parent: [2; 32],
+            timestamp: 1,
+            target: [0xff; 32],
+            execution_commitment: [3; 32],
+            body_commitment: [4; 32],
+            nonce: 0,
+        };
+        let second = Header {
+            height: 2,
+            parent: first.id().unwrap(),
+            timestamp: 2,
+            ..first.clone()
+        };
+        let transaction = database.begin_write().unwrap();
+        {
+            let mut table = transaction.open_table(INDEX).unwrap();
+            // No body table exists: this authenticates metadata, not proofs.
+            table
+                .insert(1, compact_record(&first, 4096).unwrap().as_slice())
+                .unwrap();
+            table
+                .insert(2, compact_record(&second, 8192).unwrap().as_slice())
+                .unwrap();
+            let original = authenticate_header_prefix(
+                &table,
+                first.network,
+                first.parent,
+                2,
+                second.id().unwrap(),
+            )
+            .unwrap();
+            table
+                .insert(2, compact_record(&second, 8191).unwrap().as_slice())
+                .unwrap();
+            assert_ne!(
+                authenticate_header_prefix(
+                    &table,
+                    first.network,
+                    first.parent,
+                    2,
+                    second.id().unwrap()
+                )
+                .unwrap(),
+                original
+            );
+            first.nonce = 1;
+            table
+                .insert(1, compact_record(&first, 4096).unwrap().as_slice())
+                .unwrap();
+            assert!(
+                authenticate_header_prefix(
+                    &table,
+                    first.network,
+                    first.parent,
+                    2,
+                    second.id().unwrap()
+                )
+                .is_err()
+            );
+        }
+        transaction.commit().unwrap();
+        drop(database);
+        fs_remove_fixture(directory);
+    }
+    fn fs_remove_fixture(directory: std::path::PathBuf) {
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn persisted_body_reads_reject_proof_byte_corruption_before_export() {
+        let engine = Engine::new(genesis(), crate::eng2::snapshot::tests::limits().chain).unwrap();
+        let mut body = crate::eng2::body::tests::body();
+        body.profile = engine.body_policy().profile;
+        body.network = engine.state().network();
+        body.fund_claims.clear();
+        body.governance.clear();
+        body.transactions
+            .sort_by_key(|tx| tx.record.statement_id(&body.network));
+        let header = Header {
+            network: body.network,
+            height: body.height,
+            parent: engine.state().tip(),
+            timestamp: 1,
+            target: [0xff; 32],
+            execution_commitment: [2; 32],
+            body_commitment: body.commitment(engine.body_policy()).unwrap(),
+            nonce: 0,
+        };
+        let mut bytes = header.encode().unwrap().to_vec();
+        body.write_to(&mut bytes, engine.body_policy()).unwrap();
+        assert!(decode(&engine, &bytes).is_ok());
+        *bytes.last_mut().unwrap() ^= 1;
+        assert!(
+            decode(&engine, &bytes)
+                .err()
+                .unwrap()
+                .contains("differs from accepted header")
+        );
+    }
+    #[test]
+    #[ignore = "requires an explicitly supplied completed native 28-block fixture"]
+    fn real_native_fixture_qualifies_incremental_authenticated_restart() {
+        use std::time::Instant;
+        let source = std::path::PathBuf::from(
+            std::env::var_os("SIWORLD_ENG2_NATIVE_FIXTURE")
+                .expect("set the completed native fixture directory"),
+        );
+        let destination = std::path::PathBuf::from(
+            std::env::var_os("SIWORLD_ENG2_RESUME_FIXTURE")
+                .expect("set a new disposable resume fixture directory"),
+        );
+        assert!(source.is_absolute() && destination.is_absolute());
+        assert_eq!(source.canonicalize().unwrap(), source);
+        assert!(
+            std::fs::symlink_metadata(&source)
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+        assert!(!destination.exists());
+        for name in ["genesis.bin", "chain.redb", "result.json"] {
+            assert!(
+                std::fs::symlink_metadata(source.join(name))
+                    .unwrap()
+                    .file_type()
+                    .is_file()
+            );
+        }
+        let completed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("result.json")).unwrap()).unwrap();
+        assert_eq!(completed["native_proof_blocks"], "28");
+        assert_eq!(completed["durable_reopen_audit"], "passed");
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&destination).unwrap();
+        assert_eq!(destination.canonicalize().unwrap(), destination);
+        let path = destination.join("chain.redb");
+        // Only public genesis and the already closed canonical database are
+        // copied. Wallet or governance custody is not read or copied.
+        let genesis_bytes = std::fs::read(source.join("genesis.bin")).unwrap();
+        std::fs::write(destination.join("genesis.bin"), &genesis_bytes).unwrap();
+        std::fs::copy(source.join("chain.redb"), &path).unwrap();
+        let limits = Limits {
+            max_leaves: 1_000_000,
+            max_nullifiers: 1_000_000,
+            max_component_bytes: 64 * 1024 * 1024,
+        };
+        let genesis = || Genesis::decode(&genesis_bytes).unwrap();
+        let (last_record, prefix_header) = {
+            // Truncate only this newly created disposable copy to the actual
+            // previous accepted record. The independent native audit below
+            // authenticates the complete copied prefix before qualification.
+            let database = Database::open(&path).unwrap();
+            let transaction = database.begin_write().unwrap();
+            let mut table = transaction.open_table(BLOCKS).unwrap();
+            assert_eq!(table.len().unwrap(), 28);
+            let record = table.get(28).unwrap().unwrap().value().to_vec();
+            let prefix = Header::decode(
+                &table.get(27).unwrap().unwrap().value()[..HEADER_BYTES],
+                &genesis().config().network,
+            )
+            .unwrap();
+            table.remove(28).unwrap();
+            drop(table);
+            transaction.open_table(INDEX).unwrap().remove(28).unwrap();
+            let mut head = 27u64.to_le_bytes().to_vec();
+            head.extend_from_slice(&prefix.id().unwrap());
+            head.extend_from_slice(&prefix.execution_commitment);
+            transaction
+                .open_table(META)
+                .unwrap()
+                .insert("head", head.as_slice())
+                .unwrap();
+            transaction.commit().unwrap();
+            (record, prefix)
+        };
+        let verifier = NativeVerifier::new().unwrap();
+        let mut prefix = Store::audit_existing(&path, genesis(), limits, &verifier).unwrap();
+        assert_eq!(prefix.engine().state().tip(), prefix_header.id().unwrap());
+        let identity =
+            crate::identity::NativeIdentity::initialize(&destination, genesis().peer_binding())
+                .unwrap();
+        prefix.enable_authenticated_restart(identity).unwrap();
+        drop(prefix);
+        let timer = Instant::now();
+        let resumed = Store::resume_existing(&path, genesis(), limits).unwrap();
+        let prefix_elapsed = timer.elapsed();
+        assert_eq!(resumed.engine().state().height(), 27);
+        assert_eq!(resumed.header(27).unwrap(), prefix_header);
+        let prefix_leaves = resumed.engine().state().chain().leaves.len();
+        let prefix_spends = resumed.engine().state().chain().spent.len();
+        let (header, body) = decode(resumed.engine(), &last_record).unwrap();
+        let mut driver = super::super::driver::Driver::new(
+            resumed,
+            verifier,
+            super::super::snapshot::ImportLimits {
+                chain: limits,
+                max_snapshot_bytes: 512 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let accepted = driver.accept(&header, &body).unwrap();
+        assert_eq!(accepted.execution_commitment(), header.execution_commitment);
+        assert_eq!(accepted.height(), 28);
+        let final_leaves = driver.engine().state().chain().leaves.len();
+        let final_spends = driver.engine().state().chain().spent.len();
+        assert!(final_leaves > prefix_leaves && final_spends > prefix_spends);
+        drop(driver);
+        let timer = Instant::now();
+        let resumed = Store::resume_existing(&path, genesis(), limits).unwrap();
+        let full_elapsed = timer.elapsed();
+        assert_eq!(resumed.engine().state().tip(), header.id().unwrap());
+        assert_eq!(resumed.engine().state().height(), 28);
+        assert_eq!(resumed.engine().state().chain().leaves.len(), final_leaves);
+        assert_eq!(resumed.engine().state().chain().spent.len(), final_spends);
+        assert_eq!(resumed.header(28).unwrap(), header);
+        let actual_root = resumed
+            .engine()
+            .state()
+            .execution_commitment(
+                super::super::state_components::Binding {
+                    genesis: genesis().id(),
+                    rules_commitment: genesis().rules_commitment(),
+                    parent: header.parent,
+                },
+                limits,
+            )
+            .unwrap();
+        assert_eq!(actual_root, header.execution_commitment);
+        assert!(prefix_elapsed.as_secs() < 300 && full_elapsed.as_secs() < 300);
+        let original_compact = compact_record(
+            &header,
+            body.encoded_len(resumed.engine.body_policy()).unwrap(),
+        )
+        .unwrap();
+        let mut changed_length = original_compact.clone();
+        let length = u64::from_le_bytes(changed_length[HEADER_BYTES..].try_into().unwrap());
+        changed_length[HEADER_BYTES..].copy_from_slice(&(length + 1).to_le_bytes());
+        let transaction = resumed.database.begin_write().unwrap();
+        transaction
+            .open_table(INDEX)
+            .unwrap()
+            .insert(28, changed_length.as_slice())
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            resumed
+                .block(28)
+                .err()
+                .unwrap()
+                .contains("differs from accepted compact index")
+        );
+        drop(resumed);
+        assert!(
+            Store::resume_existing(&path, genesis(), limits)
+                .err()
+                .unwrap()
+                .contains("compact index differs from accepted local seal")
+        );
+        // Restore only the deliberately changed metadata in this registered
+        // disposable copy, preserving a healthy fixture for review.
+        let database = Database::open(&path).unwrap();
+        let transaction = database.begin_write().unwrap();
+        transaction
+            .open_table(INDEX)
+            .unwrap()
+            .insert(28, original_compact.as_slice())
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(database);
+        let restored = Store::resume_existing(&path, genesis(), limits).unwrap();
+        assert_eq!(restored.engine().state().tip(), header.id().unwrap());
+        let report = serde_json::json!({
+            "scope":"copied-native-history-authenticated-restart", "proof_generation":false,
+            "prefix_height":"27", "prefix_resume_ms":prefix_elapsed.as_millis().to_string(),
+            "prefix_leaves":prefix_leaves.to_string(), "prefix_nullifiers":prefix_spends.to_string(),
+            "height":"28", "resume_ms":full_elapsed.as_millis().to_string(),
+            "leaves":final_leaves.to_string(), "nullifiers":final_spends.to_string(),
+            "tip":crate::local::hex(&header.id().unwrap()),
+            "execution_commitment":crate::local::hex(&actual_root),
+            "exact_head_and_root":"passed", "incremental_native_commit":"passed",
+            "native_driver_accept":"passed",
+            "body_length_cross_check":"passed", "body_length_seal_tamper":"rejected",
+            "under_five_minutes":"passed", "database_bytes":std::fs::metadata(&path).unwrap().len().to_string(),
+        });
+        std::fs::write(
+            destination.join("resume-qualification.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        println!("{report}");
+        // The registered disposable copy is preserved for independent review.
     }
     #[test]
     fn authenticated_resume_requires_existing_identity_and_exact_committed_seal() {
