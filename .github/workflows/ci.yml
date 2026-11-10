@@ -255,7 +255,8 @@ jobs:
           cargo build --release --manifest-path .local/native-transaction/application/Cargo.toml --features security-report --bin v1-transaction-scan --bin v1-freeze-artifacts
           python3 scripts/check-v1-freeze.py
           timeout 600 .local/native-transaction/application/target/release/v1-freeze-artifacts \
-            --root "$GITHUB_WORKSPACE" --check crates/bench-d8/artifacts/v1-native-freeze.json
+            --root "$GITHUB_WORKSPACE" --output .local/native-transaction/reproduced-freeze.json
+          python3 scripts/check-v1-reproduction.py --reproduced .local/native-transaction/reproduced-freeze.json
           .local/native-transaction/application/target/release/v1-transaction-scan --security-only --log-blowup 4 --queries 80 --grinding 16 --output .local/native-transaction/security-diagnostic.json
       - name: Preserve registry dependency pins
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
@@ -380,7 +381,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install pinned toolchain and WASM target
-        run: rustup toolchain install --target wasm32-unknown-unknown
+        run: |
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --target wasm32-unknown-unknown
       - name: Acquire locked dependencies
         run: bash scripts/ci-fetch.sh wallet
       - name: Wallet unit and browser tests
