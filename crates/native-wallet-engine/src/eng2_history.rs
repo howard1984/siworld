@@ -114,6 +114,7 @@ impl Context {
 /// The fixed LegacyMiner fee slot is checked as zero and is not a tree output.
 pub struct ReceiptBlock {
     header: Header,
+    body_bytes: usize,
     transactions: Vec<PublicRecord>,
     rewards: Vec<RewardRecord>,
     fund_outputs: Vec<FundSpend>,
@@ -336,6 +337,7 @@ fn parse(
     Ok((
         ReceiptBlock {
             header,
+            body_bytes: body_length as usize,
             transactions,
             rewards,
             fund_outputs,
@@ -346,6 +348,11 @@ fn parse(
     ))
 }
 impl ReceiptBlock {
+    /// Canonical body length authenticated by the header commitment.
+    /// This excludes the eight-byte length prefix used only by the range proof.
+    pub fn body_bytes(&self) -> usize {
+        self.body_bytes
+    }
     pub fn header(&self) -> &Header {
         &self.header
     }

@@ -126,6 +126,10 @@ fn receipt_codec_preserves_all_slots_records_and_tree_order_without_proofs() {
     let decoded = ReceiptBlock::decode(&context, &header.encode().unwrap(), &bytes).unwrap();
     assert_eq!(decoded.header().encode().unwrap(), header.encode().unwrap());
     assert_eq!(
+        decoded.body_bytes(),
+        body.encode(policy(&context)).unwrap().len()
+    );
+    assert_eq!(
         decoded.transactions(),
         body.transactions
             .iter()
