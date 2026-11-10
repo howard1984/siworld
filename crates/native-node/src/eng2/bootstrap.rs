@@ -19,6 +19,8 @@ pub const MAX_CHUNK_BYTES: usize = p2p::MAX_CONTROL_BYTES - 160;
 const _: () = assert!(MAX_MANIFEST_BYTES < p2p::MAX_CONTROL_BYTES - 1);
 pub mod cache;
 pub mod client;
+#[cfg(feature = "eng2-runtime")]
+pub mod session;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Descriptor {

@@ -346,6 +346,7 @@ mod tests {
                 bootstrap::{
                     Provider,
                     cache::{Policy as CachePolicy, Quarantine},
+                    session::ColdSession,
                 },
                 checkpoint_exchange,
                 network::{self, Limits, Owner, Sequence},
@@ -514,26 +515,17 @@ mod tests {
         .unwrap();
         let before = peer.encrypted_stream_bytes();
         assert!(before.0 > 0 && before.1 > 0);
-        let owner = Arc::new(Mutex::new(Cold {
-            genesis: genesis.id(),
-            offer: None,
-        }));
-        let mut sequence = Sequence::default();
-        let (_, received) = network::initiate_bootstrap(
-            &mut peer,
-            &owner,
-            &mut sequence,
-            Limits::default(),
-            |pull| pull.manifest(),
-        )
-        .unwrap();
-        let received = received.unwrap();
+        let mut cold = ColdSession::new(&genesis).unwrap();
+        let completed = cold
+            .round(&mut peer, Limits::default(), |pull| pull.manifest())
+            .unwrap();
+        assert_eq!(completed.round.accepted, 0);
+        assert!(completed.checkpoints.is_empty());
+        let received = completed.acquired.unwrap();
         let decoded =
             crate::eng2::bootstrap::Manifest::decode(&received.bytes, &genesis, limits).unwrap();
         assert_eq!(decoded.bundle(), manifest.bundle());
         drop(received);
-        checkpoint_exchange::initiate(&mut peer, &[], genesis.config().network).unwrap();
-        transaction_exchange::initiate(&mut peer, &owner).unwrap();
         let cache_path = root.join("quarantine");
         let cp = CachePolicy {
             max_bytes: 1024 * 1024,
@@ -549,22 +541,17 @@ mod tests {
                 offset,
                 maximum: 4,
             };
-            let (_, chunk) = network::initiate_bootstrap(
-                &mut peer,
-                &owner,
-                &mut sequence,
-                Limits::default(),
-                |pull| pull.chunk(q),
-            )
-            .unwrap();
-            cache
-                .push(Object::Snapshot, offset, &chunk.unwrap().chunk)
+            let completed = cold
+                .round(&mut peer, Limits::default(), |pull| pull.chunk(q))
                 .unwrap();
-            checkpoint_exchange::initiate(&mut peer, &[], genesis.config().network).unwrap();
-            transaction_exchange::initiate(&mut peer, &owner).unwrap();
+            assert_eq!(completed.round.accepted, 0);
+            assert!(completed.checkpoints.is_empty());
+            cache
+                .push(Object::Snapshot, offset, &completed.acquired.unwrap().chunk)
+                .unwrap();
         }
         assert_eq!(cache.snapshot().unwrap().bytes, b"fixture");
-        assert_eq!(owner.lock().unwrap().head().unwrap(), (0, genesis.id()));
+        assert_eq!(cold.admitted_head(), (0, genesis.id()));
         let after = peer.encrypted_stream_bytes();
         assert!(after.0 > before.0 + 7 && after.1 > before.1);
         let server_counts = server_thread.join().unwrap();

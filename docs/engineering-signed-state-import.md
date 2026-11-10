@@ -113,6 +113,13 @@ result separates logical verification bytes and local cache rereads; encrypted
 stream volume must still be obtained from the session counters. Public launch
 commands and mining-readiness attachment are not supplied by this library.
 
+`ColdSession` provides the outbound round boundary for these requests. It
+announces genesis at height zero, rejects direct block acceptance, requests no
+pending transactions and consumes the universal checkpoint and transaction
+phases after each ordinary acquisition round. Received checkpoint packets
+retain their byte reservations and remain observations with no signing or
+state-adoption capability. A failed round requires discarding the peer.
+
 ## New-database installation
 
 The owner separately prepares a dedicated canonical directory, its matching
