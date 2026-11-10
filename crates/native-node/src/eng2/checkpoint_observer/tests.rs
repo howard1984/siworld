@@ -258,3 +258,30 @@ fn lawful_roster_rotation_keeps_old_certificates_historical_without_refreshing_o
     assert_eq!(observer.observed_height(), None);
     assert!(!observer.conflicted());
 }
+
+#[test]
+fn current_quorum_for_competing_authorization_latches_without_trusting_its_witness() {
+    let fixture = fixture();
+    let mut statement = fixture.statement.clone();
+    statement.authorization_block[0] ^= 1;
+    let mut packet = certified(&fixture, statement);
+    if let Incoming::Certified { witness, .. } = &mut packet {
+        // This witness cannot bind to the competing header, which is absent.
+        // Conflict authority comes only from independently current quorum keys.
+        witness.governance[0] ^= 1;
+    }
+    let mut bad_signatures = packet.clone();
+    if let Incoming::Certified { certificate, .. } = &mut bad_signatures {
+        certificate.votes[1].signature[0] ^= 1;
+    }
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &bad_signatures),
+        Err(Error::Rejected)
+    );
+    assert!(!observer.conflicted());
+    assert_eq!(observer.check(&fixture, 2, &packet), Err(Error::Conflict));
+    assert!(observer.conflicted());
+    assert_eq!(observer.error(), Some(Error::Conflict));
+    assert_eq!(observer.observed_height(), None);
+}

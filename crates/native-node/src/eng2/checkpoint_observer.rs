@@ -137,7 +137,6 @@ fn headers(view: &impl View, statement: &Statement) -> Result<(Header, Hash), Er
         || anchor.network != statement.network
         || authorization.height != statement.authorization_height
         || anchor.height != statement.checkpoint_height
-        || authorization.id().map_err(|_| Error::Rejected)? != statement.authorization_block
     {
         return Err(Error::Rejected);
     }
@@ -215,7 +214,9 @@ fn evaluate(view: &impl View, incoming: &Incoming) -> Result<Outcome, Error> {
         Incoming::Proposal(proposal) => {
             let (header, selected) = headers(view, &proposal.statement)?;
             let roster = authority(view, &proposal.statement, &header, &proposal.witness)?;
-            if selected != proposal.statement.checkpoint_block {
+            if header.id().map_err(|_| Error::Rejected)? != proposal.statement.authorization_block
+                || selected != proposal.statement.checkpoint_block
+            {
                 return Err(Error::Rejected);
             }
             if roster.epoch_sequence < view.governance().active_roster().epoch_sequence {
@@ -224,8 +225,10 @@ fn evaluate(view: &impl View, incoming: &Incoming) -> Result<Outcome, Error> {
             Ok(Outcome::Proposal)
         }
         Incoming::Vote { statement, vote } => {
-            let (_, selected) = headers(view, statement)?;
-            if selected != statement.checkpoint_block {
+            let (header, selected) = headers(view, statement)?;
+            if header.id().map_err(|_| Error::Rejected)? != statement.authorization_block
+                || selected != statement.checkpoint_block
+            {
                 return Err(Error::Rejected);
             }
             verify_vote(view, statement, vote)?;
@@ -235,16 +238,39 @@ fn evaluate(view: &impl View, incoming: &Incoming) -> Result<Outcome, Error> {
             certificate,
             witness,
         } => {
-            let (header, selected) = headers(view, &certificate.statement)?;
-            let roster = authority(view, &certificate.statement, &header, witness)?;
-            certificate
-                .check_signatures(roster.keys())
-                .map_err(|_| Error::Rejected)?;
-            if roster.epoch_sequence < view.governance().active_roster().epoch_sequence {
-                return Ok(Outcome::Historical);
+            let statement = &certificate.statement;
+            let current = view.governance().active_roster();
+            let is_current = statement.roster_sequence == current.epoch_sequence;
+            if is_current {
+                // Independent executed keys establish the current authority.
+                // A foreign authorization witness cannot excuse a valid current
+                // quorum contradicting either selected prefix identity.
+                if statement.roster_digest != current.digest(statement.network)
+                    || current.activated_height > statement.authorization_height
+                {
+                    return Err(Error::Rejected);
+                }
+                certificate
+                    .check_signatures(current.keys())
+                    .map_err(|_| Error::Rejected)?;
             }
-            if selected != certificate.statement.checkpoint_block {
+            let (header, selected) = headers(view, statement)?;
+            let matches_authorization =
+                header.id().map_err(|_| Error::Rejected)? == statement.authorization_block;
+            if is_current && (!matches_authorization || selected != statement.checkpoint_block) {
                 return Err(Error::Conflict);
+            }
+            if !matches_authorization {
+                return Err(Error::Rejected);
+            }
+            let roster = authority(view, statement, &header, witness)?;
+            if !is_current {
+                certificate
+                    .check_signatures(roster.keys())
+                    .map_err(|_| Error::Rejected)?;
+            }
+            if roster.epoch_sequence < current.epoch_sequence {
+                return Ok(Outcome::Historical);
             }
             Ok(Outcome::CurrentCertificate(
                 certificate.statement.checkpoint_height,
