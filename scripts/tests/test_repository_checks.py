@@ -16,6 +16,21 @@ repository_spec.loader.exec_module(repository)
 
 
 class RepositoryManifestTests(unittest.TestCase):
+    def test_explorer_publication_is_exactly_scoped(self):
+        names = (
+            "README.md", "chain-client.mjs", "explorer-config.example.json",
+            "explorer.css", "explorer.mjs", "index.html", "projection.mjs",
+            "proxy-location.example.conf", "tests/fixture-server.mjs",
+            "tests/projection.test.mjs",
+        )
+        for name in names:
+            self.assertTrue(repository.allowed(Path("tools/explorer") / name))
+        for name in (
+            "private.json", "screenshot.png", "other.mjs", "index.html.bak",
+            "tests/other.mjs", "runtime/explorer.json", "brand.svg",
+        ):
+            self.assertFalse(repository.allowed(Path("tools/explorer") / name))
+
     def test_wallet_text_assets_are_exactly_scoped(self):
         for name in repository.PUBLIC_TEXT_ASSETS:
             self.assertTrue(repository.allowed(Path(name)))

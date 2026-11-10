@@ -48,6 +48,18 @@ CRATES = {
     "native-wallet-core", "native-wallet-web", "native-wallet-engine",
     "miner-cli", "miner-launcher", "miner-platform",
 }
+EXPLORER_FILES = {
+    "tools/explorer/README.md",
+    "tools/explorer/chain-client.mjs",
+    "tools/explorer/explorer-config.example.json",
+    "tools/explorer/explorer.css",
+    "tools/explorer/explorer.mjs",
+    "tools/explorer/index.html",
+    "tools/explorer/projection.mjs",
+    "tools/explorer/proxy-location.example.conf",
+    "tools/explorer/tests/fixture-server.mjs",
+    "tools/explorer/tests/projection.test.mjs",
+}
 PUBLIC_TEXT_ASSETS = {
     "crates/miner-cli/help.txt",
     "crates/native-wallet-web/web/sdk/commitment-session.js",
@@ -124,7 +136,9 @@ def allowed(path):
     if path.parts[0] == "scripts":
         return path.suffix == ".py" and (len(path.parts) == 2 or (len(path.parts) == 3 and path.parts[1] == "tests"))
     if path.parts[0] == "tools":
-        return name in {"tools/control-panel/memory_trend.py", "tools/control-panel/test_memory_trend.py"}
+        return name in EXPLORER_FILES or name in {
+            "tools/control-panel/memory_trend.py", "tools/control-panel/test_memory_trend.py"
+        }
     if name in {".github/audit-registry.json", ".github/repository-profile.json"}:
         return True
     if path.parts[0] == ".github":
