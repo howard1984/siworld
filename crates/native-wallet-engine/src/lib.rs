@@ -8,6 +8,9 @@ pub(crate) fn transaction_proof_results<T: Sync>(
     values.iter().map(verify).collect()
 }
 
+#[path = "../../native-node/src/chain_actions.rs"]
+pub(crate) mod chain_transition;
+
 #[path = "../../native-node/src/audit.rs"]
 pub mod audit;
 #[path = "../../native-node/src/fund_spend.rs"]
