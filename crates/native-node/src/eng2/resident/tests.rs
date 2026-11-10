@@ -55,6 +55,39 @@ fn windows_runtime_requires_outbound_nonsigning_miner_and_authenticated_import()
     assert!(check_windows_admission(false, None).is_ok());
 }
 #[test]
+fn explicit_identity_initialization_binds_genesis_and_never_overwrites() {
+    let directory = directory();
+    let genesis = genesis();
+    let expected = crate::local::hex(&genesis.id());
+    write(&directory.join("genesis.bin"), &genesis.encode().unwrap());
+    assert!(initialize_identity(&directory, &"0".repeat(64)).is_err());
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    let receipt = initialize_identity(&directory, &expected).unwrap();
+    assert_eq!(receipt.as_object().unwrap().len(), 3);
+    let descriptor = crate::identity::Descriptor::decode(
+        &crate::eng2_operations::public_bytes(
+            &receipt["descriptor"],
+            crate::identity::DESCRIPTOR_BYTES,
+        )
+        .unwrap(),
+        &genesis.peer_binding(),
+    )
+    .unwrap();
+    assert_eq!(descriptor.binding(), genesis.peer_binding());
+    assert_eq!(
+        receipt["fingerprint"],
+        crate::local::hex(&descriptor.fingerprint())
+    );
+    assert!(NativeIdentity::load(&directory, &p2p::Binding::new(genesis.config())).is_err());
+    assert!(initialize_identity(&directory, &expected).is_err());
+    assert_eq!(
+        public_identity(&directory, &expected).unwrap()["fingerprint"],
+        receipt["fingerprint"]
+    );
+    assert!(!directory.join("chain.redb").exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+#[test]
 fn explicit_store_initialization_never_regenerates_a_missing_identity() {
     let directory = directory();
     let genesis = genesis();
@@ -63,9 +96,11 @@ fn explicit_store_initialization_never_regenerates_a_missing_identity() {
     assert!(initialize_store(&directory, &expected).is_err());
     assert!(!directory.join("chain.redb").exists());
     assert!(!directory.join("native-peer-identity.secret").exists());
+    assert!(run(&directory, &directory.join("missing-peers.json"), &expected).is_err());
+    assert!(!directory.join("native-peer-identity.secret").exists());
+    assert!(!directory.join("chain.redb").exists());
     assert!(load_genesis(&directory, &"0".repeat(64)).is_err());
-    let identity = NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap();
-    drop(identity);
+    initialize_identity(&directory, &expected).unwrap();
     initialize_store(&directory, &expected).unwrap();
     assert_eq!(restart_check(&directory, &expected).unwrap()["height"], 0);
     assert!(initialize_store(&directory, &expected).is_err());

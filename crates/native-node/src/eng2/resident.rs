@@ -78,6 +78,16 @@ pub fn genesis_identifier(directory: &Path) -> Result<String, String> {
         .map_err(|_| "explicit public genesis read failed")?;
     Ok(crate::local::hex(&Genesis::decode(&bytes)?.id()))
 }
+/// Explicit, write-once peer identity creation under an independently pinned
+/// genesis. Normal store initialization and resident startup remain load-only.
+pub fn initialize_identity(directory: &Path, expected: &str) -> Result<Value, String> {
+    // Reject a mismatched public context before acquiring a writable lease.
+    let genesis = load_genesis(directory, expected)?;
+    let _lease = service::Lease::acquire(directory)?;
+    let identity = NativeIdentity::initialize(directory, genesis.peer_binding())
+        .map_err(|_| "explicit peer identity creation rejected; existing records preserved")?;
+    identity_receipt(&identity)
+}
 pub fn initialize_store(directory: &Path, expected: &str) -> Result<Value, String> {
     let _lease = service::Lease::acquire(directory)?;
     let genesis = load_genesis(directory, expected)?;
@@ -121,6 +131,9 @@ pub fn public_identity(directory: &Path, expected: &str) -> Result<Value, String
     let genesis = load_genesis(directory, expected)?;
     let identity = NativeIdentity::load(directory, &genesis.peer_binding())
         .map_err(|_| "existing versioned identity unavailable")?;
+    identity_receipt(&identity)
+}
+fn identity_receipt(identity: &NativeIdentity) -> Result<Value, String> {
     let descriptor = identity
         .descriptor()
         .map_err(|_| "public identity descriptor unavailable")?;

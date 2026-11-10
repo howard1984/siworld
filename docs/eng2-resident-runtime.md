@@ -15,6 +15,18 @@ require `--expected-genesis ID`; a mismatched identifier fails before startup.
 No command regenerates peer or checkpoint keys, migrates an older network's
 state, or falls back to historical proof replay.
 
+`identity-init DIRECTORY --expected-genesis ID` explicitly creates a fresh
+versioned peer identity in the existing private directory. It checks the sealed
+genesis and independent identifier before acquiring a writable lease or drawing
+new independent peer seeds. Existing identities are never overwritten, imported
+from an older network or recreated by this command. The receipt contains only
+the same public version, fingerprint and signed descriptor fields returned by
+`identity-public`; it can be checked and pinned by peers. Checkpoint authority
+and wallet materials are separate and are not read. This command creates no
+chain database, listener or mining process. A failure after key publication may
+leave the new identity present; use `identity-public` to inspect it rather than
+regenerating it.
+
 `init-store DIRECTORY --expected-genesis ID` creates a new height-zero store
 only after loading the existing versioned identity. It refuses an existing
 store. `qualify-restart DIRECTORY --expected-genesis ID` is a separate explicit
