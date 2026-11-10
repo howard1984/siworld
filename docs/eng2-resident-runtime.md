@@ -89,6 +89,17 @@ against the shared operation budget. Deadline cancellation reaches the owned
 connection and is checked by the native importer between verification steps;
 synchronous proof verification is not preemptible.
 
+Before each complete cycle, the client checks the native transport's existing
+wire, record and connection-age budget. It closes expired or insufficient
+sessions and repeats full hybrid authentication. Every replacement connection
+must return the byte-identical selected manifest before cached acquisition
+continues. Partial or failed streams are always discarded. Only transient
+transport unavailability is retried, with at most four attempts per retry stage
+and cancellation-aware backoff from 100 through 800 milliseconds. All attempts
+share the original elapsed/round budget and an additional connection cap of
+`min(max_rounds + 4, 65536)`. Each candidate's header connection is closed before
+the next candidate is acquired, so an idle session cannot age during selection.
+
 The logical payload cap is divided equally among configured destinations.
 Each candidate's complete header bytes and snapshot are checked before creating
 or reopening quarantine storage; accepted receipt and proof-body chunks remain
@@ -113,8 +124,10 @@ reopen. Quarantine headers alone never establish readiness.
 Successful output reports `ready: false` and `mining_started: false`, together
 with the admitted height, checkpoint height, verification/reread bytes and
 elapsed time. Encrypted byte counters sum all candidate sessions in that
-invocation, including their hybrid handshakes and framing; they exclude prior
-resume invocations and packet-wire overhead. A subsequent explicit `run`
+invocation, including retired or failed application streams and their hybrid
+handshakes and framing. They exclude handshakes that failed before a session
+was established, prior resume invocations and packet-wire overhead. Connection
+attempt and established-session counts are reported separately. A subsequent explicit `run`
 requires ordinary native peer catch-up before readiness or proving. On Windows,
 `run` rejects listener, service and checkpoint-signing roles, and refuses a
 store without an authenticated positive checkpoint import boundary. No command

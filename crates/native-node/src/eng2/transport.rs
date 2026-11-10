@@ -395,6 +395,11 @@ impl Peer<p2p::NativeTlsChannel> {
     pub fn encrypted_stream_bytes(&self) -> (u64, u64) {
         self.session.encrypted_stream_bytes()
     }
+    /// Retire the authenticated stream before starting a full application cycle
+    /// that cannot fit within its unchanged wire, record or lifetime limits.
+    pub(crate) fn ready_for_cycle(&self) -> bool {
+        self.session.ready_for_cycle()
+    }
     /// Authenticate an already accepted or dialed socket. The listener/routing
     /// owner retains endpoint policy and creates the original admission deadline.
     pub fn establish(

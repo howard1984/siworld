@@ -10,6 +10,7 @@ use crate::eng2::{
     connector::Connector,
     import::{self, Installation},
     network,
+    transport::Peer,
 };
 use siworld_core::pow::Work;
 
@@ -96,6 +97,8 @@ struct Operation {
     cancel: p2p::Cancellation,
     done: Option<std::sync::mpsc::Sender<()>>,
     timer: Option<std::thread::JoinHandle<()>>,
+    connections: u64,
+    maximum_connections: u64,
 }
 impl Operation {
     fn new(policy: &Policy) -> Result<Self, String> {
@@ -122,6 +125,8 @@ impl Operation {
             cancel,
             done: Some(done),
             timer: Some(timer),
+            connections: 0,
+            maximum_connections: policy.rounds.saturating_add(4).min(65_536),
         })
     }
     fn check(&self) -> Result<(), String> {
@@ -138,6 +143,24 @@ impl Operation {
         self.rounds += 1;
         Ok(())
     }
+    fn connect(&mut self) -> Result<(), String> {
+        self.check()?;
+        if self.connections >= self.maximum_connections {
+            return Err(
+                "signed bootstrap connection budget exhausted; quarantine preserved".into(),
+            );
+        }
+        self.connections += 1;
+        Ok(())
+    }
+    fn backoff(&self, failure: u32) -> Result<(), String> {
+        let until = Instant::now() + Duration::from_millis(100 * (1 << failure.min(3)));
+        while Instant::now() < until {
+            self.check()?;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.check()
+    }
 }
 impl Drop for Operation {
     fn drop(&mut self) {
@@ -147,6 +170,202 @@ impl Drop for Operation {
         if let Some(timer) = self.timer.take() {
             let _ = timer.join();
         }
+    }
+}
+
+const RETRIES: u32 = 4;
+#[derive(Default)]
+struct Accounting {
+    received: u64,
+    sent: u64,
+    sessions: u64,
+    overflow: bool,
+    #[cfg(test)]
+    retired: Vec<(u64, u64)>,
+}
+struct Live {
+    peer: Peer<p2p::NativeTlsChannel>,
+    cold: ColdSession,
+    initial: (u64, u64),
+}
+struct Acquisition<'a> {
+    connector: &'a Connector,
+    destination: &'a config::Destination,
+    genesis: &'a Genesis,
+    accounting: Arc<Mutex<Accounting>>,
+    manifest: Option<Vec<u8>>,
+    live: Option<Live>,
+    rotation_bytes: u64,
+}
+impl<'a> Acquisition<'a> {
+    fn new(
+        connector: &'a Connector,
+        destination: &'a config::Destination,
+        genesis: &'a Genesis,
+        accounting: Arc<Mutex<Accounting>>,
+        manifest: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            connector,
+            destination,
+            genesis,
+            accounting,
+            manifest,
+            live: None,
+            rotation_bytes: u64::MAX,
+        }
+    }
+    fn bind(&mut self, manifest: &Manifest) -> Result<(), String> {
+        self.manifest = Some(manifest.encode()?);
+        Ok(())
+    }
+    fn retire(&mut self) {
+        if let Some(live) = self.live.take() {
+            let (received, sent) = live.peer.encrypted_stream_bytes();
+            // Counts cover actual encrypted I/O even when a later phase fails.
+            // The partial stream is always dropped, never resumed or reused.
+            if let Ok(mut counts) = self.accounting.lock() {
+                match (
+                    counts.received.checked_add(received),
+                    counts.sent.checked_add(sent),
+                    counts.sessions.checked_add(1),
+                ) {
+                    (Some(r), Some(s), Some(n)) => {
+                        counts.received = r;
+                        counts.sent = s;
+                        counts.sessions = n;
+                    }
+                    _ => counts.overflow = true,
+                }
+                #[cfg(test)]
+                counts.retired.push((received, sent));
+            }
+            drop(live);
+        }
+    }
+    fn reusable(&self) -> bool {
+        self.live.as_ref().is_some_and(|live| {
+            let current = live.peer.encrypted_stream_bytes();
+            live.peer.ready_for_cycle()
+                && current.0.saturating_sub(live.initial.0) < self.rotation_bytes
+                && current.1.saturating_sub(live.initial.1) < self.rotation_bytes
+        })
+    }
+    fn ready(&mut self, operation: &mut Operation) -> Result<(), String> {
+        if self.reusable() {
+            return Ok(());
+        }
+        self.retire();
+        for failure in 0..RETRIES {
+            let cold = ColdSession::new(self.genesis)?;
+            operation.connect()?;
+            let peer = match self.connector.connect(
+                self.destination.endpoint,
+                self.destination.expected.fingerprint(),
+                p2p::Role::Miner,
+                operation.cancel.clone(),
+            ) {
+                Ok(peer) => peer,
+                Err(p2p::Error::Unavailable) if failure + 1 < RETRIES => {
+                    operation.backoff(failure)?;
+                    continue;
+                }
+                Err(_) => {
+                    return Err("signed bootstrap pinned service authentication unavailable".into());
+                }
+            };
+            if !peer.ready_for_cycle() {
+                return Err("fresh signed bootstrap session cannot fit one complete cycle".into());
+            }
+            self.live = Some(Live {
+                initial: peer.encrypted_stream_bytes(),
+                peer,
+                cold,
+            });
+            // Every reconnect repeats both authentication and the entire
+            // manifest round. Changed offers never replace retained bytes.
+            if let Some(expected) = &self.manifest {
+                operation.round()?;
+                let live = self.live.as_mut().expect("authenticated session");
+                let acquired =
+                    live.cold
+                        .round(&mut live.peer, network::Limits::default(), |pull| {
+                            pull.manifest()
+                        });
+                match acquired {
+                    Ok(completed) => {
+                        let received = completed.acquired
+                            .ok_or("signed bootstrap selected offer disappeared; quarantine preserved")?;
+                        if received.bytes != *expected {
+                            return Err("signed bootstrap selected offer changed; quarantine preserved".into());
+                        }
+                    }
+                    Err(network::Error::Transport(p2p::Error::Unavailable))
+                        if failure + 1 < RETRIES => {
+                            self.retire();
+                            operation.backoff(failure)?;
+                            continue;
+                        }
+                    Err(_) => return Err("signed bootstrap exact-offer reconnection round failed; quarantine preserved".into()),
+                }
+            }
+            return Ok(());
+        }
+        Err("signed bootstrap connection retry budget exhausted; quarantine preserved".into())
+    }
+    fn round<T>(
+        &mut self,
+        operation: &mut Operation,
+        acquire: impl FnMut(
+            &mut network::BootstrapPull<'_, p2p::NativeTlsChannel>,
+        ) -> Result<T, network::Error>,
+    ) -> Result<T, String> {
+        let result = self.try_round(operation, acquire);
+        if result.is_err() {
+            self.retire();
+        }
+        result
+    }
+    fn try_round<T>(
+        &mut self,
+        operation: &mut Operation,
+        mut acquire: impl FnMut(
+            &mut network::BootstrapPull<'_, p2p::NativeTlsChannel>,
+        ) -> Result<T, network::Error>,
+    ) -> Result<T, String> {
+        for failure in 0..RETRIES {
+            operation.check()?;
+            self.ready(operation)?;
+            operation.round()?;
+            let live = self
+                .live
+                .as_mut()
+                .expect("authenticated complete-cycle session");
+            let result = live
+                .cold
+                .round(&mut live.peer, network::Limits::default(), &mut acquire);
+            match result {
+                Ok(completed) => return Ok(completed.acquired),
+                Err(network::Error::Transport(p2p::Error::Unavailable))
+                    if failure + 1 < RETRIES =>
+                {
+                    self.retire();
+                    operation.backoff(failure)?;
+                }
+                Err(_) => {
+                    self.retire();
+                    return Err(
+                        "signed bootstrap acquisition round failed; quarantine preserved".into(),
+                    );
+                }
+            }
+        }
+        Err("signed bootstrap round retry budget exhausted; quarantine preserved".into())
+    }
+}
+impl Drop for Acquisition<'_> {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 
@@ -208,29 +427,18 @@ pub fn bootstrap_signed(
     )
     .map_err(|_| "signed bootstrap connector rejected")?;
     let mut operation = Operation::new(&policy)?;
+    let accounting = Arc::new(Mutex::new(Accounting::default()));
     let mut candidates = Vec::new();
-    let mut sessions = Vec::new();
+    let mut bundles = Vec::new();
     for (index, destination) in destinations.iter().enumerate() {
-        operation.check()?;
-        // Miner ingress presents and authenticates its descriptor. It does not
-        // require the service operator to pre-register the miner identity.
-        let mut peer = connector
-            .connect(
-                destination.endpoint,
-                destination.expected.fingerprint(),
-                p2p::Role::Miner,
-                operation.cancel.clone(),
-            )
-            .map_err(|_| "signed bootstrap pinned service connection unavailable")?;
-        let mut cold = ColdSession::new(&genesis)?;
-        operation.round()?;
-        let received = cold
-            .round(&mut peer, network::Limits::default(), |p| p.manifest())
-            .map_err(|_| "signed bootstrap manifest round failed")?
-            .acquired
+        let mut session =
+            Acquisition::new(&connector, destination, &genesis, accounting.clone(), None);
+        let received = session
+            .round(&mut operation, |p| p.manifest())?
             .ok_or("signed bootstrap service has no current bounded offer")?;
         let manifest = Manifest::decode(&received.bytes, &genesis, limits())?;
         drop(received);
+        session.bind(&manifest)?;
         if manifest.tip_height > policy.headers as u64 {
             return Err("signed bootstrap manifest exceeds explicit complete header cap".into());
         }
@@ -261,52 +469,39 @@ pub fn bootstrap_signed(
             if next > total {
                 break;
             }
-            operation.round()?;
-            cold.round(&mut peer, network::Limits::default(), |p| {
-                candidate.pull_header(p)
-            })
-            .map_err(|_| "signed bootstrap complete-header round failed")?;
+            session.round(&mut operation, |p| candidate.pull_header(p))?;
         }
-        let bundle = candidate.manifest().bundle();
+        bundles.push((candidate.manifest().bundle(), index));
         candidates.push(candidate.prepare(&genesis, policy.floor)?);
-        sessions.push((bundle, peer, cold));
+        // Candidate preparation may take time. Keep no idle authenticated
+        // stream while other complete header histories are acquired.
+        drop(session);
     }
     let mut client = client::select(candidates, policy.floor)?;
-    let bundle = client.manifest().bundle();
-    let selected = sessions
+    let selected = bundles
         .iter()
-        .position(|(id, _, _)| *id == bundle)
-        .ok_or("signed bootstrap selected session unavailable")?;
-    let (_, mut peer, mut cold) = sessions.swap_remove(selected);
-    let mut other_received = 0u64;
-    let mut other_sent = 0u64;
-    for (_, peer, _) in &sessions {
-        let bytes = peer.encrypted_stream_bytes();
-        other_received = other_received
-            .checked_add(bytes.0)
-            .ok_or("bootstrap stream byte overflow")?;
-        other_sent = other_sent
-            .checked_add(bytes.1)
-            .ok_or("bootstrap stream byte overflow")?;
-    }
-    drop(sessions);
+        .find(|(bundle, _)| *bundle == client.manifest().bundle())
+        .map(|(_, index)| *index)
+        .ok_or("signed bootstrap selected service unavailable")?;
+    let mut session = Acquisition::new(
+        &connector,
+        destinations[selected],
+        &genesis,
+        accounting.clone(),
+        Some(client.manifest().encode()?),
+    );
     while client.progress()? != Progress::Downloaded {
-        operation.round()?;
-        cold.round(&mut peer, network::Limits::default(), |p| {
-            client.pull_step(p)
-        })
-        .map_err(|_| "signed bootstrap artifact round failed")?;
+        session.round(&mut operation, |p| client.pull_step(p))?;
     }
-    let encrypted = peer.encrypted_stream_bytes();
-    let received = encrypted
-        .0
-        .checked_add(other_received)
-        .ok_or("bootstrap stream byte overflow")?;
-    let sent = encrypted
-        .1
-        .checked_add(other_sent)
-        .ok_or("bootstrap stream byte overflow")?;
-    drop(peer);
+    drop(session);
+    let counts = accounting
+        .lock()
+        .map_err(|_| "signed bootstrap byte accounting unavailable")?;
+    if counts.overflow {
+        return Err("signed bootstrap byte accounting overflow".into());
+    }
+    let (received, sent, authenticated_sessions) = (counts.received, counts.sent, counts.sessions);
+    drop(counts);
     let maximum_seconds = policy.seconds;
     let started = operation.started;
     let admitted = client.verify_and_install(&genesis, directory, || {
@@ -321,10 +516,15 @@ pub fn bootstrap_signed(
         "checkpoint_height":store.imported_checkpoint_height(),"elapsed_ms":started.elapsed().as_millis().to_string(),"rounds":operation.rounds,
         "verification_bytes":admitted.verification_bytes.to_string(),"local_reread_bytes":admitted.local_reread_bytes.to_string(),
         "encrypted_received_bytes":received.to_string(),"encrypted_sent_bytes":sent.to_string(),
-        "network_byte_scope":"all candidate sessions in this invocation, including hybrid handshake and framing; previous invocations and packet-wire bytes excluded"});
+        "connection_attempts":operation.connections,"authenticated_sessions":authenticated_sessions,
+        "network_byte_scope":"all established candidate and retry sessions in this invocation, including hybrid handshake and framing; failed pre-session handshakes, previous invocations and packet-wire bytes excluded"});
     drop(store);
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "bootstrap_tests.rs"]
+mod reconnect_tests;
 
 #[cfg(test)]
 mod tests {
