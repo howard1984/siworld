@@ -257,6 +257,9 @@ pub struct ImportedAnchor {
     binding: Binding,
 }
 impl ImportedAnchor {
+    pub(super) fn into_state(self) -> SnapshotState {
+        self.state
+    }
     pub fn state(&self) -> &SnapshotState {
         &self.state
     }

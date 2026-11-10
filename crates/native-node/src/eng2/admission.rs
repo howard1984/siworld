@@ -31,6 +31,8 @@ pub enum PlanError {
     Selection(SelectionError),
     AnchorMetadata,
     NetworkRules,
+    Checkpoint,
+    Availability,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,11 +64,103 @@ impl AdmissionPlan {
             pin,
         })
     }
+    /// Explicit signed-checkpoint mode only. Select the greatest-work complete
+    /// verified header history among the supplied candidates without requiring
+    /// automatic mode's three transport source groups. This preliminary plan
+    /// grants no state admission: import must authenticate a current-roster
+    /// certificate, reconstruct permanent state and execute the complete tail.
+    pub fn select_signed(candidates: &[&VerifiedHeaders], floor: Work) -> Result<Self, PlanError> {
+        use selection::SelectionError;
+        let reject = PlanError::Selection;
+        if floor.is_zero() {
+            return Err(reject(SelectionError::WorkFloor));
+        }
+        if candidates.is_empty() || candidates.len() > 64 {
+            return Err(reject(SelectionError::Sources));
+        }
+        let mut selected = candidates[0];
+        let mut equal_competitor = false;
+        for candidate in candidates {
+            if candidate.rules() != selected.rules() {
+                return Err(reject(SelectionError::Rules));
+            }
+            if candidate.cumulative_work() > selected.cumulative_work() {
+                selected = candidate;
+                equal_competitor = false;
+            } else if candidate.cumulative_work() == selected.cumulative_work()
+                && candidate.id(candidate.height()).map_err(reject)?
+                    != selected.id(selected.height()).map_err(reject)?
+            {
+                equal_competitor = true;
+            }
+        }
+        if equal_competitor {
+            return Err(reject(SelectionError::EqualWork));
+        }
+        if selected.tail_work() < floor {
+            return Err(reject(SelectionError::WorkFloor));
+        }
+        Ok(Self {
+            headers: selected.clone(),
+            pin: Pin {
+                network: selected.rules().network,
+                genesis: selected.rules().genesis,
+                anchor_height: selected.anchor_height(),
+                anchor_id: selected.id(selected.anchor_height()).map_err(reject)?,
+                tip_height: selected.height(),
+                tip_id: selected.id(selected.height()).map_err(reject)?,
+                cumulative_work: selected.cumulative_work(),
+                tail_work: selected.tail_work(),
+                local_work_floor: floor,
+            },
+        })
+    }
     pub fn headers(&self) -> &VerifiedHeaders {
         &self.headers
     }
     pub fn pin(&self) -> Pin {
         self.pin
+    }
+    /// Explicit signed-checkpoint mode only. The selected header history and
+    /// the caller's work floor remain unchanged. Availability
+    /// is a preliminary range declaration; the importer must read and verify
+    /// every body before it can install any accepted state.
+    pub fn at_checkpoint(
+        &self,
+        checkpoint: u64,
+        first_full_body: u64,
+        last_full_body: u64,
+    ) -> Result<Self, PlanError> {
+        let tail = self
+            .pin
+            .tip_height
+            .checked_sub(checkpoint)
+            .ok_or(PlanError::Checkpoint)?;
+        if checkpoint == 0
+            || !checkpoint.is_multiple_of(super::runtime_export::CHECKPOINT_INTERVAL)
+            || !(super::runtime_export::CHECKPOINT_CONFIRMATIONS..=selection::TAIL_BLOCKS)
+                .contains(&tail)
+        {
+            return Err(PlanError::Checkpoint);
+        }
+        if first_full_body > checkpoint + 1 || last_full_body < self.pin.tip_height {
+            return Err(PlanError::Availability);
+        }
+        let mut pin = self.pin;
+        pin.anchor_height = checkpoint;
+        pin.anchor_id = self.headers.id(checkpoint).map_err(PlanError::Selection)?;
+        pin.tail_work = pin.cumulative_work
+            - self
+                .headers
+                .work_at(checkpoint)
+                .map_err(PlanError::Selection)?;
+        if pin.tail_work < pin.local_work_floor {
+            return Err(PlanError::Selection(SelectionError::WorkFloor));
+        }
+        Ok(Self {
+            headers: self.headers.clone(),
+            pin,
+        })
     }
     pub fn check_anchor_metadata(&self, state: &State) -> Result<(), PlanError> {
         let rules = self.headers.rules();

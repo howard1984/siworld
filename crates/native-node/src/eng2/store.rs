@@ -16,6 +16,7 @@ use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
 };
 use std::{fs::OpenOptions, path::Path};
+mod imported;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("eng2-canonical-meta-v1");
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("eng2-canonical-blocks-v1");
@@ -23,12 +24,18 @@ const INDEX: TableDefinition<u64, &[u8]> = TableDefinition::new("eng2-canonical-
 const INDEX_BYTES: usize = HEADER_BYTES + 8;
 const ANCHORS: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eng2-committed-anchor-states-v1");
+pub(crate) const PERMANENT_RECEIPTS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eng2-permanent-receipts-v1");
+pub(crate) const PERMANENT_RECEIPT_IDS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("eng2-permanent-receipt-ids-v1");
 
 pub struct Store {
     database: Database,
     engine: Engine,
     usable: bool,
     restart: Option<super::restart::Context>,
+    imported_prefix: u64,
+    import_seed: Hash,
 }
 impl Store {
     /// Initialize only a new absent file. Existing state is never overwritten.
@@ -77,6 +84,8 @@ impl Store {
             engine,
             usable: true,
             restart: None,
+            imported_prefix: 0,
+            import_seed: [0; 32],
         })
     }
     /// Independently reconstruct every committed block and execution root and
@@ -184,6 +193,8 @@ impl Store {
             engine,
             usable: true,
             restart: None,
+            imported_prefix: 0,
+            import_seed: [0; 32],
         })
     }
     pub fn engine(&self) -> &Engine {
@@ -247,10 +258,11 @@ impl Store {
         let blocks = txn
             .open_table(BLOCKS)
             .map_err(|_| "restart canonical table missing")?;
+        let (imported_prefix, import_seed) = imported::resume_context(&txn, height)?;
         if blocks
             .len()
             .map_err(|_| "restart block count unavailable")?
-            != height
+            != height - imported_prefix
         {
             return Err("restart canonical count differs".into());
         }
@@ -324,12 +336,13 @@ impl Store {
                 &seal,
             )
             .map_err(|_| "authenticated restart seal mismatch")?;
-        let index_digest = authenticate_header_prefix(
+        let index_digest = authenticate_header_prefix_seed(
             &index,
             genesis.config().network,
             genesis.id(),
             height,
             head_bytes[8..40].try_into().expect("checked restart tip"),
+            import_seed,
         )?;
         if index_digest != sealed_index {
             return Err("restart compact index differs from accepted local seal".into());
@@ -377,6 +390,8 @@ impl Store {
                 spends,
                 index: index_digest,
             }),
+            imported_prefix,
+            import_seed,
         };
         result.ensure_exportable()?;
         Ok(result)
@@ -461,13 +476,14 @@ impl Store {
             identity,
             leaves,
             spends,
-            index: authenticate_header_prefix(
+            index: authenticate_header_prefix_seed(
                 &txn.open_table(INDEX)
                     .map_err(|_| "restart qualification compact index unavailable")?,
                 self.engine.state().network(),
                 self.engine.genesis().id(),
                 self.engine.state().height(),
                 self.engine.state().tip(),
+                self.import_seed,
             )?,
         };
         context.write(
@@ -748,6 +764,9 @@ impl Store {
     /// Return canonical public header/body bytes for explicit independent replay.
     pub fn block(&self, height: u64) -> Result<(Header, Body), String> {
         let (expected, length) = self.compact(height)?;
+        if height <= self.imported_prefix {
+            return Err("historical proof body is unavailable before imported checkpoint".into());
+        }
         let txn = self
             .database
             .begin_read()
@@ -855,6 +874,7 @@ fn index_row_hash(previous: Hash, height: u64, bytes: &[u8]) -> Hash {
 }
 /// Read only the separate fixed-width compact index, authenticate ancestry
 /// from genesis to the sealed tip, and bind every recorded body length.
+#[cfg(test)]
 fn authenticate_header_prefix(
     index: &impl ReadableTable<u64, &'static [u8]>,
     network: Hash,
@@ -862,11 +882,21 @@ fn authenticate_header_prefix(
     height: u64,
     tip: Hash,
 ) -> Result<Hash, String> {
+    authenticate_header_prefix_seed(index, network, genesis, height, tip, [0; 32])
+}
+fn authenticate_header_prefix_seed(
+    index: &impl ReadableTable<u64, &'static [u8]>,
+    network: Hash,
+    genesis: Hash,
+    height: u64,
+    tip: Hash,
+    seed: Hash,
+) -> Result<Hash, String> {
     if index.len().map_err(|_| "restart index count unavailable")? != height {
         return Err("restart compact index count differs".into());
     }
     let mut expected = genesis;
-    let mut digest = [0; 32];
+    let mut digest = seed;
     for height in 1..=height {
         let record = index
             .get(height)

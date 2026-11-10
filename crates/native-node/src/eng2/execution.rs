@@ -64,6 +64,15 @@ pub struct Engine {
     limits: Limits,
 }
 impl Engine {
+    /// Isolated checkpoint candidate only. The import owner keeps this engine
+    /// private until complete native tail execution and current-roster checks.
+    pub(super) fn from_imported_anchor(
+        genesis: Genesis,
+        anchor: super::snapshot::ImportedAnchor,
+        limits: Limits,
+    ) -> Result<Self, String> {
+        Self::from_authenticated_local_state(genesis, anchor.into_state(), limits)
+    }
     pub(super) fn from_authenticated_local_state(
         genesis: Genesis,
         state: SnapshotState,

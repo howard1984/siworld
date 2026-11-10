@@ -115,6 +115,29 @@ pub fn receipts(
     if height == 0 || height > head.height {
         return Err("wallet receipt height is not accepted".into());
     }
+    let reservation = budget
+        .reserve(3 * codec::MAX_RECEIPT_BYTES + 65536)
+        .map_err(|_| "permanent wallet receipt memory unavailable")?;
+    if let Some(bytes) = store.permanent_receipt(height)? {
+        let header = store.header(height)?;
+        let encoded = header
+            .encode()
+            .map_err(|_| "imported wallet receipt header rejected")?;
+        let receipt = ReceiptBlock::decode(&context(store)?, &encoded, &bytes)?;
+        if receipt.body_bytes() != store.block_size(height)? {
+            return Err("permanent wallet receipt differs from accepted body length".into());
+        }
+        head.check_current(store)?;
+        return Ok(Export {
+            bytes,
+            height,
+            id: header
+                .id()
+                .map_err(|_| "imported wallet header identity rejected")?,
+            _reservation: reservation,
+        });
+    }
+    drop(reservation);
     // Fixed-width accepted index lookup precedes all proof-body allocations.
     let length = store.block_size(height)?;
     if length > codec::MAX_BODY_BYTES {
