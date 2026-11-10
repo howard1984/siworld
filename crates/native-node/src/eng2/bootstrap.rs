@@ -193,7 +193,21 @@ impl Provider {
             }
         }
         for height in anchor + 1..=state.height() {
-            store.block_size(height)?;
+            let length = store.block_size(height)?;
+            let charge = length
+                .checked_mul(3)
+                .and_then(|bytes| bytes.checked_add(65536))
+                .ok_or("bootstrap body availability memory overflow")?;
+            let _body_charge = budget
+                .reserve(charge)
+                .map_err(|_| "bootstrap body availability memory unavailable")?;
+            if store.body_availability(height)?
+                != (super::store::BodyAvailability::Full {
+                    encoded_body_bytes: length,
+                })
+            {
+                return Err("bootstrap full native tail is unavailable".into());
+            }
         }
         let charge = certified
             .snapshot_bytes()

@@ -44,6 +44,11 @@ pub struct Store {
     imported_prefix: u64,
     import_seed: Hash,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyAvailability {
+    Unavailable,
+    Full { encoded_body_bytes: usize },
+}
 impl Store {
     /// Initialize only a new absent file. Existing state is never overwritten.
     pub fn create(path: &Path, genesis: Genesis, limits: Limits) -> Result<Self, String> {
@@ -888,6 +893,43 @@ impl Store {
     /// Size the persisted body before callers reserve memory for decoding.
     pub fn block_size(&self, height: u64) -> Result<usize, String> {
         self.compact(height).map(|(_, length)| length)
+    }
+    /// Observe an actual body record separately from permanent compact length
+    /// metadata. This checks framing and presence, not native proof validity.
+    /// Callers reserve for the indexed size before reading the record.
+    pub fn body_availability(&self, height: u64) -> Result<BodyAvailability, String> {
+        self.check_readable()?;
+        if height == 0 || height > self.engine.state().height() || height <= self.imported_prefix {
+            return Ok(BodyAvailability::Unavailable);
+        }
+        let (header, length) = self.compact(height)?;
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "versioned body availability unavailable")?;
+        let table = transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "versioned body table unavailable")?;
+        let Some(value) = table
+            .get(height)
+            .map_err(|_| "versioned body presence read failed")?
+        else {
+            return Ok(BodyAvailability::Unavailable);
+        };
+        if value.value().len() != HEADER_BYTES + length
+            || value.value().get(..HEADER_BYTES)
+                != Some(
+                    header
+                        .encode()
+                        .map_err(|_| "invalid accepted compact header")?
+                        .as_slice(),
+                )
+        {
+            return Err("versioned body presence differs from accepted compact metadata".into());
+        }
+        Ok(BodyAvailability::Full {
+            encoded_body_bytes: length,
+        })
     }
     fn check_readable(&self) -> Result<(), String> {
         if self.usable {
