@@ -19,6 +19,11 @@ outstanding.
 5. [Proof-profile reproduction](native-proof-profiles.md), [transaction profile](../crates/bench-multi-asset/artifacts/v1-transaction-profile.json) and [actual-instance measurements](v1-multi-asset-evaluation.md).
 6. [Node/network milestones](v1-node-network-plan.md), [single-node engineering runtime](v1-native-runtime.md) and [testnet acceptance](prover-acceptance.md).
 
+The separately versioned [engineering-network-2 requirements](eng2-protocol.md)
+define activation profiles, execution commitments, confidential fees, fund claims
+and governance. Automatic synchronization and offline QR signing are deferred
+features, not evidence of a deployed public-testnet runtime.
+
 ## Proof implementation and measurement
 
 - [Native proof workspace](../crates/bench-multi-asset/README.md): transaction, issuance and settlement relations and reproducible checks.

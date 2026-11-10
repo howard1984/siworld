@@ -37,6 +37,8 @@ pub const UNAVAILABLE: u8 = 7;
 pub const END_BATCH: u8 = 8;
 pub const CHECKPOINT: u8 = 9;
 pub const GET_CHECKPOINT_DATA: u8 = 10;
+/// Versioned eng-2 messages remain bounded control frames.
+pub(crate) const ENG2_MESSAGE: u8 = 11;
 pub(crate) const CHECKPOINT_ALPN: &[u8] = b"/siworld/native-hybrid/checkpoint/1";
 pub const MAX_HANDSHAKES: usize = 16;
 pub const HANDSHAKE_BYTES: usize = 256 * 1024;
@@ -645,6 +647,9 @@ impl<S: Read + Write> Session<S> {
     pub(crate) fn binding(&self) -> Binding {
         self.binding
     }
+    pub(crate) fn shared_budget(&self) -> Budget {
+        self.budget.clone()
+    }
     #[cfg(feature = "native-p2p")]
     pub(crate) fn checkpoints_enabled(&self) -> bool {
         self.checkpoints
@@ -723,6 +728,10 @@ impl<S: Read + Write> Session<S> {
     /// extend one compact recovery for every transaction in the block.
     pub(crate) fn receive_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
         self.receive_deadline(deadline.clone())
+    }
+    /// Eng-2 rejects V1 block frames before their payload is allocated.
+    pub(crate) fn receive_eng2_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
+        self.receive_frame(deadline.clone(), Some(&[ENG2_MESSAGE]))
     }
     /// A paired sync request may follow synchronous proof verification by the
     /// remote owner. Only its header uses the caller's absolute wait bound;
@@ -828,7 +837,11 @@ impl<S: Read + Write> Session<S> {
         }
     }
     #[cfg(test)]
-    fn from_test_channel(channel: S, binding: Binding, budget: Budget) -> Self {
+    pub(crate) fn test_channel(&self) -> &S {
+        &self.channel
+    }
+    #[cfg(test)]
+    pub(crate) fn from_test_channel(channel: S, binding: Binding, budget: Budget) -> Self {
         Self {
             channel,
             binding,
@@ -847,7 +860,7 @@ fn frame_header(
     network: &Hash,
     length: usize,
 ) -> Result<[u8; HEADER_BYTES], Error> {
-    if !(GET_BLOCKS..=GET_CHECKPOINT_DATA).contains(&kind) {
+    if !(GET_BLOCKS..=ENG2_MESSAGE).contains(&kind) {
         return Err(Error::InvalidProtocol);
     }
     let maximum = if kind == BLOCK {

@@ -29,6 +29,13 @@ wallet-light-gateway = []
 checkpoint-rejection-acceptance = []
 # Explicit real-time pruning-alarm acceptance build; excluded from production packaging.
 checkpoint-stale-acceptance = []
+# Offline native block/wallet rehearsal, excluded from production packaging.
+eng2-rehearsal = []
+
+[[bin]]
+name = "siworld-eng2-rehearsal"
+path = "src/bin/siworld-eng2-rehearsal.rs"
+required-features = ["eng2-rehearsal"]
 
 [[bin]]
 name = "siworld-checkpoint-stale-runtime"

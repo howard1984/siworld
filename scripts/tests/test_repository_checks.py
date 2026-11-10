@@ -21,7 +21,7 @@ class RepositoryManifestTests(unittest.TestCase):
             "README.md", "chain-client.mjs", "explorer-config.example.json",
             "explorer.css", "explorer.mjs", "index.html", "projection.mjs",
             "proxy-location.example.conf", "tests/fixture-server.mjs",
-            "tests/projection.test.mjs",
+            "tests/frontend.test.mjs", "tests/projection.test.mjs",
         )
         for name in names:
             self.assertTrue(repository.allowed(Path("tools/explorer") / name))

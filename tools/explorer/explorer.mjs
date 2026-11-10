@@ -87,6 +87,13 @@ function render(value) {
   text('checkpoint-roster', checkpoint?.roster);
   text('checkpoint-votes', checkpoint ? checkpoint.signer_indices.map(index => 'Slot ' + (index + 1)).join(', ') : 'Unknown');
   for (const id of ['current-signers', 'pending-signers', 'fee-address', 'fund-addresses']) text(id, 'Unknown');
+  const issuance = value?.governance?.issuance_fee;
+  text('current-issuance-fee', issuance ? formatSIP(issuance.current_atoms) + ' SIP' : 'Unknown');
+  text('issuance-fee-bounds', issuance ? formatSIP(issuance.minimum_atoms) + '–' + formatSIP(issuance.maximum_atoms) + ' SIP' : 'Unknown');
+  text('pending-issuance-fee', !issuance ? 'Unknown' : issuance.pending ? formatSIP(issuance.pending.amount_atoms) + ' SIP' : 'None');
+  text('pending-issuance-height', !issuance ? 'Unknown' : issuance.pending ?
+    'Included #' + count(issuance.pending.included_height) + ' · effective #' + count(issuance.pending.effective_height) +
+      ' · proposal ' + issuance.pending.proposal_sequence : 'No pending change');
   table('changes', [], 5, 'Configuration-change records are unavailable on this network.');
   text('snapshot-time', value ? 'Snapshot ' + timestamp(value.published_unix_seconds) : 'Snapshot time unknown');
   renderMine();

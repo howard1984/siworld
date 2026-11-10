@@ -19,9 +19,32 @@ function atoms(value) {
   return value;
 }
 
+function issuanceFee(value, head) {
+  keys(value, 'current_atoms minimum_atoms maximum_atoms pending');
+  for (const key of ['current_atoms', 'minimum_atoms', 'maximum_atoms']) {
+    atoms(value[key]); requireValue(value[key] !== null);
+  }
+  requireValue(value.minimum_atoms === '100000000' && value.maximum_atoms === '1000000000000');
+  const within = amount => BigInt(amount) >= 100_000_000n && BigInt(amount) <= 1_000_000_000_000n;
+  requireValue(within(value.current_atoms));
+  let pending = null;
+  if (value.pending !== null) {
+    const row = value.pending;
+    keys(row, 'amount_atoms proposal_sequence included_height effective_height');
+    atoms(row.amount_atoms); atoms(row.proposal_sequence);
+    requireValue(row.amount_atoms !== null && within(row.amount_atoms) && row.proposal_sequence !== null &&
+      BigInt(row.proposal_sequence) > 0n && BigInt(row.proposal_sequence) <= (1n << 64n) - 1n);
+    integer(row.included_height); integer(row.effective_height, Number.MAX_SAFE_INTEGER);
+    requireValue(row.included_height > 0 && row.included_height <= head && head < row.effective_height &&
+      row.effective_height === row.included_height + 4032);
+    pending = Object.freeze({...row});
+  }
+  return Object.freeze({...value, pending});
+}
+
 export function normalizeProjection(value, config) {
   keys(value, 'version network genesis height tip published_unix_seconds blocks economics checkpoint governance');
-  requireValue(value.version === 1 && value.network === config.network && value.genesis === config.genesis,
+  requireValue([1, 2].includes(value.version) && value.network === config.network && value.genesis === config.genesis,
     'The public explorer returned a different network.');
   integer(value.height); hash(value.tip); integer(value.published_unix_seconds, Number.MAX_SAFE_INTEGER);
   requireValue(value.height !== 0 || value.tip === config.genesis);
@@ -70,11 +93,14 @@ export function normalizeProjection(value, config) {
       item.signer_indices.every(n => Number.isInteger(n) && n >= 0 && n < 3) && new Set(item.signer_indices).size === item.signer_indices.length);
     checkpoint = Object.freeze({...item, signer_indices: Object.freeze([...item.signer_indices])});
   }
-  keys(value.governance, 'current_signers fee_address fund_addresses changes');
-  requireValue(Object.values(value.governance).every(item => item === null));
+  const names = 'current_signers fee_address fund_addresses changes';
+  keys(value.governance, value.version === 1 ? names : names + ' issuance_fee');
+  requireValue(names.split(' ').every(key => value.governance[key] === null));
+  const governance = {...value.governance};
+  if (value.version === 2) governance.issuance_fee = issuanceFee(governance.issuance_fee, value.height);
   return Object.freeze({...value, blocks: Object.freeze(blocks), checkpoint,
     economics: Object.freeze({...economic, unlock_schedule: Object.freeze(schedule), funds: Object.freeze(funds)}),
-    governance: Object.freeze({...value.governance})});
+    governance: Object.freeze(governance)});
 }
 
 export function intervalStatistics(blocks) {

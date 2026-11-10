@@ -428,3 +428,157 @@ fn rpc_reorg_prunes_a_receipt_whose_canonical_payment_was_removed() {
     assert!(!node.state().commitments.contains(&record.fee_commitment));
     assert!(node.submit_issuance(&record.encode().unwrap()).is_err());
 }
+
+#[test]
+fn governed_issuance_freezes_exact_public_amount_and_payment_owner() {
+    use native::encryption::RecipientViewKey;
+    let config = config();
+    let recipient = RecipientViewKey::generate([F::from_u32(919); 12]).unwrap();
+    let address = recipient.address();
+    let amount = 7 * 100_000_000;
+    let policy = ActiveIssuancePolicy::new(&address, amount).unwrap();
+    let mut record = sample(&config);
+    record.signed.declaration.issuance_fee_atoms = amount;
+    resign(&mut record);
+    record.fee_commitment =
+        encode_digest(&Hasher::new().note_cm(&record.public_fee_note(&policy).unwrap()));
+    record.validate_with_policy(&config, &policy).unwrap();
+    assert!(record.validate(&config).is_err());
+    let recovered = record.public_fee_note(&policy).unwrap();
+    assert_eq!(recovered.owner, address.owner());
+    assert_eq!(recovered.asset_id, native::multi_asset::SIP_ASSET_ID);
+    assert_eq!(recovered.value, amount);
+    assert_eq!(recovered.unlock_height, 0);
+    assert_eq!(
+        encode_digest(&Hasher::new().note_cm(&recovered)),
+        record.fee_commitment
+    );
+    let wrong_amount = ActiveIssuancePolicy::new(&address, amount + 1).unwrap();
+    assert!(record.validate_with_policy(&config, &wrong_amount).is_err());
+    let wrong_recipient = RecipientViewKey::generate([F::from_u32(920); 12]).unwrap();
+    let wrong_address = wrong_recipient.address();
+    let wrong_owner = ActiveIssuancePolicy::new(&wrong_address, amount).unwrap();
+    assert!(record.validate_with_policy(&config, &wrong_owner).is_err());
+    for index in 0..5 {
+        let mut bad = record.clone();
+        match index {
+            0 => bad.fee_rho[0] ^= 1,
+            1 => bad.signed.signature.as_mut().unwrap()[0] ^= 1,
+            2 => bad.ciphertexts[0][0] ^= 1,
+            3 => bad.fee_commitment[0] ^= 1,
+            _ => bad.signed.declaration.issuance_fee_atoms += 1,
+        }
+        assert!(
+            bad.validate_with_policy(&config, &policy).is_err(),
+            "case {index}"
+        );
+    }
+    let mut wrong_network = config.clone();
+    wrong_network.network[0] ^= 1;
+    assert!(
+        record
+            .validate_with_policy(&wrong_network, &policy)
+            .is_err()
+    );
+}
+
+#[test]
+fn governed_issuance_accepts_only_the_genesis_amount_bounds() {
+    use native::encryption::RecipientViewKey;
+    let recipient = RecipientViewKey::generate([F::from_u32(921); 12]).unwrap();
+    let address = recipient.address();
+    for amount in [0, 99_999_999, 1_000_000_000_001, u64::MAX] {
+        assert!(ActiveIssuancePolicy::new(&address, amount).is_err());
+    }
+    for amount in [100_000_000, TESTNET_ISSUANCE_FEE_ATOMS, 1_000_000_000_000] {
+        assert_eq!(
+            ActiveIssuancePolicy::new(&address, amount)
+                .unwrap()
+                .fee_atoms(),
+            amount
+        );
+    }
+}
+
+#[test]
+fn governed_public_receipt_recovery_does_not_claim_kem_ciphertext_binding() {
+    use native::encryption::RecipientViewKey;
+    let config = config();
+    let owner = [F::from_u32(922); 12];
+    let first = RecipientViewKey::generate(owner).unwrap().address();
+    let second = RecipientViewKey::generate(owner).unwrap().address();
+    assert_ne!(first, second);
+    let policy = ActiveIssuancePolicy::new(&first, TESTNET_ISSUANCE_FEE_ATOMS).unwrap();
+    let alternate = ActiveIssuancePolicy::new(&second, TESTNET_ISSUANCE_FEE_ATOMS).unwrap();
+    let mut record = sample(&config);
+    record.fee_commitment =
+        encode_digest(&Hasher::new().note_cm(&record.public_fee_note(&policy).unwrap()));
+    record.validate_with_policy(&config, &policy).unwrap();
+    record.validate_with_policy(&config, &alternate).unwrap();
+    assert_eq!(policy.destination(), &first);
+    let note = record.public_fee_note(&alternate).unwrap();
+    assert_eq!(note.owner, owner);
+    assert_eq!(
+        encode_digest(&Hasher::new().note_cm(&note)),
+        record.fee_commitment
+    );
+}
+
+#[test]
+fn governed_issuance_preflight_requires_the_paid_output_and_keeps_parent_unchanged() {
+    use crate::chain_transition::{Actions, Context, PreparedActions};
+    use native::encryption::RecipientViewKey;
+    let config = config();
+    let recipient = RecipientViewKey::generate([F::from_u32(923); 12]).unwrap();
+    let address = recipient.address();
+    let policy = ActiveIssuancePolicy::new(&address, 8 * 100_000_000).unwrap();
+    let mut record = sample(&config);
+    record.signed.declaration.issuance_fee_atoms = policy.fee_atoms();
+    resign(&mut record);
+    record.fee_commitment =
+        encode_digest(&Hasher::new().note_cm(&record.public_fee_note(&policy).unwrap()));
+    let state = State::new(config).unwrap();
+    let block = issued_block(&state, record.clone(), 1000);
+    let before = state.fingerprint();
+    let prepare = |block: &Block| {
+        PreparedActions::prepare_with_issuance_policy(
+            &state,
+            Context {
+                network: block.network,
+                height: block.height,
+                parent: block.parent,
+                timestamp: block.timestamp,
+                target: block.target,
+            },
+            Actions {
+                transactions: &block.transactions,
+                issuances: &block.issuances,
+                rewards: &block.rewards,
+            },
+            Some(&policy),
+        )
+        .is_ok()
+    };
+    assert!(prepare(&block));
+    assert_eq!(state.fingerprint(), before);
+    let mut unpaid = block.clone();
+    unpaid
+        .transactions
+        .iter_mut()
+        .find(|tx| tx.record.body[96..144] == record.fee_commitment)
+        .unwrap()
+        .record
+        .body[96..144]
+        .copy_from_slice(&encode_digest(&[F::from_u32(924); 12]));
+    unpaid
+        .transactions
+        .sort_by_key(|tx| tx.record.statement_id(&unpaid.network));
+    assert!(!prepare(&unpaid));
+    assert_eq!(state.fingerprint(), before);
+    let mut outdated = block;
+    outdated.issuances[0].signed.declaration.issuance_fee_atoms = TESTNET_ISSUANCE_FEE_ATOMS;
+    resign(&mut outdated.issuances[0]);
+    assert!(!prepare(&outdated));
+    assert_eq!(state.fingerprint(), before);
+    assert!(state.assets.is_empty());
+}

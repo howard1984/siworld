@@ -1295,7 +1295,7 @@ fn detached_record(bytes: &[u8]) -> Result<&[u8], String> {
     Ok(record)
 }
 
-fn open_regular_file(path: &Path, create_allowed: bool) -> Result<(File, bool), String> {
+pub(crate) fn open_regular_file(path: &Path, create_allowed: bool) -> Result<(File, bool), String> {
     let existing = match std::fs::symlink_metadata(path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
@@ -1355,7 +1355,7 @@ fn same_file(left: &Metadata, right: &Metadata) -> bool {
 fn same_file(left: &Metadata, right: &Metadata) -> bool {
     left.len() == right.len() && left.created().ok() == right.created().ok()
 }
-fn sync_parent(path: &Path) -> Result<(), String> {
+pub(crate) fn sync_parent(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         let parent = path

@@ -258,12 +258,28 @@ fn decode_payment(bytes: &[u8; 1313]) -> PaymentCiphertext {
     }
 }
 
+#[cfg(test)]
 fn prepare_rewards(
     state: &State,
     total_fees: u64,
     settings: &MiningSettings,
 ) -> Result<PreparedRewards, String> {
     let plan = state.reward_plan(settings.mode)?;
+    prepare_rewards_with_plan(state, total_fees, settings, &plan)
+}
+
+fn prepare_rewards_with_plan(
+    state: &State,
+    total_fees: u64,
+    settings: &MiningSettings,
+    plan: &native::settlement::RewardPlan,
+) -> Result<PreparedRewards, String> {
+    plan.validate()?;
+    if state.height.checked_add(1) != Some(plan.block_height)
+        || settings.mode.to_byte() != plan.mode as u8
+    {
+        return Err("explicit reward plan differs from candidate height or mode".into());
+    }
     let h = Hasher::new();
     let ec = EncryptionContext::new(state.config.network);
     let mut records = Vec::with_capacity(plan.allocations.len());
@@ -444,19 +460,37 @@ pub(crate) fn reward_material_amounts(
 /// Generate one complete native proof with fresh OS entropy and real output
 /// encryption. The caller must independently verify it before queue admission.
 pub fn prepare_padding(state: &State, prover: &NativeProver) -> Result<Padding, String> {
-    let roots = state.recent_roots()?.tree(&Hasher::new());
-    let prepared = prepare_empty(state, &roots)?;
-    let proof = prover.transaction(&prepared.witness, &prepared.public, &context(state))?;
-    Ok(Padding {
-        transaction: Transaction {
-            record: prepared.record,
-            proof,
-        },
-        opening: prepared.opening,
-    })
+    prepare_padding_witness(state)?.prove(prover)
 }
 
-struct PreparedCandidate {
+/// Owned bounded witness material. Preparation borrows current state briefly;
+/// proving does not retain a chain owner lock or clone permanent history.
+pub struct PreparedPadding {
+    transaction: PreparedTransaction,
+    context: ProofContext,
+}
+pub fn prepare_padding_witness(state: &State) -> Result<PreparedPadding, String> {
+    let roots = state.recent_roots()?.tree(&Hasher::new());
+    Ok(PreparedPadding {
+        transaction: prepare_empty(state, &roots)?,
+        context: context(state),
+    })
+}
+impl PreparedPadding {
+    pub fn prove(self, prover: &NativeProver) -> Result<Padding, String> {
+        let prepared = self.transaction;
+        let proof = prover.transaction(&prepared.witness, &prepared.public, &self.context)?;
+        Ok(Padding {
+            transaction: Transaction {
+                record: prepared.record,
+                proof,
+            },
+            opening: prepared.opening,
+        })
+    }
+}
+
+pub(crate) struct PreparedCandidate {
     block: Block,
     settlement: FixedSettlementWitness,
     reward_secret: Zeroizing<Vec<u8>>,
@@ -467,9 +501,20 @@ struct PreparedCandidate {
 /// at admission; the final block still requires the shared state transition.
 fn prepare_candidate(
     state: &State,
+    positions: Vec<Padding>,
+    timestamp: u64,
+    settings: &MiningSettings,
+) -> Result<PreparedCandidate, String> {
+    let plan = state.reward_plan(settings.mode)?;
+    prepare_candidate_with_plan(state, positions, timestamp, settings, plan)
+}
+
+pub(crate) fn prepare_candidate_with_plan(
+    state: &State,
     mut positions: Vec<Padding>,
     timestamp: u64,
     settings: &MiningSettings,
+    plan: native::settlement::RewardPlan,
 ) -> Result<PreparedCandidate, String> {
     check_count(positions.len())?;
     if timestamp <= state.median_time_past() {
@@ -530,7 +575,7 @@ fn prepare_candidate(
         transactions.push(value.transaction);
     }
     slots.extend(tail_slots(state.config.network, height, count)?);
-    let reward = prepare_rewards(state, total_fees, settings)?;
+    let reward = prepare_rewards_with_plan(state, total_fees, settings, &plan)?;
     let block = Block {
         network: state.config.network,
         height,
@@ -546,7 +591,7 @@ fn prepare_candidate(
         settlement_proof: Vec::new(),
     };
     let witness = FixedSettlementWitness {
-        plan: state.reward_plan(settings.mode)?,
+        plan,
         network: block.network,
         transaction_list_digest: block.list_digest(),
         rewards: reward
@@ -581,7 +626,16 @@ pub fn assemble(
     timestamp: u64,
     settings: &MiningSettings,
 ) -> Result<ProducedBlock, String> {
-    let mut prepared = prepare_candidate(state, positions, timestamp, settings)?;
+    prove_candidate(
+        prover,
+        prepare_candidate(state, positions, timestamp, settings)?,
+    )
+}
+
+pub(crate) fn prove_candidate(
+    prover: &NativeProver,
+    mut prepared: PreparedCandidate,
+) -> Result<ProducedBlock, String> {
     prepared.block.settlement_proof = prover.settlement(&prepared.settlement)?;
     prepared.block.validate_shape()?;
     validate_reward_secret(&prepared.block, &prepared.reward_secret)?;

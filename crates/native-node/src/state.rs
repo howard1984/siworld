@@ -347,11 +347,11 @@ fn synthetic_fund_keys() -> Vec<[u8; crate::fund_spend::VERIFYING_KEY_BYTES]> {
 
 /// Borrowed proof input assembled from an independently checked snapshot.
 pub struct TransactionProof<'a> {
-    public: PublicTransaction,
-    context: ProofContext,
-    fee: Digest,
-    root: Digest,
-    proof: &'a [u8],
+    pub(crate) public: PublicTransaction,
+    pub(crate) context: ProofContext,
+    pub(crate) fee: Digest,
+    pub(crate) root: Digest,
+    pub(crate) proof: &'a [u8],
 }
 
 fn verify_bounded<T: Sync>(
@@ -692,97 +692,27 @@ impl State {
         if !pow::meets_target(&work, &block.target) {
             return Err("insufficient engineering proof of work".into());
         }
-        let cumulative_work = self
-            .cumulative_work
+        self.cumulative_work
             .checked_add(pow::block_work(&block.target))
             .ok_or("cumulative engineering work overflow")?;
         let id = block.id()?;
-        let mut spends = BTreeSet::new();
-        let mut outputs = BTreeSet::new();
-        let mut leaves = Vec::new();
-        let mut fees = Vec::with_capacity(MAX_SLOTS);
-        let mut trial_tree = self.tree.clone();
-        let mut transaction_proofs = Vec::with_capacity(block.transactions.len());
-        for tx in &block.transactions {
-            let snapshot = self.snapshot(tx.record.snapshot)?;
-            let root =
-                decode_digest(&snapshot.recent_root).map_err(|_| "invalid stored snapshot root")?;
-            let public = PublicTransaction::decode(&tx.record.body)
-                .map_err(|_| "noncanonical transaction public values")?;
-            let fee =
-                decode_digest(&tx.record.fee_commit).map_err(|_| "noncanonical fee commitment")?;
-            for nf in public.nf {
-                let nf = encode_digest(&nf);
-                if self.spent.contains(&nf) || !spends.insert(nf) {
-                    return Err("nullifier already used".into());
-                }
-            }
-            for cm in public.cm {
-                let bytes = encode_digest(&cm);
-                if self.commitments.contains(&bytes) || !outputs.insert(bytes) {
-                    return Err("output commitment already used".into());
-                }
-                trial_tree.append(cm)?;
-                leaves.push(cm);
-            }
-            let context = ProofContext::for_snapshot(
-                self.config.network,
-                tx.record.snapshot.height,
-                tx.record.snapshot.block_id,
-            );
-            transaction_proofs.push(TransactionProof {
-                public,
-                context,
-                fee,
-                root,
-                proof: &tx.proof,
-            });
-            fees.push(fee);
-        }
-        verifier.transactions(&transaction_proofs)?;
-        let mut trial_assets = self.assets.clone();
-        if let Some(policy) = &self.config.issuance {
-            if block.issuances.len() > usize::from(policy.max_per_block) {
-                return Err("issuance count exceeds configured block limit".into());
-            }
-        } else if !block.issuances.is_empty() {
-            return Err("issuance destination and policy are not configured".into());
-        }
-        // An exact declaration-bound fund note may be paid in this block or
-        // already exist in canonical history. Registry consumption is one-use;
-        // spending that fund note later does not undo the historical payment.
-        let transaction_outputs = outputs.clone();
-        for issuance in &block.issuances {
-            issuance.validate(&self.config)?;
-            if !transaction_outputs.contains(&issuance.fee_commitment)
-                && !self.commitments.contains(&issuance.fee_commitment)
-            {
-                return Err(
-                    "issuance fee output is not in verified canonical history or this block".into(),
-                );
-            }
-            verifier.issuance(issuance)?;
-            trial_assets.apply(issuance, block.height)?;
-            for commitment in &issuance.signed.declaration.note_commitments {
-                let bytes = encode_digest(commitment);
-                if self.commitments.contains(&bytes) || !outputs.insert(bytes) {
-                    return Err("issuance output commitment already used".into());
-                }
-                trial_tree.append(*commitment)?;
-                leaves.push(*commitment);
-            }
-        }
-        let mut rewards = Vec::with_capacity(block.rewards.len());
-        for record in &block.rewards {
-            let reward =
-                decode_digest(&record.commitment).map_err(|_| "noncanonical miner reward")?;
-            if self.commitments.contains(&record.commitment) || !outputs.insert(record.commitment) {
-                return Err("reward commitment already used".into());
-            }
-            trial_tree.append(reward)?;
-            leaves.push(reward);
-            rewards.push(reward);
-        }
+        let prepared = crate::chain_transition::PreparedActions::prepare(
+            self,
+            crate::chain_transition::Context {
+                network: block.network,
+                height: block.height,
+                parent: block.parent,
+                timestamp: block.timestamp,
+                target: block.target,
+            },
+            crate::chain_transition::Actions {
+                transactions: &block.transactions,
+                issuances: &block.issuances,
+                rewards: &block.rewards,
+            },
+        )?;
+        let mut checked = prepared.verify(verifier)?;
+        let mut fees = checked.fees().to_vec();
         fees.extend(
             tail_slots(self.config.network, block.height, block.transactions.len())?
                 .iter()
@@ -798,7 +728,7 @@ impl State {
             &plan,
             self.config.network,
             block.list_digest(),
-            &rewards,
+            checked.rewards(),
             &block.settlement_proof,
         )?;
         for spend in &block.fund_spends {
@@ -813,54 +743,14 @@ impl State {
             trial_economics
                 .spend_fund(account, u128::from(spend.amount), spend.counter)
                 .map_err(|e| e.to_string())?;
-            let commitment = Hasher::new().note_cm(&note);
-            if self.commitments.contains(&spend.commitment) || !outputs.insert(spend.commitment) {
-                return Err("fund payout commitment already used".into());
-            }
-            trial_tree.append(commitment)?;
-            leaves.push(commitment);
+            checked.append_authorized_output(Hasher::new().note_cm(&note))?;
         }
         trial_economics
             .assert_supply_invariant()
             .map_err(|e| e.to_string())?;
-        let mut roots = RecentRoots::new();
-        let h = Hasher::new();
-        for s in &self.snapshots {
-            if block.height - s.selector.height < SNAPSHOT_WINDOW as u64 {
-                roots.insert(
-                    &h,
-                    s.selector.height,
-                    &decode_digest(&s.commitment_root).map_err(|_| "invalid stored root")?,
-                    base_fee(s.selector.height),
-                );
-            }
-        }
-        roots.insert(&h, block.height, &trial_tree.root(), base_fee(block.height));
-        let snapshot = CanonicalSnapshot {
-            selector: Snapshot {
-                height: block.height,
-                block_id: id,
-            },
-            commitment_root: encode_digest(&trial_tree.root()),
-            recent_root: encode_digest(&roots.tree(&h).root()),
-        };
-        self.tree = trial_tree;
-        self.height = block.height;
-        self.tip = id;
-        self.timestamps.push_back(block.timestamp);
-        while self.timestamps.len() > siworld_core::params::MEDIAN_TIME_PAST_WINDOW {
-            self.timestamps.pop_front();
-        }
-        self.cumulative_work = cumulative_work;
+        let delta = checked.finish(id, |height| Ok(base_fee(height)))?;
+        delta.commit_into(self)?;
         self.economics = trial_economics;
-        self.assets = trial_assets;
-        self.spent.extend(spends);
-        self.commitments.extend(outputs);
-        self.leaves.extend(leaves);
-        self.snapshots.push_back(snapshot);
-        while self.snapshots.len() > SNAPSHOT_WINDOW {
-            self.snapshots.pop_front();
-        }
         Ok(())
     }
     /// Public deterministic state checksum for replay and storage corruption checks.
@@ -909,7 +799,7 @@ pub fn subsidy_split(height: u64, funds: &FundAllocation) -> (u64, Vec<u64>) {
     let pool = (u128::from(reward) * 3 / 100) as u64;
     (reward - credits.iter().sum::<u64>() - pool, credits)
 }
-fn plan_from_allocation(allocation: &RewardAllocation) -> RewardPlan {
+pub(crate) fn plan_from_allocation(allocation: &RewardAllocation) -> RewardPlan {
     RewardPlan {
         block_height: allocation.height,
         mode: match allocation.mode {

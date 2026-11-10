@@ -98,3 +98,45 @@ test('body limits apply without a trusted Content-Length', async () => {
   await assert.rejects(boundedJSON(response({large: 'a'.repeat(1000)}), 50), /limit/);
   await assert.rejects(boundedJSON(new Response('{}', {headers: {'content-type': 'text/html'}}), 50), /Unexpected/);
 });
+
+function issuanceFixture() {
+  const value = fixture(); value.version = 2;
+  value.governance.issuance_fee = {current_atoms: '5000000000', minimum_atoms: '100000000', maximum_atoms: '1000000000000',
+    pending: {amount_atoms: '7500000000', proposal_sequence: '18446744073709551615', included_height: 1, effective_height: 4033}};
+  return value;
+}
+test('v2 issuance fee preserves exact values, inclusive bounds and strict pending context', () => {
+  const view = normalizeProjection(issuanceFixture(), config);
+  assert.equal(view.governance.issuance_fee.pending.proposal_sequence, '18446744073709551615');
+  assert.equal(view.governance.issuance_fee.current_atoms, '5000000000');
+  assert.equal(Object.isFrozen(view.governance.issuance_fee.pending), true);
+  for (const amount of ['100000000', '1000000000000']) {
+    const value = issuanceFixture(); value.governance.issuance_fee.current_atoms = amount;
+    value.governance.issuance_fee.pending.amount_atoms = amount;
+    assert.equal(normalizeProjection(value, config).governance.issuance_fee.current_atoms, amount);
+  }
+  const last = issuanceFixture(); last.height = 4032; last.blocks = [];
+  assert.equal(normalizeProjection(last, config).governance.issuance_fee.pending.effective_height, 4033);
+  const empty = issuanceFixture(); empty.governance.issuance_fee.pending = null;
+  assert.equal(normalizeProjection(empty, config).governance.issuance_fee.pending, null);
+  assert.equal(normalizeProjection(fixture(), config).governance.issuance_fee, undefined);
+});
+test('v2 issuance fee rejects ambiguous amounts, invalid activation and every extra fee field', () => {
+  const mutations = [x => x.version = 3, x => x.governance.issuance_fee = null,
+    x => delete x.governance.issuance_fee,
+    ...['0', '01', '1e8', '-1', '99999999', '1000000000001', null, 5000000000].map(value => x => x.governance.issuance_fee.current_atoms = value),
+    x => x.governance.issuance_fee.minimum_atoms = '1', x => x.governance.issuance_fee.maximum_atoms = '1000000000001',
+    x => x.governance.issuance_fee.pending.amount_atoms = '0',
+    ...['0', '01', '18446744073709551616', 1, null].map(value => x => x.governance.issuance_fee.pending.proposal_sequence = value),
+    x => x.governance.issuance_fee.pending.included_height = 4, x => x.governance.issuance_fee.pending.included_height = 0,
+    x => x.governance.issuance_fee.pending.effective_height = 4032,
+    x => {x.height = 4033; x.blocks = [];},
+    ...['fee_total', 'normal_fee_atoms', 'priority_fee_atoms', 'fees_per_period'].flatMap(key => [
+      x => x[key] = '1', x => x.economics[key] = '1', x => x.blocks[0][key] = '1',
+      x => x.governance[key] = '1', x => x.governance.issuance_fee[key] = '1', x => x.governance.issuance_fee.pending[key] = '1'])];
+  for (const change of mutations) {
+    const value = issuanceFixture(); change(value); assert.throws(() => normalizeProjection(value, config));
+  }
+  const old = issuanceFixture(); old.version = 1;
+  assert.throws(() => normalizeProjection(old, config));
+});

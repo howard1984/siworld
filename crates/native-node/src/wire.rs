@@ -581,15 +581,7 @@ impl Block {
     /// Settlement statement binding, using the fixed native ordered-list domain.
     /// Callers validate shape before using this digest for admission or proving.
     pub fn list_digest(&self) -> Hash {
-        let mut hash =
-            blake3::Hasher::new_derive_key("siworld native settlement ordered transactions v1");
-        hash.update(&self.network);
-        hash.update(&self.height.to_le_bytes());
-        hash.update(&(self.transactions.len() as u16).to_le_bytes());
-        for tx in &self.transactions {
-            hash.update(&tx.record.statement_id(&self.network));
-        }
-        *hash.finalize().as_bytes()
+        ordered_transaction_digest(self.network, self.height, &self.transactions)
     }
 
     /// Hash all canonical header/body/proof bytes except nonce exactly once.
@@ -612,6 +604,22 @@ impl Block {
         hash.update(&self.nonce.to_le_bytes());
         Ok(*hash.finalize().as_bytes())
     }
+}
+
+pub(crate) fn ordered_transaction_digest(
+    network: Hash,
+    height: u64,
+    transactions: &[Transaction],
+) -> Hash {
+    let mut hash =
+        blake3::Hasher::new_derive_key("siworld native settlement ordered transactions v1");
+    hash.update(&network);
+    hash.update(&height.to_le_bytes());
+    hash.update(&(transactions.len() as u16).to_le_bytes());
+    for tx in transactions {
+        hash.update(&tx.record.statement_id(&network));
+    }
+    *hash.finalize().as_bytes()
 }
 
 fn validate_slots(count: usize) -> Result<(), String> {

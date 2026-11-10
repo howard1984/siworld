@@ -16,6 +16,18 @@ frozen hash records merely to accept unmeasured changes. Economic rule version
 3 changes no AIR relation or selected FRI parameter. Its source-bound accounting
 reference and strict per-wallet checks are separate from proof measurements.
 
+## Engineering network 2
+
+The separately versioned engineering-network requirements are specified in
+[Engineering network 2](eng2-protocol.md). They cover post-execution header
+commitments, automatic work-based state synchronization, confidential fee
+redirection, monthly fund releases and two-role governance. A jointly signed
+management-key or checkpoint-roster change requires both current management
+keys to cancel before activation. Revocation-only cancellation is restricted to
+founder-proposed fee and fund payment-address changes. These requirements do not
+reinterpret the V1 relation or activate a new network. Combined implementation,
+proof qualification and private-network rehearsal remain required.
+
 ## Network and proof architecture
 
 Preserve the existing seven-node N=2 legacy recursive classical engineering

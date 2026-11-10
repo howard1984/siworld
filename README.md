@@ -34,6 +34,14 @@ See [current decisions](docs/00-decisions.md) and the
 The default workspace node uses the **legacy recursive proof route**. The
 retained seven-node N=2 engineering testnet does not run native V1.
 
+## Engineering network 2
+
+The separately versioned [engineering-network-2 requirements](docs/eng2-protocol.md)
+cover execution commitments, deferred automatic synchronization, confidential transaction
+fees, public governed issuance fees, monthly fund releases and management
+governance. They describe a separate activation target; existing V1 proof measurements do not qualify its changed
+settlement relation or establish its network acceptance.
+
 ## Native V1 design
 
 - **One transaction shape:** two inputs and three outputs, private 32-byte

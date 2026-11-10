@@ -81,6 +81,47 @@ class ExplorerTests(unittest.TestCase):
             with self.subTest(amount=bad), self.assertRaises(ValueError):
                 m.explorer_projection(candidate, self.index)
 
+    def test_v2_public_issuance_fee_is_explicit_and_head_bound(self):
+        value = fixture()
+        value.update(version=2, height=3, tip='77' * 32)
+        value['governance']['issuance_fee'] = {
+            'current_atoms': '5000000000', 'minimum_atoms': '100000000', 'maximum_atoms': '1000000000000',
+            'pending': {'amount_atoms': '7500000000', 'proposal_sequence': '18446744073709551615',
+                        'included_height': 1, 'effective_height': 4033}}
+        index = {key: value[key] for key in ('network', 'genesis', 'height', 'tip')}
+        self.assertEqual(m.explorer_projection(value, index), value)
+        self.assertNotIn('issuance_fee', m.explorer_projection(fixture(), self.index)['governance'])
+        for amount in ('100000000', '1000000000000'):
+            bounded = copy.deepcopy(value)
+            bounded['governance']['issuance_fee']['current_atoms'] = amount
+            self.assertEqual(m.explorer_projection(bounded, index), bounded)
+        for path, bad in [
+            (('version',), 1), (('governance', 'issuance_fee'), None),
+            (('governance', 'issuance_fee', 'current_atoms'), 5000000000),
+            (('governance', 'issuance_fee', 'current_atoms'), '05000000000'),
+            (('governance', 'issuance_fee', 'current_atoms'), '99999999'),
+            (('governance', 'issuance_fee', 'current_atoms'), '1000000000001'),
+            (('governance', 'issuance_fee', 'minimum_atoms'), '0'),
+            (('governance', 'issuance_fee', 'pending', 'proposal_sequence'), '18446744073709551616'),
+            (('governance', 'issuance_fee', 'pending', 'proposal_sequence'), '0'),
+            (('governance', 'issuance_fee', 'pending', 'included_height'), 4),
+            (('governance', 'issuance_fee', 'pending', 'effective_height'), 4032),
+        ]:
+            invalid = copy.deepcopy(value)
+            target = invalid
+            for key in path[:-1]: target = target[key]
+            target[path[-1]] = bad
+            with self.subTest(path=path, value=bad), self.assertRaises(ValueError):
+                m.explorer_projection(invalid, index)
+        for field in ('normal_fee_atoms', 'priority_fee_atoms', 'fee_total', 'fees_per_period'):
+            for path in ((), ('economics',), ('governance',), ('governance', 'issuance_fee'), ('governance', 'issuance_fee', 'pending')):
+                invalid = copy.deepcopy(value)
+                target = invalid
+                for key in path: target = target[key]
+                target[field] = '1'
+                with self.subTest(path=path, field=field), self.assertRaises(ValueError):
+                    m.explorer_projection(invalid, index)
+
     def test_projection_cannot_follow_links_or_read_oversized_file(self):
         source = self.root / 'explorer.json'
         other = self.root / 'other.json'

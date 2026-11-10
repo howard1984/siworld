@@ -1,13 +1,15 @@
 //! Fixed three-note native issuance and declaration-bound SIP fee receipts.
 //!
-//! A fee receipt opens an ordinary transaction output paid to the immutable
-//! dedicated fund owner. Its randomness binds the issuance declaration, and its
+//! A fee receipt opens an ordinary transaction output paid to the selected fee
+//! owner. V1 selects its immutable owner; a separately versioned engine may pass
+//! a governance policy frozen for the inclusion height. Its randomness binds the issuance declaration, and its
 //! commitment must exist in canonical history or be created by a proof-verified
 //! transaction in the same block. Issuer signatures or claimed fee amounts alone never authorize minting.
 use crate::proof_codec::ProofShape;
 use crate::state::Config;
 use crate::wire::{DigestBytes, Hash};
 use native::codec::{decode_digest, encode_digest};
+use native::encryption::PaymentAddress;
 use native::issuance::{
     AssetMetadata, ISSUER_KEY_BYTES, ISSUER_SIGNATURE_BYTES, IssuanceDeclaration, IssuancePolicy,
     SignedIssuance,
@@ -84,6 +86,36 @@ impl IssuanceConfig {
     }
 }
 
+/// Public issuance payment policy frozen by the enclosing block engine.
+///
+/// The destination is complete public address data, but this public receipt
+/// authenticates its spending owner, not ML-KEM ciphertext correctness. Anyone
+/// can reconstruct the fee note; only the owner's secret authorizes spending.
+#[derive(Clone, Copy)]
+pub struct ActiveIssuancePolicy<'a> {
+    destination: &'a PaymentAddress,
+    fee_atoms: u64,
+}
+impl<'a> ActiveIssuancePolicy<'a> {
+    pub fn new(destination: &'a PaymentAddress, fee_atoms: u64) -> Result<Self, String> {
+        let minimum = siworld_core::params::ATOMS_PER_SIP;
+        let maximum = 10_000 * minimum;
+        if destination.owner() == [F::ZERO; 12] || !(minimum..=maximum).contains(&fee_atoms) {
+            return Err("governed issuance fee is outside the genesis bounds".into());
+        }
+        Ok(Self {
+            destination,
+            fee_atoms,
+        })
+    }
+    pub fn destination(&self) -> &'a PaymentAddress {
+        self.destination
+    }
+    pub fn fee_atoms(&self) -> u64 {
+        self.fee_atoms
+    }
+}
+
 #[derive(Clone)]
 pub struct IssuanceRecord {
     pub signed: SignedIssuance,
@@ -142,6 +174,22 @@ impl IssuanceRecord {
             rseed: fee_rseed(self.signed.declaration.binding()),
         })
     }
+    /// Reconstruct the deliberately public fee payment opening. This does not
+    /// establish signature/proof validity, canonical membership or wallet credit.
+    /// Callers must verify those properties before recording this note as paid.
+    pub fn public_fee_note(&self, policy: &ActiveIssuancePolicy<'_>) -> Result<Note, String> {
+        if self.signed.declaration.issuance_fee_atoms != policy.fee_atoms() {
+            return Err("issuance fee amount differs from frozen governance".into());
+        }
+        Ok(Note {
+            asset_id: SIP_ASSET_ID,
+            owner: policy.destination().owner(),
+            value: policy.fee_atoms(),
+            unlock_height: 0,
+            rho: decode_digest(&self.fee_rho).map_err(|_| "noncanonical issuance fee rho")?,
+            rseed: fee_rseed(self.signed.declaration.binding()),
+        })
+    }
     pub fn validate_shape(&self) -> Result<(), String> {
         let d = &self.signed.declaration;
         if d.version != 1
@@ -161,16 +209,37 @@ impl IssuanceRecord {
         let _ = decode_digest(&self.fee_rho).map_err(|_| "noncanonical issuance fee rho")?;
         Ok(())
     }
+    /// Retain the immutable V1 fee rule and wire behavior.
     pub fn validate(&self, config: &Config) -> Result<(), String> {
+        let policy = config
+            .issuance
+            .as_ref()
+            .ok_or("issuance destination and policy are not configured")?;
+        self.validate_against(config, TESTNET_ISSUANCE_FEE_ATOMS, self.fee_note(policy)?)
+    }
+    /// Verify the issuer authorization and public payment opening against the
+    /// exact active amount and owner chosen before this block's new proposals.
+    /// Proof verification, canonical fee-CM membership and single use belong to
+    /// the enclosing shared transition and cannot be replaced by this method.
+    pub fn validate_with_policy(
+        &self,
+        config: &Config,
+        policy: &ActiveIssuancePolicy<'_>,
+    ) -> Result<(), String> {
+        self.validate_against(config, policy.fee_atoms(), self.public_fee_note(policy)?)
+    }
+    fn validate_against(&self, config: &Config, amount: u64, fee_note: Note) -> Result<(), String> {
         self.validate_shape()?;
         let policy = config
             .issuance
             .as_ref()
             .ok_or("issuance destination and policy are not configured")?;
         policy.validate()?;
+        let mut declaration_policy = policy.policy();
+        declaration_policy.required_fee_atoms = amount;
         self.signed
             .declaration
-            .validate(&config.network, 1, policy.policy())
+            .validate(&config.network, 1, declaration_policy)
             .map_err(|e| format!("invalid issuance declaration: {e:?}"))?;
         self.signed
             .verify_signature()
@@ -179,7 +248,7 @@ impl IssuanceRecord {
             .declaration
             .validate_ciphertexts(&self.ciphertexts, CIPHERTEXT_BYTES)
             .map_err(|e| format!("invalid issuance ciphertext binding: {e:?}"))?;
-        if encode_digest(&Hasher::new().note_cm(&self.fee_note(policy)?)) != self.fee_commitment {
+        if encode_digest(&Hasher::new().note_cm(&fee_note)) != self.fee_commitment {
             return Err(
                 "issuance fee output does not match declaration and fund destination".into(),
             );
@@ -421,6 +490,12 @@ impl AssetRegistry {
     }
     /// Decode an already authenticated local wallet cache, never a peer checkpoint.
     pub fn from_local_encoding(bytes: &[u8], height: u64) -> Result<Self, String> {
+        Self::decode_canonical_state(bytes, height)
+    }
+    /// Bounded canonical state decoding only. The enclosing versioned snapshot
+    /// importer must authenticate the reconstructed component against a locally
+    /// selected work-verified header before this state can be adopted.
+    pub(crate) fn decode_canonical_state(bytes: &[u8], height: u64) -> Result<Self, String> {
         let mut reader = Reader { bytes, position: 0 };
         let count = usize::try_from(u64::from_le_bytes(reader.array()?))
             .map_err(|_| "Local asset cache count exceeds capacity.")?;

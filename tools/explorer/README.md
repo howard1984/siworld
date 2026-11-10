@@ -53,7 +53,7 @@ network's public export exists. Switching networks aborts outstanding requests,
 clears all displayed old data and clears imported block receipts. No receipts,
 network state or API data are written to local storage.
 
-## Projection version 1
+## Projection versions 1 and 2
 
 All names below form strict allowlists; extension fields are rejected at the
 adapter and browser boundaries. Identifiers are 32-byte lowercase hex strings.
@@ -70,7 +70,10 @@ atoms. Values are formatted with integer arithmetic.
 | Unlock, next at most 64 | `height`, `atoms` |
 | Fund, at most 32 | `index`, `entitled_atoms`, `released_atoms`, `spent_atoms` |
 | Checkpoint, nullable | `height`, `hash`, `issued_unix_seconds`, `roster`, `signer_indices` |
-| Governance | `current_signers`, `fee_address`, `fund_addresses`, `changes` |
+| Governance v1 | `current_signers`, `fee_address`, `fund_addresses`, `changes`; all null |
+| Governance v2 | The v1 fields, still null, plus required `issuance_fee` |
+| Issuance fee v2 | `current_atoms`, `minimum_atoms`, `maximum_atoms`, `pending` |
+| Pending issuance fee, nullable | `amount_atoms`, `proposal_sequence`, `included_height`, `effective_height` |
 
 The block sample is contiguous and, when nonempty, ends at the reported tip.
 Slot counts include padding. Reward mode is `holder` or `voyager` and never
@@ -87,12 +90,29 @@ or every restriction on spending. Circulating supply remains unavailable until
 a separately specified model accounts for all relevant fund, pool, maturity and
 lock states. Fund released allocation is distinct from spending. Only the next
 64 subsidy unlock heights are exposed; the completeness flag marks truncation.
-The eng-1 governance fields remain `null`. The UI reserves space for eng-2
-active and pending signer sets and public configuration-change records; these
-require an explicit subsequent schema version and the corresponding runtime
-getters. An unavailable field is displayed as `Unknown`.
+Version 1 governance fields remain `null` and contain no issuance-fee member.
+Version 2 explicitly exposes the public issuance-fee rule. Its three amount
+fields are nonnull canonical decimal strings. Bounds must be exactly
+`100000000` and `1000000000000` atoms (1 and 10,000 SIP inclusive), and current
+and pending amounts must fall within those bounds. `pending` is null or exactly
+the four named fields. `proposal_sequence` is a positive canonical decimal
+string at most 2^64 - 1; it is never converted to a JavaScript number. Pending
+heights are safe JSON integers, with `0 < included_height <= height <
+effective_height` and `effective_height = included_height + 4032`. A proposal
+at its effective height must already be reflected in current state.
 
-The schema excludes fees and fee aggregates, real transaction counts,
+The UI shows current and pending amounts and inclusion/effective heights.
+Version 1, unavailable data and validation failures show `Unknown`; no initial
+amount is inferred from the network name or substituted for missing data. A
+validated v2 null pending value shows `None`. Other active/pending governance
+views still require a separately specified schema extension. A v2 runtime
+producer must bind actual governance getters to the same accepted network,
+genesis, height and tip as the projection. The existing eng-1 native exporter
+continues to produce v1; these client and transport changes alone do not create
+an eng-2 runtime export or prove a live deployment.
+
+The schema excludes ordinary and priority transaction fees, fee aggregates,
+real transaction counts,
 real-versus-padding classification, peer identifiers, network addresses,
 transaction first-seen times, nullifiers, commitments, wallet state, rich lists,
 distribution statistics and user or address counts. No block or transaction

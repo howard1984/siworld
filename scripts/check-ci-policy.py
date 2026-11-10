@@ -20,6 +20,7 @@ def main():
     if any(token in text for token in ('workflow_dispatch:', 'schedule:', 'self-hosted',
             'windows-latest', 'secrets.', 'contents: write', 'actions/upload-artifact',
             'build-windows-miner', 'build-native-runtime', '--check-hardware',
+            'eng2-runtime', 'eng2-rehearsal',
             'run-network', 'run-native', 'ssh ', 'gh release')):
         raise SystemExit('Hosted CI contains a local-only operation')
     safe_setup = {'Install pinned toolchain', 'Install pinned toolchain and WASM target',

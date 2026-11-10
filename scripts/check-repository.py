@@ -31,6 +31,10 @@ DOCUMENTS = {
     "v1-browser-wallet.md", "windows-native-miner.md", "native-proof-storage.md",
     "checkpoint-rejection-acceptance.md", "checkpoint-rejection-ci.md",
     "engineering-checkpoint-roster-transition.md", "offline-validation.md",
+    "eng2-protocol.md", "eng2-anchor-archive.md", "eng2-block-body.md",
+    "eng2-incremental-state-roots.md", "eng2-internal-genesis.md",
+    "eng2-isolated-sync-staging.md", "eng2-public-fund-claims.md",
+    "eng2-snapshot-import.md", "eng2-operation-files.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
@@ -58,6 +62,7 @@ EXPLORER_FILES = {
     "tools/explorer/projection.mjs",
     "tools/explorer/proxy-location.example.conf",
     "tools/explorer/tests/fixture-server.mjs",
+    "tools/explorer/tests/frontend.test.mjs",
     "tools/explorer/tests/projection.test.mjs",
 }
 PUBLIC_TEXT_ASSETS = {

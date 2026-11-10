@@ -122,6 +122,17 @@ impl FundSpend {
         network: Hash,
         genesis_key: &[u8; VERIFYING_KEY_BYTES],
     ) -> Result<Note, String> {
+        self.verify_signed_message(network, genesis_key, &self.message(network), CONTEXT)
+    }
+    /// Shared opening and immutable-authority checks with a versioned signature
+    /// message supplied only by an enclosing native protocol implementation.
+    pub(crate) fn verify_signed_message(
+        &self,
+        network: Hash,
+        genesis_key: &[u8; VERIFYING_KEY_BYTES],
+        message: &[u8],
+        context: &[u8],
+    ) -> Result<Note, String> {
         let note = self.note()?;
         if note.rho != canonical_rho(network, self.account, self.counter) {
             return Err("fund payout nonce differs from authorized wallet counter".into());
@@ -134,7 +145,7 @@ impl FundSpend {
         }
         let vk = MLDSA65VerificationKey::new(self.verifying_key);
         let signature = MLDSA65Signature::new(self.signature);
-        ml_dsa_65::verify(&vk, &self.message(network), CONTEXT, &signature)
+        ml_dsa_65::verify(&vk, message, context, &signature)
             .map_err(|_| "fund payout ML-DSA-65 signature failed".to_owned())?;
         Ok(note)
     }

@@ -51,7 +51,7 @@ def explorer_projection(value, index):
         if type(item) is not str or not 1 <= len(item) <= 39 or any(c not in '0123456789' for c in item) or (len(item) > 1 and item[0] == '0') or int(item) >= 1 << 128:
             raise ValueError('Invalid public explorer amount.')
     exact(value, 'version network genesis height tip published_unix_seconds blocks economics checkpoint governance')
-    if value['version'] != 1 or any(value[key] != index[key] for key in ('network', 'genesis', 'height', 'tip')):
+    if type(value['version']) is not int or value['version'] not in (1, 2) or any(value[key] != index[key] for key in ('network', 'genesis', 'height', 'tip')):
         raise ValueError('Public explorer snapshot identity differs.')
     for key in ('network', 'genesis', 'tip'): canonical_hex(value[key])
     integer(value['height']); integer(value['published_unix_seconds'], (1 << 53) - 1)
@@ -105,10 +105,31 @@ def explorer_projection(value, index):
         if not 0 < checkpoint['height'] <= value['height'] or type(votes) is not list or not 2 <= len(votes) <= 3 or any(type(slot) is not int or not 0 <= slot < 3 for slot in votes) or len(set(votes)) != len(votes):
             raise ValueError('Invalid public explorer checkpoint slots.')
     governance = value['governance']
-    exact(governance, 'current_signers fee_address fund_addresses changes')
-    # Governance projection is versioned separately when the eng2 adapter exists.
-    if any(item is not None for item in governance.values()):
+    names = 'current_signers fee_address fund_addresses changes'
+    exact(governance, names if value['version'] == 1 else names + ' issuance_fee')
+    if any(governance[name] is not None for name in names.split()):
         raise ValueError('Public governance projection version unavailable.')
+    if value['version'] == 2:
+        fee = governance['issuance_fee']
+        exact(fee, 'current_atoms minimum_atoms maximum_atoms pending')
+        for name in ('current_atoms', 'minimum_atoms', 'maximum_atoms'):
+            atoms(fee[name])
+            if fee[name] is None:
+                raise ValueError('Invalid public issuance fee.')
+        if (fee['minimum_atoms'] != '100000000' or fee['maximum_atoms'] != '1000000000000'
+                or not 100000000 <= int(fee['current_atoms']) <= 1000000000000):
+            raise ValueError('Invalid public issuance fee bounds.')
+        if fee['pending'] is not None:
+            pending = fee['pending']
+            exact(pending, 'amount_atoms proposal_sequence included_height effective_height')
+            atoms(pending['amount_atoms']); atoms(pending['proposal_sequence'])
+            if (pending['amount_atoms'] is None or not 100000000 <= int(pending['amount_atoms']) <= 1000000000000
+                    or pending['proposal_sequence'] is None or not 0 < int(pending['proposal_sequence']) < 1 << 64):
+                raise ValueError('Invalid public issuance fee proposal.')
+            integer(pending['included_height']); integer(pending['effective_height'], (1 << 53) - 1)
+            if (not 0 < pending['included_height'] <= value['height'] < pending['effective_height']
+                    or pending['effective_height'] != pending['included_height'] + 4032):
+                raise ValueError('Invalid public issuance fee activation.')
     return value
 
 def read_explorer(root):
