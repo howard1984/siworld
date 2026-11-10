@@ -4,6 +4,16 @@ import {normalizeProjection, intervalStatistics, difficulty, formatSIP, publicRe
 import {PublicChainClient, boundedJSON, networkConfiguration} from '../chain-client.mjs';
 
 const config = {name: 'siworld-eng-1', network: '11'.repeat(32), genesis: '22'.repeat(32), api: '/chain'};
+
+test('projection accepts all configured fund members and rejects an oversized roster', () => {
+  const value = fixture();
+  value.economics.funds = Array.from({length: 32}, (_, index) => ({
+    index, entitled_atoms: '2', released_atoms: '1', spent_atoms: '0',
+  }));
+  assert.equal(normalizeProjection(value, config).economics.funds.length, 32);
+  value.economics.funds.push({index: 32, entitled_atoms: '2', released_atoms: '1', spent_atoms: '0'});
+  assert.throws(() => normalizeProjection(value, config));
+});
 const origin = 'https://explorer.invalid';
 function fixture() {
   const blocks = [1, 2, 3].map(height => ({height, hash: height.toString(16).padStart(64, '0'),

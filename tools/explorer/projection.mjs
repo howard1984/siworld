@@ -46,7 +46,7 @@ export function normalizeProjection(value, config) {
   keys(economic, 'issued_atoms burned_atoms holder_pool_atoms locked_reward_atoms unlock_schedule unlock_schedule_complete funds circulating_estimate_atoms');
   for (const name of ['issued_atoms', 'burned_atoms', 'holder_pool_atoms', 'locked_reward_atoms', 'circulating_estimate_atoms']) atoms(economic[name]);
   requireValue(Array.isArray(economic.unlock_schedule) && economic.unlock_schedule.length <= 64 &&
-    typeof economic.unlock_schedule_complete === 'boolean' && Array.isArray(economic.funds) && economic.funds.length <= 16);
+    typeof economic.unlock_schedule_complete === 'boolean' && Array.isArray(economic.funds) && economic.funds.length <= 32);
   const schedule = economic.unlock_schedule.map((row, index) => {
     keys(row, 'height atoms'); integer(row.height, Number.MAX_SAFE_INTEGER); atoms(row.atoms);
     requireValue(row.height > value.height && (index === 0 || row.height > economic.unlock_schedule[index - 1].height));
