@@ -3,8 +3,9 @@ use super::*;
 use crate::{eng2::wallet_history, p2p};
 
 impl PublicExport {
-    /// Publish only when requested by the existing read-only export owner.
-    /// No resident scheduling, HTTP route or wallet capability is enabled here.
+    /// Historical synthetic fixture helper. Production publication uses the
+    /// complete generation publisher and commits the head last.
+    #[cfg(test)]
     pub fn publish_wallet_head(
         &self,
         store: &Store,
@@ -22,8 +23,7 @@ impl PublicExport {
         self.replace("wallet-head.json", &bytes)?;
         Ok(head)
     }
-    /// The requested pin must still match the actual accepted head. A published
-    /// head does not claim that every historical receipt artifact exists.
+    /// Stage a receipt dependency without advertising a complete generation.
     pub fn publish_wallet_receipts(
         &self,
         store: &Store,

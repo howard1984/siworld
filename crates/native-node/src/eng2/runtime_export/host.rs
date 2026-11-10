@@ -179,6 +179,9 @@ pub struct Host {
     last_now: Option<u64>,
     last_exported: Option<(u64, Hash, Option<u64>)>,
     last_status: Option<Status>,
+    wallet: Option<WalletPublisher>,
+    wallet_requested: bool,
+    wallet_paused: bool,
 }
 impl Host {
     /// The accepted, durably published capability only; pending proposals and
@@ -210,7 +213,49 @@ impl Host {
             last_now: None,
             last_exported: None,
             last_status: None,
+            wallet: None,
+            wallet_requested: false,
+            wallet_paused: false,
         })
+    }
+    /// Explicit wallet opt-in, independent of checkpoint signing and admission.
+    /// An opening failure pauses only this export; no new Store is opened.
+    pub fn enable_wallet_export(
+        &mut self,
+        store: &Store,
+        policy: WalletPolicy,
+        budget: &crate::p2p::Budget,
+    ) -> Result<(), String> {
+        if self.wallet_requested {
+            return Err("wallet export was already requested".into());
+        }
+        self.wallet_requested = true;
+        self.wallet_paused = true;
+        self.wallet = Some(WalletPublisher::open(&self.export, store, policy, budget)?);
+        self.wallet_paused = false;
+        Ok(())
+    }
+    pub fn wallet_export_state(&self) -> Option<bool> {
+        self.wallet_requested.then_some(self.wallet_paused)
+    }
+    /// The existing resident owner calls one step with its shared budget.
+    /// Failure cannot stop checkpoint coordination or canonical validation.
+    pub fn tick_wallet_export(
+        &mut self,
+        store: &Store,
+        now: u64,
+        budget: &crate::p2p::Budget,
+    ) -> Result<Option<WalletProgress>, String> {
+        if !self.wallet_requested {
+            return Ok(None);
+        }
+        let result = self
+            .wallet
+            .as_mut()
+            .ok_or_else(|| "wallet publisher unavailable".to_string())
+            .and_then(|publisher| publisher.tick(&self.export, store, now, budget));
+        self.wallet_paused = result.is_err();
+        result.map(Some)
     }
     /// Work is bounded to at most three messages, one local vote, one certificate
     /// and one current projection. No waiting, mining or proof replay occurs.

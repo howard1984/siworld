@@ -169,3 +169,44 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     assert!(result.vote.is_none());
     assert!(!root.join("checkpoint-eng2.json").exists());
 }
+
+#[test]
+fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-owner");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    let budget = crate::p2p::Budget::new(2 * 1024 * 1024);
+    assert_eq!(host.wallet_export_state(), None);
+    assert_eq!(
+        host.tick_wallet_export(&store, 1000, &budget).unwrap(),
+        None
+    );
+    assert!(!root.join("wallet-head.json").exists());
+    assert!(
+        host.enable_wallet_export(
+            &store,
+            WalletPolicy {
+                max_artifact_bytes: 1
+            },
+            &budget
+        )
+        .is_err()
+    );
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert!(host.tick_wallet_export(&store, 1000, &budget).is_err());
+    assert!(host.tick(&store, 1000, &[]).is_ok());
+    assert!(!root.join("wallet-head.json").exists());
+    drop(host);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    let progress = host
+        .tick_wallet_export(&store, 1001, &budget)
+        .unwrap()
+        .unwrap();
+    assert!(progress.published);
+    assert_eq!(progress.published_height, Some(0));
+    assert_eq!(host.wallet_export_state(), Some(false));
+    assert!(host.tick(&store, 1001, &[]).is_ok());
+}

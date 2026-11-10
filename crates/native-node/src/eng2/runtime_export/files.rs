@@ -8,7 +8,9 @@ use std::{
     path::Path,
 };
 
+mod generations;
 mod wallet;
+pub use generations::{WalletPolicy, WalletProgress, WalletPublisher};
 
 pub struct PublicExport {
     root: fs::File,

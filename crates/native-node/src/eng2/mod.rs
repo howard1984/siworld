@@ -36,6 +36,7 @@ pub mod staging;
 pub mod state_components;
 pub mod store;
 pub mod transport;
+pub mod wallet_generation;
 pub mod wallet_history;
 
 #[cfg(feature = "eng2-runtime")]

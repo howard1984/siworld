@@ -241,8 +241,9 @@ fn export_status(
     started: Instant,
     sequence: u64,
     mode: (bool, bool),
-    checkpoint_error: Option<&str>,
+    export_state: (Option<&str>, Option<bool>),
 ) -> Result<(), String> {
+    let (checkpoint_error, wallet_export) = export_state;
     let (mining, listening) = mode;
     let owner = shared
         .owner
@@ -273,6 +274,7 @@ fn export_status(
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
             "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
+            "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
             "signed_bootstrap_available":owner.bootstrap_available(),
             "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
             "checkpoint_observed_height":observer.observed_height(),"checkpoint_conflict":conflict,
@@ -452,6 +454,20 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             config.checkpoint_key.as_deref(),
         )?
     };
+    #[cfg(unix)]
+    if std::env::var_os("SIWORLD_ENG2_WALLET_EXPORT").is_some_and(|value| value == "1") {
+        let owner = shared
+            .owner
+            .lock()
+            .map_err(|_| "resident owner lock poisoned")?;
+        // Unavailable wallet exports remain visibly paused while the already
+        // authorized checkpoint, peer and validation paths keep running.
+        let _ = checkpoint_host.enable_wallet_export(
+            owner.store(),
+            super::runtime_export::WalletPolicy::default(),
+            &shared.budget,
+        );
+    }
     #[cfg(not(unix))]
     if config.checkpoint_key.is_some() {
         return Err("checkpoint signing host is unavailable on this platform".into());
@@ -490,6 +506,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let mut checkpoint_error = None;
     #[cfg(not(unix))]
     let checkpoint_error = None;
+    #[cfg(not(unix))]
+    let wallet_export = None;
     let result = (|| {
         while !shared.cancel.is_cancelled() {
             if service::stop_requested(directory, &run.run_id)? {
@@ -530,6 +548,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable")
                         }
                     }
+                    let _ = checkpoint_host.tick_wallet_export(
+                        owner.store(),
+                        unix_ms()? / 1000,
+                        &shared.budget,
+                    );
                 }
                 last_checkpoint = Instant::now();
             }
@@ -544,7 +567,16 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     started,
                     sequence,
                     (mining, listening),
-                    checkpoint_error,
+                    (checkpoint_error, {
+                        #[cfg(unix)]
+                        {
+                            checkpoint_host.wallet_export_state()
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            wallet_export
+                        }
+                    }),
                 )?;
                 last_export = Instant::now();
             }
@@ -573,7 +605,16 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         started,
         sequence.saturating_add(1),
         (mining, false),
-        checkpoint_error,
+        (checkpoint_error, {
+            #[cfg(unix)]
+            {
+                checkpoint_host.wallet_export_state()
+            }
+            #[cfg(not(unix))]
+            {
+                wallet_export
+            }
+        }),
     )?;
     result
 }

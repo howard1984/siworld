@@ -26,7 +26,7 @@ pub const MAX_PROJECTION_BYTES: usize = 131072;
 #[cfg(unix)]
 mod files;
 #[cfg(unix)]
-pub use files::PublicExport;
+pub use files::{PublicExport, WalletPolicy, WalletProgress, WalletPublisher};
 #[cfg(unix)]
 pub mod host;
 
