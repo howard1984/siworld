@@ -31,10 +31,10 @@ mod production;
 pub(crate) mod submission;
 #[cfg(unix)]
 pub use mailbox::CheckpointMailbox;
-#[cfg(test)]
-mod tests;
 #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
 mod public_fixture;
+#[cfg(test)]
+mod tests;
 
 const MAX_GENESIS_BYTES: usize = 1024 * 1024;
 const MEMORY_BYTES: usize = 640 * 1024 * 1024;
