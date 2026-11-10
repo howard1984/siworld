@@ -18,6 +18,8 @@ use redb::{
 #[cfg(not(windows))]
 use std::fs::OpenOptions;
 use std::path::Path;
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+mod commitment_tests;
 mod imported;
 mod receipts;
 
