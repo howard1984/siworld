@@ -17,7 +17,7 @@ Existing wallets and V1 checkpoint authority files are not accepted.
 Build the tool from the selected source, recording its commit and executable hash:
 
 ```sh
-SIWORLD_BUILD_COMMIT=COMMIT cargo build --offline --release \
+SIWORLD_BUILD_COMMIT=COMMIT cargo build --offline --locked --release \
   --manifest-path crates/native-node/Cargo.toml --bin siworld-eng2-materials
 ```
 
