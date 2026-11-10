@@ -10,6 +10,7 @@ pub(crate) mod checkpoint_service;
 #[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
 pub mod checkpoint_stale_runtime;
 pub mod eng2;
+pub(crate) use eng2::header as wallet_eng2_header;
 pub mod eng2_economics;
 pub mod eng2_fund;
 pub mod eng2_governance;

@@ -38,8 +38,11 @@ pub mod local {
 }
 pub mod commitment;
 pub mod compact;
+pub mod eng2_history;
 pub mod history;
 pub mod light;
 pub mod ranges;
+#[path = "../../native-node/src/eng2/header.rs"]
+mod wallet_eng2_header;
 
 pub mod paths;

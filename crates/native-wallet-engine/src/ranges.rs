@@ -68,15 +68,27 @@ impl Sparse {
     }
 }
 fn hash_nonroot(data: &[u8], offset: usize) -> [u8; 32] {
-    blake3::Hasher::new_derive_key(DOMAIN)
+    hash_nonroot_bound(data, offset, DOMAIN)
+}
+fn hash_nonroot_bound(data: &[u8], offset: usize, domain: &str) -> [u8; 32] {
+    blake3::Hasher::new_derive_key(domain)
         .set_input_offset(offset as u64)
         .update(data)
         .finalize_non_root()
 }
 impl RangeProof {
     pub fn create(data: &[u8], ranges: &[(usize, usize)]) -> Result<Vec<u8>, String> {
+        Self::create_bound(data, ranges, DOMAIN, MAX_PREIMAGE)
+    }
+    /// Reuse the same range encoding for an explicitly selected existing root.
+    pub(crate) fn create_bound(
+        data: &[u8],
+        ranges: &[(usize, usize)],
+        domain: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, String> {
         if data.is_empty()
-            || data.len() > MAX_PREIMAGE
+            || data.len() > maximum
             || ranges
                 .iter()
                 .any(|(a, n)| a.checked_add(*n).is_none_or(|e| e > data.len()))
@@ -91,6 +103,7 @@ impl RangeProof {
             ranges: &[(usize, usize)],
             root: bool,
             out: &mut Vec<u8>,
+            domain: &str,
         ) {
             let selected = root
                 || ranges
@@ -98,18 +111,18 @@ impl RangeProof {
                     .any(|(a, n)| *a < offset + data.len() && a + n > offset);
             if !selected {
                 out.push(0);
-                out.extend_from_slice(&hash_nonroot(data, offset));
+                out.extend_from_slice(&hash_nonroot_bound(data, offset, domain));
             } else if data.len() <= 1024 {
                 out.push(1);
                 out.extend_from_slice(data);
             } else {
                 out.push(2);
                 let left = left_subtree_len(data.len() as u64) as usize;
-                emit(&data[..left], offset, ranges, false, out);
-                emit(&data[left..], offset + left, ranges, false, out);
+                emit(&data[..left], offset, ranges, false, out, domain);
+                emit(&data[left..], offset + left, ranges, false, out, domain);
             }
         }
-        emit(data, 0, ranges, true, &mut out);
+        emit(data, 0, ranges, true, &mut out, domain);
         if out.len() > MAX_COMPACT {
             return Err("Compact response byte limit.".into());
         }
@@ -201,18 +214,27 @@ impl RangeProof {
     }
 
     pub fn verify(encoded: &[u8], root: [u8; 32]) -> Result<Sparse, String> {
+        Self::verify_bound(encoded, root, DOMAIN, MAX_PREIMAGE)
+    }
+    /// Authenticate the unchanged range encoding against an explicit root domain.
+    pub(crate) fn verify_bound(
+        encoded: &[u8],
+        root: [u8; 32],
+        domain: &str,
+        maximum: usize,
+    ) -> Result<Sparse, String> {
         if encoded.len() < 17 || encoded.len() > MAX_COMPACT || &encoded[..8] != b"SWLR0001" {
             return Err("Invalid compact range envelope.".into());
         }
         let length = u64::from_le_bytes(encoded[8..16].try_into().unwrap());
-        if length == 0 || length > MAX_PREIMAGE as u64 {
+        if length == 0 || length > maximum as u64 {
             return Err("Compact preimage length limit.".into());
         }
         let mut sparse = Sparse {
             length: length as usize,
             chunks: BTreeMap::new(),
         };
-        let key = hash_derive_key_context(DOMAIN);
+        let key = hash_derive_key_context(domain);
         struct Reader<'a> {
             bytes: &'a [u8],
             at: usize,
@@ -236,6 +258,7 @@ impl RangeProof {
             is_root: bool,
             key: &[u8; 32],
             s: &mut Sparse,
+            domain: &str,
         ) -> Result<[u8; 32], String> {
             r.nodes += 1;
             if r.nodes > 65536 {
@@ -245,7 +268,7 @@ impl RangeProof {
                 0 if !is_root => Ok(r.take(32)?.try_into().unwrap()),
                 1 if len <= 1024 => {
                     let data = r.take(len)?;
-                    let mut h = blake3::Hasher::new_derive_key(DOMAIN);
+                    let mut h = blake3::Hasher::new_derive_key(domain);
                     h.set_input_offset(offset as u64).update(data);
                     s.chunks.insert(offset / 1024, data.to_vec());
                     Ok(if is_root {
@@ -256,8 +279,8 @@ impl RangeProof {
                 }
                 2 if len > 1024 => {
                     let n = left_subtree_len(len as u64) as usize;
-                    let a = walk(r, offset, n, false, key, s)?;
-                    let b = walk(r, offset + n, len - n, false, key, s)?;
+                    let a = walk(r, offset, n, false, key, s, domain)?;
+                    let b = walk(r, offset + n, len - n, false, key, s, domain)?;
                     Ok(if is_root {
                         *merge_subtrees_root(&a, &b, Mode::DeriveKeyMaterial(key)).as_bytes()
                     } else {
@@ -272,7 +295,7 @@ impl RangeProof {
             at: 16,
             nodes: 0,
         };
-        let computed = walk(&mut r, 0, length as usize, true, &key, &mut sparse)?;
+        let computed = walk(&mut r, 0, length as usize, true, &key, &mut sparse, domain)?;
         if computed != root || r.at != encoded.len() {
             return Err("Compact range authentication failed.".into());
         }

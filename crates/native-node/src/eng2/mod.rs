@@ -32,6 +32,7 @@ pub mod staging;
 pub mod state_components;
 pub mod store;
 pub mod transport;
+pub mod wallet_history;
 
 #[cfg(all(unix, feature = "eng2-runtime"))]
 pub(crate) mod transaction_exchange;

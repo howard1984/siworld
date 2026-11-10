@@ -8,6 +8,8 @@ use std::{
     path::Path,
 };
 
+mod wallet;
+
 pub struct PublicExport {
     root: fs::File,
     network: Hash,
