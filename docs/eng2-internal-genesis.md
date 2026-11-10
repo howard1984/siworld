@@ -76,3 +76,78 @@ The authenticated committed-state restart path is described in the resident
 runtime specification and must be measured on the actual accepted native
 fixture. The offline log does not activate a listener, live synchronization or
 a miner daemon.
+
+## Public parameter sealing and inspection
+
+The offline `siworld-eng2-genesis` tool seals existing canonical public
+configuration and governance component bytes. It does not create parameters,
+keys, node state, identities or services. It performs no network operations.
+Its availability does not establish that deployment or key custody has been
+qualified.
+
+```
+siworld-eng2-genesis seal-public CONFIG_RULES.bin GOVERNANCE.bin \
+  --expected-config-sha256 C --expected-governance-sha256 G \
+  --expected-network N --expected-profile P \
+  --expected-fee-recipient-sha256 R --new-genesis NEW_FILE --json
+
+siworld-eng2-genesis inspect GENESIS.bin \
+  --expected-config-sha256 C --expected-governance-sha256 G \
+  --expected-network N --expected-profile P \
+  --expected-fee-recipient-sha256 R --json
+```
+
+All five independent expected values are mandatory 32-byte lowercase
+hexadecimal strings. Configuration and governance are the existing canonical
+`Config::encode_rules` and `GovernanceState::canonical_component_bytes` formats;
+there is no additional consensus manifest format. Configure the complete
+allocation, authority roles, checkpoint slots and payment destinations in a
+separate public parameter preparation step. This tool never chooses them.
+
+Both commands require non-fixture ASERT rules with production economic timing,
+nonzero timestamp and target, canonical work selector zero, interval 300 and
+work iterations in 1 through 1,000,000. Ordinary transfer fees remain explicitly
+`LegacyMiner`. The issuance fee owner must equal the actual governance fee
+owner, and the complete 1,232-byte fee destination must match R. Matching only
+the owner with a substituted encapsulation key is insufficient.
+
+The fixed known-fixture denylist contains SHA-256 fingerprints of public
+ML-DSA-65 keys already reproducible from the repeated-byte seeds 1 through 5,
+83 and 84, and the 24-member registry derivation in
+`Config::with_test_fund_registry`. The tool contains only their fingerprints
+and performs no key derivation. This finite check cannot establish that an
+arbitrary key is privately generated or that a custodian controls it.
+Independent authority signature and custody qualification remain necessary.
+
+Input files must be bounded regular files without a final symlink. Config
+length is exact; governance length is at most 131,072 bytes. A fixture flag is
+rejected before shared configuration decoding can reach development helpers.
+The output file must not exist. Sealing performs all semantic checks before
+exclusive creation, writes and synchronizes the file, and on Unix synchronizes
+its parent directory. It never overwrites or removes files. A write or sync
+failure may leave a partial new file; inspect it separately rather than retrying
+against that path. Inspection performs no writes. A relative or symlinked
+parent path is resolved by the operating system; the caller selects the explicit
+public input and output directories.
+
+The receipt reconstructs the actual genesis state and reports all eleven
+ordered execution-component byte lengths and domain-separated component digests.
+Tree and nullifier execution encodings use the existing compact commitment
+formats; full snapshot bytes carry the reconstruction vectors. Their byte lengths
+and snapshot SHA-256 values are reported separately. The aggregate of execution
+components must equal the direct execution commitment. Individual component
+digests and the aggregate h0 root are separate fields. The receipt also reports
+the genesis, rules, proof profile, peer verifier, exact public input hashes,
+ASERT parameters and public authority/destination fingerprints. It does not
+claim that an h0 block was mined.
+
+The command reports the executing binary SHA-256. Its source commit is not
+inferred or accepted as verified from a caller string. A separate build receipt
+must bind the exact source archive, locked dependencies, command, toolchain,
+target/features and binary hash. No provenance reporting field changes the
+existing genesis encoding or rules-commitment formulas.
+
+Failures return structured JSON with fixed error codes and no input echo. A
+successful seal is not deployment, block admission, synchronization or proof
+of authority-key ownership. The standalone binary requires neither
+`eng2-runtime`, `native-p2p` nor `eng2-rehearsal`.

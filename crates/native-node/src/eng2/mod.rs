@@ -18,6 +18,7 @@ pub mod driver;
 pub mod execution;
 pub mod fund_claim;
 pub mod genesis;
+pub mod genesis_tool;
 pub mod header;
 pub mod import;
 pub mod network;

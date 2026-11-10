@@ -35,6 +35,10 @@ eng2-rehearsal = []
 eng2-runtime = ["native-p2p"]
 
 [[bin]]
+name = "siworld-eng2-genesis"
+path = "src/bin/siworld-eng2-genesis.rs"
+
+[[bin]]
 name = "siworld-eng2-node"
 path = "src/bin/siworld-eng2-node.rs"
 required-features = ["eng2-runtime"]
