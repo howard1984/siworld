@@ -367,11 +367,18 @@ verification work. Capacity, bandwidth, and mempool budgets must include those
 bytes, plus the fixed sidecar and retransmissions. The implemented 2,027-byte
 transaction body alone is not a complete relay budget.
 
-Settlement proofs and sidecars are retained for three elapsed days after final
-confirmation to support reorg handling, checkpoint recovery, and
-operational recovery. After that period, nodes delete the proof bodies and
-sidecars. The public fee commitments `F_i` remain permanently with the
-confirmed transaction; no fee opening is retained in the permanent record.
+Proof deletion follows the active node storage policy; this relation does not
+assign a separate three-day retention period. Service-node policy retains at
+least 24 hours after observed final confirmation, while miner and ordinary-node
+policy defaults to 96 blocks with a configurable minimum of 24. Recovery,
+reorganization and admitted-transfer pins can require longer retention. The
+engineering-v2 resident currently retains complete canonical proof-bearing
+bodies; its destructive retention path is not connected. Before removing any
+proof body, the store must durably preserve authenticated permanent public
+records and the active synchronization policy's recovery data. The public fee
+commitments `F_i` remain permanent; private fee openings are excluded from
+permanent public records. These statements do not activate proof deletion or
+qualify a confidential-fee resident.
 
 ## Revised profile and activation gates
 

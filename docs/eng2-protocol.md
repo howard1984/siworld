@@ -152,6 +152,13 @@ Private keys do not enter QR messages, logs or network requests.
 
 ## Deferred automatic synchronization and proof retention
 
+The following automatic-admission and retention rules are a deferred design.
+The current resident does not select this synchronization mode and still keeps
+complete proof-bearing canonical bodies. Implemented alarm/export fields do
+not perform proof deletion. Signed fresh-node admission and permanent receipt
+retention must be qualified independently; implementation of this design
+cannot be inferred from the existing storage policy constants.
+
 A joining node verifies all headers and difficulty rules from pinned genesis,
 then selects the greatest verified cumulative work after consulting at least
 three distinct sources. Insufficient sources, unresolved equal-work alternatives
