@@ -97,9 +97,10 @@ impl Store {
     pub fn imported_checkpoint_height(&self) -> Option<u64> {
         (self.imported_prefix != 0).then_some(self.imported_prefix)
     }
-    /// Authenticated proof-free public history only. No missing proof can be
-    /// reconstructed or advertised as available by this read path.
-    pub fn permanent_receipt(&self, height: u64) -> Result<Option<Vec<u8>>, String> {
+    /// Internal stored-digest check only; this returns an unauthenticated buffer.
+    /// The caller must decode the receipt against the exact accepted header and
+    /// body length before export. This read never reconstructs a missing proof.
+    pub(crate) fn permanent_receipt(&self, height: u64) -> Result<Option<Vec<u8>>, String> {
         self.ensure_exportable()?;
         if height == 0 || height > self.engine.state().height() {
             return Ok(None);
