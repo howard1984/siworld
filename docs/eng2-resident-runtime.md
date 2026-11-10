@@ -92,8 +92,11 @@ synchronous proof verification is not preemptible.
 Before each complete cycle, the client checks the native transport's existing
 wire, record and connection-age budget. It closes expired or insufficient
 sessions and repeats full hybrid authentication. Every replacement connection
-must return the byte-identical selected manifest before cached acquisition
-continues. Partial or failed streams are always discarded. Only transient
+requests its exact selected bundle and must return the byte-identical manifest
+before cached acquisition continues. A provider retains valid peer-bound
+transfers across checkpoint publication within its fixed two-hour lease;
+expired, invalidated or unavailable bundles preserve the client's quarantine.
+Partial or failed streams are always discarded. Only transient
 transport unavailability is retried, with at most four attempts per retry stage
 and cancellation-aware backoff from 100 through 800 milliseconds. All attempts
 share the original elapsed/round budget and an additional connection cap of

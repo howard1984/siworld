@@ -286,11 +286,12 @@ impl<'a> Acquisition<'a> {
             // manifest round. Changed offers never replace retained bytes.
             if let Some(expected) = &self.manifest {
                 operation.round()?;
+                let selected_bundle = Manifest::decode(expected, self.genesis, limits())?.bundle();
                 let live = self.live.as_mut().expect("authenticated session");
                 let acquired =
                     live.cold
                         .round(&mut live.peer, network::Limits::default(), |pull| {
-                            pull.manifest()
+                            pull.exact_manifest(Some(selected_bundle))
                         });
                 match acquired {
                     Ok(completed) => {

@@ -19,6 +19,8 @@ pub const MAX_CHUNK_BYTES: usize = p2p::MAX_CONTROL_BYTES - 160;
 const _: () = assert!(MAX_MANIFEST_BYTES < p2p::MAX_CONTROL_BYTES - 1);
 pub mod cache;
 pub mod client;
+pub(crate) mod leases;
+pub use leases::BodyPins;
 #[cfg(feature = "eng2-runtime")]
 pub mod session;
 
@@ -256,25 +258,32 @@ impl Provider {
     pub fn check_current(&self, store: &Store) -> Result<(), String> {
         store.ensure_exportable()?;
         let state = store.engine().state();
+        self.check_bindings(
+            store.engine().genesis().id(),
+            state.height(),
+            state.governance().active_roster().digest(state.network()),
+            |height| {
+                store
+                    .header(height)?
+                    .id()
+                    .map_err(|_| "bootstrap canonical header encoding invalid".into())
+            },
+        )
+    }
+    fn check_bindings(
+        &self,
+        genesis: Hash,
+        height: u64,
+        roster_digest: Hash,
+        mut header_id: impl FnMut(u64) -> Result<Hash, String>,
+    ) -> Result<(), String> {
         let statement = &self.manifest.certificate.statement;
-        if store.engine().genesis().id() != self.manifest.genesis
-            || state.height() < self.manifest.tip_height
-            || state.governance().active_roster().digest(state.network()) != statement.roster_digest
-            || store
-                .header(self.manifest.tip_height)?
-                .id()
-                .map_err(|_| "bootstrap tip encoding invalid")?
-                != self.manifest.tip_id
-            || store
-                .header(statement.checkpoint_height)?
-                .id()
-                .map_err(|_| "bootstrap anchor encoding invalid")?
-                != statement.checkpoint_block
-            || store
-                .header(statement.authorization_height)?
-                .id()
-                .map_err(|_| "bootstrap authorization encoding invalid")?
-                != statement.authorization_block
+        if genesis != self.manifest.genesis
+            || height < self.manifest.tip_height
+            || roster_digest != statement.roster_digest
+            || header_id(self.manifest.tip_height)? != self.manifest.tip_id
+            || header_id(statement.checkpoint_height)? != statement.checkpoint_block
+            || header_id(statement.authorization_height)? != statement.authorization_block
         {
             return Err("bootstrap offer no longer matches current accepted history".into());
         }

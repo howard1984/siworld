@@ -83,11 +83,38 @@ Only explicit bootstrap and validator resident roles enable an offer. Its
 capability can be constructed only from an actual durable Store and a current
 certified checkpoint. Service maintenance materializes at most one missing
 permanent receipt per tick and preserves all full proof bodies. The provider
-holds one bounded snapshot copy; receipt slices are copied under the owner lock
+holds a bounded snapshot copy; receipt slices are copied under the owner lock
 and sent after releasing it. A changed signer epoch or canonical prefix makes
-the offer unavailable. Publishing a replacement offer can retire the old
-bundle; resumable acquisition requires exactly the same manifest and policy.
-This implementation enables no expiry and establishes no pruning lease.
+the offer and its leases unavailable immediately.
+
+Each manifest acquisition leases one exact bundle to the authenticated peer
+identity for two hours from its first acquisition. Reconnection cannot renew
+that deadline. An initial manifest request selects current; a reconnect includes
+the selected bundle and receives only that manifest or explicit unavailable.
+It cannot silently select a replacement. Exact-bundle requests and artifact
+requests require that peer's existing lease. Expired or exhausted entries remain
+nonrenewable tombstones while their offer remains published. Process restart
+clears this in-memory registry; unavailable old offers leave client quarantine
+intact and require a separate checked selection.
+
+The owner retains current plus at most two retired offers. Replacement receipt
+preparation leaves the previous valid current offer visible; publication occurs
+only after complete capture and capacity checks. Limits are 32 authenticated
+peers, 64 lease records, two bundles per peer, 64 MiB per snapshot, 192 MiB of
+published snapshot bytes and 256 MiB including replacement preparation. Each
+lease allows at most 1,048,576 manifest, snapshot and receipt requests and
+256 GiB of their returned payload bytes, including repeated requests. Complete
+native proof bodies use the ordinary body exchange and its separate connection
+and memory limits; these lease counters do not measure that traffic. Exhaustion
+returns unavailable and does not evict another peer's active promise.
+
+The same registry derives full-body pins from checkpoint height plus one through
+the selected tip, inclusive. Current offers and unexpired retired offers retain
+those ranges; expiration or invalidation removes retired pins. Callers cannot
+supply arbitrary ranges to this capability. Snapshot ownership alone does not
+pin database bodies. This change exposes the pin capability but enables no
+proof deletion or compaction; actual expiry must consume these owner-derived
+pins together with role retention, checkpoint and restart-safety requirements.
 
 The quarantine stores chunks and ordered progress atomically, checks retained
 chunk hashes on reopen, rejects changed complete-object hashes and exposes

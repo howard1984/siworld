@@ -37,7 +37,7 @@ pub enum Request {
     Tip { height: u64, id: Hash },
     Header { height: u64 },
     Body { height: u64, id: Hash },
-    BootstrapManifest,
+    BootstrapManifest { bundle: Option<Hash> },
     BootstrapChunk(ChunkRequest),
 }
 

@@ -25,11 +25,16 @@ pub trait Owner: Send {
     fn block(&self, height: u64) -> Result<(Header, Body), String>;
     fn accept(&mut self, header: &Header, body: &Body) -> Result<(), String>;
     /// Explicit service capability only. Ordinary and miner owners expose none.
-    fn bootstrap_provider(&self) -> Result<Option<Arc<super::bootstrap::Provider>>, String> {
+    fn bootstrap_manifest(
+        &mut self,
+        _authenticated_peer: Hash,
+        _requested_bundle: Option<Hash>,
+    ) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
     }
     fn bootstrap_chunk(
-        &self,
+        &mut self,
+        _authenticated_peer: Hash,
         _query: super::transport::ChunkRequest,
     ) -> Result<Option<super::bootstrap::Chunk>, String> {
         Ok(None)
@@ -205,17 +210,19 @@ fn serve<S: Read + Write, O: Owner>(
     message: Request,
 ) -> Result<u16, Error> {
     match message {
-        Request::BootstrapManifest => {
+        Request::BootstrapManifest { bundle } => {
             let _charge = peer.reserve_bootstrap(super::bootstrap::MAX_MANIFEST_BYTES + 1)?;
-            let provider = with_owner(owner, |o| o.bootstrap_provider())?;
+            let authenticated_peer = peer.peer();
+            let provider = with_owner(owner, |o| o.bootstrap_manifest(authenticated_peer, bundle))?;
             match provider {
-                Some(provider) => peer.send_bootstrap_manifest(request, provider.encoded())?,
+                Some(manifest) => peer.send_bootstrap_manifest(request, &manifest)?,
                 None => peer.send_bootstrap_missing(request)?,
             }
         }
         Request::BootstrapChunk(query) => {
             let _charge = peer.reserve_bootstrap(query.maximum as usize + 160)?;
-            let chunk = with_owner(owner, |o| o.bootstrap_chunk(query))?;
+            let authenticated_peer = peer.peer();
+            let chunk = with_owner(owner, |o| o.bootstrap_chunk(authenticated_peer, query))?;
             match chunk {
                 Some(chunk) => peer.send_bootstrap_chunk(request, query, &chunk)?,
                 None => peer.send_bootstrap_missing(request)?,
@@ -278,10 +285,16 @@ impl<S: Read + Write> BootstrapPull<'_, S> {
         self.sequence.next()
     }
     pub fn manifest(&mut self) -> Result<Option<super::transport::ReceivedManifest>, Error> {
+        self.exact_manifest(None)
+    }
+    pub fn exact_manifest(
+        &mut self,
+        bundle: Option<Hash>,
+    ) -> Result<Option<super::transport::ReceivedManifest>, Error> {
         let request = self.request()?;
         Ok(self
             .peer
-            .fetch_bootstrap_manifest_before(request, &self.deadline)?)
+            .fetch_bootstrap_manifest_before(request, bundle, &self.deadline)?)
     }
     pub fn chunk(
         &mut self,

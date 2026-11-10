@@ -72,7 +72,14 @@ pub(crate) fn framing_fixture() -> (Genesis, ImportLimits, Manifest) {
 /// Deliberately synthetic transport fixture, inaccessible in production builds.
 #[cfg(feature = "eng2-runtime")]
 pub(crate) fn transport_fixture() -> Provider {
-    let (_, _, manifest) = framing_fixture();
+    transport_fixture_tag(7)
+}
+/// Distinct synthetic offers for transport rollover; no signature admission.
+pub(crate) fn transport_fixture_tag(tag: u8) -> Provider {
+    let (_, _, mut manifest) = framing_fixture();
+    manifest.tip_id = [tag; 32];
+    manifest.certificate.statement.authorization_block = [tag; 32];
+    manifest.bundle = *blake3::hash(&manifest.prefix().unwrap()).as_bytes();
     let encoded = manifest.encode().unwrap();
     Provider {
         manifest,
@@ -116,4 +123,70 @@ fn manifest_binding_rejects_foreign_context_version_truncation_and_inconsistent_
     bad.snapshot.length = 0;
     bad.bundle = *blake3::hash(&bad.prefix().unwrap()).as_bytes();
     assert!(Manifest::decode(&bad.encode().unwrap(), &genesis, limits).is_err());
+}
+
+#[test]
+fn retained_offer_canonical_prefix_and_signer_epoch_invalidate_lookup_and_pins() {
+    use super::leases::Registry;
+    use std::{sync::Arc, time::Instant};
+    let (genesis, _, _) = framing_fixture();
+    let mut provider = transport_fixture();
+    provider.manifest.tip_height = 120;
+    provider.manifest.tip_id = [9; 32];
+    provider.manifest.bundle = *blake3::hash(&provider.manifest.prefix().unwrap()).as_bytes();
+    provider.encoded = provider.manifest.encode().unwrap();
+    let provider = Arc::new(provider);
+    let canonical = |height| match height {
+        72 => Ok([2; 32]),
+        96 => Ok([7; 32]),
+        120 => Ok([9; 32]),
+        _ => Err("missing canonical header".into()),
+    };
+    assert!(
+        provider
+            .check_bindings(genesis.id(), 121, [4; 32], canonical)
+            .is_ok()
+    );
+    assert!(
+        provider
+            .check_bindings([0; 32], 121, [4; 32], canonical)
+            .is_err()
+    );
+    assert!(
+        provider
+            .check_bindings(genesis.id(), 119, [4; 32], canonical)
+            .is_err()
+    );
+    for changed in [72, 96, 120, 0] {
+        let now = Instant::now();
+        let mut registry = Registry::default();
+        assert!(registry.publish(provider.clone(), now));
+        let bundle = provider.manifest().bundle();
+        assert!(registry.manifest([1; 32], None, now).is_some());
+        assert!(registry.body_pins(now).protects(73));
+        registry.reconcile(now, |offer| {
+            offer
+                .check_bindings(
+                    genesis.id(),
+                    121,
+                    if changed == 0 { [5; 32] } else { [4; 32] },
+                    |height| {
+                        if height == changed {
+                            Ok([99; 32])
+                        } else {
+                            canonical(height)
+                        }
+                    },
+                )
+                .is_ok()
+        });
+        assert!(registry.manifest([1; 32], Some(bundle), now).is_none());
+        assert!(!registry.body_pins(now).protects(73));
+        assert!(registry.current().is_none());
+    }
+    assert!(
+        provider
+            .check_bindings(genesis.id(), 121, [4; 32], |_| Err("read failed".into()))
+            .is_err()
+    );
 }

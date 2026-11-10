@@ -84,7 +84,7 @@ pub struct Driver {
     pending: Mempool,
     imports: ImportLimits,
     last_archive_error: Option<String>,
-    bootstrap: Option<std::sync::Arc<super::bootstrap::Provider>>,
+    bootstrap: super::bootstrap::leases::Registry,
     bootstrap_receipt_height: u64,
 }
 impl Driver {
@@ -113,7 +113,7 @@ impl Driver {
             verifier,
             imports,
             last_archive_error: None,
-            bootstrap: None,
+            bootstrap: super::bootstrap::leases::Registry::default(),
             bootstrap_receipt_height: 0,
         })
     }
@@ -127,17 +127,19 @@ impl Driver {
         certified: Option<&super::runtime_export::CertifiedCheckpoint>,
         budget: &crate::p2p::Budget,
     ) -> Result<(), String> {
+        let now = std::time::Instant::now();
+        self.bootstrap
+            .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
         let Some(certified) = certified else {
-            self.bootstrap = None;
             return Ok(());
         };
-        if let Some(provider) = &self.bootstrap
-            && provider.manifest().certificate == *certified.certificate()
-            && provider.check_current(&self.store).is_ok()
+        if self
+            .bootstrap
+            .current()
+            .is_some_and(|provider| provider.manifest().certificate == *certified.certificate())
         {
             return Ok(());
         }
-        self.bootstrap = None;
         certified.check_current(&self.store)?;
         let anchor = certified.certificate().statement.checkpoint_height;
         if self.bootstrap_receipt_height < anchor {
@@ -150,18 +152,33 @@ impl Driver {
                 return Ok(());
             }
         }
-        self.bootstrap = Some(std::sync::Arc::new(super::bootstrap::Provider::capture(
-            &self.store,
-            certified,
-            self.imports,
-            budget,
-        )?));
+        if !self
+            .bootstrap
+            .preparation_allowed(certified.snapshot_bytes().len(), now)
+        {
+            return Ok(());
+        }
+        let provider =
+            super::bootstrap::Provider::capture(&self.store, certified, self.imports, budget)?;
+        // Capacity was checked under this same owner lock. Publication replaces
+        // current atomically; old valid leased offers remain exact-addressable.
+        if !self.bootstrap.publish(std::sync::Arc::new(provider), now) {
+            return Err("bootstrap publication capacity changed under owner lock".into());
+        }
         Ok(())
     }
     pub fn bootstrap_available(&self) -> bool {
         self.bootstrap
-            .as_ref()
+            .current()
             .is_some_and(|provider| provider.check_current(&self.store).is_ok())
+    }
+    /// Derive conservative proof-body retention from this owner's registry.
+    /// No public constructor accepts remote ranges; deletion is not enabled.
+    pub fn bootstrap_body_pins(&mut self) -> super::bootstrap::BodyPins {
+        let now = std::time::Instant::now();
+        self.bootstrap
+            .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
+        self.bootstrap.body_pins(now)
     }
     pub fn engine(&self) -> &Engine {
         self.store.engine()
@@ -202,6 +219,10 @@ impl Driver {
         if committed.height().is_multiple_of(72) {
             self.last_archive_error = self.store.archive_checkpoint_anchor(self.imports).err();
         }
+        self.bootstrap
+            .reconcile(std::time::Instant::now(), |provider| {
+                provider.check_current(&self.store).is_ok()
+            });
         Ok(committed)
     }
     pub fn last_archive_error(&self) -> Option<&str> {
@@ -371,29 +392,52 @@ impl Driver {
 }
 
 impl super::network::Owner for Driver {
-    fn bootstrap_provider(
-        &self,
-    ) -> Result<Option<std::sync::Arc<super::bootstrap::Provider>>, String> {
-        match &self.bootstrap {
-            Some(provider) if provider.check_current(&self.store).is_ok() => {
-                Ok(Some(provider.clone()))
-            }
-            _ => Ok(None),
-        }
+    fn bootstrap_manifest(
+        &mut self,
+        authenticated_peer: Hash,
+        requested_bundle: Option<Hash>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let now = std::time::Instant::now();
+        self.bootstrap
+            .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
+        Ok(self
+            .bootstrap
+            .manifest(authenticated_peer, requested_bundle, now)
+            .map(|provider| provider.encoded().to_vec()))
     }
     fn bootstrap_chunk(
-        &self,
+        &mut self,
+        authenticated_peer: Hash,
         query: super::transport::ChunkRequest,
     ) -> Result<Option<super::bootstrap::Chunk>, String> {
-        match &self.bootstrap {
-            Some(provider) => provider.chunk(
-                &self.store,
-                query.bundle,
-                query.object,
-                query.offset,
-                query.maximum as usize,
-            ),
-            None => Ok(None),
+        let now = std::time::Instant::now();
+        self.bootstrap
+            .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
+        let Some(provider) = self
+            .bootstrap
+            .chunk_provider(authenticated_peer, query.bundle, now)
+        else {
+            return Ok(None);
+        };
+        let chunk = provider.chunk(
+            &self.store,
+            query.bundle,
+            query.object,
+            query.offset,
+            query.maximum as usize,
+        )?;
+        match chunk {
+            Some(chunk)
+                if self.bootstrap.charge_chunk(
+                    authenticated_peer,
+                    query.bundle,
+                    chunk.bytes.len(),
+                    now,
+                ) =>
+            {
+                Ok(Some(chunk))
+            }
+            _ => Ok(None),
         }
     }
     fn head(&self) -> Result<(u64, Hash), String> {

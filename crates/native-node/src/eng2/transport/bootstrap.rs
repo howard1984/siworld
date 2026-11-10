@@ -44,7 +44,12 @@ impl ChunkRequest {
 }
 pub(super) fn request(bytes: &[u8]) -> Option<Request> {
     if bytes == [GET_MANIFEST, 1] {
-        return Some(Request::BootstrapManifest);
+        return Some(Request::BootstrapManifest { bundle: None });
+    }
+    if bytes.len() == 34 && bytes[..2] == [GET_MANIFEST, 1] {
+        return Some(Request::BootstrapManifest {
+            bundle: Some(digest(&bytes[2..34])),
+        });
     }
     if bytes.len() != QUERY_BYTES || bytes[0] != GET_CHUNK || bytes[1] != 1 {
         return None;
@@ -88,21 +93,23 @@ impl<S: Read + Write> Peer<S> {
     ) -> Result<Option<ReceivedManifest>, p2p::Error> {
         self.fetch_bootstrap_manifest_before(
             request,
+            None,
             &p2p::Deadline::new(std::time::Duration::from_secs(10)),
         )
     }
     pub(crate) fn fetch_bootstrap_manifest_before(
         &mut self,
         request: u64,
+        bundle: Option<Hash>,
         deadline: &p2p::Deadline,
     ) -> Result<Option<ReceivedManifest>, p2p::Error> {
         let reservation = self.reserve_bootstrap(MAX_MANIFEST_BYTES + 1)?;
-        self.session.send_control_before(
-            p2p::ENG2_MESSAGE,
-            request,
-            &[GET_MANIFEST, 1],
-            deadline,
-        )?;
+        let mut query = vec![GET_MANIFEST, 1];
+        if let Some(bundle) = bundle {
+            query.extend_from_slice(&bundle);
+        }
+        self.session
+            .send_control_before(p2p::ENG2_MESSAGE, request, &query, deadline)?;
         let (received, bytes, _frame_charge) = self.receive_before(deadline)?;
         if received != request {
             return Err(p2p::Error::InvalidProtocol);
@@ -276,6 +283,29 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn exact_manifest_request_has_one_strict_optional_bundle_encoding() {
+        assert_eq!(
+            request(&[GET_MANIFEST, 1]),
+            Some(Request::BootstrapManifest { bundle: None })
+        );
+        let mut query = vec![GET_MANIFEST, 1];
+        query.extend_from_slice(&[7; 32]);
+        assert_eq!(
+            request(&query),
+            Some(Request::BootstrapManifest {
+                bundle: Some([7; 32])
+            })
+        );
+        for len in 3..34 {
+            assert!(request(&query[..len]).is_none());
+        }
+        query.push(0);
+        assert!(request(&query).is_none());
+        query.truncate(34);
+        query[1] = 2;
+        assert!(request(&query).is_none());
+    }
+    #[test]
     fn chunk_framing_rejects_cross_request_bundle_object_offset_length_and_resource_confusion() {
         let query = query();
         let bytes = response(query, b"fixt");
@@ -381,10 +411,24 @@ mod tests {
             fn accept(&mut self, _: &Header, _: &super::super::Body) -> Result<(), String> {
                 Err("cold transfer cannot admit blocks".into())
             }
-            fn bootstrap_provider(&self) -> Result<Option<Arc<Provider>>, String> {
-                Ok(self.offer.clone())
+            fn bootstrap_manifest(
+                &mut self,
+                _peer: Hash,
+                requested: Option<Hash>,
+            ) -> Result<Option<Vec<u8>>, String> {
+                Ok(self
+                    .offer
+                    .as_ref()
+                    .filter(|provider| {
+                        requested.is_none_or(|bundle| bundle == provider.manifest().bundle())
+                    })
+                    .map(|provider| provider.encoded().to_vec()))
             }
-            fn bootstrap_chunk(&self, q: ChunkRequest) -> Result<Option<Chunk>, String> {
+            fn bootstrap_chunk(
+                &mut self,
+                _peer: Hash,
+                q: ChunkRequest,
+            ) -> Result<Option<Chunk>, String> {
                 let Some(p) = &self.offer else {
                     return Ok(None);
                 };

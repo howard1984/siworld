@@ -16,14 +16,22 @@ use std::{
 };
 
 struct Fixture {
-    provider: Arc<Provider>,
+    registry: crate::eng2::bootstrap::leases::Registry,
+    clock: Instant,
+}
+impl Fixture {
+    fn new(provider: Arc<Provider>) -> Self {
+        let clock = Instant::now();
+        let mut registry = crate::eng2::bootstrap::leases::Registry::default();
+        assert!(registry.publish(provider, clock));
+        Self { registry, clock }
+    }
 }
 impl Owner for Fixture {
     fn head(&self) -> Result<(u64, Hash), String> {
-        Ok((
-            self.provider.manifest().tip_height,
-            self.provider.manifest().tip_id,
-        ))
+        Ok(self.registry.current().map_or((0, [0; 32]), |provider| {
+            (provider.manifest().tip_height, provider.manifest().tip_id)
+        }))
     }
     fn header(&self, _: u64) -> Result<Option<Header>, String> {
         Ok(None)
@@ -37,21 +45,41 @@ impl Owner for Fixture {
     fn accept(&mut self, _: &Header, _: &super::super::super::body::Body) -> Result<(), String> {
         Err("synthetic transport fixture cannot accept blocks".into())
     }
-    fn bootstrap_provider(&self) -> Result<Option<Arc<Provider>>, String> {
-        Ok(Some(self.provider.clone()))
+    fn bootstrap_manifest(
+        &mut self,
+        peer: Hash,
+        requested: Option<Hash>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.registry.reconcile(self.clock, |_| true);
+        Ok(self
+            .registry
+            .manifest(peer, requested, self.clock)
+            .map(|provider| provider.encoded().to_vec()))
     }
-    fn bootstrap_chunk(&self, query: ChunkRequest) -> Result<Option<Chunk>, String> {
-        if query.bundle != self.provider.manifest().bundle()
-            || query.object != Object::Snapshot
-            || query.offset >= 7
-        {
+    fn bootstrap_chunk(
+        &mut self,
+        peer: Hash,
+        query: ChunkRequest,
+    ) -> Result<Option<Chunk>, String> {
+        self.registry.reconcile(self.clock, |_| true);
+        let Some(provider) = self.registry.chunk_provider(peer, query.bundle, self.clock) else {
+            return Ok(None);
+        };
+        if query.object != Object::Snapshot || query.offset >= 7 {
             return Ok(None);
         }
         let start = query.offset as usize;
         let end = (start + query.maximum as usize).min(7);
+        let bytes = b"fixture"[start..end].to_vec();
+        if !self
+            .registry
+            .charge_chunk(peer, query.bundle, bytes.len(), self.clock)
+        {
+            return Ok(None);
+        }
         Ok(Some(Chunk {
-            descriptor: self.provider.manifest().snapshot,
-            bytes: b"fixture"[start..end].to_vec(),
+            descriptor: provider.manifest().snapshot,
+            bytes,
         }))
     }
 }
@@ -95,13 +123,14 @@ fn directory() -> PathBuf {
 }
 
 #[test]
-fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_error_streams() {
+fn hybrid_rollover_reauthenticates_exact_lease_resumes_and_rejects_expired_or_foreign_bundle() {
     let root = directory();
     let (genesis, limits, _) = crate::eng2::bootstrap::tests::framing_fixture();
     let genesis = Arc::new(genesis);
     let client_directory = root.join("client");
     let server_directory = root.join("server");
-    for directory in [&client_directory, &server_directory] {
+    let fresh_directory = root.join("fresh");
+    for directory in [&client_directory, &server_directory, &fresh_directory] {
         std::fs::create_dir(directory).unwrap();
         #[cfg(unix)]
         {
@@ -113,6 +142,8 @@ fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_
         Arc::new(NativeIdentity::initialize(&client_directory, genesis.peer_binding()).unwrap());
     let server_identity =
         Arc::new(NativeIdentity::initialize(&server_directory, genesis.peer_binding()).unwrap());
+    let fresh_identity =
+        Arc::new(NativeIdentity::initialize(&fresh_directory, genesis.peer_binding()).unwrap());
     let descriptor = server_identity.descriptor().unwrap();
     let pin = PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding()).unwrap();
     let expected =
@@ -139,6 +170,14 @@ fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_
         body,
     )
     .unwrap();
+    let fresh_connector = Connector::new(
+        genesis.clone(),
+        fresh_identity,
+        vec![expected.clone()],
+        budget.clone(),
+        body,
+    )
+    .unwrap();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let destination = config::Destination {
@@ -150,11 +189,20 @@ fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_
     let stopped = Arc::new(AtomicBool::new(false));
     let stop_server = stopped.clone();
     let server = std::thread::spawn(move || {
-        let owner = Arc::new(Mutex::new(Fixture {
-            provider: Arc::new(crate::eng2::bootstrap::tests::transport_fixture()),
-        }));
+        let owner = Arc::new(Mutex::new(Fixture::new(Arc::new(
+            crate::eng2::bootstrap::tests::transport_fixture(),
+        ))));
         let mut observed = Vec::new();
-        for connection in 0..5 {
+        for connection in 0..8 {
+            if connection == 2 {
+                let mut owner = owner.lock().unwrap();
+                let now = owner.clock;
+                let replacement = Arc::new(crate::eng2::bootstrap::tests::transport_fixture_tag(8));
+                assert!(owner.registry.publish(replacement, now));
+            }
+            if connection == 7 {
+                owner.lock().unwrap().clock += Duration::from_secs(7200);
+            }
             let started = Instant::now();
             let socket = loop {
                 if stop_server.load(Ordering::SeqCst) || started.elapsed() > Duration::from_secs(10)
@@ -262,7 +310,10 @@ fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_
     assert_eq!(cache.snapshot().unwrap().bytes, b"fixture");
     drop(session);
     let mut wrong = manifest.encode().unwrap();
-    wrong[0] ^= 1;
+    wrong[144] ^= 1;
+    let end = wrong.len() - 32;
+    let changed_bundle = *blake3::hash(&wrong[..end]).as_bytes();
+    wrong[end..].copy_from_slice(&changed_bundle);
     let mut changed = Acquisition::new(
         &client_connector,
         &destination,
@@ -283,10 +334,62 @@ fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_
     drop(changed);
     assert_eq!(cache.snapshot().unwrap().bytes, b"fixture");
     assert!(!client_directory.join("chain.redb").exists());
+    let mut foreign = Acquisition::new(
+        &fresh_connector,
+        &destination,
+        &genesis,
+        accounting.clone(),
+        Some(manifest.encode().unwrap()),
+    );
+    let mut called_foreign = false;
+    assert!(
+        foreign
+            .round(&mut operation, |pull| {
+                called_foreign = true;
+                pull.manifest()
+            })
+            .is_err()
+    );
+    assert!(!called_foreign);
+    drop(foreign);
+    let mut fresh = Acquisition::new(
+        &fresh_connector,
+        &destination,
+        &genesis,
+        accounting.clone(),
+        None,
+    );
+    let current = fresh
+        .round(&mut operation, |pull| pull.manifest())
+        .unwrap()
+        .unwrap();
+    let current = Manifest::decode(&current.bytes, &genesis, limits).unwrap();
+    assert_ne!(current.bundle(), manifest.bundle());
+    assert_eq!(current.tip_id, [8; 32]);
+    drop(fresh);
+    let mut expired = Acquisition::new(
+        &client_connector,
+        &destination,
+        &genesis,
+        accounting.clone(),
+        Some(manifest.encode().unwrap()),
+    );
+    let mut called_after_expiry = false;
+    assert!(
+        expired
+            .round(&mut operation, |pull| {
+                called_after_expiry = true;
+                pull.manifest()
+            })
+            .is_err()
+    );
+    assert!(!called_after_expiry);
+    drop(expired);
+    assert_eq!(cache.snapshot().unwrap().bytes, b"fixture");
     let counts = accounting.lock().unwrap();
     assert!(!counts.overflow);
-    assert_eq!(counts.sessions, 5);
-    assert_eq!(operation.connections, 5);
+    assert_eq!(counts.sessions, 8);
+    assert_eq!(operation.connections, 8);
     assert_eq!(
         counts.received,
         counts.retired.iter().map(|v| v.0).sum::<u64>()
@@ -296,7 +399,7 @@ fn hybrid_rotation_reauthenticates_resumes_preserves_binding_and_counts_retired_
     assert!(counts.received > counts.retired.iter().map(|v| v.0).max().unwrap());
     drop(counts);
     stopped.store(true, Ordering::SeqCst);
-    assert_eq!(server.join().unwrap().len(), 5);
+    assert_eq!(server.join().unwrap().len(), 8);
     drop(cache);
     std::fs::remove_dir_all(root).unwrap();
 }
