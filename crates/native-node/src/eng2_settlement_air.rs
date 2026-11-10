@@ -5,11 +5,14 @@
 //! The always-present fee note receives the private sum; reward notes receive
 //! exactly the subsidy/Holder allocations. Neither the sum nor padding flags
 //! occur in public inputs. Ciphertext correctness is not proved by this AIR.
-use crate::air::{LinearLayers, P2, p2_constants};
+#![allow(clippy::needless_range_loop)]
+
 use crate::eng2_settlement::{MAX_SETTLEMENT_SLOTS, PrivateSettlement, SettlementPolicy};
-use crate::multi_asset::{self as common, F, Hasher, LIMB_BITS, LIMBS, RATE, WIDTH};
-use crate::settlement::{FeeP2Air, MAX_REWARD_NOTES};
-use crate::{Cfg, FriParams};
+
+use native::air::{LinearLayers, P2, p2_constants};
+use native::multi_asset::{self as common, F, Hasher, LIMB_BITS, LIMBS, RATE, WIDTH};
+use native::settlement::{FeeP2Air, MAX_REWARD_NOTES};
+use native::{Cfg, FriParams};
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing, PrimeField32};
 use p3_matrix::dense::RowMajorMatrix;
@@ -659,7 +662,7 @@ fn generate_trace(
 mod tests {
     use super::*;
     use crate::eng2_settlement::FeeSchedule;
-    use crate::settlement::{RewardMode, sample_fixed_settlement_witness};
+    use native::settlement::{RewardMode, sample_fixed_settlement_witness};
     use p3_air::check_all_constraints;
 
     fn fixture(mode: RewardMode) -> SettlementWitnessV2 {

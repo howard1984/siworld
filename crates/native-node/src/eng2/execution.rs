@@ -249,12 +249,8 @@ enum HeaderUse {
     Mined,
     Template,
 }
-use native::{
-    codec::decode_digest,
-    encryption::PaymentAddress,
-    eng2_settlement::{FeeSchedule, SettlementPolicy},
-    multi_asset::Digest,
-};
+use crate::eng2_settlement::{FeeSchedule, SettlementPolicy};
+use native::{codec::decode_digest, encryption::PaymentAddress, multi_asset::Digest};
 
 struct CandidateLedgers {
     economics: EconomicState,

@@ -3,9 +3,9 @@
 //! This module is a witness specification, not a proof verifier or an activated
 //! network rule. Its corresponding AIR and authenticated state adapters must
 //! enforce the same relation before any version-two block can be accepted.
-use crate::confidential_fees::SettlementSlot;
-use crate::multi_asset::{Digest, Hasher, Note, SIP_ASSET_ID};
-use crate::settlement::RewardPlan;
+use native::confidential_fees::SettlementSlot;
+use native::multi_asset::{Digest, Hasher, Note, SIP_ASSET_ID};
+use native::settlement::RewardPlan;
 
 pub const MAX_SETTLEMENT_SLOTS: usize = 576;
 

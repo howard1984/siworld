@@ -1,10 +1,10 @@
-use p3_field::PrimeCharacteristicRing;
-use siworld_multi_asset_experiment::{
+use native::{
     confidential_fees::{FeeOpening, SettlementSlot},
-    eng2_settlement::{FeeSchedule, PrivateSettlement, SettlementPolicy},
     multi_asset::{F, FEE_BLIND_LEN, Hasher, Note, SIP_ASSET_ID},
     settlement::{RewardAllocation, RewardMode, RewardPlan},
 };
+use p3_field::PrimeCharacteristicRing;
+use siworld_native_node::eng2_settlement::{FeeSchedule, PrivateSettlement, SettlementPolicy};
 
 fn sample(mode: RewardMode, fees: &[u64]) -> (SettlementPolicy, PrivateSettlement) {
     let h = Hasher::new();

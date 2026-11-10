@@ -14,6 +14,8 @@ pub mod eng2_economics;
 pub mod eng2_fund;
 pub mod eng2_governance;
 pub mod eng2_operations;
+pub mod eng2_settlement;
+pub mod eng2_settlement_air;
 pub mod engineering_checkpoint;
 pub mod engineering_genesis;
 pub mod fund_spend;

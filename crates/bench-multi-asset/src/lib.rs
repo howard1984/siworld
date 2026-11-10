@@ -7,8 +7,6 @@ pub use native_base::{air, common, fee_settlement, proof_codec};
 pub mod codec;
 pub mod confidential_fees;
 pub mod encryption;
-pub mod eng2_settlement;
-pub mod eng2_settlement_air;
 pub mod issuance;
 pub mod issuance_air;
 pub mod multi_asset;
