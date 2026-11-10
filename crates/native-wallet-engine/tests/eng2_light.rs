@@ -157,7 +157,8 @@ fn receives_scans_all_history_and_reopens_only_same_context_private_cache() {
     assert_eq!(balance["send_supported"], false);
     assert_eq!(balance["full_node_consensus_verified"], false);
     assert_eq!(wallet.wallet().receipts().len(), 1);
-    assert_eq!(wallet.output_count(), 133);
+    // Sixty-four three-output transaction slots and five reward records.
+    assert_eq!(wallet.output_count(), 197);
     assert_eq!(wallet.asset_count(), 0);
     assert_eq!(wallet.tip_snapshot().selector.height, 1);
     assert_eq!(wallet.tip_snapshot().selector.block_id, wallet.tip());
