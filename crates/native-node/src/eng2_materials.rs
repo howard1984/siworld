@@ -27,6 +27,7 @@ pub enum Purpose {
     FundClaim = 3,
     FeeWallet = 4,
     FundWallet = 5,
+    MinerWallet = 6,
 }
 impl Purpose {
     pub fn parse(name: &str) -> Result<Self> {
@@ -37,6 +38,7 @@ impl Purpose {
             "fund-claim" => Ok(Self::FundClaim),
             "fee-wallet" => Ok(Self::FeeWallet),
             "fund-wallet" => Ok(Self::FundWallet),
+            "miner-wallet" => Ok(Self::MinerWallet),
             _ => Err("unknown engineering material purpose".into()),
         }
     }
@@ -48,6 +50,7 @@ impl Purpose {
             Self::FundClaim => "fund-claim",
             Self::FeeWallet => "fee-wallet",
             Self::FundWallet => "fund-wallet",
+            Self::MinerWallet => "miner-wallet",
         }
     }
     fn check(self, index: u8) -> Result<()> {
@@ -63,7 +66,7 @@ impl Purpose {
         }
     }
     fn wallet(self) -> bool {
-        matches!(self, Self::FeeWallet | Self::FundWallet)
+        matches!(self, Self::FeeWallet | Self::FundWallet | Self::MinerWallet)
     }
 }
 fn sha(bytes: &[u8]) -> String {

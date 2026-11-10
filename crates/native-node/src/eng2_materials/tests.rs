@@ -94,6 +94,7 @@ fn all_purposes_export_public_material_without_changing_fund_allocation() {
         Purpose::FundClaim,
         Purpose::FeeWallet,
         Purpose::FundWallet,
+        Purpose::MinerWallet,
     ]
     .into_iter()
     .enumerate()
@@ -141,6 +142,7 @@ fn wrong_roster_slot_key_network_or_role_cannot_bind() {
         ("slot", Purpose::Checkpoint, 1, 3),
         ("key", Purpose::Checkpoint, 0, 8),
         ("role", Purpose::Founder, 0, 3),
+        ("miner-wallet", Purpose::MinerWallet, 0, 3),
     ] {
         prepared(&dir, name, role, index, seed);
         assert!(bind_checkpoint(&dir.path(name), &genesis, id, digest).is_err());
@@ -526,4 +528,44 @@ fn custody_fund_signature_attaches_through_existing_claim_verification() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn miner_wallet_is_network_bound_and_cannot_use_a_nonzero_index() {
+    let dir = Directory::new();
+    assert_eq!(
+        Purpose::parse("miner-wallet").unwrap(),
+        Purpose::MinerWallet
+    );
+    let first = prepared(&dir, "miner", Purpose::MinerWallet, 0, 21);
+    prepare_seed(
+        &dir.path("other-network"),
+        [2; 32],
+        Purpose::MinerWallet,
+        0,
+        Zeroizing::new([21; 32]),
+    )
+    .unwrap();
+    let public = |name| -> Value {
+        serde_json::from_slice(&fs::read(dir.path(name).join("public.json")).unwrap()).unwrap()
+    };
+    let a = public("miner");
+    let b = public("other-network");
+    assert_eq!(a["purpose"], "miner-wallet");
+    assert_eq!(a["algorithm"], "native-payment-address");
+    assert_eq!(a["account"], 0);
+    assert_ne!(a["address_hex"], b["address_hex"]);
+    assert_eq!(first["purpose"], "miner-wallet");
+    assert!(first.get("address_hex").is_none());
+    assert!(
+        prepare_with_entropy(
+            &dir.path("invalid-index"),
+            [1; 32],
+            Purpose::MinerWallet,
+            1,
+            |_| panic!("invalid role index must fail before entropy"),
+        )
+        .is_err()
+    );
+    assert!(!dir.path("invalid-index").exists());
 }

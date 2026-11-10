@@ -40,7 +40,7 @@ fn run() -> Result<(), String> {
     let mut result = match args.as_slice() {
         [flag] if flag == "--help" => {
             println!(
-                "siworld-eng2-materials\nprepare NETWORK_HEX PURPOSE INDEX NEW_PRIVATE_DIRECTORY\nbind-checkpoint PRIVATE_DIRECTORY GENESIS_FILE EXPECTED_GENESIS_ID EXPECTED_GENESIS_SHA256\nsign PRIVATE_DIRECTORY NETWORK_HEX PURPOSE INDEX AUTHORITY_SHA256 PUBLIC_REQUEST_FILE REQUEST_SHA256\n\nPURPOSE: checkpoint, founder, revocation, fund-claim, fee-wallet, fund-wallet.\nINDEX: checkpoint slot0..2; fund member0..31; founder/revocation/fee-wallet0.\nNew owner-only custody must be outside Git. No existing wallet or seed is imported.\npublic.json contains public parameters; prepare/bind stdout contains fingerprints only. Signing emits detached public signatures and hashes.\nGenerate each checkpoint seed on its own signing host, before sealing genesis."
+                "siworld-eng2-materials\nprepare NETWORK_HEX PURPOSE INDEX NEW_PRIVATE_DIRECTORY\nbind-checkpoint PRIVATE_DIRECTORY GENESIS_FILE EXPECTED_GENESIS_ID EXPECTED_GENESIS_SHA256\nsign PRIVATE_DIRECTORY NETWORK_HEX PURPOSE INDEX AUTHORITY_SHA256 PUBLIC_REQUEST_FILE REQUEST_SHA256\n\nPURPOSE: checkpoint, founder, revocation, fund-claim, fee-wallet, fund-wallet, miner-wallet.\nINDEX: checkpoint slot0..2; fund member0..31; founder/revocation/fee-wallet/miner-wallet0.\nNew owner-only custody must be outside Git. No existing wallet or seed is imported.\npublic.json contains public parameters; prepare/bind stdout contains fingerprints only. Signing emits detached public signatures and hashes.\nGenerate each checkpoint seed on its own signing host, before sealing genesis."
             );
             return Ok(());
         }
