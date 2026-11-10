@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "active": "siworld-eng-1",
+  "networks": [
+    {
+      "name": "siworld-eng-1",
+      "network": "REPLACE_WITH_64_LOWERCASE_HEX_NETWORK_ID",
+      "genesis": "REPLACE_WITH_64_LOWERCASE_HEX_GENESIS_HASH",
+      "api": "/chain/eng1"
+    }
+  ]
+}

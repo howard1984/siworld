@@ -14,7 +14,6 @@ import subprocess
 import threading
 import time
 from urllib.parse import urlsplit, parse_qs
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 SNAPSHOT = 524288
 ZERO = '00' * 32
@@ -37,6 +36,93 @@ def chain_page(index, tip, start, limit):
     if start < 1 or start > end + 1 or not 1 <= limit <= 128:
         raise ValueError('Invalid pinned index range.')
     return {'ids': ids[start-1:min(end, start-1+limit)]}
+
+def explorer_projection(value, index):
+    """Reject extensions outside the public aggregate projection contract."""
+    def exact(item, fields):
+        if type(item) is not dict or set(item) != set(fields.split()):
+            raise ValueError('Public explorer projection unavailable.')
+    def integer(item, maximum=1000000):
+        if type(item) is not int or not 0 <= item <= maximum:
+            raise ValueError('Invalid public explorer integer.')
+    def atoms(item):
+        if item is None:
+            return
+        if type(item) is not str or not 1 <= len(item) <= 39 or any(c not in '0123456789' for c in item) or (len(item) > 1 and item[0] == '0') or int(item) >= 1 << 128:
+            raise ValueError('Invalid public explorer amount.')
+    exact(value, 'version network genesis height tip published_unix_seconds blocks economics checkpoint governance')
+    if value['version'] != 1 or any(value[key] != index[key] for key in ('network', 'genesis', 'height', 'tip')):
+        raise ValueError('Public explorer snapshot identity differs.')
+    for key in ('network', 'genesis', 'tip'): canonical_hex(value[key])
+    integer(value['height']); integer(value['published_unix_seconds'], (1 << 53) - 1)
+    if value['height'] == 0 and value['tip'] != value['genesis']:
+        raise ValueError('Public explorer genesis differs.')
+    if type(value['blocks']) is not list or len(value['blocks']) > 101:
+        raise ValueError('Public explorer block limit.')
+    previous = None
+    for block in value['blocks']:
+        exact(block, 'height hash parent_hash timestamp target slots_including_padding reward_mode work')
+        integer(block['height']); integer(block['timestamp'], (1 << 53) - 1)
+        for key in ('hash', 'parent_hash', 'target'): canonical_hex(block[key])
+        target = int(block['target'], 16)
+        if target == 0 or type(block['work']) is not str or block['work'] != str((1 << 256) // (target + 1)) or not 0 < block['height'] <= value['height']:
+            raise ValueError('Invalid public explorer header work.')
+        slots = block['slots_including_padding']
+        if type(slots) is not int or not 64 <= slots <= 576 or slots % 16 or block['reward_mode'] not in ('holder', 'voyager'):
+            raise ValueError('Invalid public explorer block metadata.')
+        if previous is not None and (previous['height'] + 1 != block['height'] or previous['hash'] != block['parent_hash']):
+            raise ValueError('Public explorer sample is not contiguous.')
+        previous = block
+    if previous is not None and (previous['height'] != value['height'] or previous['hash'] != value['tip']):
+        raise ValueError('Public explorer sample tip differs.')
+    economics = value['economics']
+    exact(economics, 'issued_atoms burned_atoms holder_pool_atoms locked_reward_atoms unlock_schedule unlock_schedule_complete funds circulating_estimate_atoms')
+    for key in ('issued_atoms', 'burned_atoms', 'holder_pool_atoms', 'locked_reward_atoms', 'circulating_estimate_atoms'): atoms(economics[key])
+    if type(economics['unlock_schedule_complete']) is not bool:
+        raise ValueError('Invalid public explorer schedule coverage.')
+    for name, limit, fields in [('unlock_schedule', 64, 'height atoms'), ('funds', 16, 'index entitled_atoms released_atoms spent_atoms')]:
+        if type(economics[name]) is not list or len(economics[name]) > limit:
+            raise ValueError('Public explorer aggregate limit.')
+        for row in economics[name]: exact(row, fields)
+    last = value['height']
+    for row in economics['unlock_schedule']:
+        integer(row['height'], (1 << 53) - 1); atoms(row['atoms'])
+        if row['height'] <= last:
+            raise ValueError('Invalid public explorer unlock schedule.')
+        last = row['height']
+    for position, fund in enumerate(economics['funds']):
+        if type(fund['index']) is not int or fund['index'] != position:
+            raise ValueError('Invalid public explorer fund index.')
+        for key in ('entitled_atoms', 'released_atoms', 'spent_atoms'): atoms(fund[key])
+        if all(fund[key] is not None for key in ('entitled_atoms', 'released_atoms', 'spent_atoms')) and not int(fund['spent_atoms']) <= int(fund['released_atoms']) <= int(fund['entitled_atoms']):
+            raise ValueError('Invalid public explorer fund totals.')
+    if value['checkpoint'] is not None:
+        checkpoint = value['checkpoint']
+        exact(checkpoint, 'height hash issued_unix_seconds roster signer_indices')
+        integer(checkpoint['height']); integer(checkpoint['issued_unix_seconds'], (1 << 53) - 1)
+        canonical_hex(checkpoint['hash']); canonical_hex(checkpoint['roster'])
+        votes = checkpoint['signer_indices']
+        if not 0 < checkpoint['height'] <= value['height'] or type(votes) is not list or not 2 <= len(votes) <= 3 or any(type(slot) is not int or not 0 <= slot < 3 for slot in votes) or len(set(votes)) != len(votes):
+            raise ValueError('Invalid public explorer checkpoint slots.')
+    governance = value['governance']
+    exact(governance, 'current_signers fee_address fund_addresses changes')
+    # Governance projection is versioned separately when the eng2 adapter exists.
+    if any(item is not None for item in governance.values()):
+        raise ValueError('Public governance projection version unavailable.')
+    return value
+
+def read_explorer(root):
+    path = root / 'explorer.json'
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 131072 or info.st_nlink != 1:
+            raise ValueError('Public explorer projection unavailable.')
+        body = stream.read(131073)
+        if len(body) > 131072:
+            raise ValueError('Public explorer projection limit.')
+    index = json.loads((root / 'chain.json').read_text())
+    return explorer_projection(json.loads(body), index)
 
 class VaultStore:
     def __init__(self, path, origin, accounts=10, clock=time.monotonic):
@@ -61,6 +147,7 @@ class VaultStore:
             return {'challenge': token, 'expires_in_seconds': 60}
 
     def authenticate(self, method, locator, body, headers, key=None):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         canonical_hex(locator)
         challenge = canonical_hex(headers.get('X-Vault-Challenge'))
         signature = bytes.fromhex(canonical_hex(headers.get('X-Vault-Signature'), 64))
@@ -94,6 +181,7 @@ class VaultStore:
         return {'status': 'created', 'revision': '0'}
 
     def put(self, locator, body, headers):
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         if len(body) != SNAPSHOT or body[:8] != b'SWVSNP01':
             raise ValueError('Snapshot must be exactly 512 KiB.')
         revision, previous = self.authenticate('PUT', locator, body, headers)
@@ -196,6 +284,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path)
             parts = path.path.strip('/').split('/')
+            if self.server.role == 'chain' and method == 'GET' and path.path == '/v1/explorer' and not path.query:
+                self.reply(200, json.dumps(read_explorer(self.server.data), separators=(',', ':')).encode())
+                return
             if self.server.role=='chain' and getattr(self.server,'native_socket',None):
                 self.native_request(method,path)
                 return

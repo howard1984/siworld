@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>SIWORLD Explorer</title>
+  <link rel="stylesheet" href="explorer.css">
+  <script type="module" src="explorer.mjs"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="site-brand" href="/index.html" aria-label="siworld home"><img src="/assets/siworld-horizontal-on-dark.svg" alt="siworld" width="96" height="37"></a>
+    <nav class="site-nav" aria-label="Website"><a href="/whitepaper.html">Whitepaper</a><a href="/mining.html">Mining</a><a href="/wallet.html">Wallet / Vault</a><a href="/explorer/" aria-current="page">Explorer</a><a href="https://github.com/howard1984/siworld" rel="noreferrer noopener">GitHub</a></nav>
+  </header>
+  <main id="main">
+    <div class="explorer-toolbar"><span class="console-title">SIWORLD<span>.</span>EXPLORER</span><div class="network-control"><label for="network">Network</label><select id="network" disabled><option>Not configured</option></select></div><button id="refresh" disabled>Refresh data <span aria-hidden="true">↻</span></button></div>
+    <div class="page-heading"><div><p class="eyebrow">ENGINEERING NETWORK</p><h1>Network overview</h1></div><div class="sample"><span class="status-dot"></span><span id="status" role="status" aria-live="polite">Loading network configuration…</span></div></div>
+    <p class="notice" id="notice">Public node data. Missing measurements are shown as Unknown.</p>
+    <section class="metrics" aria-label="Network summary">
+      <div><span class="label">Chain height</span><strong id="chain-height">Unknown</strong><small id="tip-hash" class="mono">—</small></div>
+      <div><span class="label">Latest block</span><strong id="latest-age">Unknown</strong><small id="latest-time">Unknown</small></div>
+      <div><span class="label">Difficulty</span><strong id="difficulty">Unknown</strong><small>Relative to the easiest target</small></div>
+      <div><span class="label">Estimated network work rate</span><strong id="hashrate">Unknown</strong><small>Nonce attempts / second · block-time estimate</small></div>
+    </section>
+    <nav class="tabs" aria-label="Explorer sections">
+      <button data-panel="overview" aria-current="page">Overview</button>
+      <button data-panel="supply">Supply &amp; unlocks</button>
+      <button data-panel="governance">Governance</button>
+      <button data-panel="mine">My blocks</button>
+    </nav>
+    <section id="overview" class="panel">
+      <div class="section-heading"><h2>Block intervals</h2><span id="interval-count" class="subtle">No interval sample</span></div>
+      <div class="interval-layout"><div id="interval-chart" class="chart empty" role="img" aria-label="Block intervals unavailable"><span>Interval measurements are unavailable.</span></div><dl class="interval-summary"><div><dt>Mean</dt><dd id="interval-mean">Unknown</dd></div><div><dt>Median</dt><dd id="interval-median">Unknown</dd></div><div><dt>95th percentile</dt><dd id="interval-p95">Unknown</dd></div><div><dt>Range</dt><dd id="interval-range">Unknown</dd></div></dl></div>
+      <div class="section-heading blocks-heading"><h2>Latest blocks</h2><span class="subtle">Slots include padding</span></div>
+      <div class="table-wrap"><table><caption class="sr-only">Latest public block headers</caption><thead><tr><th>Height</th><th>Block hash</th><th>Time</th><th>Difficulty</th><th>Slots <span class="dim">incl. padding</span></th><th>Mode</th></tr></thead><tbody id="blocks"><tr><td colspan="6" class="empty-cell">Block data is unavailable.</td></tr></tbody></table></div>
+    </section>
+    <section id="supply" class="panel" hidden>
+      <div class="section-heading"><h2>Supply</h2><span class="subtle">Amounts in SIP</span></div>
+      <dl class="supply-grid"><div><dt>Cumulative issuance</dt><dd id="issued">Unknown</dd></div><div><dt>Cumulative burn</dt><dd id="burned">Unknown</dd></div><div><dt>Holder pool</dt><dd id="holder-pool">Unknown</dd></div><div><dt>Locked rewards</dt><dd id="locked">Unknown</dd><small>Scheduled subsidy locks only</small></div><div><dt>Estimated circulating supply</dt><dd id="circulating">Unknown</dd><small>Not available from the current projection</small></div></dl>
+      <div class="two-columns"><div><div class="section-heading"><h2>Upcoming reward unlocks</h2></div><p id="unlock-note" class="subtle">Public subsidy reward schedule.</p><div class="table-wrap"><table><thead><tr><th>Unlock height</th><th>Amount · SIP</th></tr></thead><tbody id="unlocks"><tr><td colspan="2" class="empty-cell">Unknown</td></tr></tbody></table></div></div><div><div class="section-heading"><h2>Development fund</h2></div><p class="subtle">Entitlement, released allocation and aggregate spending.</p><div class="table-wrap"><table><thead><tr><th>Member</th><th>Entitled · SIP</th><th>Released · SIP</th><th>Spent · SIP</th></tr></thead><tbody id="funds"><tr><td colspan="4" class="empty-cell">Unknown</td></tr></tbody></table></div></div></div>
+    </section>
+    <section id="governance" class="panel" hidden>
+      <div class="two-columns"><div><div class="section-heading"><h2>Latest signed checkpoint</h2></div><dl class="detail-list"><div><dt>Height</dt><dd id="checkpoint-height">Unknown</dd></div><div><dt>Block hash</dt><dd id="checkpoint-hash" class="mono">Unknown</dd></div><div><dt>Published</dt><dd id="checkpoint-time">Unknown</dd></div><div><dt>Signer-set fingerprint</dt><dd id="checkpoint-roster" class="mono">Unknown</dd></div><div><dt>Signing slots</dt><dd id="checkpoint-votes">Unknown</dd></div></dl></div><div><div class="section-heading"><h2>Active configuration</h2></div><dl class="detail-list"><div><dt>Checkpoint signers</dt><dd id="current-signers">Unknown</dd></div><div><dt>Pending signer changes</dt><dd id="pending-signers">Unknown</dd></div><div><dt>Fee destination</dt><dd id="fee-address" class="mono">Unknown</dd></div><div><dt>Fund destinations</dt><dd id="fund-addresses" class="mono">Unknown</dd></div></dl></div></div>
+      <div class="section-heading"><h2>Public configuration changes</h2><span class="subtle">Address and signer changes</span></div><div class="table-wrap"><table><thead><tr><th>Sequence</th><th>Change</th><th>Submitted</th><th>Effective height</th><th>Status</th></tr></thead><tbody id="changes"><tr><td colspan="5" class="empty-cell">Configuration-change records are unavailable on this network.</td></tr></tbody></table></div>
+    </section>
+    <section id="mine" class="panel" hidden>
+      <div class="section-heading"><h2>My blocks</h2><span class="subtle">Local public receipts</span></div>
+      <div class="receipt-toolbar"><div><p>Load a public block-receipt file from your miner.</p><p class="subtle">The file stays in this tab. Do not select wallet files or keys.</p></div><div class="file-actions"><label class="file-button" for="receipts">Load public receipts<input id="receipts" type="file" accept=".json,application/json"></label><button id="clear-receipts" disabled>Clear</button></div></div>
+      <p id="receipt-status" role="status" class="subtle">No receipts loaded. A public receipt export is required.</p>
+      <div class="mode-summary"><div><span class="label">Imported block receipts</span><strong id="mine-count">—</strong></div><div><span class="label">Holder share</span><strong id="holder-share">—</strong></div><div><span class="label">Voyager share</span><strong id="voyager-share">—</strong></div></div>
+      <div class="table-wrap"><table><thead><tr><th>Height</th><th>Block hash</th><th>Mode</th><th>Current sample</th></tr></thead><tbody id="mine-blocks"><tr><td colspan="4" class="empty-cell">No public receipts loaded.</td></tr></tbody></table></div>
+    </section>
+    <footer><span>SIWORLD · Public chain data</span><span id="snapshot-time">Snapshot time unknown</span><span>Engineering network</span></footer>
+  </main>
+</body>
+</html>

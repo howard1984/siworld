@@ -21,6 +21,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+mod explorer;
 mod export;
 mod recovery;
 use export::PublicExport;
@@ -233,7 +234,10 @@ impl Gateway {
             }
             self.index_step(node)?;
             if self.indexed < self.ids.len() {
-                self.compact(node, self.indexed)?;
+                let bytes = self.compact(node, self.indexed)?;
+                if let Some(export) = &mut self.export {
+                    export.record_header(&crate::compact::CompactBlock::decode(&bytes)?);
+                }
                 self.indexed += 1;
             }
             if self.index_complete(node)
@@ -242,6 +246,10 @@ impl Gateway {
             {
                 export.publish(&node.state().config, &self.ids)?;
                 export.publish_checkpoint(node.store(), &self.ids)?;
+                export.publish_explorer(
+                    node.state(),
+                    node.store().latest_engineering_checkpoint()?.as_ref(),
+                )?;
             }
             Ok(())
         })();
@@ -297,6 +305,9 @@ impl Gateway {
         {
             return Ok(true);
         }
+        if let Some(export) = &mut self.export {
+            export.record_header(&compact);
+        }
         candidate.verified += 1;
         if candidate.verified == candidate.ids.len() {
             // The canonical owner may have reorganized during the bounded warmup.
@@ -326,6 +337,9 @@ impl Gateway {
         {
             self.ids.clear();
             self.indexed = 0;
+            if let Some(export) = &mut self.export {
+                export.clear_headers();
+            }
         }
         if (self.ids.len() as u64) < node.state().height {
             self.ids

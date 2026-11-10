@@ -579,7 +579,14 @@ fn file_export_publishes_only_complete_public_snapshots_without_request_capabili
         private_file(&path);
     }
     private_file(&public.join("chain.json"));
-    assert_eq!(std::fs::read_dir(&public).unwrap().count(), 3);
+    private_file(&public.join("explorer.json"));
+    let explorer: Value =
+        serde_json::from_slice(&std::fs::read(public.join("explorer.json")).unwrap()).unwrap();
+    assert_eq!(explorer["height"], index["height"]);
+    assert_eq!(explorer["tip"], index["tip"]);
+    assert_eq!(explorer["blocks"].as_array().unwrap().len(), 2);
+    assert!(explorer["economics"]["circulating_estimate_atoms"].is_null());
+    assert_eq!(std::fs::read_dir(&public).unwrap().count(), 4);
     assert_eq!(node.state().tip, accepted_tip);
     assert_eq!(node.state().height, 2);
     assert_eq!(node.mempool().len(), 0);

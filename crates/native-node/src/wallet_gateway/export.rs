@@ -13,6 +13,8 @@ pub(super) struct PublicExport {
     published: Option<Hash>,
     checkpoint_published: Option<Hash>,
     next: Instant,
+    headers: super::explorer::Headers,
+    explorer_published: Option<Hash>,
 }
 impl PublicExport {
     pub fn open(root: &Path) -> Result<Self, String> {
@@ -29,7 +31,70 @@ impl PublicExport {
             published: None,
             checkpoint_published: None,
             next: Instant::now(),
+            headers: super::explorer::Headers::default(),
+            explorer_published: None,
         })
+    }
+
+    pub(super) fn record_header(&mut self, record: &crate::compact::CompactBlock) {
+        self.headers.record(record);
+    }
+
+    pub(super) fn clear_headers(&mut self) {
+        self.headers.clear();
+    }
+
+    pub(super) fn publish_explorer(
+        &mut self,
+        state: &crate::state::State,
+        certificate: Option<&crate::engineering_checkpoint::Certificate>,
+    ) -> Result<(), String> {
+        let checkpoint = certificate.map(|certificate| {
+            let statement = &certificate.statement;
+            serde_json::json!({"height":statement.height,"hash":hex(&statement.block_id),
+                "issued_unix_seconds":statement.issued_unix_seconds,"roster":hex(&statement.roster),
+                "signer_indices":certificate.votes.iter().map(|vote|vote.signer).collect::<Vec<_>>()})
+        }).unwrap_or(serde_json::Value::Null);
+        let mut view = self.headers.projection(state, checkpoint, 0);
+        let body = serde_json::to_vec(&view).map_err(|_| "Explorer export encoding failed.")?;
+        let digest = *blake3::hash(&body).as_bytes();
+        if self.explorer_published == Some(digest) {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "Explorer export clock unavailable.")?
+            .as_secs();
+        view["published_unix_seconds"] = now.into();
+        let body = serde_json::to_vec(&view).map_err(|_| "Explorer export encoding failed.")?;
+        if body.len() > 128 * 1024 {
+            return Err("Explorer export byte limit.".into());
+        }
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(|_| "Explorer export randomness unavailable.")?;
+        let temporary = self.root.join(format!("{}.tmp", hex(&random)));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|_| "Explorer export write unavailable.")?;
+            file.write_all(&body)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "Explorer export write failed.")?;
+            fs::rename(&temporary, self.root.join("explorer.json"))
+                .map_err(|_| "Explorer export commit failed.")?;
+            fs::File::open(&self.root)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| "Explorer export directory commit failed.")?;
+            self.explorer_published = Some(digest);
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
     }
 
     /// Only a certificate already accepted by the canonical store is exported.
