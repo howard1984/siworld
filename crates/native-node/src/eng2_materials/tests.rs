@@ -320,3 +320,210 @@ fn fixture_genesis_is_refused_before_binding() {
     );
     assert!(!dir.path("key/checkpoint-bound.secret").exists());
 }
+
+fn signing_file(dir: &Directory, name: &str, command: &Value) -> (std::path::PathBuf, [u8; 32]) {
+    let bytes = serde_json::to_vec(command).unwrap();
+    let path = dir.path(name);
+    fs::write(&path, &bytes).unwrap();
+    (path, Sha256::digest(&bytes).into())
+}
+fn signing_pins(receipt: &Value, purpose: Purpose, request_sha256: [u8; 32]) -> SigningPins {
+    SigningPins {
+        network: [1; 32],
+        purpose,
+        index: 0,
+        authority_sha256: crate::eng2_operations::public_bytes(
+            &receipt["public_identity_sha256"],
+            32,
+        )
+        .unwrap()
+        .try_into()
+        .unwrap(),
+        request_sha256,
+    }
+}
+fn joint_request() -> Value {
+    let public_key = |seed| {
+        let (bytes, _) =
+            public_parameters([1; 32], Purpose::Founder, 0, Zeroizing::new([seed; 32])).unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()["public_key_hex"].clone()
+    };
+    crate::eng2_operations::execute(&serde_json::to_vec(&json!({
+        "operation":"governance-prepare", "network":crate::local::hex(&[1;32]), "sequence":"1",
+        "action":{"type":"rotate-owners", "founder_hex":public_key(6), "revocation_hex":public_key(7)}
+    })).unwrap()).unwrap()
+}
+#[test]
+fn custody_joint_signatures_bind_one_payload_and_verify_existing_governance() {
+    let dir = Directory::new();
+    let operation = joint_request();
+    let mut signatures = Vec::new();
+    let mut payload = None;
+    for (i, purpose) in [Purpose::Founder, Purpose::Revocation]
+        .into_iter()
+        .enumerate()
+    {
+        let name = purpose.name();
+        let material = prepared(&dir, name, purpose, 0, i as u8 + 1);
+        let command = json!({"operation":"governance-sign", "request_hex":operation["request_hex"], "confirmed_digest":operation["messages"][i]["review_digest"]});
+        let (path, digest) = signing_file(&dir, &format!("{name}.json"), &command);
+        let result = sign_operation(
+            &dir.path(name),
+            &path,
+            signing_pins(&material, purpose, digest),
+        )
+        .unwrap();
+        assert_eq!(result["role"], name);
+        assert_eq!(result["signature_verified"], true);
+        assert_eq!(result["chain_state_verified"], false);
+        if let Some(expected) = &payload {
+            assert_eq!(&result["unsigned_payload_sha256"], expected);
+        }
+        payload = Some(result["unsigned_payload_sha256"].clone());
+        for excluded in [
+            "seed",
+            "public_key_hex",
+            "address_hex",
+            "authority_hex",
+            "request_hex",
+            "claim_hex",
+        ] {
+            assert!(result.get(excluded).is_none());
+        }
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains(dir.0.to_str().unwrap())
+        );
+        signatures.push(json!({"role":name,"signature_hex":result["signature_hex"]}));
+    }
+    let wrapped = crate::eng2_operations::execute(&serde_json::to_vec(&json!({"operation":"governance-wrap", "request_hex":operation["request_hex"], "signatures":signatures})).unwrap()).unwrap();
+    let action = crate::eng2_governance::SignedAction::decode(
+        &crate::eng2_operations::public_bytes(&wrapped["signed_action_hex"], 16384).unwrap(),
+    )
+    .unwrap();
+    let mut changed_payload = action.clone();
+    if let crate::eng2_governance::ActionKind::RotateOwnerKeys { founder, .. } =
+        &mut changed_payload.action.kind
+    {
+        founder[0] ^= 1;
+    } else {
+        panic!("joint fixture must rotate owners");
+    }
+    assert!(
+        crate::eng2::snapshot::tests::bootstrap()
+            .governance
+            .apply_block(1, &[changed_payload])
+            .is_err()
+    );
+    let mut state = crate::eng2::snapshot::tests::bootstrap().governance;
+    state.apply_block(1, std::slice::from_ref(&action)).unwrap();
+    let mut wrong = action;
+    wrong.signatures[0].role = crate::eng2_governance::SignerRole::Revocation;
+    wrong.signatures[1].role = crate::eng2_governance::SignerRole::Founder;
+    assert!(
+        crate::eng2::snapshot::tests::bootstrap()
+            .governance
+            .apply_block(1, &[wrong])
+            .is_err()
+    );
+}
+#[test]
+fn custody_signing_rejects_wrong_network_role_index_authority_and_request_pins() {
+    let dir = Directory::new();
+    let material = prepared(&dir, "founder", Purpose::Founder, 0, 1);
+    let operation = joint_request();
+    let command = json!({"operation":"governance-sign", "request_hex":operation["request_hex"], "confirmed_digest":operation["messages"][0]["review_digest"]});
+    let (path, digest) = signing_file(&dir, "request.json", &command);
+    let correct = signing_pins(&material, Purpose::Founder, digest);
+    for pins in [
+        SigningPins {
+            network: [2; 32],
+            ..correct
+        },
+        SigningPins {
+            purpose: Purpose::Revocation,
+            ..correct
+        },
+        SigningPins {
+            index: 1,
+            ..correct
+        },
+        SigningPins {
+            authority_sha256: [9; 32],
+            ..correct
+        },
+        SigningPins {
+            request_sha256: [9; 32],
+            ..correct
+        },
+        SigningPins {
+            purpose: Purpose::FeeWallet,
+            ..correct
+        },
+    ] {
+        assert!(sign_operation(&dir.path("founder"), &path, pins).is_err());
+    }
+    let mut wrong = command;
+    wrong["confirmed_digest"] = operation["messages"][1]["review_digest"].clone();
+    let (path, digest) = signing_file(&dir, "wrong-role-review.json", &wrong);
+    assert!(
+        sign_operation(
+            &dir.path("founder"),
+            &path,
+            SigningPins {
+                request_sha256: digest,
+                ..correct
+            }
+        )
+        .is_err()
+    );
+    let key = dir.path("founder/pending.secret");
+    let mut bytes = fs::read(&key).unwrap();
+    bytes[105] ^= 1;
+    fs::write(&key, bytes).unwrap();
+    assert!(sign_operation(&dir.path("founder"), &dir.path("request.json"), correct).is_err());
+}
+#[test]
+fn custody_fund_signature_attaches_through_existing_claim_verification() {
+    let dir = Directory::new();
+    let material = prepared(&dir, "claim", Purpose::FundClaim, 0, 8);
+    let public: Value =
+        serde_json::from_slice(&fs::read(dir.path("claim/public.json")).unwrap()).unwrap();
+    let (address, _) =
+        public_parameters([1; 32], Purpose::FundWallet, 0, Zeroizing::new([44; 32])).unwrap();
+    let address: Value = serde_json::from_slice(&address).unwrap();
+    let prepare = |member| {
+        crate::eng2_operations::execute(&serde_json::to_vec(&json!({
+        "operation":"claim-prepare", "network":crate::local::hex(&[1;32]), "height":"26", "member":member,
+        "amount_atoms":"1", "counter":"0", "destination_hex":address["address_hex"], "authority_hex":public["public_key_hex"], "rseed_hex":"00".repeat(48)
+    })).unwrap()).unwrap()
+    };
+    let claim = prepare(0);
+    let command = json!({"operation":"claim-sign", "claim_hex":claim["claim_hex"], "confirmed_digest":claim["review_digest"]});
+    let (path, digest) = signing_file(&dir, "claim.json", &command);
+    let result = sign_operation(
+        &dir.path("claim"),
+        &path,
+        signing_pins(&material, Purpose::FundClaim, digest),
+    )
+    .unwrap();
+    let attached = crate::eng2_operations::execute(&serde_json::to_vec(&json!({"operation":"claim-attach", "claim_hex":claim["claim_hex"], "authority_hex":public["public_key_hex"], "signature_hex":result["signature_hex"]})).unwrap()).unwrap();
+    assert_eq!(attached["signature_verified"], true);
+    assert_eq!(result["entitlement_verified"], false);
+    assert!(result.get("claim_hex").is_none());
+    let other = prepare(1);
+    let (path, digest) = signing_file(
+        &dir,
+        "wrong-member.json",
+        &json!({"operation":"claim-sign", "claim_hex":other["claim_hex"], "confirmed_digest":other["review_digest"]}),
+    );
+    assert!(
+        sign_operation(
+            &dir.path("claim"),
+            &path,
+            signing_pins(&material, Purpose::FundClaim, digest)
+        )
+        .is_err()
+    );
+}

@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
+mod signing;
 mod storage;
+pub use signing::{SigningPins, sign_operation};
 #[cfg(test)]
 mod tests;
 
@@ -106,7 +108,7 @@ fn receipt(
     identity: &str,
     operation: &str,
 ) -> Value {
-    json!({"version":1,"scope":"eng2-only","operation":operation,"network":crate::local::hex(&network),"purpose":purpose.name(),"index":index,"public_parameters_sha256":sha(public),"public_identity_sha256":identity,"private_directory_mode":"0700","private_file_mode":"0600","write_once":true,"source":{"package_version":env!("CARGO_PKG_VERSION"),"commit":option_env!("SIWORLD_BUILD_COMMIT"),"module_sha256":sha(include_bytes!("eng2_materials.rs")),"storage_sha256":sha(include_bytes!("eng2_materials/storage.rs")),"cli_sha256":sha(include_bytes!("bin/siworld-eng2-materials.rs"))}})
+    json!({"version":1,"scope":"eng2-only","operation":operation,"network":crate::local::hex(&network),"purpose":purpose.name(),"index":index,"public_parameters_sha256":sha(public),"public_identity_sha256":identity,"private_directory_mode":"0700","private_file_mode":"0600","write_once":true,"source":{"package_version":env!("CARGO_PKG_VERSION"),"commit":option_env!("SIWORLD_BUILD_COMMIT"),"module_sha256":sha(include_bytes!("eng2_materials.rs")),"storage_sha256":sha(include_bytes!("eng2_materials/storage.rs")),"signing_sha256":sha(include_bytes!("eng2_materials/signing.rs")),"cli_sha256":sha(include_bytes!("bin/siworld-eng2-materials.rs"))}})
 }
 /// Create a new independent seed. The custody directory must not exist and must
 /// be outside every Git checkout. Only public hashes are returned.

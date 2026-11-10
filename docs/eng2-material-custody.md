@@ -75,3 +75,54 @@ changing the runtime loader. A second bind, wrong genesis, wrong slot, altered
 public record, permissive private mode, hard link or symlink fails without
 replacing existing files. Interrupted preparation is preserved for explicit
 inspection; there is no automatic repair or replacement identity.
+
+## Reviewed local authority signing
+
+Existing founder, revocation and fund-claim records can sign a reviewed public
+operation without exporting their seed or creating another secret file:
+
+```sh
+siworld-eng2-materials sign PRIVATE_DIRECTORY NETWORK_HEX PURPOSE INDEX \
+  AUTHORITY_SHA256 PUBLIC_REQUEST_FILE REQUEST_SHA256
+```
+
+`PURPOSE` is exactly `founder`, `revocation` or `fund-claim`. Founder and
+revocation indices are zero; a fund-claim index must match the public claim's
+member. `AUTHORITY_SHA256` independently pins the original preparation receipt's
+`public_identity_sha256`, which hashes the raw ML-DSA-65 verification key.
+`REQUEST_SHA256` independently pins the exact complete public request file.
+Both pins and the nonzero network are mandatory lowercase 32-byte hashes.
+Wallet and checkpoint material purposes cannot use this command.
+
+The public file uses the canonical `governance-sign` or `claim-sign` request
+specified in [operation files](eng2-operation-files.md). Its `confirmed_digest`
+remains the independently reviewed, role-specific digest returned by public
+preparation. A changed file, wrong network, purpose, index, authority, digest or
+malformed custody record is rejected. Record and directory ownership, exact
+permissions, single links, symlink rejection and checksum verification use the
+same protected local custody rules as preparation and binding. The stored public
+parameters must exactly equal those derived from the prepared authority.
+
+Signing calls the existing operation signer in the same process. Owned record,
+seed and signing-key buffers are erased on release. The seed is never sent to
+another process, an argument, environment variable, temporary file, log or
+output. The original custody files are preserved. This remains an engineering
+utility with owner-protected plaintext seed storage; it does not establish
+production encrypted custody or protection from operating-system compromise.
+
+The result contains a detached `signature_hex`, public fingerprints,
+`public_request_sha256`, `unsigned_payload_sha256`, `review_digest` and the
+source/executable receipt. It does not echo public keys, addresses or the
+operation payload. Governance signatures additionally identify their role.
+Joint management authorization requires separately reviewed founder and
+revocation files for the same unsigned action: their role-specific review
+and file digests differ, while `unsigned_payload_sha256` must match. The existing
+`governance-wrap` operation combines the public signatures; `claim-attach`
+attaches a fund signature to the original public claim.
+
+`signature_verified` establishes only local cryptographic verification.
+`chain_state_verified`, `state_changed` and `submitted` remain false; fund
+entitlement and current-recipient checks also remain false. Actual native block
+admission checks active roles, sequence, recipient, member counter and available
+fund balance. Public claim `rseed_hex` is a public 48-byte note opening and must
+never contain the private 32-byte authority seed.
