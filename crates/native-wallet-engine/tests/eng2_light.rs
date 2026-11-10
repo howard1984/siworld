@@ -157,6 +157,11 @@ fn receives_scans_all_history_and_reopens_only_same_context_private_cache() {
     assert_eq!(balance["send_supported"], false);
     assert_eq!(balance["full_node_consensus_verified"], false);
     assert_eq!(wallet.wallet().receipts().len(), 1);
+    assert_eq!(wallet.output_count(), 133);
+    assert_eq!(wallet.asset_count(), 0);
+    assert_eq!(wallet.tip_snapshot().selector.height, 1);
+    assert_eq!(wallet.tip_snapshot().selector.block_id, wallet.tip());
+    assert_eq!(wallet.tip_snapshot().commitment_root, wallet.root());
     let cached = wallet.local_cache().unwrap();
     let reopened =
         Eng2LightState::open_local(&genesis, id, Zeroizing::new([42; 32]), 0, &cached).unwrap();

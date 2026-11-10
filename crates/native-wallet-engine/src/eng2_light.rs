@@ -90,6 +90,18 @@ impl Eng2LightState {
     pub fn root(&self) -> DigestBytes {
         encode_digest(&self.state.tree.root())
     }
+    /// Number of public output commitments scanned into the local frontier.
+    pub fn output_count(&self) -> u64 {
+        self.state.tree.count
+    }
+    /// Latest authenticated public root snapshot retained by this wallet.
+    pub fn tip_snapshot(&self) -> &CanonicalSnapshot {
+        self.state.tip_snapshot()
+    }
+    /// Number of public asset declarations scanned from authenticated receipts.
+    pub fn asset_count(&self) -> usize {
+        self.state.assets.len()
+    }
     pub fn header(&self, height: u64) -> Option<&Header> {
         usize::try_from(height.checked_sub(1)?)
             .ok()
