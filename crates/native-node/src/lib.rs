@@ -14,6 +14,8 @@ pub(crate) use eng2::header as wallet_eng2_header;
 pub mod eng2_economics;
 pub mod eng2_fund;
 pub mod eng2_governance;
+#[cfg(unix)]
+pub mod eng2_materials;
 pub mod eng2_operations;
 pub mod eng2_settlement;
 pub mod eng2_settlement_air;
