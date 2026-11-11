@@ -55,6 +55,14 @@ The source adapter uses the following routes:
 Head publication must be no more than 300 seconds old or 30 seconds in the
 future. This is a freshness check on a service export, not proof of current
 peer connectivity. The client rechecks the head before durable adoption.
+Public reads use at most three transport attempts, each with a separate
+30-second deadline and 0.5- then 1-second backoff. Network failures, timeouts
+and HTTP 429, 502, 503 or 504 are retryable. Decoding, byte bounds, context
+checks and native authentication remain outside that retry boundary.
+Cancellation ends the pending request and backoff. The page retries a paused
+synchronization after five seconds; a failed initialization is attempted again
+by either the timer or the explicit synchronization control.
+
 Transport admission or an unsigned head response does not establish native
 proof validity. Redirects, credentials and legacy endpoint fallback are absent.
 
@@ -62,9 +70,13 @@ proof validity. Redirects, credentials and legacy endpoint fallback are absent.
 
 All block work and receipt checks finish in an isolated native candidate.
 Candidate append returns height, tip and `committed:false`; it does not return
-candidate balances as final. Adoption requires reaching the exact pinned head
-and greater cumulative work for a changed tip. The current local balance
-remains available as stale data if a scan fails.
+candidate balances as final. A direct extension saves an authenticated prefix
+every eight blocks after checking its work and the fresh service head's branch.
+A competing branch is adopted only after the complete selected candidate passes
+validation; partial competing prefixes never replace the accepted state.
+Only the exact fresh head marks synchronization ready. Saved partial prefixes
+remain stale, and reopening downloads only blocks after that durable prefix.
+The current local balance remains available as stale data if a scan fails.
 
 The IndexedDB namespace contains network, genesis, rules, native profile and
 fee mode. No engineering-v1 database, journal, compact cache, vault store or

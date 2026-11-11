@@ -2,8 +2,8 @@
   "version": 1,
   "application": "wallet",
   "network_context": "../networks/eng2-readonly.json",
-  "release": "affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6",
-  "release_manifest_sha256": "7f73a579f40050b2f968b4b5316a6401bbb6bb1823cdc8382c645cab9580bfa0",
+  "release": "b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957",
+  "release_manifest_sha256": "2ee6245c3b6cb10b2abfa7fce864e41b55f58bf90a484db9f7fd6145c0ce736f",
   "tool_versions": {
     "esbuild": "0.25.12",
     "wasm_bindgen": "0.2.120",
@@ -391,8 +391,8 @@
     },
     {
       "raw_path": "assets/native-wallet.js",
-      "bytes": 33904,
-      "sha256": "b6d1f7c73ee9f8d50301c7c67d8400daf7508fb77b71d0c92fb6a2fea08ed086",
+      "bytes": 33885,
+      "sha256": "73850da1968520e7202d4346a768118a6a11a9fb1334a5b28c09a546ed4a79c4",
       "kind": "source",
       "source_mapping": "crates/native-wallet-web/web/assets/native-wallet.js"
     },
@@ -524,8 +524,8 @@
     },
     {
       "raw_path": "sdk/eng2-session.js",
-      "bytes": 10526,
-      "sha256": "56cd9dabadadb265b89aa72d4997eb188a9f3b5f42e3a8a96d5aead9dccb805c",
+      "bytes": 12059,
+      "sha256": "cc46c38eea4d150da723340b78830ac95b2591e4bf4f3e7c3382a8e6649d3b51",
       "kind": "source",
       "source_mapping": "crates/native-wallet-web/web/sdk/eng2-session.js"
     },
@@ -570,6 +570,13 @@
       "sha256": "3d4baf1a9aa59b13d83ec045e03101638ce8e9b22ab61e030283e095d711dc26",
       "kind": "source",
       "source_mapping": "crates/native-wallet-web/web/sdk/proof-progress.js"
+    },
+    {
+      "raw_path": "sdk/public-fetch.js",
+      "bytes": 1875,
+      "sha256": "d67335fd9110533ac06bfe18921df55afff613fa59a3ab6823dcbe2c58226690",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/public-fetch.js"
     },
     {
       "raw_path": "sdk/runtime-profile.js",
@@ -625,30 +632,30 @@
     {
       "path": "release-manifest.json",
       "bytes": 1262,
-      "sha256": "7f73a579f40050b2f968b4b5316a6401bbb6bb1823cdc8382c645cab9580bfa0"
+      "sha256": "2ee6245c3b6cb10b2abfa7fce864e41b55f58bf90a484db9f7fd6145c0ce736f"
     },
     {
-      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/rayon-worker.mjs",
+      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/rayon-worker.mjs",
       "bytes": 53978,
       "sha256": "727e3afbbd4fc1b6ad98b35c577edd54c3fa37a116d7d916602fa4f1effb1179"
     },
     {
-      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet-worker.mjs",
-      "bytes": 156260,
-      "sha256": "45a8843abaef3aa7d9bfac589d64e6dcf46bd6cb1d738b9fc18d40e8f1f1871d"
+      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet-worker.mjs",
+      "bytes": 159671,
+      "sha256": "caee373623625e706dcaba57e08a0d4759e75ba354eb861ef393cc515bb0da81"
     },
     {
-      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet.css",
+      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet.css",
       "bytes": 12276,
       "sha256": "eecb297e9a64345accc810f95adddbb0408da186fadeb20f05fa6175a1cc1c1d"
     },
     {
-      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet.mjs",
-      "bytes": 56210,
-      "sha256": "1949dac01237f41870e868b3b0f4c3398e7646f03aaa9c52823068a34a927a05"
+      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet.mjs",
+      "bytes": 56144,
+      "sha256": "fb0ecae0740f3df8ebc64e2683c15e44ec8b3d78b2464f064bce5bfc08bd199e"
     },
     {
-      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet_bg.wasm",
+      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet_bg.wasm",
       "bytes": 9740455,
       "sha256": "7d95a72ac5ab2f78d1633ead7d1000646f19eaeee189180c29d8600cec3d8b64"
     },
@@ -660,7 +667,7 @@
     {
       "path": "wallet.html",
       "bytes": 14860,
-      "sha256": "b7c76c17c152690ce0c736c48a0129620c44ddfa4ba67c0cdef9137f1e658f28"
+      "sha256": "a90cf4843958bdb521db82253fa879e37f2052bad8be7414b68bc2afa278bba9"
     }
   ]
 }
