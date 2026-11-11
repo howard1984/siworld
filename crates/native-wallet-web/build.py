@@ -1,4 +1,4 @@
-"""Build the locked portable V1 wallet into a separate static directory."""
+"""Build the locked portable wallet into an isolated static directory."""
 import argparse
 import json
 import os
@@ -7,12 +7,53 @@ import shlex
 from pathlib import Path
 import shutil
 import subprocess
+from urllib.parse import urlsplit
+
+
+def engineering_v2_manifest(data):
+    required = {'version', 'name', 'network', 'genesis', 'rules', 'profile', 'fee_mode', 'api', 'read_only'}
+    identifiers = ('network', 'genesis', 'rules', 'profile')
+    if (not isinstance(data, dict) or set(data) != required or type(data['version']) is not int or data['version'] != 2
+            or data['name'] != 'siworld-eng-2' or type(data['fee_mode']) is not int or data['fee_mode'] != 0
+            or data['read_only'] is not True or any(not isinstance(data[key], str)
+                or not re.fullmatch('[0-9a-f]{64}', data[key]) or set(data[key]) == {'0'} for key in identifiers)):
+        raise ValueError('Pin the exact read-only engineering-v2 network, genesis, rules, native profile and LegacyMiner mode.')
+    if not isinstance(data['api'], str):
+        raise ValueError('An exact engineering-v2 API origin is required.')
+    endpoint = urlsplit(data['api'])
+    endpoint.port  # Reject invalid or out-of-range ports before invoking tools.
+    if (not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment
+            or endpoint.path not in ('', '/') or not (endpoint.scheme == 'https' or endpoint.scheme == 'http'
+                and endpoint.hostname in ('localhost', '127.0.0.1', '::1'))
+            or not re.fullmatch(r'[A-Za-z0-9.:[\]\-]+', endpoint.netloc)):
+        raise ValueError('Use an exact pinned HTTPS or loopback engineering-v2 API origin.')
+    return {**data, 'api': data['api'].rstrip('/'), 'account': 0, 'desktop_send_measured': False}
+
+
+
+def engineering_v2_html(text):
+    """Label the engineering-v2 page without changing the shared V1 template."""
+    replacements = {
+        'siworld-eng-1': 'siworld-eng-2', 'SIWORLD-ENG-1': 'SIWORLD-ENG-2',
+        'native V1': 'engineering-v2', 'Native V1': 'Engineering-v2',
+        'NATIVE V1': 'ENGINEERING-V2', 'V1 ACCOUNT': 'ENGINEERING-V2 ACCOUNT',
+        'Your V1 receiving address.': 'Your engineering-v2 receiving address.',
+        'Recipient short or full V1 address': 'Recipient full engineering-v2 address',
+        'Authenticated compact sync': 'Authenticated receipt sync',
+        'Unlock to scan public compact records locally.': 'Unlock to scan authenticated receipts locally.',
+        'Paste either address directly into the miner setup. Full addresses work without a directory; enable the short address once to make it resolvable.': 'Use the full receiving address. Short-address publication is unavailable in this build.',
+        'Enable the short address before using it. This publishes only its matching public full address; no recovery words, private keys or viewing keys leave this device.': 'Use the full receiving address. Short-address publication is unavailable in this build.',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--network-manifest', type=Path)
+    parser.add_argument('--eng2-manifest', type=Path, help='Explicit read-only engineering-v2 context; incompatible with legacy manifests and fixtures.')
     parser.add_argument('--wasm-bindgen', default='wasm-bindgen')
     parser.add_argument('--rules-file', type=Path)
     parser.add_argument('--chain-api')
@@ -27,8 +68,12 @@ def main():
     if output.exists():
         raise SystemExit('Output must be a fresh directory; existing files are preserved.')
     manifest = None
+    if args.eng2_manifest and (args.network_manifest or args.browser_fixtures or args.rules_file or args.chain_api or args.vault_manifest):
+        raise SystemExit('Engineering-v2 builds cannot use legacy rules, manifests, endpoints or synthetic fixture mode.')
     if args.browser_fixtures and args.network_manifest:
         raise SystemExit('Synthetic fixture builds cannot use a deployment manifest.')
+    if args.eng2_manifest:
+        manifest = engineering_v2_manifest(json.loads(args.eng2_manifest.read_text()))
     if args.network_manifest:
         data = json.loads(args.network_manifest.read_text())
         network = data.get('network')
@@ -85,6 +130,10 @@ def main():
     binary = (core / 'wallet_bg.wasm').read_bytes()
     if manifest:
         (output / 'sdk/network.js').write_text('export const ENGINEERING = ' + json.dumps(manifest) + ';\n')
+        if manifest['name'] == 'siworld-eng-2':
+            shutil.copyfile(crate / 'web/sdk/eng2-custody.js', output / 'sdk/storage.js')
+            page = output / 'wallet.html'
+            page.write_text(engineering_v2_html(page.read_text()))
     if manifest:
         html=(output/'wallet.html').read_text().replace("connect-src 'self';", "connect-src 'self' " + manifest['api'] + ";")
         (output/'wallet.html').write_text(html)

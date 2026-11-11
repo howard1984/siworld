@@ -1,5 +1,5 @@
 const sip = '0'.repeat(64);
-const phases = {prepared: 'Proof incomplete', finalized: 'Ready to send', pending: 'Pending', unknown: 'Status uncertain', confirmed: 'Confirmed'};
+const phases = {prepared: 'Proof incomplete', finalized: 'Ready to send', pending: 'Pending', unknown: 'Status uncertain', confirmed: 'Confirmed', reserved: 'Proof incomplete', uncertain: 'Status uncertain', accepted: 'Pending', included: 'Included in authenticated receipt', cancelled: 'Cancelled'};
 export function transactionRows(result) {
   const grouped = new Map();
   for (const note of result.received_records || []) {

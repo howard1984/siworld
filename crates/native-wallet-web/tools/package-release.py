@@ -20,7 +20,7 @@ HEADERS = {
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), display-capture=()',
-    'Strict-Transport-Security': 'max-age=31536000',
+    'Strict-Transport-Security': 'max-age=86400',
 }
 
 

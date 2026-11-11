@@ -1,0 +1,666 @@
+{
+  "version": 1,
+  "application": "wallet",
+  "network_context": "../networks/eng2-readonly.json",
+  "release": "affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6",
+  "release_manifest_sha256": "7f73a579f40050b2f968b4b5316a6401bbb6bb1823cdc8382c645cab9580bfa0",
+  "tool_versions": {
+    "esbuild": "0.25.12",
+    "wasm_bindgen": "0.2.120",
+    "rustc": "1.99.1 (58cf8f9c3 2026-10-13)"
+  },
+  "runtime_binary": {
+    "sha256": "7d95a72ac5ab2f78d1633ead7d1000646f19eaeee189180c29d8600cec3d8b64",
+    "bytes": 9740455,
+    "reuse_existing_binary": true,
+    "rebuilt_for_this_revision": false,
+    "bit_reproduction_verified": false,
+    "features": [
+      "wasm-simd",
+      "wasm-threads"
+    ],
+    "browser_fixtures": false
+  },
+  "packager": {
+    "path": "crates/native-wallet-web/tools/package-release.py",
+    "sha256": "37443ad17a1a5d9ed97315135ae81f4bad1d8e6b581ea2b05b17177d74f67e86"
+  },
+  "wasm_source_inputs": [
+    {
+      "path": "crates/bench-d8/src/agg.rs",
+      "bytes": 46668,
+      "sha256": "8938c4cd8aa11c845769258d7f07402087b653619cb8306181f2d2c1e6bfd5aa"
+    },
+    {
+      "path": "crates/bench-d8/src/air.rs",
+      "bytes": 29280,
+      "sha256": "f2ad495f685af6a4f32fe9efbeb184b4a6e9563a2704b09e55f9634a9feaa841"
+    },
+    {
+      "path": "crates/bench-d8/src/codec.rs",
+      "bytes": 16458,
+      "sha256": "701c18cf2325024726de26d9bb2c41853131676ce9ca15227a6d16635bcf5c29"
+    },
+    {
+      "path": "crates/bench-d8/src/common.rs",
+      "bytes": 43347,
+      "sha256": "438c3c5a4366227312beab31b5da6b882181eeb588f9735bd8e2e7393038a4bd"
+    },
+    {
+      "path": "crates/bench-d8/src/encryption.rs",
+      "bytes": 42553,
+      "sha256": "791d6f58cb3b7138b82038d06307e809987a8761b18eeec93c237f662e04361d"
+    },
+    {
+      "path": "crates/bench-d8/src/envelope.rs",
+      "bytes": 37153,
+      "sha256": "c10ebdffacffe99bcf5eef20d899106ce1a7950700df7784cc5d4ad786628526"
+    },
+    {
+      "path": "crates/bench-d8/src/fee_settlement.rs",
+      "bytes": 13272,
+      "sha256": "4e6d6cfd7df71f8a11695d0819bc7abe9b3b6c39db268b614b6eae778b0b1b47"
+    },
+    {
+      "path": "crates/bench-d8/src/fee_settlement_air.rs",
+      "bytes": 29258,
+      "sha256": "55c5e0995df1f6eb557f68167a86056f2fccf8adce73b58fe7c668ca61239918"
+    },
+    {
+      "path": "crates/bench-d8/src/lib.rs",
+      "bytes": 28501,
+      "sha256": "e204c3c32291c09cec04ebd8acdcbe17d74b2e91396f9a4355d1897f33d9b764"
+    },
+    {
+      "path": "crates/bench-d8/src/native_verifier.rs",
+      "bytes": 11837,
+      "sha256": "361f02c2be9376d1d0f844104295eea8cc5ac36adba471d49d760c6da1c75662"
+    },
+    {
+      "path": "crates/bench-d8/src/padding_pool.rs",
+      "bytes": 26772,
+      "sha256": "17ea7229b0542ffffe3e974e2d2641658e3c63bbfa240a8ebcfb835359b25193"
+    },
+    {
+      "path": "crates/bench-d8/src/proof_codec.rs",
+      "bytes": 34774,
+      "sha256": "5f0efab7f375054835583fae3d1692d91169e4dc6756f9f010568b6791283c00"
+    },
+    {
+      "path": "crates/bench-d8/src/snapshots.rs",
+      "bytes": 17361,
+      "sha256": "e3decb9c103e8766c04e7377eb808aa271a40a82e35a0f85e7ee3d2de1ff764c"
+    },
+    {
+      "path": "crates/bench-d8/src/trace.rs",
+      "bytes": 11671,
+      "sha256": "2d52c913666acd1839b40c101a0bd990431590f33791808fc6a8478391a49ed2"
+    },
+    {
+      "path": "crates/bench-d8/src/transaction.rs",
+      "bytes": 24408,
+      "sha256": "dcc5cf7d983d71975cf0ac4bd1b3167f19737f50582b2aeec8cd03a0acdda15c"
+    },
+    {
+      "path": "crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json",
+      "bytes": 17054,
+      "sha256": "c50622d69bdb6db816121dd716255f64ab796c37fdab8a96675e34875ecb8664"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/codec.rs",
+      "bytes": 13904,
+      "sha256": "063ee6abe4598043306c68c7ac6804bb0f79cd6758d4e0f21308d422dd9a2107"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/confidential_fees.rs",
+      "bytes": 13327,
+      "sha256": "f43732a5cea78865be53d6c20034f1eadcfe4423d151e898bf9a581d7ef05c8b"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/encryption.rs",
+      "bytes": 45829,
+      "sha256": "bfdad201823f6a0db5ff217c9702e507d9c871597fd20098ab3316668cd04bd0"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/issuance.rs",
+      "bytes": 18424,
+      "sha256": "4cffebde2cf7f8b72ef99499ea8077513c628bb9b7e09001b71d9e1afa647fef"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/issuance_air.rs",
+      "bytes": 18515,
+      "sha256": "4ec04d8216274351c088adc5057be6013fb78683b71fb8af0b1e1177d7af957f"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/lib.rs",
+      "bytes": 611,
+      "sha256": "8968f9875bcbdf716d52f4f26eac27a42ae9a7acd15c722e2d537c1e01bf1ca2"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/multi_asset.rs",
+      "bytes": 30237,
+      "sha256": "387afb36293b43391da44aaab1febd48dad44d0d2cccdc685e577dfa80fc2a97"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/multi_asset_air.rs",
+      "bytes": 33704,
+      "sha256": "0746dcdda77f7c3cbf7a8457e310bff877a4d968976aabccd0351f72fedbc055"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/multi_asset_trace.rs",
+      "bytes": 14551,
+      "sha256": "18fa9a819e2db084c232dad7d847b633aeb3eed46808e34bde0511d7b94d2c11"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/multi_asset_transaction.rs",
+      "bytes": 32935,
+      "sha256": "c951ba3d54131934f0871165e758ae08a4fafe84ec70bf7561b5ffdb9153c2d4"
+    },
+    {
+      "path": "crates/bench-multi-asset/src/settlement.rs",
+      "bytes": 33775,
+      "sha256": "df51629a6bb3b6a8cd01144d2cf73aaf8779352e51368912202b133a147f9a98"
+    },
+    {
+      "path": "crates/core/src/codec.rs",
+      "bytes": 11777,
+      "sha256": "bdc351faf5ded6637be55e5f64830ab55c28ff0fa934cdbfbc29577abaa7f8d7"
+    },
+    {
+      "path": "crates/core/src/issuance.rs",
+      "bytes": 2266,
+      "sha256": "6e1d2f18a87345306285ca036290a906bef38b693453d04b0b0397c8eb6c6b6d"
+    },
+    {
+      "path": "crates/core/src/lib.rs",
+      "bytes": 313,
+      "sha256": "2a15841a36c46443dfea7023d412bb78ee182efa86f14db39c7c6557a4842a53"
+    },
+    {
+      "path": "crates/core/src/params.rs",
+      "bytes": 7279,
+      "sha256": "7ae2fd61bc73ee1192424505271e4fc120fc029ceadfb9c9c515c6002e74ba4b"
+    },
+    {
+      "path": "crates/core/src/pow.rs",
+      "bytes": 5730,
+      "sha256": "8598471aa0b655d56cda2ab17aa00d5e026aac26b5cdf5e47f0be66f1920cba7"
+    },
+    {
+      "path": "crates/core/src/types.rs",
+      "bytes": 20192,
+      "sha256": "3bdd90cf0dd1ee275e42301d090bef2d738d67fd0d407d4ebad874fc5048c573"
+    },
+    {
+      "path": "crates/core/src/v1_economics.rs",
+      "bytes": 33398,
+      "sha256": "f83784fd9fadfd6e7bd18b213831f65272ab2d03cb38ff64ab741661ad379726"
+    },
+    {
+      "path": "crates/core/src/v1_economics/cache.rs",
+      "bytes": 6723,
+      "sha256": "5fb63da5bf26117eea1956b60b82c3eadfc865ad872993babf54bc653fe0572a"
+    },
+    {
+      "path": "crates/native-node/src/audit.rs",
+      "bytes": 9218,
+      "sha256": "a4ca5af2a70b5d5ead9a1f5ff9ca2f5b758b0aa0099b20329652e85ad3460efd"
+    },
+    {
+      "path": "crates/native-node/src/chain_actions.rs",
+      "bytes": 14163,
+      "sha256": "dd6fe77fdb503addf3a901f4e3cd45133c1b82e33c1e932c644daced7b7326d0"
+    },
+    {
+      "path": "crates/native-node/src/eng2/header.rs",
+      "bytes": 7788,
+      "sha256": "b944d977e21e8de3460819f535f1c9f9a6fc72771e28e5c7bf8f4d8c2fceab0c"
+    },
+    {
+      "path": "crates/native-node/src/fund_spend.rs",
+      "bytes": 8684,
+      "sha256": "9f525722cefa3f4222c540e93af4549f0064dd74a20d8b478dfd494477abf019"
+    },
+    {
+      "path": "crates/native-node/src/issuance.rs",
+      "bytes": 26074,
+      "sha256": "d045619fe93705cda77542e64f36197c90bc6a0a0f8a9233e46c6e99b5d5da6a"
+    },
+    {
+      "path": "crates/native-node/src/proof_codec.rs",
+      "bytes": 35407,
+      "sha256": "29189be26fb098ade0f3e106445ec94ae923b5a5f205e1bb95c5f9f46c184ede"
+    },
+    {
+      "path": "crates/native-node/src/proofs.rs",
+      "bytes": 33301,
+      "sha256": "852e5ccd65d820e2d995ef923a2eab43af36ddbd912b2b6527d3339be8b1534a"
+    },
+    {
+      "path": "crates/native-node/src/state.rs",
+      "bytes": 35885,
+      "sha256": "3bd59e8ffbd775c2e7a069d572106aa93d4904e109f92db4daf7808530d21a5f"
+    },
+    {
+      "path": "crates/native-node/src/wallet.rs",
+      "bytes": 43205,
+      "sha256": "cb2814ffd18f669bbcf8e581e772339954b1946b9ef2f54ca058aab9571f61c8"
+    },
+    {
+      "path": "crates/native-node/src/wallet/issuance.rs",
+      "bytes": 12549,
+      "sha256": "6e782a2674c62d6f579a8b49916268ddcf38f2478928b2a24328e4cbf4018a8f"
+    },
+    {
+      "path": "crates/native-node/src/wallet_cache.rs",
+      "bytes": 4984,
+      "sha256": "9f57cabb9522650427d6403c981af1de327be5884d67038527ea90a4f4f620e7"
+    },
+    {
+      "path": "crates/native-node/src/wallet_crypto.rs",
+      "bytes": 5444,
+      "sha256": "4b2762cf3376fb44a435a928eb7cdef10aa6e7b4c0fd4e5a1dcc7ed398e2f8fd"
+    },
+    {
+      "path": "crates/native-node/src/wallet_policy.rs",
+      "bytes": 9815,
+      "sha256": "d95b2002b1826aaf537acf4a790bd10e83f6d5eaf7010de2c77740954e1ab954"
+    },
+    {
+      "path": "crates/native-node/src/wire.rs",
+      "bytes": 50706,
+      "sha256": "8af5cdc85c2438d3bc607ff44761a69f17a12e4794b4356870eb50f60c4c77ae"
+    },
+    {
+      "path": "crates/native-wallet-core/src/address.rs",
+      "bytes": 6098,
+      "sha256": "550288e57cad34adc9f978813c67b9c3d67af468502f7ad0c58f6df1eba7b916"
+    },
+    {
+      "path": "crates/native-wallet-core/src/cloud_vault.rs",
+      "bytes": 9399,
+      "sha256": "3e219415f2dfff140794602821082ac8710cc85d161e0aa0fb524c46dcb3fe77"
+    },
+    {
+      "path": "crates/native-wallet-core/src/content_vault.rs",
+      "bytes": 5311,
+      "sha256": "7fc88ad45d9a5b559db37aeaa0b563ee690c9d672411b3b2cb82252d7a19f73a"
+    },
+    {
+      "path": "crates/native-wallet-core/src/identity.rs",
+      "bytes": 3211,
+      "sha256": "9857ef949e1290aef45d0ba61c82fb42228a4feb01010406a2f5797470f634be"
+    },
+    {
+      "path": "crates/native-wallet-core/src/lib.rs",
+      "bytes": 1413,
+      "sha256": "37dea8d1cd9a9e843f2c5830577555a186083d541eea9e42d346c496001c5437"
+    },
+    {
+      "path": "crates/native-wallet-core/src/vault.rs",
+      "bytes": 8298,
+      "sha256": "5935dbd474fed9933761e4ad8858c7e90bc079d4d8f28c60780ecb3c91902c41"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/cache.rs",
+      "bytes": 5024,
+      "sha256": "6c3a20894f5556f9bf2dcf827c083976ca5c5c4a36e90a1fd8c542c4c6cf8c85"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/commitment.rs",
+      "bytes": 8386,
+      "sha256": "406109a595a8ffd1b0ac0fc9ad541608963e3840f688a996d4163b2eb9cf9a9b"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/compact.rs",
+      "bytes": 8664,
+      "sha256": "eb49ac45f687c4bac36d3b80ee9093e3ba681b3da67fccdcfbeb00c12edb268b"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/eng2_history.rs",
+      "bytes": 22361,
+      "sha256": "879cd3799a5bca06c0266e812cc49f7259d58c9bb746bc875d126ba1a9e8456f"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/eng2_light.rs",
+      "bytes": 14375,
+      "sha256": "30de8595b7255ba625033a4399136106cf76cbd0f5dcc0e3e8bab9f55332c956"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/eng2_light_cache.rs",
+      "bytes": 9554,
+      "sha256": "acfcf84a04fa10378158628f8b07e6c2192b668c03abf1f81adb162399a9c52e"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/eng2_payments.rs",
+      "bytes": 10454,
+      "sha256": "bf603d55086bd24426d6af868d59e4359f2a43466b62cb6f5b5066e2a5f5bc67"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/history.rs",
+      "bytes": 8545,
+      "sha256": "24603ea4bd5e95075b020d45ee421dc7bcc49af3266d6d015d23c8fbc87476a4"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/lib.rs",
+      "bytes": 1406,
+      "sha256": "2ce4fb22d873998334011f7f0b3bd0f94318de0c8c081b6ebe4754d204204118"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/light.rs",
+      "bytes": 15095,
+      "sha256": "7122e87c9db39295e3297d98a37b6e55b772bcea3d679ec74ae2d8484dce073e"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/paths.rs",
+      "bytes": 6609,
+      "sha256": "60f4e2c962c9d72d601bbaa7fc8e81e098015a9e50b1e35b1257894e7aa529d0"
+    },
+    {
+      "path": "crates/native-wallet-engine/src/ranges.rs",
+      "bytes": 10963,
+      "sha256": "d00be6e3be9ce95c7f4d20a464ad1911de039904376b8142c2fb85c0574aa014"
+    },
+    {
+      "path": "crates/native-wallet-web/src/lib.rs",
+      "bytes": 43670,
+      "sha256": "a35dbab4ae51bd16419d347c9aeacc3535c3487803c7078b593e91459216ee8d"
+    }
+  ],
+  "packager_inputs": [
+    {
+      "raw_path": "assets/cloud-vault.js",
+      "bytes": 6840,
+      "sha256": "71406f5c4203f227fcc603e3fb2c68860e3f69c66c01da9fb3310f7606fd33cc",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/cloud-vault.js"
+    },
+    {
+      "raw_path": "assets/native-vault.js",
+      "bytes": 11439,
+      "sha256": "9d8afa9bddc34c78686fb82648984ba318fc2e98095dc9dfe755266bc6fa7560",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/native-vault.js"
+    },
+    {
+      "raw_path": "assets/native-wallet.css",
+      "bytes": 12276,
+      "sha256": "eecb297e9a64345accc810f95adddbb0408da186fadeb20f05fa6175a1cc1c1d",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/native-wallet.css"
+    },
+    {
+      "raw_path": "assets/native-wallet.js",
+      "bytes": 33904,
+      "sha256": "b6d1f7c73ee9f8d50301c7c67d8400daf7508fb77b71d0c92fb6a2fea08ed086",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/native-wallet.js"
+    },
+    {
+      "raw_path": "assets/vault-application.js",
+      "bytes": 428,
+      "sha256": "5c195ab74b25d2d05b23fee95de9099b92f8882b09407871c71eb4957e0f645c",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/vault-application.js"
+    },
+    {
+      "raw_path": "assets/wallet-history.js",
+      "bytes": 5472,
+      "sha256": "5951fca1abc1a164e79b3a9bd43a21240a0c6bccda807de16bdc31b470ed3ea7",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/wallet-history.js"
+    },
+    {
+      "raw_path": "assets/wallet-list.js",
+      "bytes": 3259,
+      "sha256": "372fde25cc0e68406b46d8f8f17a98776afcd30c59b9bb2b3e1b183a6fe61eb5",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/wallet-list.js"
+    },
+    {
+      "raw_path": "sdk/cloud-session.js",
+      "bytes": 3068,
+      "sha256": "4dc693f19adc879c39080e0007dd0e5a44528f6efd9ab2991b1750c060388c33",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/cloud-session.js"
+    },
+    {
+      "raw_path": "sdk/cloud-worker.js",
+      "bytes": 2800,
+      "sha256": "dab30781143bc384f369d27c48080057cc1eb084f9d3a66f190ad88a5b4f8eee",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/cloud-worker.js"
+    },
+    {
+      "raw_path": "sdk/commitment-session.js",
+      "bytes": 10432,
+      "sha256": "57d0d4f2b67868dd1ba8fef1348b007957a8281af1486aebd2050c77c0a6c28b",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/commitment-session.js"
+    },
+    {
+      "raw_path": "sdk/content-storage.js",
+      "bytes": 5021,
+      "sha256": "33a407457c1d3c314183040ee23c672864f060352dd358f6fb9319e0960fda7f",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/content-storage.js"
+    },
+    {
+      "raw_path": "sdk/content-worker.js",
+      "bytes": 691,
+      "sha256": "de71f3c16a7cf2b7a0fe79637d4c4414e4de6f2261864059f8e9a0b21087d666",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/content-worker.js"
+    },
+    {
+      "raw_path": "sdk/core/snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.no-bundler.js",
+      "bytes": 2947,
+      "sha256": "9801503f464f848c6c7405462fca9a5c721556904c5fee5ee0afcb0887ea1b7f",
+      "kind": "generated_wasm_bindgen_input",
+      "source_mapping": "Rust inputs, Cargo.lock, build.py and wasm-bindgen0.2.120; preserve generated bytes by hash, do not copy into source web/sdk/core."
+    },
+    {
+      "raw_path": "sdk/core/wallet.d.ts",
+      "bytes": 16630,
+      "sha256": "033a784a106a85827c1bab82e4976ec90d795081f72b6a3489d1a88819c0afc7",
+      "kind": "generated_wasm_bindgen_input",
+      "source_mapping": "Rust inputs, Cargo.lock, build.py and wasm-bindgen0.2.120; preserve generated bytes by hash, do not copy into source web/sdk/core."
+    },
+    {
+      "raw_path": "sdk/core/wallet.js",
+      "bytes": 62699,
+      "sha256": "71db27ff70dca64f7de99a9c9b26b587827667ae9eeadd1c699e349e362d35b6",
+      "kind": "generated_wasm_bindgen_input",
+      "source_mapping": "Rust inputs, Cargo.lock, build.py and wasm-bindgen0.2.120; preserve generated bytes by hash, do not copy into source web/sdk/core."
+    },
+    {
+      "raw_path": "sdk/core/wallet_bg.wasm",
+      "bytes": 9740455,
+      "sha256": "7d95a72ac5ab2f78d1633ead7d1000646f19eaeee189180c29d8600cec3d8b64",
+      "kind": "generated_wasm_bindgen_input",
+      "source_mapping": "Rust inputs, Cargo.lock, build.py and wasm-bindgen0.2.120; preserve generated bytes by hash, do not copy into source web/sdk/core."
+    },
+    {
+      "raw_path": "sdk/core/wallet_bg.wasm.d.ts",
+      "bytes": 9206,
+      "sha256": "52d1fbb1eead4648518ec26349cb785705d08516e0f976b40b34897d8ee1d213",
+      "kind": "generated_wasm_bindgen_input",
+      "source_mapping": "Rust inputs, Cargo.lock, build.py and wasm-bindgen0.2.120; preserve generated bytes by hash, do not copy into source web/sdk/core."
+    },
+    {
+      "raw_path": "sdk/eng2-admission.js",
+      "bytes": 3510,
+      "sha256": "d8c310d74029e906f33288bfdbb08c59eaae791bd0ccef3c2508cd6c321fa8c3",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-admission.js"
+    },
+    {
+      "raw_path": "sdk/eng2-context.js",
+      "bytes": 2126,
+      "sha256": "1a5f7ed9ab3c709febe0fbc74c80b60d38864d6a3405cc85a0cbda48b1f7899b",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-context.js"
+    },
+    {
+      "raw_path": "sdk/eng2-custody-storage.js",
+      "bytes": 5067,
+      "sha256": "39131af8707cc44a270ccee1a99597d3d23053a9ce348bc57620eaa472346004",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-custody-storage.js"
+    },
+    {
+      "raw_path": "sdk/eng2-custody.js",
+      "bytes": 246,
+      "sha256": "989b3a3963c1549d5a6e7d26afe8f188e5c152337a01b41bc4db23478c946b1f",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-custody.js"
+    },
+    {
+      "raw_path": "sdk/eng2-payments.js",
+      "bytes": 15162,
+      "sha256": "917a8a743ad26f5cef3bd9992d47d336023c116cf83a73993ac47f15b6392a46",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-payments.js"
+    },
+    {
+      "raw_path": "sdk/eng2-session.js",
+      "bytes": 10526,
+      "sha256": "56cd9dabadadb265b89aa72d4997eb188a9f3b5f42e3a8a96d5aead9dccb805c",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-session.js"
+    },
+    {
+      "raw_path": "sdk/eng2-storage.js",
+      "bytes": 1936,
+      "sha256": "268cf121694147be62b06eba05dfd395efbac8d892b6d516384c9e0da2904fef",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-storage.js"
+    },
+    {
+      "raw_path": "sdk/eng2-wallet-session.js",
+      "bytes": 5447,
+      "sha256": "07b3361feb9c675ed73587ed9e6799e9897a58c03b64dd911bcc9b964386da1b",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/eng2-wallet-session.js"
+    },
+    {
+      "raw_path": "sdk/light-session.js",
+      "bytes": 19736,
+      "sha256": "7461bdd3e97103a5ed580b8152123cba9d1d45d78a25beadb3450544e4dc3297",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/light-session.js"
+    },
+    {
+      "raw_path": "sdk/network.js",
+      "bytes": 502,
+      "sha256": "f93207d4abb69f54a604920c70ee5cd5c02d02d8a6d386038d09c14d4d65f244",
+      "kind": "generated_context",
+      "source_mapping": "build.py engineering_v2_manifest + official-context.json. Keep generic web/sdk/network.js from main."
+    },
+    {
+      "raw_path": "sdk/online-storage.js",
+      "bytes": 4274,
+      "sha256": "3ac40704567b682cdb5815211cd972fb3d289296bea2782e6cb0ff7351c28ddc",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/online-storage.js"
+    },
+    {
+      "raw_path": "sdk/proof-progress.js",
+      "bytes": 3152,
+      "sha256": "3d4baf1a9aa59b13d83ec045e03101638ce8e9b22ab61e030283e095d711dc26",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/proof-progress.js"
+    },
+    {
+      "raw_path": "sdk/runtime-profile.js",
+      "bytes": 1581,
+      "sha256": "7cad60261a358c65ba147460145e52c21631e1fb7563e8db5336b966121cdf3f",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/runtime-profile.js"
+    },
+    {
+      "raw_path": "sdk/storage.js",
+      "bytes": 246,
+      "sha256": "989b3a3963c1549d5a6e7d26afe8f188e5c152337a01b41bc4db23478c946b1f",
+      "kind": "generated_selected_adapter",
+      "source_mapping": "build.py copies committed web/sdk/eng2-custody.js. Keep generic web/sdk/storage.js from main."
+    },
+    {
+      "raw_path": "sdk/vault-network.js",
+      "bytes": 152,
+      "sha256": "a89661bf3b96d6d6e2f62b256fae8a711e433dcca80af5e079028225378d78a6",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/vault-network.js"
+    },
+    {
+      "raw_path": "sdk/wallet-accounts.js",
+      "bytes": 8831,
+      "sha256": "765fe34fb770f6e2536c2082bc3878cfd7e37fc805562fd821770f44e952b158",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/wallet-accounts.js"
+    },
+    {
+      "raw_path": "sdk/worker.js",
+      "bytes": 6469,
+      "sha256": "b8860862c73693acbd0331fb74a5a1f2b02789d82857c3906c290b37f774c5fa",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/sdk/worker.js"
+    },
+    {
+      "raw_path": "vault.html",
+      "bytes": 7544,
+      "sha256": "51cf46a22443b12e8c5edacabb866f44fe86f7c6ec9bc97f7500e0819ae97d63",
+      "kind": "generated_html",
+      "source_mapping": "Main web template + build.py runtime labeling/context/thread-CSP transformation; package-release.py removes the raw CSP meta."
+    },
+    {
+      "raw_path": "wallet.html",
+      "bytes": 14806,
+      "sha256": "04a8b2663cd000462ceb0844de08dc5dfefc5d76a5230384c556386bdcbd9c9b",
+      "kind": "generated_html",
+      "source_mapping": "Main web template + build.py runtime labeling/context/thread-CSP transformation; package-release.py removes the raw CSP meta."
+    }
+  ],
+  "files": [
+    {
+      "path": "release-manifest.json",
+      "bytes": 1262,
+      "sha256": "7f73a579f40050b2f968b4b5316a6401bbb6bb1823cdc8382c645cab9580bfa0"
+    },
+    {
+      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/rayon-worker.mjs",
+      "bytes": 53978,
+      "sha256": "727e3afbbd4fc1b6ad98b35c577edd54c3fa37a116d7d916602fa4f1effb1179"
+    },
+    {
+      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet-worker.mjs",
+      "bytes": 156260,
+      "sha256": "45a8843abaef3aa7d9bfac589d64e6dcf46bd6cb1d738b9fc18d40e8f1f1871d"
+    },
+    {
+      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet.css",
+      "bytes": 12276,
+      "sha256": "eecb297e9a64345accc810f95adddbb0408da186fadeb20f05fa6175a1cc1c1d"
+    },
+    {
+      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet.mjs",
+      "bytes": 56210,
+      "sha256": "1949dac01237f41870e868b3b0f4c3398e7646f03aaa9c52823068a34a927a05"
+    },
+    {
+      "path": "releases/affa8b1232cbca7c5935bf69f022bf77d0a0e1819cbb7280144dbd810d7481c6/assets/wallet_bg.wasm",
+      "bytes": 9740455,
+      "sha256": "7d95a72ac5ab2f78d1633ead7d1000646f19eaeee189180c29d8600cec3d8b64"
+    },
+    {
+      "path": "response-headers.json",
+      "bytes": 815,
+      "sha256": "7aab542023cf2931a8714aa86cabf578c9e6a3aaed0a7f5a3f6a16999f54d69a"
+    },
+    {
+      "path": "wallet.html",
+      "bytes": 14860,
+      "sha256": "b7c76c17c152690ce0c736c48a0129620c44ddfa4ba67c0cdef9137f1e658f28"
+    }
+  ]
+}
