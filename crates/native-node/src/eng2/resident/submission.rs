@@ -61,6 +61,65 @@ impl Drop for SocketFile {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn restrict_open_socket(file: &SocketFile, descriptor: &rustix::fd::OwnedFd) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let matches = |value: &rustix::fs::Stat| {
+        stat_identity(value) == file.identity
+            && FileType::from_raw_mode(value.st_mode) == FileType::Socket
+            && value.st_uid == rustix::process::geteuid().as_raw()
+    };
+    let opened =
+        rustix::fs::fstat(descriptor).map_err(|_| "submission socket metadata unavailable")?;
+    if !matches(&opened) {
+        return Err("submission socket identity or permissions changed".into());
+    }
+    // O_PATH pins the filesystem socket inode without connecting to it.
+    // Following this process's held descriptor is intentional; a replacement
+    // named symlink is never resolved by the permission-changing operation.
+    let reference = format!("/proc/self/fd/{}", descriptor.as_raw_fd());
+    chmodat(
+        rustix::fs::CWD,
+        Path::new(&reference),
+        Mode::from_raw_mode(0o600),
+        AtFlags::empty(),
+    )
+    .map_err(|_| "submission socket permissions unavailable")?;
+    let held =
+        rustix::fs::fstat(descriptor).map_err(|_| "submission socket metadata unavailable")?;
+    let named = statat(&file.directory, &file.name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| "submission socket directory changed")?;
+    if !matches(&held) || held.st_mode & 0o777 != 0o600 || !matches(&named) {
+        return Err("submission socket identity or permissions changed".into());
+    }
+    Ok(())
+}
+
+fn restrict_socket_permissions(file: &SocketFile) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let descriptor = rustix::fs::openat(
+            &file.directory,
+            &file.name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| "submission socket metadata unavailable")?;
+        restrict_open_socket(file, &descriptor)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        chmodat(
+            &file.directory,
+            &file.name,
+            Mode::from_raw_mode(0o600),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|_| "submission socket permissions unavailable".into())
+    }
+}
+
 fn bind(path: &Path) -> Result<(UnixListener, SocketFile), String> {
     let parent = path
         .parent()
@@ -104,13 +163,7 @@ fn bind(path: &Path) -> Result<(UnixListener, SocketFile), String> {
     if stat_identity(&original) != identity {
         return Err("submission socket directory changed".into());
     }
-    chmodat(
-        &file.directory,
-        &file.name,
-        Mode::from_raw_mode(0o600),
-        AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .map_err(|_| "submission socket permissions unavailable")?;
+    restrict_socket_permissions(&file)?;
     let current = path
         .symlink_metadata()
         .map_err(|_| "submission socket unavailable")?;

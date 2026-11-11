@@ -308,3 +308,67 @@ fn private_directory_and_existing_path_rules_preserve_replacements() {
         b"new directory entry"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_socket_permission_change_never_follows_a_replacement_symlink() {
+    let directory = Directory::new();
+    let (listener, file) = bind(&directory.socket()).unwrap();
+    let descriptor = rustix::fs::openat(
+        &file.directory,
+        &file.name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    let target = directory.0.join("target");
+    fs::write(&target, b"synthetic target").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::metadata(&target).unwrap();
+    fs::remove_file(directory.socket()).unwrap();
+    symlink("target", directory.socket()).unwrap();
+    assert!(restrict_open_socket(&file, &descriptor).is_err());
+    assert!(restrict_socket_permissions(&file).is_err());
+    let after = fs::metadata(&target).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.mode()),
+        (after.dev(), after.ino(), after.mode())
+    );
+    drop(file);
+    drop(listener);
+    assert!(
+        fs::symlink_metadata(directory.socket())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(target).unwrap(), b"synthetic target");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_socket_permission_change_rejects_a_different_named_socket() {
+    let directory = Directory::new();
+    let (listener, file) = bind(&directory.socket()).unwrap();
+    let descriptor = rustix::fs::openat(
+        &file.directory,
+        &file.name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    fs::remove_file(directory.socket()).unwrap();
+    let replacement = UnixListener::bind(directory.socket()).unwrap();
+    fs::set_permissions(directory.socket(), fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::symlink_metadata(directory.socket()).unwrap();
+    assert!(restrict_open_socket(&file, &descriptor).is_err());
+    assert!(restrict_socket_permissions(&file).is_err());
+    drop(file);
+    drop(listener);
+    let after = fs::symlink_metadata(directory.socket()).unwrap();
+    assert_eq!(
+        (before.dev(), before.ino(), before.mode()),
+        (after.dev(), after.ino(), after.mode())
+    );
+    drop(replacement);
+}
