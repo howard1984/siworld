@@ -50,24 +50,42 @@ pub(super) fn keys(value: &Value) -> Vec<String> {
     keys
 }
 #[test]
-fn cadence_requires_a_positive_72_multiple_and_24_confirmations() {
-    for (head, expected) in [
-        (0, None),
-        (23, None),
-        (24, None),
-        (71, None),
-        (72, None),
-        (95, None),
-        (96, Some(72)),
-        (167, Some(72)),
-        (168, Some(144)),
-        (239, Some(144)),
-        (240, Some(216)),
-        (u64::MAX, Some((u64::MAX - 24) / 72 * 72)),
-    ] {
+fn cadence_requires_a_positive_12_multiple_and_24_confirmations() {
+    for head in 0..600 {
+        let expected = if head < 36 {
+            None
+        } else {
+            Some((head - 24) / 12 * 12)
+        };
         assert_eq!(eligible_checkpoint(head), expected);
+        if let Some(height) = expected {
+            assert!((24..36).contains(&(head - height)));
+        }
     }
+    assert_eq!(
+        eligible_checkpoint(u64::MAX),
+        Some((u64::MAX - 24) / 12 * 12)
+    );
 }
+#[test]
+fn checkpoint_upgrade_keeps_old_certificates_and_retires_published_candidates() {
+    assert!(confirmed_checkpoint(72, 96));
+    assert!(confirmed_checkpoint(72, 167));
+    assert!(confirmed_checkpoint(432, 472));
+    assert!(confirmed_checkpoint(444, 472));
+    assert!(!confirmed_checkpoint(456, 472));
+    for height in [1, 11, 13, 71, 73, 431, 445, u64::MAX - 24] {
+        assert!(confirmed_checkpoint(height, height + 24));
+        assert!(!confirmed_checkpoint(height, height + 23));
+    }
+    assert!(!confirmed_checkpoint(u64::MAX, 0));
+    assert!(!confirmed_checkpoint(444, 467));
+    assert!(!confirmed_checkpoint(0, 24));
+    assert!(pending_obsolete(72, Some(72), 96));
+    assert!(pending_obsolete(72, None, 472));
+    assert!(!pending_obsolete(444, Some(432), 472));
+}
+
 #[test]
 fn real_durable_genesis_exports_exact_current_ledgers_and_no_claimed_checkpoint() {
     let dir = Directory::new();

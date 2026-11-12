@@ -350,11 +350,7 @@ fn check_windows_configuration(
     Ok(())
 }
 fn check_windows_admission(windows: bool, imported: Option<u64>) -> Result<(), String> {
-    if windows
-        && !imported.is_some_and(|height| {
-            height > 0 && height.is_multiple_of(super::runtime_export::CHECKPOINT_INTERVAL)
-        })
-    {
+    if windows && !imported.is_some_and(|height| height > 0) {
         return Err(
             "Windows resident requires a durably imported and authenticated signed checkpoint"
                 .into(),

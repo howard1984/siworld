@@ -132,8 +132,10 @@ impl Manifest {
         if !(CHECKPOINT_CONFIRMATIONS..=super::selection::TAIL_BLOCKS).contains(&tail)
             || tip_height > 1_000_000
             || statement.authorization_height > tip_height
-            || super::runtime_export::eligible_checkpoint(statement.authorization_height)
-                != Some(statement.checkpoint_height)
+            || !super::runtime_export::confirmed_checkpoint(
+                statement.checkpoint_height,
+                statement.authorization_height,
+            )
             || snapshot.length == 0
             || snapshot.length > limits.max_snapshot_bytes as u64
         {

@@ -279,7 +279,13 @@ impl Host {
             .map(|path| ExistingSigner::load(path, store))
             .transpose()?;
         let latest = export.restore_latest(store, limits)?;
-        let pending = export.resume_candidate(store, limits)?;
+        let pending = export.resume_candidate(store, limits)?.filter(|candidate| {
+            !super::pending_obsolete(
+                candidate.statement().checkpoint_height,
+                export.latest_height(),
+                store.engine().state().height(),
+            )
+        });
         Ok(Self {
             export,
             signer,
@@ -359,8 +365,9 @@ impl Host {
         self.tick_inner(store, now, incoming, Some(&readiness))
     }
     /// Work is bounded to at most three messages, one local vote, one certificate
-    /// and one current projection. No waiting, mining or proof replay occurs.
-    /// The driver archives every positive 72-block boundary after durable append.
+    /// and one current projection. Cadence migration may verify a bounded
+    /// retained native suffix in an isolated engine. The driver archives each
+    /// positive 12-block boundary after durable append.
     fn tick_inner(
         &mut self,
         store: &Store,
@@ -412,19 +419,38 @@ impl Host {
         }
         self.last_now = Some(now);
         let state = store.engine().state();
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.check_current(store).is_err())
-        {
+        if self.pending.as_ref().is_some_and(|p| {
+            p.check_current(store).is_err()
+                || super::pending_obsolete(
+                    p.statement().checkpoint_height,
+                    self.export.latest_height(),
+                    state.height(),
+                )
+        }) {
             self.pending = None;
             self.votes = std::array::from_fn(|_| None);
         }
         let mut newly_published = false;
         for item in incoming {
             match item {
-                Incoming::Proposal(proposal) => self.accept_proposal(store, proposal)?,
+                Incoming::Proposal(proposal) => {
+                    if super::pending_obsolete(
+                        proposal.statement.checkpoint_height,
+                        self.export.latest_height(),
+                        state.height(),
+                    ) {
+                        continue;
+                    }
+                    self.accept_proposal(store, proposal)?;
+                }
                 Incoming::Vote { statement, vote } => {
+                    if super::pending_obsolete(
+                        statement.checkpoint_height,
+                        self.export.latest_height(),
+                        state.height(),
+                    ) {
+                        continue;
+                    }
                     let pending = self
                         .pending
                         .as_ref()
@@ -461,6 +487,15 @@ impl Host {
                             .map_err(|_| "known checkpoint certificate signatures invalid")?;
                         // Another valid two-slot subset authenticates the same
                         // statement, but must never refresh publication time.
+                        continue;
+                    }
+                    if self
+                        .export
+                        .latest_height()
+                        .is_some_and(|height| certificate.statement.checkpoint_height < height)
+                    {
+                        // Retired certificates cannot replace a newer local
+                        // publication or block its next coordination step.
                         continue;
                     }
                     if self.export.latest_height() != Some(certificate.statement.checkpoint_height)

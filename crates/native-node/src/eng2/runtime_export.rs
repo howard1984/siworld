@@ -18,9 +18,11 @@ use libcrux_ml_dsa::ml_dsa_65::MLDSA65SigningKey;
 use libcrux_ml_dsa::ml_dsa_65::{self, MLDSA65Signature, MLDSA65VerificationKey};
 use serde_json::{Value, json};
 
-pub const CHECKPOINT_INTERVAL: u64 = 72;
+pub const CHECKPOINT_INTERVAL: u64 = 12;
+pub const LEGACY_CHECKPOINT_INTERVAL: u64 = 72;
 pub const CHECKPOINT_CONFIRMATIONS: u64 = 24;
-pub const PUBLICATION_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+/// Nominal cadence at the five-minute target; publication follows block height.
+pub const PUBLICATION_INTERVAL_SECONDS: u64 = 60 * 60;
 pub const STALE_SECONDS: u64 = 18 * 60 * 60;
 pub const MAX_PROJECTION_BYTES: usize = 131072;
 #[cfg(unix)]
@@ -35,6 +37,20 @@ pub fn eligible_checkpoint(head: u64) -> Option<u64> {
     let height =
         head.checked_sub(CHECKPOINT_CONFIRMATIONS)? / CHECKPOINT_INTERVAL * CHECKPOINT_INTERVAL;
     (height > 0).then_some(height)
+}
+
+/// Check confirmation depth independently of the publisher's local cadence.
+/// Signature, authorized roster and selected-chain checks remain separate gates.
+pub fn confirmed_checkpoint(height: u64, authorization: u64) -> bool {
+    height > 0
+        && authorization
+            .checked_sub(height)
+            .is_some_and(|depth| depth >= CHECKPOINT_CONFIRMATIONS)
+}
+
+pub(super) fn pending_obsolete(height: u64, published: Option<u64>, head: u64) -> bool {
+    published.is_some_and(|latest| height <= latest)
+        || eligible_checkpoint(head).is_some_and(|eligible| height < eligible)
 }
 
 /// An independently matched anchor and authenticated current signer context.
@@ -92,8 +108,7 @@ impl PreparedCheckpoint {
         let engine = store.engine();
         let state = engine.state();
         if statement.network != state.network()
-            || eligible_checkpoint(statement.authorization_height)
-                != Some(statement.checkpoint_height)
+            || !confirmed_checkpoint(statement.checkpoint_height, statement.authorization_height)
             || statement.authorization_height > state.height()
             || snapshot.len() > limits.max_snapshot_bytes
         {

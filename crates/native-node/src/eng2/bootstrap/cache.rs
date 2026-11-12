@@ -150,6 +150,30 @@ impl Quarantine {
             _cache_reservation: cache_reservation,
         })
     }
+    /// Read the retained manifest without creating a missing quarantine. Resume
+    /// callers must request this exact bundle and still run full reopen checks.
+    pub fn retained_manifest(directory: &Path) -> Result<Option<Vec<u8>>, String> {
+        match std::fs::symlink_metadata(directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Bootstrap quarantine metadata unavailable; preserve data".into()),
+            Ok(_) => (),
+        }
+        let database = open_database(directory, false)?;
+        let transaction = database
+            .begin_read()
+            .map_err(|_| "Bootstrap retained manifest read failed")?;
+        let meta = transaction
+            .open_table(META)
+            .map_err(|_| "Bootstrap retained manifest table missing")?;
+        let row = meta
+            .get("manifest")
+            .map_err(|_| "Bootstrap retained manifest unavailable")?
+            .ok_or("Bootstrap retained manifest missing")?;
+        if row.value().len() > super::MAX_MANIFEST_BYTES {
+            return Err("Bootstrap retained manifest bound exceeded".into());
+        }
+        Ok(Some(row.value().to_vec()))
+    }
     pub fn reopen(
         directory: &Path,
         manifest: Manifest,
@@ -852,6 +876,28 @@ mod tests {
             max_chunks_per_object: 8,
             max_body_bytes: 1024,
         }
+    }
+    #[test]
+    fn explicit_resume_preserves_existing_manifest_and_leaves_missing_provider_uncreated() {
+        let (_, _, manifest) = crate::eng2::bootstrap::tests::framing_fixture();
+        let first = Directory::new();
+        let second = Directory::new();
+        let budget = p2p::Budget::new(64 * 1024 * 1024);
+        assert!(Quarantine::retained_manifest(&first.0).unwrap().is_none());
+        assert!(!first.0.exists());
+        drop(Quarantine::create(&first.0, manifest.clone(), policy(), budget.clone()).unwrap());
+        assert_eq!(
+            Quarantine::retained_manifest(&first.0).unwrap().unwrap(),
+            manifest.encode().unwrap()
+        );
+        assert!(Quarantine::retained_manifest(&second.0).unwrap().is_none());
+        assert!(!second.0.exists());
+        drop(Quarantine::reopen(&first.0, manifest.clone(), policy(), budget.clone()).unwrap());
+        drop(Quarantine::create(&second.0, manifest.clone(), policy(), budget).unwrap());
+        assert_eq!(
+            Quarantine::retained_manifest(&first.0).unwrap(),
+            Quarantine::retained_manifest(&second.0).unwrap()
+        );
     }
     #[test]
     fn minimum_payload_and_malformed_bounds_reject_before_filesystem_mutation() {

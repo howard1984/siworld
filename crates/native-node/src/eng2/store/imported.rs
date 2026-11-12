@@ -35,7 +35,7 @@ pub(super) fn resume_context(
         return Err("import marker framing rejected".into());
     }
     let prefix = u64::from_le_bytes(bytes[8..16].try_into().expect("fixed import prefix"));
-    if prefix == 0 || !prefix.is_multiple_of(72) || prefix >= height {
+    if prefix == 0 || prefix >= height {
         return Err("import prefix height rejected".into());
     }
     let receipts = txn

@@ -48,10 +48,12 @@ fn windows_runtime_requires_outbound_nonsigning_miner_and_authenticated_import()
     }
     assert!(check_windows_configuration(true, p2p::Role::Miner, true, false).is_err());
     assert!(check_windows_configuration(true, p2p::Role::Miner, false, true).is_err());
-    for prefix in [None, Some(0), Some(1), Some(71)] {
+    for prefix in [None, Some(0)] {
         assert!(check_windows_admission(true, prefix).is_err());
     }
-    assert!(check_windows_admission(true, Some(72)).is_ok());
+    for prefix in [1, 11, 13, 71, 72, 73] {
+        assert!(check_windows_admission(true, Some(prefix)).is_ok());
+    }
     assert!(check_windows_admission(false, None).is_ok());
 }
 #[test]

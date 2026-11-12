@@ -137,7 +137,6 @@ impl AdmissionPlan {
             .checked_sub(checkpoint)
             .ok_or(PlanError::Checkpoint)?;
         if checkpoint == 0
-            || !checkpoint.is_multiple_of(super::runtime_export::CHECKPOINT_INTERVAL)
             || !(super::runtime_export::CHECKPOINT_CONFIRMATIONS..=selection::TAIL_BLOCKS)
                 .contains(&tail)
         {

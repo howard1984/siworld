@@ -271,13 +271,12 @@ fn checkpoint_reanchoring_preserves_work_and_requires_confirmed_available_tail()
     assert_eq!(anchored.pin().tip_id, plan.pin().tip_id);
     assert_eq!(anchored.pin().cumulative_work, plan.pin().cumulative_work);
     assert_eq!(anchored.pin().local_work_floor, plan.pin().local_work_floor);
-    for (checkpoint, first, last) in [
-        (0, 1, 96),
-        (71, 72, 96),
-        (73, 74, 96),
-        (72, 74, 96),
-        (72, 73, 95),
-    ] {
+    for checkpoint in [1, 11, 13, 71] {
+        let arbitrary = plan.at_checkpoint(checkpoint, checkpoint + 1, 96).unwrap();
+        assert_eq!(arbitrary.pin().anchor_height, checkpoint);
+        assert_eq!(arbitrary.pin().cumulative_work, plan.pin().cumulative_work);
+    }
+    for (checkpoint, first, last) in [(0, 1, 96), (73, 74, 96), (72, 74, 96), (72, 73, 95)] {
         assert!(plan.at_checkpoint(checkpoint, first, last).is_err());
     }
     let (short, _) = selected(&genesis, 95);

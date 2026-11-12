@@ -449,52 +449,106 @@ fn bootstrap_signed_observed(
     let mut operation = Operation::new(&policy)?;
     let mut candidates = Vec::new();
     let mut bundles = Vec::new();
+    let mut unavailable_sources = Vec::new();
     for (index, destination) in destinations.iter().enumerate() {
-        let mut session =
-            Acquisition::new(&connector, destination, &genesis, accounting.clone(), None);
-        let received = session
-            .round(&mut operation, |p| p.manifest())?
-            .ok_or("signed bootstrap service has no current bounded offer")?;
-        let manifest = Manifest::decode(&received.bytes, &genesis, limits())?;
-        drop(received);
-        session.bind(&manifest)?;
-        if manifest.tip_height > policy.headers as u64 {
-            return Err("signed bootstrap manifest exceeds explicit complete header cap".into());
-        }
-        let path = directory.join(format!("signed-bootstrap-quarantine-{index}"));
-        let cache_policy = cache::Policy {
-            max_bytes: per_candidate,
-            max_chunks_per_object: 1_048_576,
-            max_body_bytes: body_policy.max_body_bytes,
-        };
-        let cache = if policy.resume {
-            cache::Quarantine::reopen(&path, manifest, cache_policy, budget.clone())?
-        } else {
-            cache::Quarantine::create(&path, manifest, cache_policy, budget.clone())?
-        };
-        let mut candidate = Candidate::new(
-            cache,
-            &genesis,
-            import::Policy {
-                state: limits(),
-                max_headers: policy.headers,
-                max_verification_bytes: per_candidate
-                    .checked_add(MAX_GENESIS_BYTES as u64 + 1024 * 1024)
-                    .ok_or("bootstrap verification budget overflow")?,
-            },
-            body_policy,
-        )?;
-        while let Progress::Headers { next, total } = candidate.progress() {
-            if next > total {
-                break;
+        let acquired: Result<(client::Prepared, Hash), String> = (|| {
+            let mut session =
+                Acquisition::new(&connector, destination, &genesis, accounting.clone(), None);
+            let received = session
+                .round(&mut operation, |p| p.exact_manifest(None))?
+                .ok_or("signed bootstrap service has no current bounded offer")?;
+            let manifest = Manifest::decode(&received.bytes, &genesis, limits())?;
+            let legacy = directory.join(format!("signed-bootstrap-quarantine-{index}"));
+            let saved = if policy.resume {
+                cache::Quarantine::retained_manifest(&legacy)?
+            } else {
+                None
+            };
+            let path = if saved.as_deref() == Some(received.bytes.as_slice()) || !legacy.exists() {
+                legacy
+            } else {
+                directory.join(format!(
+                    "signed-bootstrap-quarantine-{index}-{}",
+                    crate::local::hex(&manifest.bundle())
+                ))
+            };
+            let retained = if policy.resume {
+                cache::Quarantine::retained_manifest(&path)?
+            } else {
+                None
+            };
+            if retained
+                .as_ref()
+                .is_some_and(|bytes| bytes != &received.bytes)
+            {
+                return Err(
+                    "latest checkpoint cache identity differs; existing data preserved".into(),
+                );
             }
-            session.round(&mut operation, |p| candidate.pull_header(p))?;
+            eprintln!(
+                "Network checkpoint offer: height {}, source head {} (pending independent verification)",
+                manifest.checkpoint_height(),
+                manifest.tip_height
+            );
+            drop(received);
+            session.bind(&manifest)?;
+            if manifest.tip_height > policy.headers as u64 {
+                return Err(
+                    "signed bootstrap manifest exceeds explicit complete header cap".into(),
+                );
+            }
+            let cache_policy = cache::Policy {
+                max_bytes: per_candidate,
+                max_chunks_per_object: 1_048_576,
+                max_body_bytes: body_policy.max_body_bytes,
+            };
+            let cache = if retained.is_some() {
+                cache::Quarantine::reopen(&path, manifest, cache_policy, budget.clone())?
+            } else {
+                cache::Quarantine::create(&path, manifest, cache_policy, budget.clone())?
+            };
+            let mut candidate = Candidate::new(
+                cache,
+                &genesis,
+                import::Policy {
+                    state: limits(),
+                    max_headers: policy.headers,
+                    max_verification_bytes: per_candidate
+                        .checked_add(MAX_GENESIS_BYTES as u64 + 1024 * 1024)
+                        .ok_or("bootstrap verification budget overflow")?,
+                },
+                body_policy,
+            )?;
+            while let Progress::Headers { next, total } = candidate.progress() {
+                if next > total {
+                    break;
+                }
+                session.round(&mut operation, |p| candidate.pull_header(p))?;
+            }
+            let bundle = candidate.manifest().bundle();
+            let prepared = candidate.prepare(&genesis, policy.floor)?;
+            // Candidate preparation may take time. Keep no idle authenticated
+            // stream while other complete header histories are acquired.
+            drop(session);
+            Ok((prepared, bundle))
+        })();
+        match acquired {
+            Ok((prepared, bundle)) => {
+                bundles.push((bundle, index));
+                candidates.push(prepared);
+            }
+            Err(_) => {
+                unavailable_sources.push(index);
+                eprintln!(
+                    "Checkpoint source {} unavailable or rejected; retained data preserved.",
+                    index + 1
+                );
+                operation.check()?;
+            }
         }
-        bundles.push((candidate.manifest().bundle(), index));
-        candidates.push(candidate.prepare(&genesis, policy.floor)?);
-        // Candidate preparation may take time. Keep no idle authenticated
-        // stream while other complete header histories are acquired.
-        drop(session);
+    }
+    if candidates.is_empty() {
+        return Err("no authenticated checkpoint source completed header verification; retained data preserved".into());
     }
     let mut client = client::select(candidates, policy.floor)?;
     let selected = bundles
@@ -523,6 +577,8 @@ fn bootstrap_signed_observed(
     }
     let (received, sent, authenticated_sessions) = (counts.received, counts.sent, counts.sessions);
     drop(counts);
+    let checkpoint_height = client.manifest().checkpoint_height();
+    let source_head_height = client.manifest().tip_height;
     let maximum_seconds = policy.seconds;
     let started = operation.started;
     let admitted = client.verify_and_install(&genesis, directory, || {
@@ -532,7 +588,10 @@ fn bootstrap_signed_observed(
         Installation::Durable(store) => store,
         Installation::DurabilityUnconfirmed => return Err("signed bootstrap canonical admission durability or reopen unconfirmed; preserve data and do not retry".into()),
     };
-    let result = json!({"version":1,"phase":"durably_imported_waiting_for_native_peer_catchup","ready":false,"mining_started":false,
+    eprintln!(
+        "Verified checkpoint installed: height {checkpoint_height}, source head {source_head_height}; native peer catchup follows."
+    );
+    let result = json!({"checkpoint_source":"authenticated_network_latest","selected_source_index":selected,"unavailable_source_indexes":unavailable_sources,"selected_source_head_height":source_head_height,"version":1,"phase":"durably_imported_waiting_for_native_peer_catchup","ready":false,"mining_started":false,
         "height":store.engine().state().height(),"tip":crate::local::hex(&store.engine().state().tip()),
         "checkpoint_height":store.imported_checkpoint_height(),"elapsed_ms":started.elapsed().as_millis().to_string(),"rounds":operation.rounds,
         "verification_bytes":admitted.verification_bytes.to_string(),"local_reread_bytes":admitted.local_reread_bytes.to_string(),

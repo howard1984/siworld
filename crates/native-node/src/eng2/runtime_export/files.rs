@@ -358,9 +358,6 @@ impl PublicExport {
                     )
                 };
             }
-            if now - published < PUBLICATION_INTERVAL_SECONDS {
-                return Err("checkpoint publication is before the six-hour interval".into());
-            }
         }
         Ok(true)
     }
@@ -371,10 +368,10 @@ impl PublicExport {
         match self.latest {
             None => Ok(true),
             Some((previous, _, published)) => {
-                let elapsed = now
+                let _elapsed = now
                     .checked_sub(published)
                     .ok_or("checkpoint publication clock moved backwards")?;
-                Ok(height > previous && elapsed >= PUBLICATION_INTERVAL_SECONDS)
+                Ok(height > previous)
             }
         }
     }

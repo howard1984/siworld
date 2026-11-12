@@ -126,26 +126,18 @@ fn malformed_cursor_cannot_supply_arbitrary_paths_or_advance_pruning_clock() {
     );
 }
 #[test]
-fn publication_intervals_duplicates_and_staleness_do_not_mutate_the_clock() {
+fn block_cadence_duplicates_and_staleness_do_not_mutate_the_clock() {
     let dir = Directory::new();
     let store = dir.store();
     let root = dir.private("export");
     let mut export = PublicExport::open(&root, &store, limits()).unwrap();
     let published = 100_000;
     export.latest = Some((72, [7; 32], published));
+    assert!(!export.publication_due(published, 107).unwrap());
+    assert!(export.publication_due(published, 108).unwrap());
     assert!(
         !export
-            .publication_due(published + PUBLICATION_INTERVAL_SECONDS - 1, 168)
-            .unwrap()
-    );
-    assert!(
-        export
-            .publication_due(published + PUBLICATION_INTERVAL_SECONDS, 168)
-            .unwrap()
-    );
-    assert!(
-        !export
-            .publication_due(published + PUBLICATION_INTERVAL_SECONDS, 167)
+            .publication_due(published + PUBLICATION_INTERVAL_SECONDS, 107)
             .unwrap()
     );
     assert!(export.publication_due(published - 1, 168).is_err());
@@ -169,7 +161,12 @@ fn publication_intervals_duplicates_and_staleness_do_not_mutate_the_clock() {
     );
     assert!(
         export
-            .accept_publication(144, [8; 32], published + PUBLICATION_INTERVAL_SECONDS - 1)
+            .accept_publication(84, [8; 32], published + 1)
+            .unwrap()
+    );
+    assert!(
+        export
+            .accept_publication(84, [8; 32], published - 1)
             .is_err()
     );
     assert!(

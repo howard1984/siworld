@@ -8,7 +8,7 @@ use super::{
     execution::Engine,
     genesis::{FeeMode, Genesis},
     header::Header,
-    runtime_export::{CHECKPOINT_CONFIRMATIONS, CHECKPOINT_INTERVAL},
+    runtime_export::CHECKPOINT_CONFIRMATIONS,
     snapshot::{ImportLimits, ImportedAnchor},
     wallet_history::codec::{Context, MAX_RECEIPT_BYTES, ReceiptBlock},
 };
@@ -162,7 +162,6 @@ fn preflight(
         || rules.pow_iterations != config.pow_iterations
         || pin.tip_height > policy.max_headers as u64
         || pin.anchor_height == 0
-        || !pin.anchor_height.is_multiple_of(CHECKPOINT_INTERVAL)
         || !(CHECKPOINT_CONFIRMATIONS..=super::selection::TAIL_BLOCKS).contains(&tail)
     {
         return Err("signed checkpoint plan, complete rules or retained tail rejected".into());
@@ -174,8 +173,10 @@ fn preflight(
         || statement.checkpoint_block != pin.anchor_id
         || statement.authorization_height < pin.anchor_height + CHECKPOINT_CONFIRMATIONS
         || statement.authorization_height > pin.tip_height
-        || super::runtime_export::eligible_checkpoint(statement.authorization_height)
-            != Some(pin.anchor_height)
+        || !super::runtime_export::confirmed_checkpoint(
+            pin.anchor_height,
+            statement.authorization_height,
+        )
     {
         return Err("checkpoint certificate is outside selected confirmed ancestry".into());
     }

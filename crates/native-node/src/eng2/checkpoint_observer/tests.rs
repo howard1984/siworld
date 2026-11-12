@@ -25,10 +25,14 @@ impl View for Synthetic {
     }
 }
 fn fixture() -> Synthetic {
+    fixture_at(72)
+}
+fn fixture_at(checkpoint: u64) -> Synthetic {
+    let authorization_height = checkpoint + 24;
     let mut governance = crate::eng2::snapshot::tests::bootstrap()
         .governance()
         .clone();
-    for height in 1..=96 {
+    for height in 1..=authorization_height {
         governance.apply_block(height, &[]).unwrap();
     }
     let network = governance.network();
@@ -51,7 +55,7 @@ fn fixture() -> Synthetic {
     };
     let anchor = Header {
         network,
-        height: 72,
+        height: checkpoint,
         parent: [7; 32],
         timestamp: 21600,
         target: [255; 32],
@@ -61,13 +65,13 @@ fn fixture() -> Synthetic {
     };
     let authorization = Header {
         network,
-        height: 96,
+        height: authorization_height,
         parent: [10; 32],
         timestamp: 28800,
         target: [255; 32],
         execution_commitment: commitment::aggregate_descriptors(
             network,
-            96,
+            authorization_height,
             [10; 32],
             &witness.descriptors,
         )
@@ -78,16 +82,16 @@ fn fixture() -> Synthetic {
     let roster = governance.active_roster();
     let statement = Statement {
         network,
-        checkpoint_height: 72,
+        checkpoint_height: checkpoint,
         checkpoint_block: anchor.id().unwrap(),
-        authorization_height: 96,
+        authorization_height,
         authorization_block: authorization.id().unwrap(),
         roster_sequence: roster.epoch_sequence,
         roster_digest: roster.digest(network),
     };
     Synthetic {
         governance,
-        headers: BTreeMap::from([(72, anchor), (96, authorization)]),
+        headers: BTreeMap::from([(checkpoint, anchor), (authorization_height, authorization)]),
         statement,
         witness,
     }
@@ -298,4 +302,23 @@ pub(crate) fn synthetic_current_conflict() -> Observer {
         Err(Error::Conflict)
     );
     observer
+}
+
+#[test]
+fn current_quorum_verification_does_not_depend_on_publisher_cadence() {
+    for checkpoint in [1, 11, 13, 71, 73] {
+        let fixture = fixture_at(checkpoint);
+        let packet = certified(&fixture, fixture.statement.clone());
+        assert_eq!(
+            Observer::default().check(&fixture, 1, &packet),
+            Ok(Outcome::CurrentCertificate(checkpoint))
+        );
+        let mut insufficient = fixture.statement.clone();
+        insufficient.checkpoint_height += 1;
+        let packet = certified(&fixture, insufficient);
+        assert_eq!(
+            Observer::default().check(&fixture, 1, &packet),
+            Err(Error::Rejected)
+        );
+    }
 }

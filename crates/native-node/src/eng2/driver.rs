@@ -216,7 +216,10 @@ impl Driver {
         self.padding
             .prune(self.store.engine().state().chain())
             .expect("owner padding network is immutable");
-        if committed.height().is_multiple_of(72) {
+        if committed
+            .height()
+            .is_multiple_of(crate::eng2::runtime_export::CHECKPOINT_INTERVAL)
+        {
             self.last_archive_error = self.store.archive_checkpoint_anchor(self.imports).err();
         }
         self.bootstrap

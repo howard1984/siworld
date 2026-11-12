@@ -5,7 +5,6 @@ use super::{
     checkpoint_wire::{Incoming, MAX_GOVERNANCE_BYTES},
     commitment::{self, Component, ComponentId},
     header::Header,
-    runtime_export::eligible_checkpoint,
     store::Store,
 };
 use crate::{
@@ -124,7 +123,10 @@ fn headers(view: &impl View, statement: &Statement) -> Result<(Header, Hash), Er
     if current.height() != view.height()
         || statement.network != current.network()
         || statement.encode().is_err()
-        || eligible_checkpoint(statement.authorization_height) != Some(statement.checkpoint_height)
+        || !super::runtime_export::confirmed_checkpoint(
+            statement.checkpoint_height,
+            statement.authorization_height,
+        )
     {
         return Err(Error::Rejected);
     }

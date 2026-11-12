@@ -164,7 +164,8 @@ pub fn select(candidates: Vec<Prepared>, floor: Work) -> Result<Client, String> 
     let tip = selected.pin().tip_id;
     let prepared = candidates
         .into_iter()
-        .find(|p| p.plan.pin().tip_id == tip)
+        .filter(|p| p.plan.pin().tip_id == tip)
+        .max_by_key(|p| p.candidate.manifest().checkpoint_height())
         .ok_or("bootstrap selected candidate unavailable")?;
     let manifest = prepared.candidate.manifest();
     let plan = selected

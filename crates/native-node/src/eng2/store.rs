@@ -655,8 +655,8 @@ impl Store {
     ) -> Result<(), String> {
         self.ensure_exportable()?;
         let height = self.engine.state().height();
-        if height == 0 || !height.is_multiple_of(72) {
-            return Err("checkpoint archive requires a positive 72-block boundary".into());
+        if height == 0 || !height.is_multiple_of(crate::eng2::runtime_export::CHECKPOINT_INTERVAL) {
+            return Err("checkpoint archive requires a positive checkpoint boundary".into());
         }
         let header = self.header(height)?;
         let binding = super::state_components::Binding {
@@ -677,6 +677,9 @@ impl Store {
             return Err("checkpoint archive differs from actual accepted header".into());
         }
         let bytes = super::snapshot::encode_components(&components, limits)?;
+        self.persist_checkpoint_archive(height, &bytes)
+    }
+    fn persist_checkpoint_archive(&self, height: u64, bytes: &[u8]) -> Result<(), String> {
         let mut txn = self
             .database
             .begin_write()
@@ -695,7 +698,7 @@ impl Store {
                 return Err("existing checkpoint archive differs; preserved".into());
             }
             table
-                .insert(height, bytes.as_slice())
+                .insert(height, bytes)
                 .map_err(|_| "checkpoint archive write failed")?;
         }
         txn.commit()
@@ -709,7 +712,7 @@ impl Store {
         limits: super::snapshot::ImportLimits,
     ) -> Result<super::snapshot::SnapshotState, String> {
         self.ensure_exportable()?;
-        if height == 0 || !height.is_multiple_of(72) || height > self.engine.state().height() {
+        if height == 0 || height > self.engine.state().height() {
             return Err("invalid requested checkpoint archive height".into());
         }
         let header = self.header(height)?;
@@ -720,16 +723,72 @@ impl Store {
         let table = txn
             .open_table(ANCHORS)
             .map_err(|_| "checkpoint archive is not available")?;
-        let bytes = table
+        if let Some(bytes) = table
             .get(height)
             .map_err(|_| "checkpoint archive lookup failed")?
-            .ok_or("checkpoint archive missing")?;
-        super::snapshot::SnapshotState::from_committed_components(
+        {
+            return super::snapshot::SnapshotState::from_committed_components(
+                self.engine.genesis(),
+                &header,
+                bytes.value(),
+                limits,
+            );
+        }
+        // A cadence upgrade can introduce a boundary absent from an older
+        // archive. Reconstruct only a bounded suffix in an isolated engine;
+        // normal committed-state recovery and canonical tables are unchanged.
+        let lower =
+            height.saturating_sub(crate::eng2::runtime_export::LEGACY_CHECKPOINT_INTERVAL - 1);
+        let mut entries = table
+            .range(lower..height)
+            .map_err(|_| "checkpoint migration archive range unavailable")?;
+        let (base_height, base_bytes) = loop {
+            let (key, value) = entries
+                .next_back()
+                .ok_or("checkpoint archive missing within bounded migration window")?
+                .map_err(|_| "checkpoint migration archive read failed")?;
+            let candidate = key.value();
+            if candidate > 0 {
+                break (candidate, value.value().to_vec());
+            }
+        };
+        drop(entries);
+        drop(table);
+        drop(txn);
+        let base_header = self.header(base_height)?;
+        let base = super::snapshot::SnapshotState::from_committed_components(
+            self.engine.genesis(),
+            &base_header,
+            &base_bytes,
+            limits,
+        )?;
+        let mut reconstructed = Engine::from_authenticated_local_state(
+            Genesis::decode(&self.engine.genesis().encode()?)?,
+            base,
+            self.engine.limits(),
+        )?;
+        let verifier = NativeVerifier::new()?;
+        for current in base_height + 1..=height {
+            let (header, body) = self.block(current)?;
+            reconstructed.apply(&header, &body, &verifier)?;
+        }
+        let binding = super::state_components::Binding {
+            genesis: self.engine.genesis().id(),
+            rules_commitment: self.engine.genesis().rules_commitment(),
+            parent: header.parent,
+        };
+        let components = reconstructed
+            .state()
+            .canonical_components(binding, limits.chain)?;
+        let bytes = super::snapshot::encode_components(&components, limits)?;
+        let state = super::snapshot::SnapshotState::from_committed_components(
             self.engine.genesis(),
             &header,
-            bytes.value(),
+            &bytes,
             limits,
-        )
+        )?;
+        self.persist_checkpoint_archive(height, &bytes)?;
+        Ok(state)
     }
     /// The sole successful return occurs after an immediate durable redb commit
     /// and in-memory publication of the same fully verified native block.
@@ -1176,6 +1235,127 @@ mod tests {
     }
     fn fs_remove_fixture(directory: std::path::PathBuf) {
         std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    #[ignore = "requires a disposable copy of at least 24 accepted native blocks"]
+    fn checkpoint_archive_migration_verifies_a_bounded_native_suffix_without_changing_head() {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("SIWORLD_CHECKPOINT_ARCHIVE_FIXTURE").unwrap(),
+        );
+        assert!(directory.is_absolute() && directory.file_name().unwrap() == "archive-fixture");
+        assert!(directory.join("disposable-fixture").is_file());
+        let path = directory.join("chain.redb");
+        let genesis_bytes = std::fs::read(directory.join("genesis.bin")).unwrap();
+        let genesis = || Genesis::decode(&genesis_bytes).unwrap();
+        let records = {
+            let database = Database::open(&path).unwrap();
+            let txn = database.begin_write().unwrap();
+            let mut blocks = txn.open_table(BLOCKS).unwrap();
+            let records: Vec<Vec<u8>> = (13..=24)
+                .map(|height| blocks.get(height).unwrap().unwrap().value().to_vec())
+                .collect();
+            let header = Header::decode(
+                &blocks.get(12).unwrap().unwrap().value()[..HEADER_BYTES],
+                &genesis().config().network,
+            )
+            .unwrap();
+            let extra: Vec<u64> = blocks
+                .range(13..)
+                .unwrap()
+                .map(|row| row.unwrap().0.value())
+                .collect();
+            for height in &extra {
+                blocks.remove(*height).unwrap();
+            }
+            drop(blocks);
+            let mut index = txn.open_table(INDEX).unwrap();
+            for height in extra {
+                index.remove(height).unwrap();
+            }
+            drop(index);
+            let mut anchors = txn.open_table(ANCHORS).unwrap();
+            let existing: Vec<u64> = anchors
+                .iter()
+                .unwrap()
+                .map(|row| row.unwrap().0.value())
+                .collect();
+            for height in existing {
+                anchors.remove(height).unwrap();
+            }
+            drop(anchors);
+            let mut head = 12u64.to_le_bytes().to_vec();
+            head.extend_from_slice(&header.id().unwrap());
+            head.extend_from_slice(&header.execution_commitment);
+            txn.open_table(META)
+                .unwrap()
+                .insert("head", head.as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+            records
+        };
+        let limits = super::super::snapshot::ImportLimits {
+            chain: Limits {
+                max_leaves: 1_000_000,
+                max_nullifiers: 1_000_000,
+                max_component_bytes: 64 * 1024 * 1024,
+            },
+            max_snapshot_bytes: 512 * 1024 * 1024,
+        };
+        let verifier = NativeVerifier::new().unwrap();
+        let mut store = Store::audit_existing(&path, genesis(), limits.chain, &verifier).unwrap();
+        store.archive_checkpoint_anchor(limits).unwrap();
+        for record in &records {
+            let (header, body) = decode(store.engine(), record).unwrap();
+            store.append(&header, &body, &verifier).unwrap();
+        }
+        let before = head(
+            store.engine(),
+            store.header(24).unwrap().execution_commitment,
+        );
+        let original = records[0].clone();
+        let mut corrupt = original.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let txn = store.database.begin_write().unwrap();
+        txn.open_table(BLOCKS)
+            .unwrap()
+            .insert(13, corrupt.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(store.checkpoint_anchor(24, limits).is_err());
+        assert_eq!(
+            head(
+                store.engine(),
+                store.header(24).unwrap().execution_commitment
+            ),
+            before
+        );
+        let txn = store.database.begin_write().unwrap();
+        assert!(txn.open_table(ANCHORS).unwrap().get(24).unwrap().is_none());
+        txn.open_table(BLOCKS)
+            .unwrap()
+            .insert(13, original.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        let migrated = store.checkpoint_anchor(24, limits).unwrap();
+        assert_eq!(migrated.height(), 24);
+        assert_eq!(
+            head(
+                store.engine(),
+                store.header(24).unwrap().execution_commitment
+            ),
+            before
+        );
+        // Successful reconstruction is cached. It no longer reads the suffix.
+        let txn = store.database.begin_write().unwrap();
+        txn.open_table(BLOCKS)
+            .unwrap()
+            .insert(13, corrupt.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.checkpoint_anchor(24, limits).unwrap().height(), 24);
+        println!(
+            "bounded_checkpoint_archive_native_replay=passed blocks=12 accepted_head_unchanged=true corrupt_suffix_rejected=true"
+        );
     }
     #[test]
     fn persisted_body_reads_reject_proof_byte_corruption_before_export() {
