@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "name": "siworld-eng-2",
+  "network": "06fa3ed71960f2d6add484afba453091a2536e718234df1187f33c0f7dcf5b5d",
+  "genesis": "9cdb6925e53ff9b6ff12051a00d86ab965f33c3e2e806c4b9cd2f13f3984591d",
+  "rules": "b763d3cd4a95a7393a581fe76040b73f7de4fd53ebb4bceb044e123855c65433",
+  "profile": "d1e01c6576947286d6d2a859bbab3b24b3dba0af812b1c79d8f67b8e4833e4c1",
+  "fee_mode": 0,
+  "read_only": true,
+  "api": "https://wallet-eng.siworld.io"
+}

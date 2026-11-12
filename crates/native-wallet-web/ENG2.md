@@ -4,9 +4,14 @@
 
 The portable `Eng2LightState`, explicit `BrowserWallet` eng2 methods and
 worker-only `Eng2Session` implement a staged receive, balance and history path.
+`Eng2WalletSession` composes that owner with the encrypted payment journal and
+the explicit engineering-v2 admission adapter; construction leaves every
+website mutation gate closed.
 They are separate from the engineering-v1 light wallet and compact history.
-The existing website build, vault selection and worker dispatcher remain
-engineering-v1. Importing this module does not activate a website or service.
+The website builder accepts an explicit read-only engineering-v2 profile and
+selects this worker runtime without constructing an engineering-v1 history
+owner. The default unconfigured build remains inactive. Importing this module
+does not activate a website or service.
 
 The client verifies complete native-header continuity, median time past,
 ASERT difficulty, proof of work, cumulative work and receipt authentication
@@ -50,6 +55,14 @@ The source adapter uses the following routes:
 Head publication must be no more than 300 seconds old or 30 seconds in the
 future. This is a freshness check on a service export, not proof of current
 peer connectivity. The client rechecks the head before durable adoption.
+Public reads use at most three transport attempts, each with a separate
+30-second deadline and 0.5- then 1-second backoff. Network failures, timeouts
+and HTTP 429, 502, 503 or 504 are retryable. Decoding, byte bounds, context
+checks and native authentication remain outside that retry boundary.
+Cancellation ends the pending request and backoff. The page retries a paused
+synchronization after five seconds; a failed initialization is attempted again
+by either the timer or the explicit synchronization control.
+
 Transport admission or an unsigned head response does not establish native
 proof validity. Redirects, credentials and legacy endpoint fallback are absent.
 
@@ -57,9 +70,13 @@ proof validity. Redirects, credentials and legacy endpoint fallback are absent.
 
 All block work and receipt checks finish in an isolated native candidate.
 Candidate append returns height, tip and `committed:false`; it does not return
-candidate balances as final. Adoption requires reaching the exact pinned head
-and greater cumulative work for a changed tip. The current local balance
-remains available as stale data if a scan fails.
+candidate balances as final. A direct extension saves an authenticated prefix
+every eight blocks after checking its work and the fresh service head's branch.
+A competing branch is adopted only after the complete selected candidate passes
+validation; partial competing prefixes never replace the accepted state.
+Only the exact fresh head marks synchronization ready. Saved partial prefixes
+remain stale, and reopening downloads only blocks after that durable prefix.
+The current local balance remains available as stale data if a scan fails.
 
 The IndexedDB namespace contains network, genesis, rules, native profile and
 fee mode. No engineering-v1 database, journal, compact cache, vault store or
@@ -76,15 +93,84 @@ metadata must remain in the worker and must never be sent to a service.
 A cancelled scan, head race, authentication failure, foreign cache or failed
 storage transaction preserves the preceding committed state.
 
-## Remaining integration
+## Read-only website build
 
-A dedicated engineering-v2 custody/backup namespace, website dispatcher and
-pinned build manifest are required before exposing this runtime in a website.
-A new compatible WASM artifact and endpoint/export deployment must be qualified
-separately. This source does not supply either deployment.
+`build.py --eng2-manifest CONTEXT --output DIRECTORY` requires exactly version 2,
+name `siworld-eng-2`, network, genesis, rules and native-profile identifiers,
+fee mode 0, the API origin and `read_only:true`. Legacy rules/manifests,
+synthetic fixture mode and a separate Vault manifest are incompatible with this
+profile. The output fixes `desktop_send_measured:false` and installs the
+engineering-v2 custody adapter as its storage entry point. Legacy builds keep
+their existing storage adapter.
 
-Sending requires exact anchored transaction witness preparation, native
-proof runtime and profile dispatch, a durable payment journal, submission
-admission, and receipt-confirmed inclusion. These capabilities are not enabled
-by this staged receive/balance runtime. Owner custody data is not required for
-source or synthetic fixture validation.
+Encrypted vault records, account registries and selection preferences use a
+separate database bound to network, genesis, rules, profile and fee mode. The
+backup format is `siworld-eng2-wallet-backup`; its public context must match the
+build before unlock/import. Vault encryption and address derivation retain
+their existing native network binding. This adapter does not introduce a new
+vault cipher or imply that its public backup-context fields are encrypted.
+There is no legacy database discovery, backup conversion or automatic migration.
+
+The worker independently rejects payment preparation, submission, cancellation
+and public address registration in this read-only profile. UI flags cannot
+enable them. A new compatible WASM artifact and a packaged browser integration
+must still be qualified against the independently pinned genesis and profile.
+This source does not supply a deployment or claim browser acceptance.
+
+## Offline transaction interfaces
+
+`Eng2LightState::prepare_sip` constructs the shared native witness from the
+complete body-authenticated receipt prefix and owned membership paths. The
+caller pins the network and exact current engineering-v2 header snapshot.
+The fee schedule and frozen proof profile remain unchanged. The canonical
+transaction-anchor lifetime is 4,096 blocks, independently of local proof
+storage retention. Unknown, expired, future and foreign anchors are rejected.
+
+`prove_sip` uses the frozen native transaction prover and independently verifies
+the generated proof against the retained engineering-v2 snapshot. Packet
+verification checks the exact network, snapshot identity, recent-root anchor,
+fee opening and proof. It does not establish global admission or inclusion.
+The framing is the native envelope followed by the fixed sidecar; the private
+owner socket adds its own transport prefix.
+
+The worker-only `Eng2Payments` journal durably encrypts input reservations and
+payment openings before proving, and stores the finalized exact packet before
+any transport call. It records uncertainty before an explicitly injected
+admission adapter runs. Timeouts and ambiguous replies never release inputs;
+reopening retries the same stored packet. Only an authenticated receipt under
+a committed native header marks inclusion. A removed inclusion restores the
+uncertain reservation. The receipt session and payment journal share a lock.
+An interrupted reserved witness can be cancelled locally; it is never silently
+reconstructed after reopening.
+
+The composed website owner returns an allowlisted display projection, subtracts
+held input totals from available SIP and never exports openings, input
+commitments or exact packet bytes to the page. Accepted and uncertain rows keep
+their reservations. A refresh scans at most 32 pinned receipts for unresolved
+payments, authenticates them against committed native headers and resumes an
+in-memory cursor. A branch change resets that cursor; a removed inclusion
+restores uncertainty. Account switching and lock release only the in-memory
+owner and preserve encrypted records. The history distinguishes pending
+admission from authenticated inclusion.
+
+The worker mutation gate remains closed, and both
+`send_supported` and `full_node_consensus_verified` remain false. Local synthetic
+framing tests, generated native proof tests and browser automation evidence
+must be reported separately from deployed-chain transfer acceptance.
+
+The source-level entry qualification reports `entry_qualified:false`,
+`static_thread_adapter_qualified:false` and `live_transfer_qualified:false`.
+Service replies and caller flags cannot change these values. A separate
+packaged UI and static-worker trial, followed by deployed-chain transfer
+acceptance, is required before a send-enabled release can be qualified.
+
+## Engineering deployment artifact binding
+
+`networks/eng2-readonly.json` fixes the current internal engineering network and
+exact API origin. `releases/eng2-readonly.json` lists the complete eight-file
+static release, raw packager inputs, tool versions and native runtime source
+hashes. The runtime binary is reused from the corresponding nonfixture build;
+the manifest does not assert that a fresh runtime compilation is byte identical.
+Deployment records bind the published source commit to the immutable output
+hashes outside the served static directory. An additional file in that
+directory is rejected by the static integrity verifier. Sending remains closed.

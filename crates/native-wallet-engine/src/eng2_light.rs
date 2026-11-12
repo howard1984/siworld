@@ -21,6 +21,9 @@ use zeroize::Zeroizing;
 
 #[path = "eng2_light_cache.rs"]
 mod cache;
+#[path = "eng2_payments.rs"]
+mod payments;
+pub use payments::PaymentAnchor;
 /// Exact immutable native proof profile compiled into this client.
 pub fn native_profile() -> Hash {
     crate::proofs::protocol_profile_fingerprint()
@@ -34,6 +37,8 @@ pub struct Eng2LightState {
     wallet: Wallet,
     paths: OwnedPaths,
     headers: Vec<Header>,
+    prover: Option<native::multi_asset_transaction::TransactionProver>,
+    prepared: Option<crate::wallet::PreparedTransfer>,
 }
 impl Eng2LightState {
     pub fn new(
@@ -67,6 +72,8 @@ impl Eng2LightState {
             wallet,
             paths: OwnedPaths::new(),
             headers: Vec::new(),
+            prover: None,
+            prepared: None,
         })
     }
     pub fn fresh(&self, seed: Zeroizing<[u8; 32]>, account: u32) -> Result<Self, String> {

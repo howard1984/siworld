@@ -20,7 +20,7 @@ HEADERS = {
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), display-capture=()',
-    'Strict-Transport-Security': 'max-age=31536000',
+    'Strict-Transport-Security': 'max-age=86400',
 }
 
 
@@ -170,6 +170,8 @@ def package(source, destination, esbuild):
             assets = app_root / 'assets'
             assets.mkdir(parents=True)
             entries = {app: entry, **workers}
+            if app == 'wallet':
+                entries['wallet-startup'] = 'assets/wallet-startup.js'
             if threaded:
                 entries['rayon-worker'] = 'rayon-entry.js'
             meta = temporary / (app + '-meta.json')
@@ -202,6 +204,9 @@ def package(source, destination, esbuild):
             original = 'native-wallet.js' if app == 'wallet' else 'vault-application.js'
             html = replace_once(html, '<script type="module" src="assets/' + original + '"></script>',
                                 '<script type="module" src="/releases/' + release + '/assets/' + app + '.mjs" integrity="' + digests[app + '.mjs'] + '" crossorigin="anonymous"></script>')
+            if app == 'wallet':
+                html = replace_once(html, '<script src="assets/wallet-startup.js"></script>',
+                                    '<script src="/releases/' + release + '/assets/wallet-startup.mjs" integrity="' + digests['wallet-startup.mjs'] + '" crossorigin="anonymous"></script>')
             (app_root / (app + '.html')).write_text(html)
             manifest = {'version': 1, 'application': app, 'release': release, 'threaded': threaded,
                         'assets': {f'releases/{release}/assets/{name}': digest for name, digest in digests.items()},
