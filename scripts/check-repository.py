@@ -67,6 +67,7 @@ EXPLORER_FILES = {
     "tools/explorer/tests/projection.test.mjs",
 }
 PUBLIC_TEXT_ASSETS = {
+    'crates/native-wallet-web/web/assets/wallet-startup.js',
     'crates/native-wallet-web/tests/public-fetch.test.mjs',
     'crates/native-wallet-web/tests/wallet-sync-ui.test.mjs',
     'crates/native-wallet-web/web/sdk/public-fetch.js',

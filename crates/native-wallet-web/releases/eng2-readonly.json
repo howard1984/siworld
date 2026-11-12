@@ -2,8 +2,8 @@
   "version": 1,
   "application": "wallet",
   "network_context": "../networks/eng2-readonly.json",
-  "release": "b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957",
-  "release_manifest_sha256": "2ee6245c3b6cb10b2abfa7fce864e41b55f58bf90a484db9f7fd6145c0ce736f",
+  "release": "ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b",
+  "release_manifest_sha256": "2c95434ef6c529335b7f5dcedf45cf86115335e68dfd6108cb8af8628f97f66e",
   "tool_versions": {
     "esbuild": "0.25.12",
     "wasm_bindgen": "0.2.120",
@@ -23,7 +23,7 @@
   },
   "packager": {
     "path": "crates/native-wallet-web/tools/package-release.py",
-    "sha256": "37443ad17a1a5d9ed97315135ae81f4bad1d8e6b581ea2b05b17177d74f67e86"
+    "sha256": "5535a53a9db9039786fdd9481ff0e4a2e4419f65046df1b8c47dcf792c8b5225"
   },
   "wasm_source_inputs": [
     {
@@ -384,8 +384,8 @@
     },
     {
       "raw_path": "assets/native-wallet.css",
-      "bytes": 12276,
-      "sha256": "eecb297e9a64345accc810f95adddbb0408da186fadeb20f05fa6175a1cc1c1d",
+      "bytes": 12565,
+      "sha256": "19b688af99319b59216e481f26af40c4b2f929da204ef28849015999eb1e1bf5",
       "kind": "source",
       "source_mapping": "crates/native-wallet-web/web/assets/native-wallet.css"
     },
@@ -416,6 +416,13 @@
       "sha256": "372fde25cc0e68406b46d8f8f17a98776afcd30c59b9bb2b3e1b183a6fe61eb5",
       "kind": "source",
       "source_mapping": "crates/native-wallet-web/web/assets/wallet-list.js"
+    },
+    {
+      "raw_path": "assets/wallet-startup.js",
+      "bytes": 2116,
+      "sha256": "393d5c82800c6ab38efc4977ed685475cbab83b385e8af7f28659ab23a5f1100",
+      "kind": "source",
+      "source_mapping": "crates/native-wallet-web/web/assets/wallet-startup.js"
     },
     {
       "raw_path": "sdk/cloud-session.js",
@@ -622,8 +629,8 @@
     },
     {
       "raw_path": "wallet.html",
-      "bytes": 14806,
-      "sha256": "04a8b2663cd000462ceb0844de08dc5dfefc5d76a5230384c556386bdcbd9c9b",
+      "bytes": 15324,
+      "sha256": "4128ad21c3d7ad6669ff076a33eced0a50a7a4ccc4a931b322740cb3f7f95142",
       "kind": "generated_html",
       "source_mapping": "Main web template + build.py runtime labeling/context/thread-CSP transformation; package-release.py removes the raw CSP meta."
     }
@@ -631,31 +638,36 @@
   "files": [
     {
       "path": "release-manifest.json",
-      "bytes": 1262,
-      "sha256": "2ee6245c3b6cb10b2abfa7fce864e41b55f58bf90a484db9f7fd6145c0ce736f"
+      "bytes": 1444,
+      "sha256": "2c95434ef6c529335b7f5dcedf45cf86115335e68dfd6108cb8af8628f97f66e"
     },
     {
-      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/rayon-worker.mjs",
+      "path": "releases/ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b/assets/rayon-worker.mjs",
       "bytes": 53978,
       "sha256": "727e3afbbd4fc1b6ad98b35c577edd54c3fa37a116d7d916602fa4f1effb1179"
     },
     {
-      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet-worker.mjs",
+      "path": "releases/ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b/assets/wallet-startup.mjs",
+      "bytes": 1979,
+      "sha256": "ae85934b96ba08b3812226d1fa5d28d79bac2a4ff373aa32003c3fe36323fa25"
+    },
+    {
+      "path": "releases/ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b/assets/wallet-worker.mjs",
       "bytes": 159671,
       "sha256": "caee373623625e706dcaba57e08a0d4759e75ba354eb861ef393cc515bb0da81"
     },
     {
-      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet.css",
-      "bytes": 12276,
-      "sha256": "eecb297e9a64345accc810f95adddbb0408da186fadeb20f05fa6175a1cc1c1d"
+      "path": "releases/ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b/assets/wallet.css",
+      "bytes": 12565,
+      "sha256": "19b688af99319b59216e481f26af40c4b2f929da204ef28849015999eb1e1bf5"
     },
     {
-      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet.mjs",
+      "path": "releases/ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b/assets/wallet.mjs",
       "bytes": 56144,
       "sha256": "fb0ecae0740f3df8ebc64e2683c15e44ec8b3d78b2464f064bce5bfc08bd199e"
     },
     {
-      "path": "releases/b628f9ff4375b37bb081e383f2a958b9ae62e1f8f6091ad22dc130f46a1e1957/assets/wallet_bg.wasm",
+      "path": "releases/ddfc777a4e887c796fd72451118f1132e7308ce9a379dac866d4fc554cbbd87b/assets/wallet_bg.wasm",
       "bytes": 9740455,
       "sha256": "7d95a72ac5ab2f78d1633ead7d1000646f19eaeee189180c29d8600cec3d8b64"
     },
@@ -666,8 +678,8 @@
     },
     {
       "path": "wallet.html",
-      "bytes": 14860,
-      "sha256": "a90cf4843958bdb521db82253fa879e37f2052bad8be7414b68bc2afa278bba9"
+      "bytes": 15562,
+      "sha256": "2d6040dbd1cae9f84e7d1b2aa79fc49960f82a245d537161052dd48f90c7f791"
     }
   ]
 }

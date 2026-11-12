@@ -36,12 +36,22 @@ class ReleaseTests(unittest.TestCase):
             manifest = packaging.verify_release(root)
             self.assertFalse((root / (other + '.html')).exists())
             html = (root / (app + '.html')).read_text()
-            self.assertEqual(html.count('integrity="sha384-'), 2)
+            self.assertEqual(html.count('integrity="sha384-'), 3 if app == 'wallet' else 2)
             self.assertNotIn('http-equiv="Content-Security-Policy"', html)
             self.assertIn('releases/' + manifest['release'], html)
 
+    def test_wallet_startup_is_visible_before_application_execution(self):
+        root = self.output / 'wallet'
+        html = (root / 'wallet.html').read_text()
+        self.assertRegex(html, r'<dialog id="wallet-startup"[^>]* open>')
+        self.assertLess(html.index('id="wallet-startup"'), html.index('id="create"'))
+        self.assertLess(html.index('/assets/wallet-startup.mjs'), html.index('/assets/wallet.mjs'))
+        startup = next(root.rglob('wallet-startup.mjs')).read_text()
+        self.assertNotRegex(startup, r'\b(?:import|export)\b')
+        self.assertNotIn('wallet-startup', (self.output / 'vault/vault.html').read_text())
+
     def test_javascript_and_wasm_corruption_are_rejected(self):
-        for suffix in ['wallet.mjs', 'wallet-worker.mjs', 'rayon-worker.mjs', 'wallet_bg.wasm', 'wallet.css']:
+        for suffix in ['wallet.mjs', 'wallet-startup.mjs', 'wallet-worker.mjs', 'rayon-worker.mjs', 'wallet_bg.wasm', 'wallet.css']:
             root = self.mutated(suffix)
             artifact = next(root.rglob(suffix))
             artifact.write_bytes(artifact.read_bytes() + b'altered')
