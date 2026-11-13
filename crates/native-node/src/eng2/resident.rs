@@ -255,9 +255,9 @@ fn export_status(
     started: Instant,
     sequence: u64,
     mode: (bool, bool),
-    export_state: (Option<&str>, Option<bool>),
+    export_state: (Option<&str>, Option<bool>, Option<&str>),
 ) -> Result<(), String> {
-    let (checkpoint_error, wallet_export) = export_state;
+    let (checkpoint_error, wallet_export, checkpoint_tick_reason) = export_state;
     let (mining, listening) = mode;
     let owner = shared
         .owner
@@ -287,7 +287,7 @@ fn export_status(
             "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
-            "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
+            "checkpoint_error":checkpoint_error,"checkpoint_tick_reason":checkpoint_tick_reason,"checkpoint_archive_error":owner.last_archive_error(),
             "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
             "signed_bootstrap_available":owner.bootstrap_available(),
             "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
@@ -468,6 +468,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         )?
     };
     #[cfg(unix)]
+    checkpoint_host.enable_async_preparation(&shared.budget)?;
+    #[cfg(unix)]
     if std::env::var_os("SIWORLD_ENG2_WALLET_EXPORT").is_some_and(|value| value == "1") {
         let owner = shared
             .owner
@@ -519,6 +521,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let mut checkpoint_error = None;
     #[cfg(not(unix))]
     let checkpoint_error = None;
+    #[cfg(unix)]
+    let mut checkpoint_tick_reason = None;
+    #[cfg(not(unix))]
+    let checkpoint_tick_reason = None;
     #[cfg(not(unix))]
     let wallet_export = None;
     let result = (|| {
@@ -558,6 +564,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             shared.mailbox.acknowledge(&incoming)?;
                             shared.mailbox.publish(&tick.messages())?;
                             checkpoint_error = None;
+                            checkpoint_tick_reason = None;
                             if bootstrap_service
                                 && owner
                                     .refresh_bootstrap(
@@ -570,7 +577,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             }
                         }
                         Err(_) => {
-                            checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable")
+                            checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable");
+                            checkpoint_tick_reason = checkpoint_host
+                                .tick_failure_reason()
+                                .map(super::runtime_export::host::TickFailureReason::code);
                         }
                     }
                     let _ = checkpoint_host.tick_wallet_export(
@@ -592,16 +602,20 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     started,
                     sequence,
                     (mining, listening),
-                    (checkpoint_error, {
-                        #[cfg(unix)]
+                    (
+                        checkpoint_error,
                         {
-                            checkpoint_host.wallet_export_state()
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            wallet_export
-                        }
-                    }),
+                            #[cfg(unix)]
+                            {
+                                checkpoint_host.wallet_export_state()
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                wallet_export
+                            }
+                        },
+                        checkpoint_tick_reason,
+                    ),
                 )?;
                 last_export = Instant::now();
             }
@@ -611,6 +625,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     })();
     shared.phase("stopping")?;
     shared.cancel.cancel();
+    #[cfg(unix)]
+    let result = result.and(checkpoint_host.stop_preparation());
     #[cfg(unix)]
     drop(submission);
     let network_result = network
@@ -630,16 +646,20 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         started,
         sequence.saturating_add(1),
         (mining, false),
-        (checkpoint_error, {
-            #[cfg(unix)]
+        (
+            checkpoint_error,
             {
-                checkpoint_host.wallet_export_state()
-            }
-            #[cfg(not(unix))]
-            {
-                wallet_export
-            }
-        }),
+                #[cfg(unix)]
+                {
+                    checkpoint_host.wallet_export_state()
+                }
+                #[cfg(not(unix))]
+                {
+                    wallet_export
+                }
+            },
+            checkpoint_tick_reason,
+        ),
     )?;
     result
 }

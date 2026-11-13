@@ -168,13 +168,13 @@ impl Configuration {
             if entries.len() > 16 {
                 return Err("legacy checkpoint peer limit".into());
             }
+            // This set only suppresses incompatible advertisements after peer
+            // authentication. Configured destinations still require PeerPins.
             for entry in entries {
                 let fingerprint = unhex::<32>(entry)?;
                 if fingerprint == local || !legacy_checkpoint_peers.insert(fingerprint) {
                     return Err("duplicate or local legacy checkpoint peer".into());
                 }
-                PeerPin::load(directory, fingerprint, &genesis.peer_binding())
-                    .map_err(|_| "independently checked legacy peer pin required")?;
             }
         }
         Ok(Self {
