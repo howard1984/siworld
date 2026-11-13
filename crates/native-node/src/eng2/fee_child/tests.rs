@@ -223,3 +223,6 @@ fn arbitrary_configuration_cannot_select_another_air_or_relation() {
         assert!(TrustedFactory::from_local_configuration(network, binding, identity).is_err());
     }
 }
+
+#[path = "held_body.rs"]
+mod held_body;
