@@ -17,6 +17,7 @@ pub mod commitment;
 pub mod connector;
 pub mod driver;
 pub mod execution;
+pub mod fee_candidate;
 pub mod fund_claim;
 pub mod genesis;
 pub mod genesis_tool;
