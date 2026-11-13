@@ -13,6 +13,7 @@ pub mod multi_asset;
 pub mod multi_asset_air;
 pub mod multi_asset_trace;
 pub mod multi_asset_transaction;
+pub mod native_hiding_v2;
 #[cfg(feature = "security-report")]
 pub mod security;
 pub mod settlement;

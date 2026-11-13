@@ -11,6 +11,9 @@
 //! Decoding establishes structure, not proof validity: callers must still
 //! verify the proof against their independently reconstructed statement.
 
+#[path = "proof_codec/v2.rs"]
+pub mod v2;
+
 use native::{Cfg, multi_asset::F};
 use p3_air::{
     Air,
@@ -79,6 +82,7 @@ struct FoldShape {
 #[derive(Clone, Debug)]
 pub struct ProofShape {
     body_limit: usize,
+    salt_elements: usize,
     main_width: usize,
     preprocessed_width: usize,
     main_next: bool,
@@ -232,6 +236,7 @@ impl ProofShape {
         }
         Ok(Self {
             body_limit,
+            salt_elements: 0,
             main_width: air.width(),
             preprocessed_width: vk.width,
             main_next,
@@ -257,6 +262,9 @@ impl ProofShape {
     /// exact consumption and canonical re-encoding. Perform cryptographic
     /// verification afterwards; an admitted shape can contain a false proof.
     pub fn decode(&self, bytes: &[u8]) -> Result<Proof<Cfg>, ProofDecodeError> {
+        if self.salt_elements != 0 {
+            return Err(ProofDecodeError::InvalidTrustedShape);
+        }
         self.validate_encoding(bytes)?;
         let (proof, remaining) = postcard::take_from_bytes::<Proof<Cfg>>(bytes)
             .map_err(|_| ProofDecodeError::DependencyCodec)?;
@@ -344,6 +352,9 @@ impl ProofShape {
                     cursor.base_vec("input_values", round.width)?;
                 }
             }
+            if self.salt_elements != 0 {
+                cursor.salts(self.num_queries, round.matrices, self.salt_elements)?;
+            }
             cursor.path("input_path", self.input_path_hashes)?;
         }
         // CommitPhaseMultiStep likewise owns two vector headers.
@@ -360,6 +371,9 @@ impl ProofShape {
             )?;
             for _ in 0..self.num_queries {
                 cursor.extension_vec("commit_siblings", fold.siblings)?;
+            }
+            if self.salt_elements != 0 {
+                cursor.salts(self.num_queries, 1, self.salt_elements)?;
             }
             cursor.path("commit_path", fold.path_hashes)?;
         }
@@ -499,6 +513,22 @@ impl Cursor<'_> {
     fn base_vec(&mut self, label: &'static str, count: usize) -> Result<(), ProofDecodeError> {
         self.exact_vec(label, count, size_of::<F>())?;
         self.fields(count)
+    }
+
+    fn salts(
+        &mut self,
+        queries: usize,
+        matrices: usize,
+        elements: usize,
+    ) -> Result<(), ProofDecodeError> {
+        self.exact_vec("salt_queries", queries, size_of::<Vec<Vec<F>>>())?;
+        for _ in 0..queries {
+            self.exact_vec("salt_matrices", matrices, size_of::<Vec<F>>())?;
+            for _ in 0..matrices {
+                self.base_vec("salt_elements", elements)?;
+            }
+        }
+        Ok(())
     }
 
     fn cap(&mut self, label: &'static str, roots: usize) -> Result<(), ProofDecodeError> {
