@@ -2,6 +2,7 @@
 mod common;
 use native::codec::encode_digest;
 use siworld_core::pow;
+use siworld_native_wallet_engine::local::hex;
 pub use siworld_native_wallet_engine::wire;
 use siworld_native_wallet_engine::{
     eng2_history::{BODY_DOMAIN, Context, Header, MAX_BODY_BYTES},
@@ -325,5 +326,458 @@ fn legacy_genesis_compact_and_other_profile_are_rejected() {
     assert_eq!(
         wallet.root(),
         encode_digest(&siworld_native_wallet_engine::state::CommitmentTree::new().root())
+    );
+}
+
+#[test]
+fn payments_bind_the_verified_eng2_anchor_network_and_input_reservations() {
+    let (config, genesis, id, block) = fixture();
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let (header, receipt) =
+        qualified_block(&config, &context, block, 1, id, config.genesis_timestamp);
+    let mut wallet = Eng2LightState::new(&genesis, id, Zeroizing::new([42; 32]), 0).unwrap();
+    wallet.append(&header.encode().unwrap(), &receipt).unwrap();
+    let recipient = wallet.wallet().address();
+    let anchor = wallet.tip_snapshot().selector;
+    let before = wallet.local_cache().unwrap();
+    assert!(
+        wallet
+            .prepare_sip([8; 32], anchor, &recipient, 1_000_000, false, &[])
+            .is_err()
+    );
+    assert!(
+        wallet
+            .prepare_sip(
+                config.network,
+                Snapshot {
+                    height: 1,
+                    block_id: id
+                },
+                &recipient,
+                1_000_000,
+                false,
+                &[]
+            )
+            .is_err()
+    );
+    let reserved = [wallet.wallet().receipts()[0].commitment];
+    assert!(
+        wallet
+            .prepare_sip(
+                config.network,
+                anchor,
+                &recipient,
+                1_000_000,
+                false,
+                &reserved
+            )
+            .is_err()
+    );
+    assert_eq!(wallet.local_cache().unwrap().as_slice(), before.as_slice());
+    let prepared: serde_json::Value = serde_json::from_str(
+        &wallet
+            .prepare_sip(config.network, anchor, &recipient, 1_000_000, false, &[])
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prepared["network"], hex(&config.network));
+    assert_eq!(prepared["genesis"], hex(&id));
+    assert_eq!(prepared["anchor_height"], 1);
+    assert_eq!(prepared["anchor_tip"], hex(&header.id().unwrap()));
+    assert_eq!(prepared["commitment_root"], hex(&wallet.root()));
+    assert_eq!(
+        prepared["fee_atoms"],
+        siworld_native_wallet_engine::state::base_fee(1).to_string()
+    );
+    assert_eq!(prepared["inputs"][0], hex(&reserved[0]));
+    assert_eq!(
+        prepared["expires_at_height"],
+        1 + siworld_native_wallet_engine::state::SNAPSHOT_WINDOW
+    );
+    assert!(
+        wallet
+            .prepare_sip(config.network, anchor, &recipient, 1_000_000, false, &[])
+            .is_err()
+    );
+    wallet.clear_eng2_prepared();
+    assert!(wallet.prove_sip().is_err());
+    assert_eq!(wallet.local_cache().unwrap().as_slice(), before.as_slice());
+}
+
+#[test]
+fn offline_payment_proves_and_verifies_the_frozen_native_eng2_binding() {
+    let (config, genesis, id, block) = fixture();
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let (header, receipt) =
+        qualified_block(&config, &context, block, 1, id, config.genesis_timestamp);
+    let mut wallet = Eng2LightState::new(&genesis, id, Zeroizing::new([42; 32]), 0).unwrap();
+    wallet.append(&header.encode().unwrap(), &receipt).unwrap();
+    let recipient = wallet.wallet().address();
+    let before = wallet.local_cache().unwrap();
+    let prepared: serde_json::Value = serde_json::from_str(
+        &wallet
+            .prepare_sip(
+                config.network,
+                wallet.tip_snapshot().selector,
+                &recipient,
+                1_000_000,
+                false,
+                &[],
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let packet = wallet.prove_sip().unwrap();
+    let checked: serde_json::Value = serde_json::from_str(
+        &wallet
+            .check_payment_packet(config.network, &packet)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(checked["statement_id"], prepared["statement_id"]);
+    assert_eq!(checked["anchor_height"], 1);
+    assert_eq!(checked["anchor_tip"], hex(&header.id().unwrap()));
+    assert_eq!(checked["proof_verified"], true);
+    assert_eq!(checked["send_supported"], false);
+    assert!(wallet.check_payment_packet([8; 32], &packet).is_err());
+    let mut corrupt = packet.clone();
+    corrupt[TX_PREFIX_BYTES + 20] ^= 1;
+    assert!(
+        wallet
+            .check_payment_packet(config.network, &corrupt)
+            .is_err()
+    );
+    let mut wrong_anchor = packet.clone();
+    wrong_anchor[4 + 2 + 27 + 32 + 8] ^= 1;
+    assert!(
+        wallet
+            .check_payment_packet(config.network, &wrong_anchor)
+            .is_err()
+    );
+    assert_eq!(wallet.local_cache().unwrap().as_slice(), before.as_slice());
+}
+
+#[test]
+fn payment_anchor_lifetime_rejects_the_exact_expiry_and_future_boundaries() {
+    use siworld_native_wallet_engine::{eng2_light::PaymentAnchor, state::SNAPSHOT_WINDOW};
+    let anchor = PaymentAnchor {
+        network: [3; 32],
+        snapshot: Snapshot {
+            height: 9,
+            block_id: [4; 32],
+        },
+    };
+    assert!(anchor.check_lifetime([3; 32], 9).is_ok());
+    assert!(
+        anchor
+            .check_lifetime([3; 32], 9 + SNAPSHOT_WINDOW as u64 - 1)
+            .is_ok()
+    );
+    assert!(
+        anchor
+            .check_lifetime([3; 32], 9 + SNAPSHOT_WINDOW as u64)
+            .is_err()
+    );
+    assert!(anchor.check_lifetime([3; 32], 8).is_err());
+    assert!(anchor.check_lifetime([8; 32], 9).is_err());
+    assert!(anchor.check_lifetime([3; 32], u64::MAX).is_err());
+}
+
+#[test]
+fn payment_inclusion_requires_a_committed_header_and_body_authenticated_statement() {
+    let (config, genesis, id, block) = fixture();
+    let statement = block.transactions[0].record.clone();
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let (header, receipt) =
+        qualified_block(&config, &context, block, 1, id, config.genesis_timestamp);
+    let mut wallet = Eng2LightState::new(&genesis, id, Zeroizing::new([42; 32]), 0).unwrap();
+    assert!(wallet.payment_receipt(1, &receipt, [0; 32]).is_err());
+    wallet.append(&header.encode().unwrap(), &receipt).unwrap();
+    let mut statement = statement;
+    statement.snapshot = Snapshot {
+        height: 0,
+        block_id: id,
+    };
+    let transaction = statement.statement_id(&config.network);
+    let included: serde_json::Value =
+        serde_json::from_str(&wallet.payment_receipt(1, &receipt, transaction).unwrap()).unwrap();
+    assert_eq!(included["statement_id"], hex(&transaction));
+    assert_eq!(included["block_id"], hex(&wallet.tip()));
+    assert_eq!(included["receipt_authenticated"], true);
+    assert_eq!(included["full_node_consensus_verified"], false);
+    assert!(wallet.payment_inclusion_valid(1, wallet.tip()));
+    assert!(!wallet.payment_inclusion_valid(1, id));
+    assert!(!wallet.payment_inclusion_valid(2, wallet.tip()));
+    assert!(wallet.payment_receipt(1, &receipt, [8; 32]).is_err());
+    let mut corrupt = receipt;
+    *corrupt.last_mut().unwrap() ^= 1;
+    assert!(wallet.payment_receipt(1, &corrupt, transaction).is_err());
+}
+
+#[test]
+fn isolated_cached_prefix_replays_a_branch_without_mutating_the_accepted_wallet() {
+    let (config, genesis, id, block) = fixture();
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let mut empty = block.clone();
+    empty.rewards[0].commitment = common::digest(810001);
+    empty.rewards[0].ciphertext = [0; REWARD_CIPHERTEXT_BYTES];
+    let (first, first_receipt) = qualified_block(
+        &config,
+        &context,
+        empty.clone(),
+        1,
+        id,
+        config.genesis_timestamp,
+    );
+    let mut accepted = Eng2LightState::new(&genesis, id, Zeroizing::new([42; 32]), 0).unwrap();
+    accepted
+        .append(&first.encode().unwrap(), &first_receipt)
+        .unwrap();
+    let checkpoint = accepted.tip_snapshot().selector;
+    let cached = accepted.local_cache().unwrap();
+    let (original, original_receipt) = qualified_block(
+        &config,
+        &context,
+        block,
+        2,
+        first.id().unwrap(),
+        first.timestamp,
+    );
+    accepted
+        .append(&original.encode().unwrap(), &original_receipt)
+        .unwrap();
+    let before = accepted.local_cache().unwrap();
+    let balance: serde_json::Value =
+        serde_json::from_str(&accepted.balance_json().unwrap()).unwrap();
+    assert_eq!(balance["rows"][0]["available_atoms"], "100000000000");
+    for wrong in [
+        Snapshot {
+            height: 0,
+            block_id: id,
+        },
+        Snapshot {
+            height: 1,
+            block_id: [8; 32],
+        },
+        Snapshot {
+            height: 3,
+            block_id: original.id().unwrap(),
+        },
+    ] {
+        assert!(
+            accepted
+                .fork_local_cache(&genesis, id, Zeroizing::new([42; 32]), 0, &cached, wrong)
+                .is_err()
+        );
+    }
+    assert!(
+        accepted
+            .fork_local_cache(
+                &genesis,
+                id,
+                Zeroizing::new([42; 32]),
+                1,
+                &cached,
+                checkpoint
+            )
+            .is_err()
+    );
+    assert!(
+        accepted
+            .fork_local_cache(
+                &genesis,
+                id,
+                Zeroizing::new([43; 32]),
+                0,
+                &cached,
+                checkpoint
+            )
+            .is_err()
+    );
+    let mut foreign_config = config.clone();
+    foreign_config.target_interval += 1;
+    let (foreign_genesis, foreign_id) = self::genesis(&foreign_config);
+    assert!(
+        accepted
+            .fork_local_cache(
+                &foreign_genesis,
+                foreign_id,
+                Zeroizing::new([42; 32]),
+                0,
+                &cached,
+                checkpoint
+            )
+            .is_err()
+    );
+    let mut corrupted = cached.to_vec();
+    corrupted[0] ^= 1;
+    assert!(
+        accepted
+            .fork_local_cache(
+                &genesis,
+                id,
+                Zeroizing::new([42; 32]),
+                0,
+                &corrupted,
+                checkpoint
+            )
+            .is_err()
+    );
+    let mut candidate = accepted
+        .fork_local_cache(
+            &genesis,
+            id,
+            Zeroizing::new([42; 32]),
+            0,
+            &cached,
+            checkpoint,
+        )
+        .unwrap();
+    assert_eq!(candidate.height(), 1);
+    assert_eq!(candidate.wallet().receipts().len(), 0);
+    assert!(
+        candidate
+            .check_head(1, candidate.tip(), Some(&accepted))
+            .is_err()
+    );
+    empty.rewards[4].commitment = common::digest(820004);
+    let (alternate, alternate_receipt) = qualified_block(
+        &config,
+        &context,
+        empty.clone(),
+        2,
+        first.id().unwrap(),
+        first.timestamp,
+    );
+    let mut bad = alternate_receipt.clone();
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(
+        candidate
+            .append(&alternate.encode().unwrap(), &bad)
+            .is_err()
+    );
+    assert_eq!(
+        candidate.local_cache().unwrap().as_slice(),
+        cached.as_slice()
+    );
+    candidate
+        .append(&alternate.encode().unwrap(), &alternate_receipt)
+        .unwrap();
+    assert_eq!(candidate.cumulative_work(), accepted.cumulative_work());
+    assert!(
+        candidate
+            .check_head(2, candidate.tip(), Some(&accepted))
+            .is_err()
+    );
+    let (third, third_receipt) = qualified_block(
+        &config,
+        &context,
+        empty,
+        3,
+        alternate.id().unwrap(),
+        alternate.timestamp,
+    );
+    candidate
+        .append(&third.encode().unwrap(), &third_receipt)
+        .unwrap();
+    candidate
+        .check_head(3, third.id().unwrap(), Some(&accepted))
+        .unwrap();
+    assert!(candidate.cumulative_work() > accepted.cumulative_work());
+    assert_ne!(candidate.root(), accepted.root());
+    assert!(candidate.wallet().receipts().is_empty());
+    // Dropping/reopening this synthetic candidate models private cache lifetime;
+    // it does not model a real browser's five-minute automatic lock timer.
+    let saved_candidate = candidate.local_cache().unwrap();
+    drop(candidate);
+    let reopened =
+        Eng2LightState::open_local(&genesis, id, Zeroizing::new([42; 32]), 0, &saved_candidate)
+            .unwrap();
+    reopened
+        .check_head(3, third.id().unwrap(), Some(&accepted))
+        .unwrap();
+    assert!(reopened.wallet().receipts().is_empty());
+    assert_eq!(
+        accepted.local_cache().unwrap().as_slice(),
+        before.as_slice()
+    );
+    assert_eq!(accepted.wallet().receipts().len(), 1);
+}
+
+#[test]
+fn cached_candidate_bounds_include_24_blocks_plus_seven_prefix_replay_blocks() {
+    let (config, genesis, id, mut block) = fixture();
+    block.rewards[0].commitment = common::digest(830001);
+    block.rewards[0].ciphertext = [0; REWARD_CIPHERTEXT_BYTES];
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let mut accepted = Eng2LightState::new(&genesis, id, Zeroizing::new([42; 32]), 0).unwrap();
+    let genesis_cache = accepted.local_cache().unwrap();
+    let mut first_cache = None;
+    let mut first_tip = id;
+    let mut parent = id;
+    let mut timestamp = config.genesis_timestamp;
+    for height in 1..=32 {
+        let (header, receipt) =
+            qualified_block(&config, &context, block.clone(), height, parent, timestamp);
+        accepted
+            .append(&header.encode().unwrap(), &receipt)
+            .unwrap();
+        parent = header.id().unwrap();
+        timestamp = header.timestamp;
+        if height == 1 {
+            first_cache = Some(accepted.local_cache().unwrap());
+            first_tip = parent;
+        }
+        if height == 31 {
+            assert!(
+                accepted
+                    .fork_local_cache(
+                        &genesis,
+                        id,
+                        Zeroizing::new([42; 32]),
+                        0,
+                        &genesis_cache,
+                        Snapshot {
+                            height: 0,
+                            block_id: id
+                        }
+                    )
+                    .is_ok()
+            );
+        }
+    }
+    let before = accepted.local_cache().unwrap();
+    assert!(
+        accepted
+            .fork_local_cache(
+                &genesis,
+                id,
+                Zeroizing::new([42; 32]),
+                0,
+                &genesis_cache,
+                Snapshot {
+                    height: 0,
+                    block_id: id
+                }
+            )
+            .is_err()
+    );
+    let prefix = accepted
+        .fork_local_cache(
+            &genesis,
+            id,
+            Zeroizing::new([42; 32]),
+            0,
+            first_cache.as_ref().unwrap(),
+            Snapshot {
+                height: 1,
+                block_id: first_tip,
+            },
+        )
+        .unwrap();
+    assert_eq!(prefix.height(), 1);
+    assert_eq!(
+        accepted.local_cache().unwrap().as_slice(),
+        before.as_slice()
     );
 }

@@ -9,6 +9,12 @@ or establish a complete zero-knowledge security claim. Transaction, retained
 settlement and asset-issuance adapters exist. The complete confidential fee
 relation, network admission and browser generation remain integration gates.
 
+The inactive backend and relation adapters live under the native node V2 codec.
+The previously measured benchmark sources and frozen artifacts remain unchanged.
+Trace adapters construct witnesses for the retained issuance and settlement AIRs;
+they do not modify those constraint programs. Signed-issuance verification in this
+inactive adapter returns a proof-validation result, not a ledger transition token.
+
 ## Private and public information
 
 The intended private transaction witness includes input note amounts, note
@@ -116,9 +122,25 @@ query values alone require `7668 * 80 * 4 = 2453760` bytes, before any salts,
 paths or other sections. Existing complete frames of 3982061 through 3992477
 bytes fit the separate fee cap. Those measurements are from an earlier
 confidential candidate and do not qualify the V2 profile. The uni-STARK codec
-still explicitly rejects the complete-fee relation: its batch schema contains
-additional permutation and lookup fields and requires its own bounded decoder
-and authenticated verification adapter. No AIR compression or security-parameter
+still explicitly rejects the complete-fee relation. A separate inactive
+single-AIR batch adapter includes the permutation and lookup openings, validates
+all lengths before typed decoding and calls the stock batch verifier. Its fixed
+profile uses logarithmic blowup five (factor 32), eighty queries and zero
+proof-of-work difficulty,
+with the same dual salted commitments and polynomial masks. The verifier owns
+its AIR and rebuilds preprocessing locally; the caller supplies authenticated
+genesis, rules, complete AIR digest and the independently reconstructed statement.
+It rejects empty bindings, periodic columns, boundary I/O, absent lookups and
+unsupported geometry. Closed single-instance lookup terminals must be zero.
+The complete frame remains capped at 5 MiB and the batch parser separately caps
+declared decoded vectors at 32 MiB. Other native decoders retain their existing
+4 MiB allocation budget.
+
+A synthetic 256-row lookup AIR exercises an actual full-profile batch proof,
+newly rebuilt verification, changed public statements and malformed fields.
+This is codec and backend evidence. The actual complete-fee AIR, authenticated
+network registry, engine admission and normal/priority fee blocks still require
+integration and qualification. No AIR compression or security-parameter
 reduction is required by the fee size limit.
 
 The V2 fee receiver checks the outer declared length before reading proof bytes

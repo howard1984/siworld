@@ -87,18 +87,6 @@ impl IssuanceAir {
     pub fn preprocessed_width(&self) -> usize {
         PRE_NOTE + self.note_count
     }
-    /// Construct this exact relation's trace for an explicit proof backend.
-    /// Witness checks are not a proof-verification or state-admission result.
-    pub fn generate(
-        &self,
-        witness: &IssuanceWitness,
-    ) -> Result<(RowMajorMatrix<F>, Vec<F>), IssuanceError> {
-        witness.check()?;
-        if witness.notes.len() != self.note_count {
-            return Err(IssuanceError::NoteCountMismatch);
-        }
-        Ok(generate_trace(self, witness))
-    }
     pub fn constraint_count(&self, witness: &IssuanceWitness) -> usize {
         let (trace, public) = generate_trace(self, witness);
         p3_air::check_all_constraints(self, &trace, &public, Some(1)).total_constraints_per_row

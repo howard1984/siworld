@@ -14,7 +14,6 @@ pub mod encryption;
 pub mod envelope;
 pub mod fee_settlement;
 pub mod fee_settlement_air;
-pub mod native_hiding_v2;
 #[cfg(feature = "security-report")]
 pub mod native_security;
 pub mod native_verifier;

@@ -36,17 +36,81 @@ class ReleaseTests(unittest.TestCase):
             manifest = packaging.verify_release(root)
             self.assertFalse((root / (other + '.html')).exists())
             html = (root / (app + '.html')).read_text()
-            self.assertEqual(html.count('integrity="sha384-'), 2)
+            self.assertEqual(html.count('integrity="sha384-'), 3 if app == 'wallet' else 2)
             self.assertNotIn('http-equiv="Content-Security-Policy"', html)
             self.assertIn('releases/' + manifest['release'], html)
 
+    def test_wallet_startup_is_visible_before_application_execution(self):
+        root = self.output / 'wallet'
+        html = (root / 'wallet.html').read_text()
+        self.assertRegex(html, r'<dialog id="wallet-startup"[^>]* open>')
+        self.assertLess(html.index('id="wallet-startup"'), html.index('id="create"'))
+        self.assertLess(html.index('/assets/wallet-startup.mjs'), html.index('/assets/wallet.mjs'))
+        startup = next(root.rglob('wallet-startup.mjs')).read_text()
+        self.assertNotRegex(startup, r'\b(?:import|export)\b')
+        self.assertNotIn('wallet-startup', (self.output / 'vault/vault.html').read_text())
+
     def test_javascript_and_wasm_corruption_are_rejected(self):
-        for suffix in ['wallet.mjs', 'wallet-worker.mjs', 'rayon-worker.mjs', 'wallet_bg.wasm', 'wallet.css']:
+        for suffix in ['wallet.mjs', 'wallet-startup.mjs', 'wallet-worker.mjs', 'rayon-worker.mjs', 'wallet_bg.wasm', 'wallet.css']:
             root = self.mutated(suffix)
             artifact = next(root.rglob(suffix))
             artifact.write_bytes(artifact.read_bytes() + b'altered')
             with self.assertRaisesRegex(ValueError, 'integrity mismatch'):
                 packaging.verify_release(root)
+
+    def test_runtime_connection_origins_are_frozen_and_independently_checked(self):
+        wallet = self.output / 'wallet'
+        pinned = packaging.wallet_connection_origins(Path(os.environ['WALLET_WEB_OUTPUT']))
+        manifest = packaging.verify_release(wallet, expected_connect_origins=pinned)
+        self.assertEqual(manifest['connect_origins'], pinned)
+        headers = json.loads((wallet / 'response-headers.json').read_text())
+        self.assertEqual(headers, packaging.response_headers(pinned))
+        self.assertEqual(headers['Strict-Transport-Security'], 'max-age=31536000')
+        self.assertEqual(packaging.verify_release(self.output / 'vault')['connect_origins'], [])
+        with self.assertRaisesRegex(ValueError, 'Approved connection origins differ'):
+            packaging.verify_release(wallet, expected_connect_origins=['https://unapproved.example.test'])
+        altered = self.mutated('extra-connection-origin')
+        headers['Content-Security-Policy'] = headers['Content-Security-Policy'].replace(
+            "connect-src 'self'", "connect-src 'self' https://unapproved.example.test")
+        (altered / 'response-headers.json').write_text(json.dumps(headers))
+        with self.assertRaisesRegex(ValueError, 'Response policy differs'):
+            packaging.verify_release(altered)
+        downgraded = self.mutated('hsts-downgrade')
+        policy = json.loads((downgraded / 'response-headers.json').read_text())
+        policy['Strict-Transport-Security'] = 'max-age=86400'
+        (downgraded / 'response-headers.json').write_text(json.dumps(policy))
+        with self.assertRaisesRegex(ValueError, 'Response policy differs'):
+            packaging.verify_release(downgraded)
+
+    def test_runtime_policy_comes_from_a_fixed_engineering_module(self):
+        source = self.root / 'runtime-config-only'
+        (source / 'sdk').mkdir(parents=True)
+        config = dict(version=2, name='siworld-eng-2', network='1'*64, genesis='2'*64,
+                      rules='3'*64, profile='4'*64, fee_mode=0, read_only=True,
+                      api='https://primary.example.test',
+                      apis=['https://primary.example.test', 'https://secondary.example.test'],
+                      submission_apis=['https://secondary.example.test', 'https://primary.example.test'])
+        module = source / 'sdk/network.js'
+        module.write_text('export const ENGINEERING = ' + json.dumps(config) + ';\n')
+        self.assertEqual(packaging.wallet_connection_origins(source), config['apis'])
+        for changes in ({'fee_mode': False}, {'apis': []}, {'submission_apis': ['https://bad.example.test/path']},
+                        {'api': 'https://other.example.test'}, {'read_only': False}):
+            module.write_text('export const ENGINEERING = ' + json.dumps({**config, **changes}) + ';\n')
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                packaging.wallet_connection_origins(source)
+        module.write_text('export const ENGINEERING = discoverSources();\n')
+        with self.assertRaisesRegex(ValueError, 'runtime configuration differs'):
+            packaging.wallet_connection_origins(source)
+
+    def test_connection_policy_rejects_discovery_wildcards_and_credentials(self):
+        for values in (['*'], ['https:'], ['https://*.example.test'], ['https://a.example.test/path'],
+                       ['https://user:password@a.example.test'], ['http://a.example.test'],
+                       ['https://a.example.test', 'https://a.example.test'], ['https://a.example.test:443'],
+                       ['https://a.example.test#fragment'], ['https://a.example.test?query'], 'https://a.example.test'):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                packaging.connection_origins(values)
+        self.assertEqual(packaging.connection_origins(['http://127.0.0.1:8890', 'https://a.example.test']),
+                         ['http://127.0.0.1:8890', 'https://a.example.test'])
 
     def test_unexpected_files_symlinks_and_html_changes_are_rejected(self):
         for index, mutation in enumerate(['extra', 'link', 'html']):

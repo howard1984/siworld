@@ -6,10 +6,17 @@
 //! post-quantum security level. Both the hash model and combined disclosures
 //! require separate qualification.
 mod entropy;
+mod issuance_trace;
 mod owner;
 mod pcs;
+mod relations;
+mod settlement_trace;
+pub use relations::{
+    IssuanceProver, IssuanceVerifier, SettlementProver, SettlementVerifier, TransactionProver,
+    TransactionVerifier,
+};
 
-use crate::FriParams;
+use ::native::FriParams;
 pub use entropy::EntropyError;
 pub use owner::{AccessError, OwnerError};
 pub use pcs::{Challenger, Config, E, PrivateAttempt, PublicPreprocessing};

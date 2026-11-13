@@ -285,7 +285,7 @@ impl ProofShape {
         if bytes.len() > self.body_limit {
             return Err(ProofDecodeError::BodyTooLarge);
         }
-        let mut cursor = Cursor {
+        let mut cursor = Cursor::<MAX_DECLARED_VECTOR_BYTES> {
             bytes,
             offset: 0,
             declared_vector_bytes: 0,
@@ -397,13 +397,13 @@ fn power_of_two(log: usize) -> Result<usize, ProofDecodeError> {
         .ok_or(ProofDecodeError::InvalidTrustedShape)
 }
 
-struct Cursor<'a> {
+struct Cursor<'a, const VECTOR_LIMIT: usize = MAX_DECLARED_VECTOR_BYTES> {
     bytes: &'a [u8],
     offset: usize,
     declared_vector_bytes: usize,
 }
 
-impl Cursor<'_> {
+impl<const VECTOR_LIMIT: usize> Cursor<'_, VECTOR_LIMIT> {
     fn byte(&mut self) -> Result<u8, ProofDecodeError> {
         let value = *self
             .bytes
@@ -439,7 +439,7 @@ impl Cursor<'_> {
             .checked_mul(element_bytes)
             .and_then(|bytes| bytes.checked_add(size_of::<Vec<()>>()))
             .and_then(|bytes| self.declared_vector_bytes.checked_add(bytes))
-            .filter(|bytes| *bytes <= MAX_DECLARED_VECTOR_BYTES)
+            .filter(|bytes| *bytes <= VECTOR_LIMIT)
             .ok_or(ProofDecodeError::AllocationBudget)?;
         Ok(())
     }
@@ -959,7 +959,7 @@ mod tests {
             ProofShape::from_trusted(&TinyAir, &vk, &cfg, MAX_ISSUANCE_PROOF_BODY_LEN + 1).is_err()
         );
         assert_eq!(MAX_DECLARED_VECTOR_BYTES, 4_194_304);
-        let mut cursor = Cursor {
+        let mut cursor = Cursor::<MAX_DECLARED_VECTOR_BYTES> {
             bytes: &[],
             offset: 0,
             declared_vector_bytes: 0,

@@ -1,10 +1,12 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {Eng2Session} from '../web/sdk/eng2-session.js';
+import {Eng2Session,eng2Confirmations} from '../web/sdk/eng2-session.js';
 import {eng2Context,eng2Namespace,eng2Head} from '../web/sdk/eng2-context.js';
 import {eng2Storage} from '../web/sdk/eng2-storage.js';
 const enc = value => new TextEncoder().encode(JSON.stringify(value));
-const dec = bytes => JSON.parse(new TextDecoder().decode(bytes));
+const seal=(magic,plain)=>{const bytes=new Uint8Array(plain.length+48);bytes.set(new TextEncoder().encode(magic));bytes.set(plain,32);return bytes;};
+const open=bytes=>new TextDecoder().decode(bytes.slice(0,4))==='SWE2'?bytes.slice(32,-16):bytes.slice();
+const dec = bytes => JSON.parse(new TextDecoder().decode(open(bytes)));
 const pin = {version:2,name:'siworld-eng-2',network:'1'.repeat(64),genesis:'2'.repeat(64),rules:'3'.repeat(64),profile:'4'.repeat(64),fee_mode:0,api:'http://127.0.0.1:8890'};
 const id = height => height === 0 ? pin.genesis : (height+4).toString(16).padStart(64,'0');
 const state = (height=0) => ({version:2,network:pin.network,genesis:pin.genesis,rules:pin.rules,profile:pin.profile,fee_mode:0,height,tip:id(height),send_supported:false,full_node_consensus_verified:false,rows:[]});
@@ -16,8 +18,10 @@ function fixture() {
     public_info: () => JSON.stringify({network:pin.network,full_address:'synthetic-public-address'}),
     enable_eng2: () => JSON.stringify(current=state()),
     eng2_balance: () => JSON.stringify(current),eng2_history: () => '[]',
-    protect_eng2_local: bytes => bytes.slice(),open_eng2_local: bytes => bytes.slice(),
-    eng2_cache: pending => enc(pending ? candidate : current),
+    protect_eng2_local: bytes => seal('SWE2JL01',bytes),open_eng2_local: open,
+    eng2_cache: pending => seal('SWE2SC01',enc(pending ? candidate : current)),
+    eng2_recent_headers:()=>JSON.stringify(Array.from({length:Math.min(current.height+1,32)},(_,i)=>{const height=Math.max(0,current.height-31)+i;return {height,id:id(height),parent:height===0?null:id(height-1)};})),
+    begin_eng2_cached_candidate:(_g,_p,bytes,height,tip)=>{const value=dec(bytes);assert.equal(value.height,Number(height));assert.equal(value.tip,tip);candidate=value;return JSON.stringify({height:value.height,tip:value.tip,committed:false});},
     restore_eng2_cache: (_g,_p,bytes) => JSON.stringify(current=dec(bytes)),
     begin_eng2_candidate: extension => {candidate=extension?structuredClone(current):state();},
     eng2_header_page: bytes => JSON.stringify(dec(bytes)),
@@ -26,7 +30,7 @@ function fixture() {
     commit_eng2_candidate: () => {commits++;current=candidate;candidate=null;return JSON.stringify(current);},
     abort_eng2_candidate: () => {candidate=null;}
   };
-  const storage = {read:async key=>data.get(key)?.slice(),pair:async (a,av,b,bv)=>{writeHook?.();if(fail)throw new Error('Synthetic durable write failed.');data.set(a,av.slice());data.set(b,bv.slice());}};
+  const storage = {read:async key=>data.get(key)?.slice(),pair:async (a,av,b,bv)=>storage.atomic([[a,av],[b,bv]]),atomic:async(entries,removed=[])=>{writeHook?.();if(fail)throw new Error('Synthetic durable write failed.');for(const [key,value] of entries)data.set(key,value.slice());for(const key of removed)data.delete(key);}};
   const io = {storage,now:()=>1000,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,options,fn)=>(typeof options==='function'?options:fn)()},
     json:async url=>{requests.push(url);headCalls++;const value=heads?.[Math.min(headCalls-1,heads.length-1)];return typeof value==='object'?value:head(value??(changed&&headCalls>1?2:1));},
     binary:async url=>{
@@ -57,10 +61,10 @@ test('scans to a fresh pinned head, saves atomically and returns only committed 
   const progress=[];const result=await f.session.sync(value=>{progress.push(value);assert.equal(f.current().height,0);});
   assert.equal(result.height,1);assert.equal(result.ready,true);assert.equal(result.committed,true);assert.equal(result.send_supported,false);assert.equal(f.commits(),1);
   assert.equal(progress.length,1);assert.equal(progress[0].height,1);assert.ok(f.receipts.every(bytes=>bytes.every(byte=>byte===0)));
-  assert.equal(f.data.size,2);assert.ok(f.requests.every(url=>!url.includes('/v1/')));
+  assert.equal(f.data.size,4);assert.ok(f.requests.every(url=>!url.includes('/v1/')));
   assert.ok(f.requests.some(url=>url.includes('/api/v2/wallet/receipts/1/')));
   assert.throws(()=>f.session.prepare(),/unavailable/);assert.throws(()=>f.session.submit(),/unavailable/);
-  const before=f.requests.length;await f.session.sync();assert.equal(f.requests.length,before+1);assert.equal(f.commits(),1);
+  const before=f.requests.length;await f.session.sync();assert.equal(f.requests.length,before+2);assert.equal(f.commits(),1);
 });
 test('native authentication errors and durable-write failures preserve accepted state', async () => {
   for(const change of ['setCorrupt','setFail']){
@@ -96,7 +100,7 @@ test('same-height forks, regressed heads, mismatched prefixes and foreign heads 
 test('failure on a later extension preserves the completed prefix for reopen', async () => {
   const f=fixture();await f.session.initialize();f.setHeads([1,2,2,2]);await f.session.sync();f.setCorrupt();
   await assert.rejects(f.session.sync());assert.equal(f.current().height,1);assert.equal(f.commits(),1);assert.equal(f.session.invalidated,false);
-  const reopened=new Eng2Session(f.wallet,pin,{storage:f.storage,now:()=>1000,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,fn)=>fn()},binary:async () => ({bytes:new Uint8Array([1,2,3])})});
+  const reopened=new Eng2Session(f.wallet,pin,{storage:f.storage,now:()=>1000,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,options,fn)=>(typeof options==='function'?options:fn)()},binary:async () => ({bytes:new Uint8Array([1,2,3])})});
   assert.equal((await reopened.initialize()).height,1);assert.equal(reopened.summary().ready,false);
 });
 test('cancellation during durable adoption finishes matching native state but remains stale', async () => {
@@ -110,14 +114,242 @@ test('cancellation and cross-tab metadata changes prevent candidate adoption', a
 });
 test('same-context local cache can reopen; foreign profile metadata cannot', async () => {
   const f=fixture();await f.session.initialize();await f.session.sync();
-  const reopened=new Eng2Session(f.wallet,pin,{storage:f.storage,now:()=>1000,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,fn)=>fn()},binary:async () => ({bytes:new Uint8Array([1,2,3])})});
+  const reopened=new Eng2Session(f.wallet,pin,{storage:f.storage,now:()=>1000,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,options,fn)=>(typeof options==='function'?options:fn)()},binary:async () => ({bytes:new Uint8Array([1,2,3])})});
   assert.equal((await reopened.initialize()).height,1);assert.equal(reopened.summary().ready,false);
   f.data.set(reopened.key,enc({...reopened.metadata,profile:'8'.repeat(64)}));
-  const foreign=new Eng2Session(f.wallet,pin,{storage:f.storage,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,fn)=>fn()},binary:async () => ({bytes:new Uint8Array([1,2,3])})});
+  const foreign=new Eng2Session(f.wallet,pin,{storage:f.storage,hash:async ()=>'opaque-wallet-hash',locks:{request:async (_key,options,fn)=>(typeof options==='function'?options:fn)()},binary:async () => ({bytes:new Uint8Array([1,2,3])})});
   await assert.rejects(foreign.initialize(),/context differs/);
 });
 test('storage uses a dedicated exact-context database and one two-record transaction', async () => {
   const original=globalThis.indexedDB,names=[],puts=[];let closed=0;
   globalThis.indexedDB={open(name){names.push(name);const request={};queueMicrotask(()=>{request.result={close(){closed++;},transaction(store,mode){assert.equal(store,'private');assert.equal(mode,'readwrite');const tx={objectStore:()=>({put(value,key){puts.push([key,[...value]]);if(puts.length===2)queueMicrotask(()=>tx.oncomplete());}})};return tx;}};request.onsuccess();});return request;}};
   try{const storage=eng2Storage(pin);await storage.pair('a',new Uint8Array([1]),'b',new Uint8Array([2]));assert.deepEqual(names,[eng2Namespace(pin)]);assert.deepEqual(puts,[['a',[1]],['b',[2]]]);assert.equal(closed,1);await assert.rejects(storage.pair('a',{},'b',new Uint8Array()),/encrypted/);assert.equal(names.length,1);}finally{globalThis.indexedDB=original;}
+});
+
+test('genesis transport retry succeeds but exhausted initialization remains a real failure',async()=>{
+  const f=fixture(),binary=f.session.binary;let calls=0;
+  f.session.binary=async(...args)=>{if(++calls===1)throw new DOMException('Synthetic timeout.','TimeoutError');return binary(...args);};
+  assert.equal((await f.session.initialize()).height,0);assert.equal(calls,2);assert.equal(f.session.controller,null);
+  const g=fixture(),failure=Object.assign(new Error('Synthetic unavailable.'),{status:503});let attempts=0;
+  g.session.binary=async()=>{attempts++;throw failure;};
+  await assert.rejects(g.session.initialize(),error=>error===failure);assert.equal(attempts,3);
+  assert.equal(g.session.metadata,null);assert.equal(g.session.controller,null);assert.equal(g.data.size,0);
+});
+test('a later receipt retries the same GET without redownloading the verified candidate prefix',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([2,2]);const binary=f.session.binary,calls=[];let interrupted=false;
+  f.session.binary=async(url,options)=>{
+    if(url.includes('/receipts/')){const height=Number(new URL(url).pathname.split('/').at(-2));calls.push(height);if(height===2&&!interrupted){interrupted=true;throw Object.assign(new Error('Synthetic rate limit.'),{status:429});}}
+    return binary(url,options);
+  };
+  const result=await f.session.sync();assert.equal(result.height,2);assert.equal(result.ready,true);assert.equal(f.commits(),1);
+  assert.deepEqual(calls,[1,2,2]);assert.ok(f.receipts.every(bytes=>bytes.every(byte=>byte===0)));
+});
+test('default public head transport retries while injected JSON decoding is not retried',async()=>{
+  const f=fixture();await f.session.initialize();let calls=0;
+  const binary=f.session.binary;
+  f.session.binary=async(url,options)=>{if(url.endsWith('/head')){if(++calls===1)throw Object.assign(new Error('Synthetic gateway failure.'),{status:502});return {bytes:enc(head())};}return binary(url,options);};
+  // Default construction installs a closure over this.binary; retain the same
+  // synthetic wallet/storage while omitting the optional JSON test adapter.
+  const original=f.session;
+  const session=new Eng2Session(f.wallet,pin,{storage:f.storage,now:()=>1000,hash:async()=>'opaque-wallet-hash',locks:original.locks,binary:original.binary});
+  await session.initialize();assert.equal((await session.sync()).height,1);assert.equal(calls,3);
+  const g=fixture();await g.session.initialize();let jsonCalls=0;const failure=new TypeError('Synthetic JSON adapter decoding failure.');
+  g.session.json=async()=>{jsonCalls++;throw failure;};
+  await assert.rejects(g.session.sync(),error=>error===failure);assert.equal(jsonCalls,1);assert.equal(g.commits(),0);
+});
+test('native receipt authentication errors are not retried and the caller still wipes received bytes',async()=>{
+  const f=fixture();await f.session.initialize();f.setCorrupt();
+  await assert.rejects(f.session.sync(),/Synthetic native receipt authentication rejected/);
+  assert.equal(f.requests.filter(url=>url.includes('/receipts/')).length,1);assert.equal(f.receipts.length,1);
+  assert.ok(f.receipts[0].every(byte=>byte===0));assert.equal(f.commits(),0);
+});
+test('wallet cancellation aborts an initializing genesis GET without enabling native state or retrying',async()=>{
+  const f=fixture();let attempts=0,enables=0;f.wallet.enable_eng2=()=>{enables++;throw new Error('Native state must not be enabled.');};
+  f.session.binary=async(_url,{signal})=>{attempts++;return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));};
+  const pending=f.session.initialize();await new Promise(resolve=>setImmediate(resolve));f.session.cancelSync();
+  await assert.rejects(pending,error=>error.name==='AbortError');assert.equal(attempts,1);assert.equal(enables,0);assert.equal(f.session.controller,null);assert.equal(f.data.size,0);
+});
+
+function reopen(f) {
+  return new Eng2Session(f.wallet,pin,{storage:f.storage,now:()=>1000,hash:f.session.hash,locks:f.session.locks,binary:f.session.binary,json:f.session.json});
+}
+test('eight-block extension commits remain stale until the exact fresh head is reached',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);const commit=f.wallet.commit_eng2_candidate,ends=[],begins=[];
+  const begin=f.wallet.begin_eng2_candidate;f.wallet.begin_eng2_candidate=extension=>{begins.push(extension);return begin(extension);};
+  f.wallet.commit_eng2_candidate=(height,tip)=>{ends.push(Number(height));return commit(height,tip);};
+  const result=await f.session.sync(progress=>{if(progress.height===9){assert.equal(f.current().height,8);assert.equal(f.session.metadata.height,8);assert.equal(f.session.summary().stale,true);}});
+  assert.deepEqual(ends,[8,16,17]);assert.deepEqual(begins,[true,true,true]);assert.equal(result.ready,true);assert.equal(result.height,17);
+  assert.equal(dec(f.data.get(f.session.key)).height,17);assert.ok(f.receipts.every(bytes=>bytes.every(byte=>byte===0)));
+});
+test('a failed later receipt reopens from the last complete eight-block prefix',async()=>{
+  for(const [failedHeight,prefix] of [[10,8],[17,16]]){
+    const f=fixture();await f.session.initialize();f.setHeads([17]);f.setHook(height=>{if(height===failedHeight)throw new Error('Synthetic terminal receipt failure.');});
+    await assert.rejects(f.session.sync(),/Synthetic terminal receipt failure/);
+    assert.equal(f.current().height,prefix);assert.equal(f.session.metadata.height,prefix);assert.equal(f.session.invalidated,false);assert.equal(f.session.ready,false);
+    assert.equal(dec(f.data.get(f.session.key)).height,prefix);assert.equal(dec(f.data.get(f.session.cacheKey)).height,prefix);
+    f.setHook(null);const before=f.requests.length,next=reopen(f);assert.equal((await next.initialize()).height,prefix);
+    assert.equal((await next.sync()).height,17);
+    const downloaded=f.requests.slice(before).filter(url=>url.includes('/receipts/')).map(url=>Number(new URL(url).pathname.split('/').at(-2)));
+    assert.deepEqual(downloaded,Array.from({length:17-prefix},(_,index)=>prefix+index+1));
+  }
+});
+test('cancellation before an eight-block adoption preserves the prior pair',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);
+  await assert.rejects(f.session.sync(progress=>{if(progress.height===8)f.session.cancelSync();}),error=>error.name==='AbortError');
+  assert.equal(f.current().height,0);assert.equal(f.commits(),0);assert.equal(dec(f.data.get(f.session.key)).height,0);
+  assert.ok(f.receipts.every(bytes=>bytes.every(byte=>byte===0)));assert.equal(f.session.invalidated,false);
+});
+test('cancellation during partial durable adoption finishes native commit and stops stale',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);f.setWriteHook(()=>f.session.cancelSync());
+  const result=await f.session.sync();assert.equal(result.height,8);assert.equal(result.ready,false);assert.equal(result.catchup_pending,true);
+  assert.equal(f.current().height,8);assert.equal(f.session.metadata.height,8);assert.equal(f.commits(),1);assert.equal(f.session.invalidated,false);
+  assert.equal(dec(f.data.get(f.session.key)).height,8);assert.equal(dec(f.data.get(f.session.cacheKey)).height,8);
+  f.setWriteHook(null);const next=reopen(f);assert.equal((await next.initialize()).height,8);assert.equal((await next.sync()).height,17);
+});
+test('cancellation after a prefix commit cannot append to its consumed candidate',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);const commit=f.wallet.commit_eng2_candidate,begin=f.wallet.begin_eng2_candidate;let begins=0;
+  f.wallet.begin_eng2_candidate=extension=>{begins++;return begin(extension);};
+  f.wallet.commit_eng2_candidate=(height,tip)=>{const value=commit(height,tip);f.session.cancelSync();return value;};
+  assert.equal((await f.session.sync()).height,8);assert.equal(begins,1);assert.equal(f.session.invalidated,false);assert.equal(f.session.ready,false);
+});
+test('second-batch storage failure preserves the first matched cache without invalidating it',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);const atomic=f.storage.atomic;let writes=0;
+  f.storage.atomic=async(...args)=>{if(++writes===2)throw new Error('Synthetic atomic storage abort.');return atomic(...args);};
+  await assert.rejects(f.session.sync(),/Synthetic atomic storage abort/);
+  assert.equal(f.current().height,8);assert.equal(f.session.metadata.height,8);assert.equal(f.session.invalidated,false);
+  assert.equal(dec(f.data.get(f.session.key)).height,8);assert.equal(dec(f.data.get(f.session.cacheKey)).height,8);
+  f.storage.atomic=atomic;const next=reopen(f);assert.equal((await next.initialize()).height,8);
+});
+test('a native commit failure after storage marks uncertainty and reopen restores the durable pair',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);const commit=f.wallet.commit_eng2_candidate;
+  f.wallet.commit_eng2_candidate=(height,tip)=>{if(Number(height)===16)throw new Error('Synthetic native commit failure.');return commit(height,tip);};
+  await assert.rejects(f.session.sync(),/Engineering-v2 state was saved/);
+  assert.equal(f.current().height,8);assert.equal(f.session.metadata.height,8);assert.equal(f.session.invalidated,true);
+  assert.equal(dec(f.data.get(f.session.key)).height,16);assert.equal(dec(f.data.get(f.session.cacheKey)).height,16);
+  const next=reopen(f);assert.equal((await next.initialize()).height,16);assert.equal(next.invalidated,false);
+});
+test('a later native receipt failure wipes bytes and retains the completed prefix',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17]);const append=f.wallet.append_eng2_receipt;
+  f.wallet.append_eng2_receipt=(header,bytes)=>{if(dec(bytes).height===10)throw new Error('Synthetic later native authentication failure.');return append(header,bytes);};
+  await assert.rejects(f.session.sync(),/Synthetic later native authentication failure/);
+  assert.equal(f.current().height,8);assert.equal(f.session.invalidated,false);assert.equal(f.receipts.length,10);
+  assert.ok(f.receipts.every(bytes=>bytes.every(byte=>byte===0)));
+});
+test('fresh reorganization candidates never commit partial eight-block prefixes',async()=>{
+  for(const fail of [false,true]){
+    const f=fixture();await f.session.initialize();f.setHeads([9]);await f.session.sync();
+    const binary=f.session.binary,commit=f.wallet.commit_eng2_candidate,begin=f.wallet.begin_eng2_candidate,ends=[],begins=[];
+    f.session.binary=async(url,options)=>{const result=await binary(url,options);const parsed=new URL(url);if(parsed.pathname.endsWith('/headers')&&Number(parsed.searchParams.get('from'))===10){const value=dec(result.bytes);value.headers[0].parent=id(99);result.bytes=enc(value);}return result;};
+    f.wallet.commit_eng2_candidate=(height,tip)=>{ends.push(Number(height));return commit(height,tip);};
+    f.wallet.begin_eng2_candidate=extension=>{begins.push(extension);return begin(extension);};
+    f.setHeads([17]);if(fail)f.setHook(height=>{if(height===10)throw new Error('Synthetic fork authentication failure.');});
+    if(fail){await assert.rejects(f.session.sync(),/Synthetic fork authentication failure/);assert.deepEqual(ends,[]);assert.equal(f.current().height,9);assert.equal(dec(f.data.get(f.session.key)).height,9);}
+    else{assert.equal((await f.session.sync()).height,17);assert.deepEqual(ends,[17]);}
+    assert.deepEqual(begins,[false]);
+  }
+});
+test('a changed branch at a later prefix boundary cannot replace the preceding saved prefix',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17,17,{...head(17),tip:id(99)}]);
+  await assert.rejects(f.session.sync(),/incompatible branch/);assert.equal(f.current().height,8);assert.equal(f.session.invalidated,false);assert.equal(dec(f.data.get(f.session.key)).height,8);
+});
+test('an advancing head preserves completed batches but does not claim complete synchronization',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([17,18,18,18,18,18]);
+  const result=await f.session.sync();assert.equal(result.height,17);assert.equal(result.ready,false);assert.equal(result.catchup_pending,true);assert.equal(result.target_height,18);
+  assert.equal(f.commits(),3);assert.equal((await f.session.sync()).height,18);assert.equal(f.session.ready,true);
+});
+
+
+test('cancelling initialization during wallet hashing prevents genesis and storage work',async()=>{
+  const f=fixture();let finishHash,enables=0;
+  f.session.hash=()=>new Promise(resolve=>{finishHash=resolve;});
+  f.wallet.enable_eng2=()=>{enables++;throw new Error('Cancelled initialization must not enable native state.');};
+  const pending=f.session.initialize();f.session.cancelSync();finishHash('opaque-wallet-hash');
+  await assert.rejects(pending,error=>error.name==='AbortError');
+  assert.equal(f.requests.length,0);assert.equal(enables,0);assert.equal(f.data.size,0);assert.equal(f.session.metadata,null);assert.equal(f.session.controller,null);
+});
+test('cancelling initialization queued behind another owner aborts the lock request',async()=>{
+  const f=fixture();let entered,callbackCalls=0,reads=0;
+  const queued=new Promise(resolve=>{entered=resolve;});
+  f.storage.read=async()=>{reads++;};
+  f.session.locks={request:(_key,options,callback)=>{
+    entered(options.signal);assert.ok(options.signal instanceof AbortSignal);
+    return new Promise((resolve,reject)=>{
+      options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true});
+      // No callback runs while the synthetic other owner retains its lock.
+      if(options.signal.aborted)reject(options.signal.reason);
+    });
+  }};
+  const pending=f.session.initialize();
+  const rejected=assert.rejects(pending,error=>error.name==='AbortError');
+  const signal=await queued;f.session.cancelSync();await rejected;
+  assert.equal(signal.aborted,true);assert.equal(callbackCalls,0);assert.equal(reads,0);assert.equal(f.data.size,0);assert.equal(f.session.metadata,null);assert.equal(f.session.controller,null);
+});
+test('cancelling either initialization read preserves the existing matched cache',async()=>{
+  for(const stopAt of [1,2]){
+    const f=fixture();await f.session.initialize();await f.session.sync();
+    const before=Array.from(f.data,([key,value])=>[key,[...value]]),next=reopen(f),read=f.storage.read;
+    let reads=0,finish,entered,restores=0;
+    const waiting=new Promise(resolve=>{entered=resolve;});
+    f.storage.read=async key=>{if(++reads===stopAt){entered();await new Promise(resolve=>{finish=resolve;});}return read(key);};
+    next.storage=f.storage;f.wallet.restore_eng2_cache=()=>{restores++;throw new Error('Cancelled initialization must not restore native cache.');};
+    const pending=next.initialize();await waiting;next.cancelSync();finish();
+    await assert.rejects(pending,error=>error.name==='AbortError');
+    assert.equal(reads,stopAt);assert.equal(restores,0);assert.equal(next.metadata,null);assert.equal(next.controller,null);
+    assert.deepEqual(Array.from(f.data,([key,value])=>[key,[...value]]),before);
+  }
+});
+test('cancellation during the initial atomic save retains the matched native and durable state',async()=>{
+  const f=fixture();f.setWriteHook(()=>f.session.cancelSync());
+  const result=await f.session.initialize();
+  assert.equal(result.ready,false);assert.equal(result.stale,true);assert.equal(result.height,0);assert.equal(f.session.metadata.height,0);assert.equal(f.session.invalidated,false);assert.equal(f.session.controller,null);
+  assert.equal(dec(f.data.get(f.session.key)).height,0);assert.equal(dec(f.data.get(f.session.cacheKey)).height,0);assert.equal(f.current().height,0);
+});
+
+
+test('receipt confirmation projection decreases after a head rollback without changing maturity',()=>{
+  assert.deepEqual(eng2Confirmations(10,33),{confirmations:24,confirmation_status:'confirmed'});
+  assert.deepEqual(eng2Confirmations(10,12),{confirmations:3,confirmation_status:'pending'});
+  assert.deepEqual(eng2Confirmations(10,9),{confirmations:0,confirmation_status:'pending'});
+  for(const height of [0,-1,1.5,100001])assert.throws(()=>eng2Confirmations(height,33));
+});
+
+
+test('an unchanged head still checks the saved block hash before claiming readiness',async()=>{
+  const f=fixture();await f.session.initialize();await f.session.sync();
+  const binary=f.session.binary;let checked=0;
+  f.session.binary=async(url,options)=>{const result=await binary(url,options);if(url.includes('/headers?')){checked++;const value=dec(result.bytes);value.headers[0].id=id(99);return {bytes:enc(value)};}return result;};
+  const before=Array.from(f.data,([key,value])=>[key,[...value]]);
+  await assert.rejects(f.session.sync(),/saved header hash/);assert.equal(checked,1);assert.equal(f.session.ready,false);assert.equal(f.current().height,1);assert.equal(f.commits(),1);
+  assert.deepEqual(Array.from(f.data,([key,value])=>[key,[...value]]),before);
+});
+test('saved-head lookup cancellation preserves the accepted cache and stops before a candidate',async()=>{
+  const f=fixture();await f.session.initialize();await f.session.sync();
+  const binary=f.session.binary,begin=f.wallet.begin_eng2_candidate;let begins=0;
+  f.wallet.begin_eng2_candidate=extension=>{begins++;return begin(extension);};
+  f.session.binary=async(url,options)=>{const result=await binary(url,options);if(url.includes('/headers?'))f.session.cancelSync();return result;};
+  await assert.rejects(f.session.sync(),error=>error.name==='AbortError');assert.equal(begins,0);assert.equal(f.current().height,1);assert.equal(f.commits(),1);assert.equal(f.session.ready,false);assert.equal(f.session.invalidated,false);
+});
+
+test('a mismatched saved hash prevents partial extension commits even when the next parent looks unchanged',async()=>{
+  const f=fixture();await f.session.initialize();f.setHeads([9]);await f.session.sync();
+  const binary=f.session.binary,begin=f.wallet.begin_eng2_candidate,commit=f.wallet.commit_eng2_candidate,begins=[],ends=[];
+  f.session.binary=async(url,options)=>{const result=await binary(url,options),query=new URL(url);if(query.pathname.endsWith('/headers')&&query.searchParams.get('from')==='9'&&query.searchParams.get('limit')==='1'){const value=dec(result.bytes);value.headers[0].id=id(99);return {bytes:enc(value)};}return result;};
+  f.wallet.begin_eng2_candidate=extension=>{begins.push(extension);return begin(extension);};
+  f.wallet.commit_eng2_candidate=(height,tip)=>{ends.push(Number(height));return commit(height,tip);};
+  f.setHeads([17]);
+  const result=await f.session.sync(progress=>{if(progress.height<17)assert.equal(f.current().height,9);});
+  assert.deepEqual(begins,[false]);assert.deepEqual(ends,[17]);assert.equal(result.height,17);assert.equal(result.ready,true);
+});
+
+test('default head decoding uses the failover source without accepting a foreign context',async()=>{
+  const f=fixture(),backup='http://127.0.0.1:8891',configuration={...pin,apis:[pin.api,backup]};
+  const calls=[],binary=f.session.binary;
+  const session=new Eng2Session(f.wallet,configuration,{storage:f.storage,now:()=>1000,hash:f.session.hash,locks:f.session.locks,publicIO:{wait:async()=>{},timeout:()=>new AbortController().signal},binary:async(url,options)=>{
+    calls.push(url);if(url.startsWith(pin.api))throw Object.assign(new Error('Synthetic unavailable.'),{status:503});
+    if(url.endsWith('/head'))return {bytes:enc(head())};return binary(url,options);
+  }});
+  await session.initialize();assert.equal((await session.sync()).ready,true);
+  assert.equal(calls.filter(url=>url.startsWith(pin.api)).length,1);assert.ok(calls.slice(1).every(url=>url.startsWith(backup)));
+  let heads=0;session.binary=async(url,options)=>{if(url.endsWith('/head')){heads++;return {bytes:enc({...head(),profile:'9'.repeat(64)})};}return binary(url,options);};
+  await assert.rejects(session.sync(),/pinned context/);assert.equal(heads,1);assert.equal(session.metadata.height,1);assert.equal(session.ready,false);
 });

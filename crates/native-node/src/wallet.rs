@@ -1037,7 +1037,7 @@ fn decode_payment(bytes: &[u8; 1313]) -> PaymentCiphertext {
         view_tag: bytes[1312],
     }
 }
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 fn encode_payment(payment: &PaymentCiphertext) -> [u8; 1313] {
     let mut out = [0; 1313];
     out[..1088].copy_from_slice(&payment.kem_ciphertext);
@@ -1129,5 +1129,5 @@ impl WalletPayment {
 #[path = "wallet/issuance.rs"]
 pub mod issuance;
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 mod tests;

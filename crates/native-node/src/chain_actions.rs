@@ -67,16 +67,22 @@ pub(crate) struct ChainDelta {
 /// Read-only candidate chain state derived only after the shared proof checks.
 /// This does not authorize settlement, the header or live state adoption.
 pub struct ChainPreview<'a> {
+    #[cfg(siworld_native_node)]
     pub(super) parent: &'a State,
+    #[cfg(siworld_native_node)]
     pub(super) delta: &'a ChainDelta,
+    #[cfg(not(siworld_native_node))]
+    _borrow: std::marker::PhantomData<(&'a State, &'a ChainDelta)>,
     pub(super) timestamps: std::collections::VecDeque<u64>,
     pub(super) snapshots: std::collections::VecDeque<CanonicalSnapshot>,
 }
 
 impl ChainDelta {
+    #[cfg(siworld_native_node)]
     pub(crate) fn new_leaves(&self) -> &[Digest] {
         &self.leaves
     }
+    #[cfg(siworld_native_node)]
     pub(crate) fn new_spends(&self) -> &BTreeSet<DigestBytes> {
         &self.spends
     }
@@ -100,8 +106,12 @@ impl ChainDelta {
             snapshots.pop_front();
         }
         Ok(ChainPreview {
+            #[cfg(siworld_native_node)]
             parent,
+            #[cfg(siworld_native_node)]
             delta: self,
+            #[cfg(not(siworld_native_node))]
+            _borrow: std::marker::PhantomData,
             timestamps,
             snapshots,
         })

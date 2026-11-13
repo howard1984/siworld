@@ -10,10 +10,6 @@ use native::{
     },
     multi_asset::{AssetId, DCT_BYTES, Digest, F, Hasher, sample_witness},
     multi_asset_transaction::statement_for,
-    native_hiding_v2::{
-        Config, IssuanceProver, IssuanceVerifier, Profile, SettlementProver, SettlementVerifier,
-        TransactionProver, TransactionVerifier,
-    },
     settlement::{
         RewardAllocation, RewardMode, RewardPlan, sample_fixed_settlement_witness,
         settlement_public,
@@ -23,6 +19,10 @@ use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_uni_stark::PreprocessedVerifierKey;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use siworld_native_node::proof_codec::v2::backend::{
+    Config, IssuanceProver, IssuanceVerifier, Profile, SettlementProver, SettlementVerifier,
+    TransactionProver, TransactionVerifier,
+};
 use siworld_native_node::proof_codec::v2::{ProtocolBinding, Relation, native::NativeProofShape};
 use std::{
     collections::BTreeMap,

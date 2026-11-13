@@ -261,6 +261,7 @@ impl IssuanceRecord {
             + self.signed.declaration.metadata.name.len()
             + self.proof.len())
     }
+    #[cfg(siworld_native_node)]
     pub(crate) fn owned_bytes(&self) -> Option<usize> {
         self.proof
             .capacity()
@@ -454,6 +455,7 @@ impl AssetRegistry {
         self.fees.insert(record.fee_commitment);
         Ok(())
     }
+    #[cfg(siworld_native_node)]
     pub(crate) fn logical_memory_bytes(&self) -> Option<usize> {
         // Logical conservative charge for sparse BTree nodes. This includes
         // doubled payload plus room for a full root node in every collection;
@@ -667,5 +669,5 @@ impl IssuanceVerifier {
         .map_err(|_| "native issuance proof verification failed".into())
     }
 }
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 mod tests;

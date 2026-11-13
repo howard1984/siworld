@@ -1,12 +1,12 @@
 use super::*;
-use crate::common::F;
+use ::native::common::F;
 use p3_commit::{Pcs, UnivariateStarkPcs};
 use p3_field::PrimeCharacteristicRing;
 use p3_matrix::dense::RowMajorMatrix;
 use p3_uni_stark::StarkGenericConfig;
 
 fn small() -> Profile {
-    Profile::new(crate::FriParams::fast()).unwrap()
+    Profile::new(::native::FriParams::fast()).unwrap()
 }
 fn values() -> RowMajorMatrix<F> {
     RowMajorMatrix::new(vec![F::ZERO; 128], 2)

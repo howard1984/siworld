@@ -7,6 +7,7 @@ import { ENGINEERING } from '../sdk/network.js';
 import { ProofProgress } from '../sdk/proof-progress.js';
 
 const $ = selector => document.querySelector(selector);
+const walletKind = ENGINEERING.name === 'siworld-eng-2' ? 'engineering-v2' : 'V1';
 const flow = $('#flow');
 let worker, sequence = 0, epoch = 0, ready = false, busy = false, storageHealthy = false;
 let mode = '', stage = '', context, positions, info, encrypted, savedRecords = [], imported, unlockingRecord;
@@ -28,11 +29,11 @@ function walletCreation(status = '') {
 }
 const paymentControls = () => { for (const id of ['send-recipient', 'send-amount', 'send-priority', 'send-prepare']) $(`#${id}`).disabled = proofProgress.active; };
 function message(text, error = false) { $('#status').textContent = text; $('#status').classList.toggle('error', error); }
-function capability(value) { value=value&&ENGINEERING.name==='siworld-eng-1'&&/^[0-9a-f]{64}$/.test(ENGINEERING.network); for (const id of ['create', 'restore', 'import-backup']) $(`#${id}`).disabled = !value; }
+function capability(value) { value=value&&['siworld-eng-1','siworld-eng-2'].includes(ENGINEERING.name)&&/^[0-9a-f]{64}$/.test(ENGINEERING.network); for (const id of ['create', 'restore', 'import-backup']) $(`#${id}`).disabled = !value; }
 function startWorker() {
   worker = new Worker(new URL('../sdk/worker.js', import.meta.url), { type: 'module' });
   worker.onmessage = ({ data }) => {
-    if (data.ready) { ready = true; capability(storageHealthy); if (storageHealthy) message('Native V1 core ready. Only the pinned engineering network can connect.'); return; }
+    if (data.ready) { ready = true; capability(storageHealthy); if (storageHealthy) message(`Wallet core ready for ${ENGINEERING.name}. Only the pinned engineering network can connect.`); return; }
     const request = pending.get(data.id);
     if (!request) return;
     if (data.progress) { request.onProgress?.(data.progress); return; }
@@ -69,7 +70,7 @@ function lock(text = 'Wallet locked. Recovery fields and the local worker sessio
   contacts.clear();
   $('#locked-notes').hidden=true;$('#locked-note-list').replaceChildren();$('#balance-detail').textContent='Unlock to scan public compact records locally.';$('#asset-balances').replaceChildren();$('#payment-list').replaceChildren();$('#send-recipient').value='';$('#send-amount').value='';$('#send-review').textContent='';$('#send-error').textContent='';
   $('#setup').hidden = false; $('#receiving').hidden = true; $('#full-address').value = ''; $('#short-address').textContent = '';
-  $('#account-title').textContent = 'V1 ACCOUNT'; $('#send-source').textContent = '';
+  $('#account-title').textContent = `${walletKind.toUpperCase()} ACCOUNT`; $('#send-source').textContent = '';
   $('#wallet-birthday').textContent = '';
   $('#account-index').textContent = 'No wallet unlocked'; $('#account-state').textContent = 'LOCKED';
   $('#lock').disabled = $('#copy-address').disabled = $('#copy-short-address').disabled = true;
@@ -83,8 +84,8 @@ function showStage(next) {
   $('#confirm-field').hidden = false;
   const display = (id, visible) => { $(`#${id}`).hidden = !visible; };
   if (next === 'context') {
-    $('#flow-title').textContent = mode === 'create' ? 'Create your V1 wallet.' : 'Restore your V1 wallet.';
-    $('#flow-description').textContent = mode === 'create' ? 'New keys are generated only on this device. Engineering assets have no monetary value.' : 'Use the original native V1 network, account and 24 recovery words. An older website wallet uses a different derivation.';
+    $('#flow-title').textContent = mode === 'create' ? `Create your ${walletKind} wallet.` : `Restore your ${walletKind} wallet.`;
+    $('#flow-description').textContent = mode === 'create' ? 'New keys are generated only on this device. Engineering assets have no monetary value.' : `Use the original network, account and 24 recovery words for this ${walletKind} wallet.`;
     display('context-fields', true); display('restore-fields', mode === 'restore');
     $('#next').textContent = mode === 'create' ? 'Generate recovery words ↗' : 'Continue ↗';
   } else if (next === 'words') {
@@ -97,7 +98,7 @@ function showStage(next) {
     display('challenge-fields', mode === 'create'); display('password-fields', true); $('#next').textContent = 'Save encrypted wallet ↗';
     $('#password').autocomplete = 'new-password';
   } else if (next === 'unlock') {
-    $('#flow-title').textContent = 'Unlock your V1 wallet.';
+    $('#flow-title').textContent = `Unlock your ${walletKind} wallet.`;
     $('#flow-description').textContent = imported
       ? 'Enter the device password used to encrypt this backup.'
       : `${savedWalletLabel(unlockingRecord)}. Enter this wallet's device password. Names appear after unlocking.`;
@@ -153,9 +154,9 @@ async function render(publicInfo, record, selected = false) {
   $('#lock').disabled = $('#copy-address').disabled = false;
   $('#copy-short-address').disabled = ENGINEERING.address_directory !== true;
   $('#copy-short-address').textContent = 'Enable short address ↙';
-  $('#short-address-status').textContent = 'Enable the short address to publish only its matching public full address. No recovery words, private keys or viewing keys are sent.';
+  $('#short-address-status').textContent = ENGINEERING.name==='siworld-eng-2' ? 'Use the full receiving address. Short-address publication is unavailable in this read-only build.' : 'Enable the short address to publish only its matching public full address. No recovery words, private keys or viewing keys are sent.';
   $('#send-open').textContent = ENGINEERING.read_only === true ? 'Read-only · Send unavailable' : 'Send ↗';
-  message('Wallet unlocked locally. Starting compact engineering synchronization.'); activity(); startOnline();
+  message('Wallet unlocked locally. Starting authenticated engineering synchronization.'); activity(); startOnline();
 }
 $('#create').addEventListener('click', () => begin('create'));
 $('#restore').addEventListener('click', () => begin('restore'));
@@ -249,12 +250,12 @@ $('#export-backup').addEventListener('click', async () => {
   try {
     const accounts_hex = await call('accounts-backup');
     if (token !== epoch) return;
-    download('siworld-native-v1-encrypted.json', parseBackup(JSON.stringify({format:record.format,version:2,network:record.network,account:record.account,vault_hex:record.vault_hex,accounts_hex})));
+    download(ENGINEERING.name==='siworld-eng-2'?'siworld-eng2-encrypted.json':'siworld-native-v1-encrypted.json', parseBackup(JSON.stringify({format:record.format,version:2,network:record.network,account:record.account,vault_hex:record.vault_hex,accounts_hex,...(record.context?{context:record.context}:{})})));
   } catch (error) { if (token === epoch) message(error.message, true); }
 });
 $('#copy-address').addEventListener('click', async () => {
   if (!info) return;
-  try { await navigator.clipboard.writeText(info.full_address); message('Full V1 address copied. This is public receiving data.'); }
+  try { await navigator.clipboard.writeText(info.full_address); message('Full receiving address copied. This is public receiving data.'); }
   catch { $('#full-address').focus(); $('#full-address').select(); message('Copy the selected public address manually.'); }
 });
 $('#copy-short-address').addEventListener('click', async () => {
@@ -288,15 +289,30 @@ function showBalance(result,stale=false){
  walletList.balance(info.account,result); history.set(result);
  const tranches=result.locked_tranches||[];$('#locked-notes').hidden=tranches.length===0;$('#locked-note-list').replaceChildren(...tranches.map(tranche=>{const p=document.createElement('p');const estimated=tranche.estimated_timestamp===null||tranche.estimated_timestamp===undefined?null:new Date(tranche.estimated_timestamp*1000);p.textContent=`${tranche.kind==='maturing'?'Awaiting 24-block maturity':'Scheduled lock'} · ${atoms(tranche.amount_atoms)} ${tranche.asset==='0'.repeat(64)?'SIP':'asset '+tranche.asset.slice(0,12)+'…'} · unlock height ${tranche.unlock_height} · ${estimated&&!Number.isNaN(estimated.valueOf())?'estimated '+estimated.toLocaleDateString():'date unavailable'}`;return p;}));
  const sip=result.rows.find(row=>row.asset==='0'.repeat(64));$('#balance-value').textContent=atoms(sip?.available_atoms);
- $('#balance-detail').textContent=`Available before reservations ${atoms(sip?.mature_atoms)} SIP · awaiting maturity ${atoms(sip?.pending_maturity_atoms)} SIP · locked ${atoms(sip?.time_locked_atoms??sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · ${result.payments?.filter(p=>p.phase==='pending'||p.phase==='unknown').length||0} pending or uncertain payments`;
- $('#chain-status').textContent=`${stale?'Stale · ':''}siworld-eng-1 · height ${result.height} · ${result.tip.slice(0,16)}… · transactions trust full-node consensus${result.public_cache_cleanup_pending?' · Public cache cleanup will retry.':''}`;
- $('#send-open').disabled=stale||!result.ready||!desktopSend();
+ $('#balance-detail').textContent=`Available before reservations ${atoms(sip?.mature_atoms)} SIP · awaiting maturity ${atoms(sip?.pending_maturity_atoms)} SIP · locked ${atoms(sip?.time_locked_atoms??sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · ${result.payments?.filter(p=>['pending','unknown','accepted','uncertain'].includes(p.phase)).length||0} pending or uncertain payments`;
+ if(ENGINEERING.name==='siworld-eng-2')$('#balance-detail').textContent=`Available ${atoms(sip?.available_atoms)} SIP · locked ${atoms(sip?.locked_atoms)} SIP · reserved ${atoms(sip?.reserved_atoms)} SIP (${result.reserved_count||0} inputs) · Read-only. Sending is unavailable.`;
+ $('#chain-status').textContent=`${stale||result.stale?'Stale · ':''}${ENGINEERING.name} · height ${result.height} · ${result.tip.slice(0,16)}… · ${ENGINEERING.name==='siworld-eng-2'?'authenticated receipts; full-node consensus not locally verified':'transactions trust full-node consensus'}${result.public_cache_cleanup_pending?' · Public cache cleanup will retry.':''}`;
+ $('#send-open').disabled=stale||!result.ready||result.send_supported===false||!desktopSend();
  $('#asset-balances').replaceChildren(...result.rows.filter(r=>r.asset!=='0'.repeat(64)).map(row=>{const p=document.createElement('p');p.textContent=`Asset ${row.asset.slice(0,12)}… · available ${row.available_atoms} atoms · locked ${row.locked_atoms} atoms`;return p;}));
- $('#payment-list').replaceChildren(...(result.payments||[]).map(payment=>{const row=document.createElement('p');row.textContent=`${atoms(payment.amount_atoms)} SIP · ${payment.phase} `;if(['finalized','pending','unknown'].includes(payment.phase)){const button=document.createElement('button');button.type='button';button.textContent=payment.phase==='finalized'?'Review and submit':'Retry same packet';button.disabled=stale||!result.ready||!desktopSend();button.onclick=()=>{if(proofProgress.active)return;proofProgress.reset();preparedId=payment.id;$('#send-disclosure').checked=false;$('#send-review').textContent=`${atoms(payment.amount_atoms)} SIP · fee ${atoms(payment.fee_atoms)} SIP · recipient ${payment.recipient}`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;$('#send-flow').showModal();};row.append(button);}if(['prepared','finalized'].includes(payment.phase)){const cancel=document.createElement('button');cancel.type='button';cancel.textContent='Cancel unsent payment';cancel.onclick=async()=>{try{showBalance(await call('cancel-payment',payment.id));}catch(error){message(error.message,true);}};row.append(cancel);}return row;}));
+ $('#payment-list').replaceChildren(...(result.payments||[]).map(payment=>{const row=document.createElement('p');row.textContent=`${atoms(payment.amount_atoms)} SIP · ${payment.phase} `;if(['finalized','pending','unknown','accepted','uncertain'].includes(payment.phase)){const button=document.createElement('button');button.type='button';button.textContent=payment.phase==='finalized'?'Review and submit':'Retry same packet';button.disabled=stale||!result.ready||result.send_supported===false||!desktopSend();button.onclick=()=>{if(proofProgress.active)return;proofProgress.reset();preparedId=payment.id;$('#send-disclosure').checked=false;$('#send-review').textContent=`${atoms(payment.amount_atoms)} SIP · fee ${atoms(payment.fee_atoms)} SIP · recipient ${payment.recipient}`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;$('#send-flow').showModal();};row.append(button);}if(['prepared','reserved','finalized'].includes(payment.phase)){const cancel=document.createElement('button');cancel.type='button';cancel.textContent='Cancel unsent payment';cancel.disabled=result.send_supported===false||!desktopSend();cancel.onclick=async()=>{try{showBalance(await call('cancel-payment',payment.id));}catch(error){message(error.message,true);}};row.append(cancel);}return row;}));
 }
-async function startOnline(){const token=epoch;onlineReady=false;try{const result=await call('online-init',ENGINEERING);if(token!==epoch)return;showBalance(result,true);onlineReady=true;await refreshOnline();}catch(error){if(token===epoch)$('#chain-status').textContent=error.message;}}
-async function refreshOnline(){clearTimeout(pollTimer);if(!onlineReady||onlineBusy||!info)return;onlineBusy=true;const token=epoch;try{const result=await call('sync');if(token===epoch)showBalance(result);}catch(error){if(token===epoch){$('#chain-status').textContent=`Synchronization paused: ${error.message} Previous balance is stale.`;$('#send-open').disabled=true;}}finally{if(token===epoch){onlineBusy=false;if(info)pollTimer=setTimeout(refreshOnline,5000);}}}
-$('#sync-now').onclick=refreshOnline;
+function startOnline(){onlineReady=false;return refreshOnline();}
+async function refreshOnline(){
+ clearTimeout(pollTimer);if(onlineBusy||!info)return;
+ onlineBusy=true;const token=epoch;
+ try{
+  if(!onlineReady){
+   const initial=await call('online-init',ENGINEERING);if(token!==epoch)return;
+   showBalance(initial,true);onlineReady=true;
+  }
+  const result=await call('sync');if(token===epoch)showBalance(result);
+ }catch(error){
+  if(token===epoch){$('#chain-status').textContent=`Synchronization paused: ${error.message} Retrying automatically; the saved verified prefix is preserved.`;$('#send-open').disabled=true;}
+ }finally{
+  if(token===epoch){onlineBusy=false;if(info)pollTimer=setTimeout(refreshOnline,5000);}
+ }
+}
+$('#sync-now').onclick=()=>refreshOnline();
 $('#send-open').onclick=()=>{if(proofProgress.active){$('#send-flow').showModal();return;}proofProgress.reset();$('#send-disclosure').checked=false;$('#send-recipient').value='';$('#send-prepare').hidden=false;$('#send-ready').hidden=true;$('#send-transmit').hidden=true;$('#send-error').textContent='';$('#send-flow').showModal();};
 $('#send-close').onclick=()=>$('#send-flow').close();
 $('#send-form').onsubmit=async event=>{event.preventDefault();if(onlineBusy)return;onlineBusy=true;clearTimeout(pollTimer);const token=epoch;$('#send-error').textContent='';try{if(!desktopSend())throw new Error('Phone sending remains disabled pending physical-device measurements.');const amount=$('#send-amount').value;if(!/^(0|[1-9][0-9]{0,10})(\.[0-9]{1,8})?$/.test(amount))throw new Error('Enter a positive SIP amount with at most eight decimals.');const [whole,fraction='']=amount.split('.');const value=BigInt(whole)*100000000n+BigInt(fraction.padEnd(8,'0'));if(value<=0n)throw new Error('Amount must be positive.');const address=$('#send-recipient').value.trim();const checked=await call('inspect',address,info.network,contacts.get(address)||'');if(token!==epoch)return;contacts.set(checked.short_address,checked.full_address);proofProgress.start();paymentControls();const result=await call('prepare',address,contacts.get(address)||'',value.toString(),$('#send-priority').checked);if(token!==epoch)return;proofProgress.finish(result.proving_ms);preparedId=result.prepared_id;showBalance(result);const review=result.payments.find(p=>p.id===preparedId);$('#send-review').textContent=`${atoms(review.amount_atoms)} SIP · fee ${atoms(review.fee_atoms)} SIP · recipient ${review.recipient}`;$('#send-error').textContent=`Proof generated and locally verified in ${(result.proving_ms/1000).toFixed(2)} seconds. Nothing has been transmitted.`;$('#send-ready').hidden=false;$('#send-prepare').hidden=true;$('#send-transmit').hidden=false;}catch(error){if(token===epoch){proofProgress.fail();$('#send-error').textContent=error.message;}}finally{if(token===epoch){onlineBusy=false;paymentControls();pollTimer=setTimeout(refreshOnline,5000);}}};

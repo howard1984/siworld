@@ -4,6 +4,12 @@
 //! must come from trusted network configuration; callers must also preflight
 //! the complete typed body and verify its independently rebuilt statement.
 
+#[path = "v2/backend/mod.rs"]
+pub mod backend;
+
+#[path = "v2/batch.rs"]
+pub mod batch;
+
 #[cfg(not(target_family = "wasm"))]
 #[path = "v2/fee_guard.rs"]
 pub mod fee_guard;

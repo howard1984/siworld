@@ -2,7 +2,7 @@
 use super::entropy::{EntropyError, Streams};
 use super::owner::{AccessError, Alias, Owner, OwnerError};
 use super::{FRI_CAP_HEIGHT, INPUT_CAP_HEIGHT, Profile, RANDOM_CODEWORDS, SALT_ELEMENTS};
-use crate::common::F;
+use ::native::common::F;
 use p3_challenger::DuplexChallenger;
 use p3_commit::{
     CommitmentOpening, ExtensionMmcs, OpenedValues, OpeningRequest, Pcs, UnivariateStarkPcs,

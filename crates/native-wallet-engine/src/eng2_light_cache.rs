@@ -52,6 +52,36 @@ impl Eng2LightState {
         out.extend_from_slice(&checksum);
         Ok(out)
     }
+    /// Open an authenticated private cache as an isolated accepted-prefix
+    /// candidate. The caller authenticates its local envelope before this API;
+    /// no accepted note, path, balance or prepared witness is changed here.
+    pub fn fork_local_cache(
+        &self,
+        genesis: &[u8],
+        expected: Hash,
+        seed: Zeroizing<[u8; 32]>,
+        account: u32,
+        bytes: &[u8],
+        checkpoint: Snapshot,
+    ) -> Result<Self, String> {
+        if checkpoint.height > self.height()
+            || self.height() - checkpoint.height > 31
+            || self.id_at(checkpoint.height)? != checkpoint.block_id
+        {
+            return Err("eng2 cached candidate is not a retained accepted prefix".into());
+        }
+        let candidate = Self::open_local(genesis, expected, seed, account, bytes)?;
+        if binding(candidate.context()) != binding(self.context())
+            || candidate.wallet().address() != self.wallet().address()
+            || candidate.height() != checkpoint.height
+            || candidate.tip() != checkpoint.block_id
+        {
+            return Err("eng2 cached candidate context, wallet or checkpoint differs".into());
+        }
+        // This is a prefix restore, not an adoption. Complete receipt replay and
+        // check_head against the accepted state remain required afterwards.
+        Ok(candidate)
+    }
     /// Accept only a same-wallet, authenticated local envelope. This API is
     /// never a network checkpoint/state-snapshot admission path.
     pub fn open_local(

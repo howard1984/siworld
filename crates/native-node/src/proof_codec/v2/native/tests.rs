@@ -1,5 +1,5 @@
+use super::super::backend::PublicPreprocessing;
 use super::*;
-use native::native_hiding_v2::PublicPreprocessing;
 use p3_air::BaseAir;
 use p3_field::PrimeCharacteristicRing;
 use p3_fri::{BatchMultiOpening, CommitPhaseMultiStep, FriProof};

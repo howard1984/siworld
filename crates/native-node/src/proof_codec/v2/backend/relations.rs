@@ -3,16 +3,12 @@
 //! Public preprocessing is prepared once and reused. Every proof creates one
 //! fresh OS-seeded attempt; no private PCS or witness is cached across attempts.
 //! The retained configuration and network adapters remain unchanged.
-use crate::issuance::{
-    IssuanceError, IssuancePolicy, IssuanceWitness, SignedIssuance, VerifiedIssuance,
-};
-use crate::issuance_air::{IssuanceAir, PUBLIC_COMMITMENTS, public_len};
-use crate::multi_asset::{AccWitness, DCT_BYTES, Digest, F, Hasher};
-use crate::multi_asset_transaction::{TransactionAir, statement_for};
-use crate::settlement::{FixedSettlementWitness, SettlementAir, validate_settlement_public};
-pub use native_base::native_hiding_v2::{
-    Config, PrivateAttempt, Profile, PublicPreprocessing, RANDOM_CODEWORDS, SALT_ELEMENTS,
-};
+use super::{Config, PrivateAttempt, Profile, PublicPreprocessing};
+use ::native::issuance::{IssuanceError, IssuancePolicy, IssuanceWitness, SignedIssuance};
+use ::native::issuance_air::{IssuanceAir, PUBLIC_COMMITMENTS, public_len};
+use ::native::multi_asset::{AccWitness, DCT_BYTES, Digest, F, Hasher};
+use ::native::multi_asset_transaction::{TransactionAir, statement_for};
+use ::native::settlement::{FixedSettlementWitness, SettlementAir, validate_settlement_public};
 use p3_field::PrimeField32;
 use p3_uni_stark::{
     PreprocessedProverData, PreprocessedVerifierKey, Proof, QuotientAir, prove_with_preprocessed,
@@ -186,7 +182,7 @@ impl SettlementProver {
         witness
             .check(&Hasher::new())
             .map_err(|_| "native hiding V2 settlement witness rejected")?;
-        let (trace, public) = crate::settlement::generate_trace(&self.air, witness);
+        let (trace, public) = super::settlement_trace::generate(&self.air, witness);
         let attempt = PrivateAttempt::from_os(self.profile())
             .map_err(|_| "native hiding V2 OS entropy unavailable")?;
         let proof = attempt
@@ -248,7 +244,7 @@ impl IssuanceProver {
         &self,
         witness: &IssuanceWitness,
     ) -> Result<(Proof<Config>, Vec<F>), IssuanceError> {
-        let (trace, public) = self.air.generate(witness)?;
+        let (trace, public) = super::issuance_trace::generate(&self.air, witness)?;
         let attempt =
             PrivateAttempt::from_os(self.profile()).map_err(|_| IssuanceError::InvalidProof)?;
         let proof = attempt
@@ -292,7 +288,7 @@ impl IssuanceVerifier {
         policy: IssuancePolicy,
         ciphertexts: &[Vec<u8>],
         verify_fee: impl FnOnce(&[u8; 32], u64) -> bool,
-    ) -> Result<VerifiedIssuance, IssuanceError> {
+    ) -> Result<(), IssuanceError> {
         signed.declaration.validate(network, version, policy)?;
         signed.verify_signature()?;
         signed
@@ -305,6 +301,6 @@ impl IssuanceVerifier {
         if !verify_fee(&signed.declaration.binding(), policy.required_fee_atoms) {
             return Err(IssuanceError::UnpaidIssuanceFee);
         }
-        Ok(VerifiedIssuance(signed.declaration.clone()))
+        Ok(())
     }
 }

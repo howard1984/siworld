@@ -1,13 +1,11 @@
 //! Bounded canonical admission for the explicit salted native uni-STARK body.
+use super::backend::{Config, Profile};
 use super::{FRAME_BYTES, FrameError, Identity, ProtocolBinding, Relation};
 use crate::proof_codec::{
     DIGEST_ELEMENTS, EXTENSION_DEGREE, FoldShape, ProofDecodeError, ProofShape, RoundShape,
     power_of_two,
 };
-use native::{
-    multi_asset::F,
-    native_hiding_v2::{Config, Profile},
-};
+use ::native::multi_asset::F;
 use p3_air::{
     Air,
     symbolic::{AirLayout, SymbolicAirBuilder},
@@ -367,7 +365,7 @@ fn cap(n: usize) -> Result<usize, ProofDecodeError> {
     vector(n, DIGEST_ELEMENTS * 4)
 }
 
-fn maximum_pruned_hashes(
+pub(super) fn maximum_pruned_hashes(
     height: usize,
     cap: usize,
     queries: usize,

@@ -261,5 +261,5 @@ pub fn load(_: &Path, _: Hash) -> Result<WalletPrivacyPolicy, String> {
 pub fn save(_: &Path, _: Hash, _: WalletPrivacyPolicy) -> Result<(), String> {
     Err("protected wallet policies require Unix".into())
 }
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 mod tests;

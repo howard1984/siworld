@@ -110,7 +110,9 @@ fn local_cache_preserves_spent_receipts_and_unspent_change_paths() {
     block.timestamp = 601;
     block.transactions[0].record.body = public
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect::<Vec<_>>()
         .try_into()
