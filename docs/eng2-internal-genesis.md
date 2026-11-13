@@ -151,3 +151,88 @@ Failures return structured JSON with fixed error codes and no input echo. A
 successful seal is not deployment, block admission, synchronization or proof
 of authority-key ownership. The standalone binary requires neither
 `eng2-runtime`, `native-p2p` nor `eng2-rehearsal`.
+
+## Encoding public parameters
+
+`encode-public` prepares the two existing canonical inputs to `seal-public`:
+
+```
+siworld-eng2-genesis encode-public PUBLIC_PARAMETERS.json \
+  --expected-input-sha256 H --new-parameters NEW_DIRECTORY --json
+```
+
+H is the independently checked SHA-256 of the exact public JSON input bytes.
+The input is a bounded regular file, at most 262,144 bytes, without a final
+symlink. The output directory must be absent. All semantic checks and canonical
+roundtrips finish before directory creation. It contains `config-rules.bin` and
+`governance.bin`; no genesis, key, identity, chain database or service is created.
+Files and the directory are synchronized. A filesystem failure may leave a
+partial new directory; preserve and inspect it rather than overwriting it.
+
+The input object contains exactly the following fields. Uppercase names in this
+illustration stand for actual lowercase hexadecimal public encodings; the
+illustration is not an executable fixture.
+
+```json
+{
+  "version": 1,
+  "network": "NETWORK_HEX",
+  "proof_profile": "PROFILE_HEX",
+  "fixture": false,
+  "work_bits": 0,
+  "genesis_timestamp": "TIMESTAMP_DECIMAL",
+  "genesis_target": "FF_REPEATED_32_BYTES_LOWERCASE_HEX",
+  "pow_iterations": 1,
+  "target_interval": 300,
+  "economics": "production",
+  "fee_mode": "legacy-miner",
+  "checkpoint_threshold": 2,
+  "checkpoint_public_keys": ["SLOT0_PUBLIC_HEX", "SLOT1_PUBLIC_HEX", "SLOT2_PUBLIC_HEX"],
+  "founder_public_key": "FOUNDER_PUBLIC_HEX",
+  "revocation_public_key": "REVOCATION_PUBLIC_HEX",
+  "fee_destination": "PAYMENT_ADDRESS_HEX",
+  "fund": {
+    "team_index": 0,
+    "members": [
+      {"basis_points": 10000, "public_key": "FUND_AUTHORITY_PUBLIC_HEX", "destination": "PAYMENT_ADDRESS_HEX"}
+    ]
+  },
+  "issuance": {"max_metadata_bytes": 256, "max_per_block": 4}
+}
+```
+
+Network and profile are 32 bytes. Each authority public key is exactly 1,952
+bytes; each payment address is the existing 1,232-byte canonical encoding.
+Copy public checkpoint keys from separately prepared `public_key_hex` values
+in slot order, and payment addresses from `address_hex`. No custody file,
+private seed, private key or secret field belongs in this input. Unknown fields
+are rejected at every object level. The timestamp is a nonzero canonical decimal
+u64 string without leading zeroes. Members number from one through 32; positive
+basis-point shares sum to 10,000, the team index selects an existing member, and
+fund authorities are distinct. Existing configuration and governance validators
+check addresses, issuance limits, owner keys and the three nonzero distinct
+checkpoint keys. Public bytes and distinctness do not prove independent key
+custody or possession.
+
+This command deliberately selects the minimum initial nonfixture ASERT work:
+target bytes are all `ff`, iterations are one, the interval is 300 seconds and
+economic timing is production. Later targets follow the existing ASERT rule.
+Zero-iteration fixtures, other targets, intervals, work selectors, fee modes,
+thresholds and profiles are rejected. These input restrictions do not modify
+consensus validation or the runtime. The original sealer's known fixture-key
+check remains in effect.
+
+The encoder uses `Config::encode_rules` and
+`GovernanceState::canonical_component_bytes`, their existing decoders, genesis
+sealing and the same public-context checks as `seal-public`. The receipt reports
+computed config, governance and fee-recipient hashes and the reconstructed
+public genesis identity. These hashes describe the encoder's output; they do
+not independently establish key ownership or a deployment approval. Compare
+both output files with the reviewed public parameters, then pass their checked
+hashes and network/profile/recipient pins to the existing `seal-public` command.
+
+The three-key roster still needs two distinct votes. Two service nodes can
+load slots zero and one while slot two remains an unconfigured local backup.
+Slot zero must be online to propose. Each resident loads at most one signer;
+miners may keep `checkpoint_key` null. A backup prepared on a service host does
+not provide a third independent host failure domain.

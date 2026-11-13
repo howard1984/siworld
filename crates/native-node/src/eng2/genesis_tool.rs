@@ -14,6 +14,9 @@ use std::{
     path::Path,
 };
 
+mod parameters;
+pub use parameters::encode_public;
+
 pub const MAX_GOVERNANCE_BYTES: usize = 131_072;
 const MAX_GENESIS_BYTES: usize = 41 + crate::state::CONFIG_RULE_BYTES + 4 + MAX_GOVERNANCE_BYTES;
 const H0_LIMITS: Limits = Limits {
