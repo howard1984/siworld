@@ -176,6 +176,90 @@ event stream; native event instrumentation, collection and clock calibration
 remain required before actual propagation can be reported. Status polling
 and opaque relay byte counts cannot replace these events or qualify G2.
 
+## Complete native journal validation
+
+The independent `native-stream-integrity` entry point consumes existing local
+collector snapshots. It does not load a node plan, inspect a process, contact a
+host, change relay controls, open a database or execute a native verifier:
+
+```sh
+python3 scripts/reorg-local-network.py native-stream-integrity "$BINDINGS" \
+  --bindings-sha256 "$BINDINGS_SHA256" --output "$NEW_INTEGRITY_OUTPUT" \
+  --snapshot "$FIRST_SNAPSHOT" --snapshot "$FINAL_STOPPED_SNAPSHOT"
+```
+
+The independently pinned version-1 bindings contain the network and genesis
+identifiers, exact source commit and executable SHA-256, and `nodes`. Each node
+contains a unique `row`, `alias`, `node_id` and `run_id`, plus `directory` and
+`unit`. The collector directory contains `index.private.json` with those exact
+bindings and, under each alias, `snapshot.private.json` and retained journal
+segments. The snapshot binds the same node, `status_before`, `status_after`,
+`unit`, `process`, and one to four `files`. Each file entry names one of
+`native-block-events-0.jsonl` through `native-block-events-3.jsonl` and supplies
+its exact `local_file`, `bytes` and SHA-256. Inputs must be owned private regular
+files without symbolic links or hard links. The command does not collect them.
+
+Every snapshot must retain both status diagnostics. `native_block_events`
+provides the shared recorder sequence, attempts, written count, dropped count,
+marker state and fixed segment limits. `native_accept_observation` separately
+provides `enabled`, `dropped_events`, `error_code`, `coverage_established` and
+`scope: "ordinary-forward-admission"`. Both diagnostics must be enabled and
+error-free with zero drops. A missing owner diagnostic is incomplete coverage;
+the consumer never substitutes a zero. A collector that previously selected
+only `native_block_events` must also retain `native_accept_observation` before
+its snapshots can qualify. Collection and remote process ownership are separate
+interfaces and receive no authority from this command.
+
+Status context requires the actual network, genesis and resident run. The
+resident status schema does not require source or executable fields; if either
+is provided, it must match. Their absence does not weaken the mandatory source
+and executable bindings in every journal record and snapshot binding.
+
+The consumer validates all three block-event kinds before choosing propagation
+samples: `native-block-produced`, `native-block-durably-accepted` and
+`native-proof-rejected`. All share the same sequence and ring. Complete
+start/end markers, every sequence from 1 through the end counter, exact
+provenance, matching counts and complete newline-terminated records are
+required. Repeated identical records across snapshots are retained once;
+different bytes for the same sequence or marker are rejected. Unknown kinds,
+duplicate JSON keys, nonfinite numbers, conflicting identities, missing
+rollover coverage and partial tails fail closed. Recorder serialization order
+does not impose monotonic timestamp order on concurrent hooks.
+
+A rejection also binds the receiver, authenticated peer fingerprint, exact
+header/block identifier, frame identifier, body commitment and byte length,
+owner attempt, fixed native error code, and independent owner/stream drop
+counts. Its deduplication key has five fields: kind, receiver, run, owner
+attempt and frame identifier. Its schema contains no acceptance timestamp.
+The recognized native relations are transaction, legacy settlement and
+issuance. Parsing such a record does not independently prove a verifier result,
+cover CompleteFee, establish current chain membership or qualify a competing
+branch/replacement path. Exact source and artifact provenance remain external
+requirements.
+
+The output preserves every validated marker and event in `records`, with its
+line SHA-256 and immutable source-file references. Only after full validation
+does `earliest_logical_events` select produced/accepted rows. Repeated logical
+production or acceptance uses the earliest process-local monotonic observation;
+all later rows remain in `records`. Rejection rows never become acceptance
+samples. The final snapshot must report the expected unit stopped, no resident
+process, a written end marker and counters matching that marker. These supplied
+facts do not replace an independently held native child or its termination
+receipt. An incomplete/crashed stream needs a separately reviewed delimited
+prefix contract; this command does not qualify it.
+
+Bounds are 64 nodes, 1440 snapshots, 50000 source files, 50000 event sequences
+per node, at most 50128 retained records including markers, 64 MiB of retained
+raw record bytes, 16 GiB total input bytes read and 128 MiB serialized output.
+The four native segments remain at most 1 MiB each, with records at most 2048
+bytes including newline. Bindings and snapshot indexes are at most 32 KiB;
+node snapshot metadata is at most 64 KiB. These are finite parser limits, not
+measured RSS, throughput or proof/runtime budgets. Repeated snapshots count
+against input limits; no truncation, automatic limit increase or source cleanup
+occurs. The output is create-only. A successful command and complete output
+still leave clock calibration, propagation statistics, native state checks and
+G2 acceptance separate; `G2_case_pass` remains false.
+
 ## Nonexecuting fault capability assessment
 
 `fault-capabilities` checks a selected node against the isolated marker,

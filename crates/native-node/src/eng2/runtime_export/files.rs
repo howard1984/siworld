@@ -131,7 +131,7 @@ impl PublicExport {
         }
         let prepared = PreparedCheckpoint::prepare_from_archive(store, limits)?
             .ok_or("eligible checkpoint disappeared")?;
-        self.write_once(&name, &encode_candidate(&prepared, limits)?)?;
+        self.write_candidate(&name, &prepared, limits)?;
         Ok(Some(prepared))
     }
     #[cfg(any(test, feature = "eng2-runtime"))]
@@ -186,12 +186,13 @@ impl PublicExport {
     ) -> Result<(), String> {
         self.check_store(store)?;
         prepared.check_current(store)?;
-        self.write_once(
+        self.write_candidate(
             &candidate_name(
                 prepared.statement.roster_sequence,
                 prepared.statement.checkpoint_height,
             ),
-            &encode_candidate(prepared, limits)?,
+            prepared,
+            limits,
         )
     }
     pub fn last_publication(&self) -> Option<u64> {
@@ -221,12 +222,13 @@ impl PublicExport {
     ) -> Result<PreparedCheckpoint, String> {
         self.check_store(store)?;
         let prepared = PreparedCheckpoint::from_proposal(store, statement, witness, limits)?;
-        self.write_once(
+        self.write_candidate(
             &candidate_name(
                 prepared.statement.roster_sequence,
                 prepared.statement.checkpoint_height,
             ),
-            &encode_candidate(&prepared, limits)?,
+            &prepared,
+            limits,
         )?;
         Ok(prepared)
     }
@@ -249,12 +251,13 @@ impl PublicExport {
     ) -> Result<Vote, String> {
         self.check_store(store)?;
         prepared.check_current(store)?;
-        self.write_once(
+        self.write_candidate(
             &candidate_name(
                 prepared.statement.roster_sequence,
                 prepared.statement.checkpoint_height,
             ),
-            &encode_candidate(prepared, limits)?,
+            prepared,
+            limits,
         )?;
         let name = format!(
             "vote-{:020}-{:020}-{}.eng2.bin",
@@ -692,7 +695,7 @@ impl PublicExport {
         self.blocks = blocks;
         Ok(())
     }
-    fn read_optional(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>, String> {
+    fn open_read(&self, name: &str, limit: usize) -> Result<Option<fs::File>, String> {
         self.check_root()?;
         let descriptor = match openat(
             &self.root,
@@ -716,6 +719,12 @@ impl PublicExport {
         {
             return Err("eng2 public artifact type, permissions or byte bound invalid".into());
         }
+        Ok(Some(file))
+    }
+    fn read_optional(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>, String> {
+        let Some(file) = self.open_read(name, limit)? else {
+            return Ok(None);
+        };
         let mut bytes = Vec::new();
         file.take((limit as u64).saturating_add(1))
             .read_to_end(&mut bytes)
@@ -768,9 +777,62 @@ impl PublicExport {
         self.latest = None;
         Ok(())
     }
+    fn write_candidate(
+        &self,
+        name: &str,
+        prepared: &PreparedCheckpoint,
+        limits: ImportLimits,
+    ) -> Result<(), String> {
+        let encoded = CandidateEncoding::new(prepared, limits)?;
+        self.write_once_parts(name, &encoded.parts())
+    }
+    fn immutable_matches_parts(
+        &self,
+        name: &str,
+        parts: &[&[u8]],
+        length: usize,
+    ) -> Result<Option<bool>, String> {
+        let Some(mut file) = self.open_read(name, length)? else {
+            return Ok(None);
+        };
+        // Compare actual bytes, including the final chunk. Metadata or a cached
+        // digest cannot establish immutable-file equality.
+        let mut buffer = [0u8; IMMUTABLE_COMPARE_BYTES];
+        for part in parts {
+            for expected in part.chunks(IMMUTABLE_COMPARE_BYTES) {
+                if let Err(error) = file.read_exact(&mut buffer[..expected.len()]) {
+                    return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                        Ok(Some(false))
+                    } else {
+                        Err("eng2 public artifact read failed".into())
+                    };
+                }
+                if &buffer[..expected.len()] != expected {
+                    return Ok(Some(false));
+                }
+            }
+        }
+        let mut trailing = [0u8; 1];
+        if file
+            .read(&mut trailing)
+            .map_err(|_| "eng2 public artifact read failed")?
+            != 0
+        {
+            return Err("eng2 public artifact exceeds byte bound".into());
+        }
+        Ok(Some(true))
+    }
     fn write_once(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
-        if let Some(existing) = self.read_optional(name, bytes.len())? {
-            return if existing == bytes {
+        self.write_once_parts(name, &[bytes])
+    }
+    fn write_once_parts(&self, name: &str, parts: &[&[u8]]) -> Result<(), String> {
+        let length = parts.iter().try_fold(0usize, |length, part| {
+            length
+                .checked_add(part.len())
+                .ok_or("eng2 immutable artifact length overflow")
+        })?;
+        if let Some(matches) = self.immutable_matches_parts(name, parts, length)? {
+            return if matches {
                 Ok(())
             } else {
                 Err("eng2 immutable public artifact differs".into())
@@ -790,10 +852,13 @@ impl PublicExport {
             )
             .map_err(|_| "eng2 immutable temporary create failed")?;
             let mut file = fs::File::from(descriptor);
-            file.write_all(bytes)
-                .and_then(|_| file.sync_all())
+            for part in parts {
+                file.write_all(part)
+                    .map_err(|_| "eng2 immutable temporary write failed")?;
+            }
+            file.sync_all()
                 .map_err(|_| "eng2 immutable temporary write failed")?;
-            self.install_immutable(temporary.as_str(), name, bytes)?;
+            self.install_immutable_parts(temporary.as_str(), name, parts, length)?;
             fsync(&self.root).map_err(|_| "eng2 immutable public directory sync failed".into())
         })();
         // Only this invocation's uninstalled temporary file may be removed.
@@ -806,7 +871,13 @@ impl PublicExport {
         target_os = "android",
         target_os = "redox"
     ))]
-    fn install_immutable(&self, temporary: &str, name: &str, bytes: &[u8]) -> Result<(), String> {
+    fn install_immutable_parts(
+        &self,
+        temporary: &str,
+        name: &str,
+        parts: &[&[u8]],
+        length: usize,
+    ) -> Result<(), String> {
         match rustix::fs::renameat_with(
             &self.root,
             temporary,
@@ -816,7 +887,7 @@ impl PublicExport {
         ) {
             Ok(()) => Ok(()),
             Err(rustix::io::Errno::EXIST) => {
-                if self.read(name, bytes.len())? == bytes {
+                if self.immutable_matches_parts(name, parts, length)? == Some(true) {
                     Ok(())
                 } else {
                     Err("eng2 concurrent immutable public artifact differs".into())
@@ -831,11 +902,12 @@ impl PublicExport {
         target_os = "android",
         target_os = "redox"
     )))]
-    fn install_immutable(
+    fn install_immutable_parts(
         &self,
         _temporary: &str,
         _name: &str,
-        _bytes: &[u8],
+        _parts: &[&[u8]],
+        _length: usize,
     ) -> Result<(), String> {
         Err("eng2 immutable atomic publication is unsupported on this platform".into())
     }
@@ -1046,6 +1118,62 @@ fn candidate_bound(limits: ImportLimits) -> Result<usize, String> {
         .and_then(|n| n.checked_add(6 + super::super::certificate::STATEMENT_BYTES + 16))
         .ok_or_else(|| "checkpoint candidate bound overflow".into())
 }
+const IMMUTABLE_COMPARE_BYTES: usize = 64 * 1024;
+
+/// The snapshot stays borrowed for the complete write and equality comparison.
+/// The encoded candidate format remains unchanged.
+struct CandidateEncoding<'a> {
+    statement: [u8; super::super::certificate::STATEMENT_BYTES],
+    lengths: [u8; 16],
+    witness: Vec<u8>,
+    snapshot: &'a [u8],
+}
+impl<'a> CandidateEncoding<'a> {
+    fn new(prepared: &'a PreparedCheckpoint, limits: ImportLimits) -> Result<Self, String> {
+        let statement = prepared
+            .statement
+            .encode()
+            .map_err(|_| "checkpoint statement malformed")?;
+        let witness = prepared
+            .witness
+            .encode(limits.chain.max_component_bytes)
+            .map_err(|_| "checkpoint witness exceeds bounds")?;
+        let snapshot = prepared.snapshot_bytes();
+        if snapshot.len() > limits.max_snapshot_bytes {
+            return Err("checkpoint candidate snapshot exceeds bounds".into());
+        }
+        let length = 6usize
+            .checked_add(statement.len())
+            .and_then(|n| n.checked_add(16))
+            .and_then(|n| n.checked_add(witness.len()))
+            .and_then(|n| n.checked_add(snapshot.len()))
+            .ok_or("checkpoint candidate bound overflow")?;
+        if length > candidate_bound(limits)? {
+            return Err("checkpoint candidate exceeds bounds".into());
+        }
+        let mut lengths = [0u8; 16];
+        lengths[..8].copy_from_slice(&(witness.len() as u64).to_le_bytes());
+        lengths[8..].copy_from_slice(&(snapshot.len() as u64).to_le_bytes());
+        Ok(Self {
+            statement,
+            lengths,
+            witness,
+            snapshot,
+        })
+    }
+    fn parts(&self) -> [&[u8]; 5] {
+        [
+            b"SW2P\x01\x00",
+            &self.statement,
+            &self.lengths,
+            &self.witness,
+            self.snapshot,
+        ]
+    }
+}
+
+// Preserve the previous contiguous encoder as an independent format oracle.
+#[cfg(test)]
 fn encode_candidate(
     prepared: &PreparedCheckpoint,
     limits: ImportLimits,

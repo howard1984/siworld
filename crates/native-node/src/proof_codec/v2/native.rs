@@ -177,6 +177,11 @@ impl NativeProofShape {
         Ok(result)
     }
 
+    /// Composite identity derived from the exact local relation, key and shape.
+    pub const fn identity(&self) -> Identity {
+        self.identity
+    }
+
     pub fn encode(&self, proof: &Proof<Config>) -> Result<Vec<u8>, DecodeError> {
         let body = postcard::to_allocvec(proof)
             .map_err(|_| DecodeError::Body(ProofDecodeError::DependencyCodec))?;

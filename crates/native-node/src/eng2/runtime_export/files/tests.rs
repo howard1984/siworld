@@ -489,3 +489,94 @@ fn material_generation_rejects_same_head_own_writes_and_exhaustion() {
     assert!(export.write_once("vote-1.eng2.bin", &[8; 64]).is_err());
     assert!(!root.join("vote-1.eng2.bin").exists());
 }
+
+#[test]
+fn segmented_candidate_preserves_the_existing_format_and_snapshot_bound() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("segmented-candidate");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let mut candidate = synthetic_candidate();
+    candidate.snapshot = (0..(2 * IMMUTABLE_COMPARE_BYTES + 17))
+        .map(|n| (n % 251) as u8)
+        .collect();
+    let expected = encode_candidate(&candidate, limits()).unwrap();
+    let name = candidate_name(candidate.statement.roster_sequence, 72);
+    export.write_candidate(&name, &candidate, limits()).unwrap();
+    assert_eq!(fs::read(root.join(&name)).unwrap(), expected);
+    export.write_candidate(&name, &candidate, limits()).unwrap();
+    let mut tiny = limits();
+    tiny.max_snapshot_bytes = candidate.snapshot.len() - 1;
+    assert!(
+        export
+            .write_candidate("refused.eng2.bin", &candidate, tiny)
+            .is_err()
+    );
+    assert!(!root.join("refused.eng2.bin").exists());
+}
+
+#[test]
+fn immutable_segment_comparison_reads_tail_bytes_and_preserves_conflicting_files() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("segmented-comparison");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let bytes = (0..(2 * IMMUTABLE_COMPARE_BYTES + 37))
+        .map(|n| (n % 251) as u8)
+        .collect::<Vec<_>>();
+    let parts = [&bytes[..1], &[][..], &bytes[1..65539], &bytes[65539..]];
+    export.write_once_parts("segmented.bin", &parts).unwrap();
+    export.write_once("segmented.bin", &bytes).unwrap();
+    export.write_once_parts("segmented.bin", &parts).unwrap();
+    let path = root.join("segmented.bin");
+    let metadata = fs::metadata(&path).unwrap();
+    let mut changed = bytes.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(&path, &changed).unwrap();
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+        .unwrap();
+    assert!(export.write_once_parts("segmented.bin", &parts).is_err());
+    assert_eq!(fs::read(&path).unwrap(), changed);
+    assert!(
+        export
+            .write_once_parts("segmented.bin", &[&bytes[..7]])
+            .is_err()
+    );
+    fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+    assert!(export.write_once_parts("segmented.bin", &parts).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes[..bytes.len() - 1]);
+    assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "tmp")
+    }));
+}
+
+#[test]
+fn immutable_install_collision_authenticates_existing_segments_without_replacing_them() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("segmented-install-collision");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let bytes = vec![19u8; IMMUTABLE_COMPARE_BYTES + 7];
+    let parts = [&bytes[..3], &bytes[3..]];
+    export.write_once_parts("occupied.bin", &parts).unwrap();
+    export.write_once_parts("incoming.tmp", &parts).unwrap();
+    export
+        .install_immutable_parts("incoming.tmp", "occupied.bin", &parts, bytes.len())
+        .unwrap();
+    let mut changed = bytes.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(root.join("occupied.bin"), &changed).unwrap();
+    assert!(
+        export
+            .install_immutable_parts("incoming.tmp", "occupied.bin", &parts, bytes.len())
+            .is_err()
+    );
+    assert_eq!(fs::read(root.join("occupied.bin")).unwrap(), changed);
+    assert_eq!(fs::read(root.join("incoming.tmp")).unwrap(), bytes);
+}

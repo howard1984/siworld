@@ -475,14 +475,32 @@ class Relay:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["preflight", "observe", "propagation", "fault-capabilities", "relay"])
-    parser.add_argument("plan", type=Path)
+    parser.add_argument("command", choices=["preflight", "observe", "propagation", "fault-capabilities", "relay", "native-stream-integrity"])
+    parser.add_argument("plan", type=Path, metavar="PLAN_OR_BINDINGS")
     parser.add_argument("--link")
     parser.add_argument("--samples", type=Path)
     parser.add_argument("--process-facts", type=Path)
     parser.add_argument("--node")
+    parser.add_argument("--snapshot", type=Path, action="append", default=[])
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--bindings-sha256")
     parser.add_argument("--seconds", type=int, default=60)
     args = parser.parse_args()
+    if args.command == "native-stream-integrity":
+        import reorg_native_events
+        owner_local()
+        require(args.output is not None and args.snapshot and
+                reorg_native_events.hex_text(args.bindings_sha256),
+                "explicit_native_stream_inputs_required")
+        raw = reorg_native_events.read_owned(args.plan, 32768)
+        require(hashlib.sha256(raw).hexdigest() == args.bindings_sha256,
+                "native_bindings_hash_mismatch")
+        result = reorg_native_events.validate(reorg_native_events.parse(raw), args.snapshot)
+        result["bindings_source"] = {"bytes": len(raw), "sha256": args.bindings_sha256}
+        reorg_native_events.write_result(args.output, result)
+        print(json.dumps({"stream_integrity": "PASS", "streams": result["streams"],
+                          "g2_passed": False}, sort_keys=True))
+        return
     plan = load_plan(args.plan)
     if args.command == "propagation":
         preflight(plan)
@@ -505,6 +523,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         print(json.dumps({"error": "isolated_network_request_rejected"}), file=sys.stderr)
         raise SystemExit(1)

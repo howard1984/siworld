@@ -20,6 +20,8 @@ pub mod fee_guard;
 pub mod native;
 #[path = "v2/receive.rs"]
 pub mod receive;
+#[path = "v2/transaction.rs"]
+pub mod transaction;
 
 pub const MAX_TRANSACTION_PROOF_BYTES: usize = 655_360;
 pub const MAX_FEE_PROOF_BYTES: usize = 5_242_880;

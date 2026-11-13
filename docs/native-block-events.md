@@ -1,7 +1,7 @@
 # Native block event observations
 
-The engineering resident records two block event types separately from its
-periodic status snapshot. Neither type establishes readiness, finality, current
+The engineering resident records three block event types separately from its
+periodic status snapshot. None establishes readiness, finality, current
 chain membership or complete observation coverage.
 
 `native-block-produced` is observed immediately when the native producer returns
@@ -24,6 +24,16 @@ hook and can still fail. The event proves the verified database commit boundary;
 it does not prove subsequent publication, eventual readiness or permanent
 membership of the canonical chain. A later reorganization can remove that block.
 
+`native-proof-rejected` records the ordinary forward admission owner's completed
+native verification failure. It requires typed evidence from the original
+transaction, legacy settlement or issuance verifier result; decode, structure,
+resource, timeout, storage and unknown errors cannot supply that evidence. It
+binds the actual receiver/run, authenticated peer, header and frame identifiers,
+body commitment and length, owner attempt and fixed native error code. It does
+not cover competing-body retention, replacement replay or CompleteFee, and does
+not contain an acceptance timestamp. A parser does not independently attest the
+verifier result or enlarge that admission-path coverage.
+
 ## Process and source bindings
 
 Every block event has version 1 and `record: "block-event"`. Its immutable
@@ -45,7 +55,9 @@ independent attestation of collected files.
 
 Events contain block identity, height, type and sequence, without block bodies,
 transaction identities, amounts, wallet data, secret material or peer endpoints.
-The logical deduplication key is `(kind, node_id, run_id, block_id)`. Each event
+The production/acceptance deduplication key is
+`(kind, node_id, run_id, block_id)`. The rejection key is
+`(kind, receiver_node_id, run_id, owner_attempt, frame_id)`. Each event
 attempt receives an increasing sequence within the run. Reaccepting a previously
 removed block may produce another record with the same logical key and a new
 sequence. Keep the earliest qualified event for propagation statistics, while
@@ -81,7 +93,10 @@ run identifier is collector metadata, distinct from each actual resident run.
 Keep `synthetic` truthful and preserve source-file hashes and the alias mapping
 outside the statistics document. This module neither collects remote files nor
 performs that conversion, clock calibration or independent verification. Status
-heads and relay byte counts cannot supply missing native events.
+heads and relay byte counts cannot supply missing native events. All three
+kinds must first pass the shared sequence, marker and counter checks. Only then
+may a consumer select production and acceptance for propagation; dropping
+rejection rows before coverage validation can hide losses or create false gaps.
 
 ## Bounded retention and incomplete observations
 
@@ -114,6 +129,16 @@ attempts. It does not change block admission, append results, rollback, chain
 selection or the existing status readiness fields. There is no retry that could
 turn a partial record into an apparently valid event. A recording error also
 prints one fixed error code without paths or private context.
+
+`native_accept_observation` is a separate owner diagnostic with enabled state,
+dropped-event count, fixed error and `scope: "ordinary-forward-admission"`.
+Rejection records expose both `owner_dropped_before` and
+`stream_dropped_before`. Complete coverage requires both diagnostics, not just
+the ring's counters. A missing owner diagnostic, either nonzero drop count or
+either error leaves coverage incomplete. Owner attempts can have gaps because
+successful or non-native outcomes do not emit rejection events; those attempts
+are not the shared journal sequence. The local complete-journal consumer is
+documented in [G2 reorganization acceptance](g2-reorganization-acceptance.md#complete-native-journal-validation).
 
 Collectors must fail closed on missing markers, sequence gaps, malformed tails,
 failed writes, unavailable diagnostics, mixed identities or missing timing.
