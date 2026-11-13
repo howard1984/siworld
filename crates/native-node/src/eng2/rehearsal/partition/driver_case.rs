@@ -132,7 +132,7 @@ pub fn driver_case(
         rules,
         branches::Limits {
             maximum_headers: 256,
-            maximum_body_bytes: 1024 * 1024 * 1024,
+            maximum_body_bytes: 2 * 1024 * 1024 * 1024,
         },
     )?)?;
     let verifier = NativeVerifier::new()?;
