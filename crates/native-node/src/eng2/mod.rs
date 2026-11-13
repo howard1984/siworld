@@ -28,6 +28,8 @@ pub mod header;
 pub mod import;
 pub mod network;
 pub mod nullifiers;
+#[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+pub(crate) mod owner_fault;
 pub mod producer;
 pub mod proof_window;
 #[cfg(feature = "eng2-rehearsal")]

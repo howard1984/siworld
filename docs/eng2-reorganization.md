@@ -284,3 +284,141 @@ context. Live resident fault injection, authenticated malformed-peer inputs,
 nonempty business-state and wallet reconciliation, peer healing and a complete
 continuous multi-miner run remain separate requirements. No command result
 asserts G1 or G2 acceptance.
+
+
+## Owner-local resident commit faults
+
+On Unix, a build selecting both `eng2-runtime` and `eng2-rehearsal` contains an
+optional local commit-fault controller. Ordinary builds and runs without
+`SIWORLD_ENG2_OWNER_FAULT=1` do not enable it. Invalid environment selections
+fail startup. The selected source declaration and actual executable SHA-256 are
+required; the controller supports nonfixture history only. The node directory
+and its sibling parent must be canonical private directories owned by the same
+user. The controller belongs only to the resident's canonical Store.
+
+After the actual resident run ID is available, the owner may create
+`owner-fault-request.json` in that node directory. The private single-link file
+is limited to 8 KiB and uses a strict schema: `version` (1), `run_id`,
+`network_id`, `genesis_id`, `rules_commitment`, `proof_profile`, `source_commit`,
+`binary_sha256`, `old_tip`, `candidate`, `ancestor_id`, `ancestor_height`,
+`point`, `height` and `marker_name`. Hashes and the run ID use lowercase
+hexadecimal; the source commit has 40 characters and other identities have 64.
+The marker name is one sibling filename, at most 128 ASCII letters, digits,
+periods, underscores or hyphens, excluding `.` and `..`.
+
+The eight point names are `restore_before_commit`, `restore_after_commit`,
+`restore_after_publish`, `restore_after_capture`, `append_before_commit`,
+`append_after_commit`, `append_after_publish` and `append_after_capture`.
+A restore point uses the selected ancestor height; an append point uses a
+height in the fully prevalidated replacement. Only the exact selected branch
+arms the request, after full native prevalidation and the normal output barrier.
+A create-only SHA-bound claim is durably written before arming, preventing reuse
+of the same request. Ordinary A construction and unrelated switches remain
+unarmed. Depth 25 retains its existing refusal before restoration.
+
+At the chosen edge the canonical Store is already unavailable for publication.
+The controller creates and fsyncs the fresh sibling rendezvous, including actual
+run, PID, request hash, selected branch and commit edge, then parks for at most
+120 seconds. It never sends a signal. The external owner must independently
+verify process ownership and the exact rendezvous, send SIGKILL to the retained
+resident child, and observe its signal termination. The rendezvous itself does
+not prove that a kill occurred. Expiry or an unreached selected boundary fails
+closed as a local fault-case error. It does not mark a branch consensus-invalid.
+
+Recovery must omit the fault environment selection and reuse the same identity
+and database. Retain requests, claims and rendezvous as private evidence. Normal
+authenticated restart and branch synchronization remain responsible for recovery;
+this controller neither restores a database copy nor permits allocator repair.
+Boundary coverage and actual full-state reconciliation remain separate results.
+
+## Authenticated explicit frame submission
+
+A rehearsal build selecting `native-p2p` provides an owner-operated sender:
+
+```text
+siworld-eng2-rehearsal --qualification-send-input IDENTITY_NODE PLAN PLAN_SHA256 BINDING BINDING_SHA256 --json
+```
+
+It loads an existing stopped local identity under its service lease, an existing
+independently installed receiver pin and a matching signed receiver descriptor.
+It creates no identity, pin or listener. The standard source/genesis/profile/
+executable binding applies. The plan is strict JSON, limited to 16 KiB, with
+`version` (1), `endpoint`, `receiver_descriptor`, `receiver_fingerprint`,
+`receiver_role` (`bootstrap` or `validator`), `receiver_height`, `receiver_tip`,
+`local_fingerprint`, `frame`, `frame_sha256` and `input_kind` (`valid_control` or
+`negative_input`). The plan's independently supplied SHA-256 is mandatory.
+Descriptor and frame are explicit public input paths. The frame must have a
+canonical native header extending the exact receiver head in the plan and fit
+the ordinary body bound. Encoded frame memory is reserved before allocation.
+
+The sender uses the existing Connector and real pinned hybrid authentication,
+checks the receiver role and live head, advertises the input header, and serves
+only matching ordinary header/body requests. It sends the explicitly pinned body
+bytes, including deliberately invalid inputs, through the existing bounded
+application framing. It does not change receiver validation or generate a new
+proof. At most one frame and four requests are served within a shared 180-second
+application deadline. The external owner must separately supervise the process
+and authorize the exact isolated destination and input material.
+
+Input classification is a declaration, not a validation result. A sender receipt
+records the actual handshake and transmission, but explicitly does not prove
+input invalidity, native receiver rejection or unchanged receiver state. A closed
+connection has an unknown cause. Receiver admission diagnostics and authenticated
+state comparisons must establish those conclusions independently. New malformed
+input copies must remain separate from valid fork corpora and accepted history.
+
+## Authenticated persisted-state comparison
+
+```text
+siworld-eng2-rehearsal --qualification-compare-state NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json
+```
+
+This owner-local operation holds the stopped node's service lease and opens its
+database through `redb::ReadOnlyDatabase`, using the existing identity and the
+same accepted-state authentication as normal restart. It separately
+replays every original public frame through the native Engine and NativeVerifier.
+The complete canonical header prefix and all eleven actual final component bytes
+must match that replay and the independently pinned audit manifest. A second
+authenticated read-only open must produce identical state. Both observations
+omit rollback capture, pruning and all other write transactions. Missing clean
+allocator state or authentication material causes refusal; the observer does not
+repair the database or regenerate a missing savepoint. Normal resident recovery
+retains its existing rollback maintenance. The command does not import, append,
+mine or generate a proof. Source, node and export context must agree with
+the nonfixture qualification binding; the node and export directories are separate.
+
+The independently SHA-pinned expectations use version 1 and a strict nested JSON
+schema, limited to 128 KiB. `state` specifies `height`, `tip`, `economics`,
+`fund_total_entitlement`, `funds`, `governance_sequence`, `issuance_fee_atoms`,
+`pending_issuance_fee`, `fee_destination`, `assets`, `leaf_count` and
+`nullifier_count`. Economic counters are canonical decimal strings:
+`issued`, `burned`, `miner_credited`, `fund_credited`, `holder_pool` and
+`locked_total`; `locked_schedule` lists ascending `{height, atoms}` entries.
+Each fund account lists its `member`, decimal `entitlement`, `direct_unlocked`,
+`vesting_unlocked`, `spent`, numeric `spend_count` and complete hexadecimal
+`destination`. Funds include every configured member in order. Assets list
+`id`, `height`, `public_supply` and `declaration` in registry order. A pending fee
+is null or has `amount_atoms`, `proposal_sequence`, `included_height` and
+`effective_height`. Destinations contain the complete canonical address bytes.
+
+`included_operations` contains `{height, operation: {kind, identity}}` assertions.
+`absent_operations` contains `{kind, identity}` assertions checked across the
+entire canonical prefix. Supported kinds are `fund_claim_sha256` (SHA-256 of the
+complete canonical claim), `governance_action_sha256` (SHA-256 of the complete
+signed action), `issuance_declaration` (native declaration binding) and
+`transaction_statement` (native statement identity). These identities use 32-byte
+lowercase hexadecimal. `present_nullifiers` and `absent_nullifiers` contain
+48-byte lowercase hexadecimal values. Each assertion array is bounded to 128
+entries; contradictory or duplicate assertions are rejected. Complete history
+remains limited to 96 blocks with a cooperative 900-second deadline.
+
+Exact public counters and operation inclusion establish only the stated public
+observations. A transaction statement can contain padding; inclusion does not
+classify it as a real payment or establish a fee opening. The receipt records
+which nonempty operation classes were explicitly asserted. Wallet scanning and
+received, spent, unspent and balance reconciliation require independent wallet
+evidence bound to the same head. This command does not read wallet material and
+always leaves wallet balance verification, full business acceptance and G1/G2
+acceptance false. It uses the Engine's actually supported fee modes and cannot
+substitute an independently proved candidate settlement for a supported complete
+block transition.

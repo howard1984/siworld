@@ -475,6 +475,13 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         config.digest.clone(),
         unix_ms()?,
     )?;
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    driver.configure_owner_fault(super::owner_fault::Controller::from_environment(
+        directory,
+        &run.run_id,
+        &genesis,
+        &running_binary,
+    )?);
     let block_events = Arc::new(block_events::Recorder::new(
         directory,
         genesis.config().network,

@@ -21,6 +21,9 @@ use std::path::Path;
 #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
 mod commitment_tests;
 mod imported;
+mod observation;
+#[cfg(feature = "eng2-rehearsal")]
+pub use observation::Observation;
 mod receipts;
 mod replacement;
 pub use replacement::{
@@ -76,6 +79,8 @@ pub struct Store {
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(feature = "eng2-runtime")]
     commit_observer: Option<std::sync::Arc<dyn CommitObserver>>,
+    #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+    owner_fault: Option<super::owner_fault::Controller>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyAvailability {
@@ -83,6 +88,27 @@ pub enum BodyAvailability {
     Full { encoded_body_bytes: usize },
 }
 impl Store {
+    #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+    pub(crate) fn set_owner_fault(&mut self, controller: Option<super::owner_fault::Controller>) {
+        self.owner_fault = controller;
+    }
+    #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+    pub(crate) fn arm_owner_fault(
+        &mut self,
+        switch: super::owner_fault::Switch,
+    ) -> Result<(), String> {
+        if let Some(controller) = &mut self.owner_fault {
+            controller.arm_switch(&switch)?;
+        }
+        Ok(())
+    }
+    #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+    pub(crate) fn complete_owner_fault(&mut self) -> Result<(), String> {
+        if let Some(controller) = &mut self.owner_fault {
+            controller.complete_switch()?;
+        }
+        Ok(())
+    }
     /// Initialize only a new absent file. Existing state is never overwritten.
     pub fn create(path: &Path, genesis: Genesis, limits: Limits) -> Result<Self, String> {
         #[cfg(windows)]
@@ -153,6 +179,8 @@ impl Store {
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "eng2-runtime")]
             commit_observer: None,
+            #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+            owner_fault: None,
         })
     }
     /// Independently reconstruct every committed block and execution root and
@@ -284,6 +312,8 @@ impl Store {
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "eng2-runtime")]
             commit_observer: None,
+            #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+            owner_fault: None,
         })
     }
     pub fn engine(&self) -> &Engine {
@@ -375,153 +405,14 @@ impl Store {
         let txn = database
             .begin_read()
             .map_err(|_| "versioned restart read unavailable")?;
-        let meta = txn
-            .open_table(META)
-            .map_err(|_| "versioned restart metadata missing")?;
-        let encoded = genesis.encode()?;
-        if meta
-            .get("genesis")
-            .map_err(|_| "restart genesis read failed")?
-            .as_ref()
-            .map(|value| value.value())
-            != Some(encoded.as_slice())
-        {
-            return Err("restart genesis differs from local configuration".into());
-        }
-        let head_bytes = meta
-            .get("head")
-            .map_err(|_| "restart head unavailable")?
-            .ok_or("restart head missing")?;
-        let head_bytes = head_bytes.value();
-        if head_bytes.len() != 72 {
-            return Err("invalid restart head width".into());
-        }
-        let height =
-            u64::from_le_bytes(head_bytes[..8].try_into().expect("checked restart height"));
-        let blocks = txn
-            .open_table(BLOCKS)
-            .map_err(|_| "restart canonical table missing")?;
-        let (imported_prefix, import_seed) = imported::resume_context(&txn, height)?;
-        if blocks
-            .len()
-            .map_err(|_| "restart block count unavailable")?
-            != height - imported_prefix
-        {
-            return Err("restart canonical count differs".into());
-        }
-        let index = txn
-            .open_table(INDEX)
-            .map_err(|_| "restart compact index missing; explicit audit required")?;
-        if index.len().map_err(|_| "restart index count unavailable")? != height {
-            return Err("restart compact index count differs".into());
-        }
-        let parent = if height == 0 {
-            [0; 32]
-        } else {
-            let value = index
-                .get(height)
-                .map_err(|_| "restart tip unavailable")?
-                .ok_or("restart tip missing")?;
-            let (header, _) = decode_compact(value.value(), genesis.config().network)?;
-            if header.height != height
-                || header
-                    .id()
-                    .map_err(|_| "restart identity invalid")?
-                    .as_slice()
-                    != &head_bytes[8..40]
-                || header.execution_commitment.as_slice() != &head_bytes[40..]
-            {
-                return Err("restart canonical header differs from durable head".into());
-            }
-            header.parent
-        };
-        let table = txn
-            .open_table(super::restart::CACHE)
-            .map_err(|_| "authenticated restart record missing; explicit audit required")?;
-        if table
-            .len()
-            .map_err(|_| "restart record count unavailable")?
-            != 5
-        {
-            return Err("incomplete authenticated restart record".into());
-        }
-        let read = |key: &str, max: usize| -> Result<Vec<u8>, String> {
-            let value = table
-                .get(key)
-                .map_err(|_| "restart field unavailable")?
-                .ok_or("restart field missing")?;
-            if value.value().len() > max {
-                return Err("restart field exceeds bound".into());
-            }
-            Ok(value.value().to_vec())
-        };
-        let maximum = limits
-            .max_component_bytes
-            .checked_mul(6)
-            .and_then(|size| size.checked_add(88))
-            .ok_or("restart total bound overflow")?;
-        let bytes = read("state", maximum)?;
-        let leaves: Hash = read("leaves", 32)?
-            .try_into()
-            .map_err(|_| "restart leaf digest width")?;
-        let spends: Hash = read("spends", 32)?
-            .try_into()
-            .map_err(|_| "restart spend digest width")?;
-        let sealed_index: Hash = read("index", 32)?
-            .try_into()
-            .map_err(|_| "restart compact index digest width")?;
-        let seal = read("seal", crate::identity::storage_checkpoint::SEAL_BYTES)?;
-        identity
-            .descriptor()
-            .map_err(|_| "restart descriptor unavailable")?
-            .verify_local_storage(
-                super::restart::digest(&genesis, &bytes, leaves, spends, sealed_index),
-                &seal,
-            )
-            .map_err(|_| "authenticated restart seal mismatch")?;
-        let index_digest = authenticate_header_prefix_seed(
-            &index,
-            genesis.config().network,
-            genesis.id(),
-            height,
-            head_bytes[8..40].try_into().expect("checked restart tip"),
+        let observation::Authenticated {
+            engine,
+            leaves,
+            spends,
+            index: index_digest,
+            imported_prefix,
             import_seed,
-        )?;
-        if index_digest != sealed_index {
-            return Err("restart compact index differs from accepted local seal".into());
-        }
-        let (leaf_values, leaf_digest) = super::restart::read_rows(
-            &txn.open_table(super::restart::LEAVES)
-                .map_err(|_| "restart permanent leaves missing")?,
-            limits.max_leaves,
-        )?;
-        let (spent_values, spent_digest) = super::restart::read_rows(
-            &txn.open_table(super::restart::SPENDS)
-                .map_err(|_| "restart permanent spends missing")?,
-            limits.max_nullifiers,
-        )?;
-        if leaf_digest != leaves || spent_digest != spends {
-            return Err("restart permanent rows differ from accepted local seal".into());
-        }
-        let spent: std::collections::BTreeSet<_> = spent_values.iter().copied().collect();
-        if spent.len() != spent_values.len() {
-            return Err("duplicate restart nullifier".into());
-        }
-        let leaves_decoded = leaf_values
-            .iter()
-            .map(|value| {
-                native::codec::decode_digest(value).map_err(|_| "invalid restart leaf".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let (state, root) =
-            super::restart::restore(&genesis, &bytes, leaves_decoded, spent, limits, parent)?;
-        if state.height() != height
-            || state.tip().as_slice() != &head_bytes[8..40]
-            || (height > 0 && root.as_slice() != &head_bytes[40..])
-        {
-            return Err("authenticated restart state differs from exact durable head".into());
-        }
-        let engine = Engine::from_authenticated_local_state(genesis, state, limits)?;
+        } = observation::authenticate(&txn, genesis, limits, &identity)?;
         drop(txn);
         let result = Self {
             database,
@@ -542,6 +433,8 @@ impl Store {
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "eng2-runtime")]
             commit_observer: None,
+            #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+            owner_fault: None,
         };
         result.ensure_exportable()?;
         result.remember_rollback_state()?;
@@ -967,6 +860,10 @@ impl Store {
         self.advance_revision()?;
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("append_before_commit", header.height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::AppendBeforeCommit, header.height)?;
+        }
         txn.commit()
             .map_err(|_| "versioned canonical durable commit failed")?;
         #[cfg(feature = "eng2-runtime")]
@@ -975,9 +872,17 @@ impl Store {
         }
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("append_after_commit", header.height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::AppendAfterCommit, header.height)?;
+        }
         let result = self.engine.publish(staged)?;
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("append_after_publish", header.height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::AppendAfterPublish, header.height)?;
+        }
         if let (Some(context), Some((leaves, spends, index))) = (&mut self.restart, next_restart) {
             context.leaves = leaves;
             context.spends = spends;
@@ -988,6 +893,10 @@ impl Store {
         }
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("append_after_capture", header.height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::AppendAfterCapture, header.height)?;
+        }
         self.usable = true;
         Ok(result)
     }
@@ -1043,14 +952,26 @@ impl Store {
         self.advance_revision()?;
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("restore_before_commit", height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::RestoreBeforeCommit, height)?;
+        }
         transaction
             .commit()
             .map_err(|_| "rollback ancestor durable commit failed")?;
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("restore_after_commit", height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::RestoreAfterCommit, height)?;
+        }
         self.engine = restored.engine;
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("restore_after_publish", height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::RestoreAfterPublish, height)?;
+        }
         let context = self.restart.as_mut().expect("checked restart context");
         context.leaves = restored.leaves;
         context.spends = restored.spends;
@@ -1060,6 +981,10 @@ impl Store {
         self.remember_rollback_state()?;
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("restore_after_capture", height);
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Some(controller) = &mut self.owner_fault {
+            controller.boundary(super::owner_fault::Point::RestoreAfterCapture, height)?;
+        }
         self.usable = true;
         Ok(())
     }
@@ -1386,6 +1311,54 @@ mod tests {
         let resumed = Store::resume_existing(&path, genesis(), limits).unwrap();
         assert_eq!(resumed.rollback_points().unwrap(), points);
         drop(resumed);
+        fs_remove_fixture(directory);
+    }
+    #[cfg(feature = "eng2-rehearsal")]
+    #[test]
+    fn read_only_observation_preserves_missing_capture_and_rejected_seal() {
+        let directory = private_directory("read-only-observation");
+        let selected = genesis();
+        let encoded = selected.encode().unwrap();
+        let identity =
+            crate::identity::NativeIdentity::initialize(&directory, selected.peer_binding())
+                .unwrap();
+        let limits = Limits {
+            max_leaves: 1024,
+            max_nullifiers: 1024,
+            max_component_bytes: 1024 * 1024,
+        };
+        let path = directory.join("chain.redb");
+        let mut store = Store::create(&path, selected, limits).unwrap();
+        store.enable_authenticated_restart(identity).unwrap();
+        // A crash can leave the committed head with a missing persistent capture.
+        let mut write = store.database.begin_write().unwrap();
+        write.set_quick_repair(true);
+        let points: Vec<_> = write.list_persistent_savepoints().unwrap().collect();
+        for point in points {
+            write.delete_persistent_savepoint(point).unwrap();
+        }
+        write.commit().unwrap();
+        drop(store);
+        let unchanged = std::fs::read(&path).unwrap();
+        let observed =
+            Observation::open(&path, Genesis::decode(&encoded).unwrap(), limits).unwrap();
+        assert_eq!(observed.engine().state().height(), 0);
+        drop(observed);
+        assert_eq!(std::fs::read(&path).unwrap(), unchanged);
+        let database = Database::open(&path).unwrap();
+        let mut write = database.begin_write().unwrap();
+        write.set_quick_repair(true);
+        {
+            let mut table = write.open_table(super::super::restart::CACHE).unwrap();
+            let mut seal = table.get("seal").unwrap().unwrap().value().to_vec();
+            seal[0] ^= 1;
+            table.insert("seal", seal.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+        drop(database);
+        let rejected = std::fs::read(&path).unwrap();
+        assert!(Observation::open(&path, Genesis::decode(&encoded).unwrap(), limits).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), rejected);
         fs_remove_fixture(directory);
     }
     #[test]

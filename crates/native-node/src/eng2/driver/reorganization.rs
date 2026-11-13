@@ -51,6 +51,13 @@ impl Reorganization {
 }
 
 impl Driver {
+    #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+    pub(crate) fn configure_owner_fault(
+        &mut self,
+        controller: Option<super::super::owner_fault::Controller>,
+    ) {
+        self.store.set_owner_fault(controller);
+    }
     // Checkpoint archives commit after canonical savepoint capture. A restore
     // or a crash at that boundary can therefore require the current archive
     // to be recreated from the authenticated committed state.
@@ -374,6 +381,17 @@ impl Driver {
                 return Err(error);
             }
         };
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        self.store
+            .arm_owner_fault(super::super::owner_fault::Switch {
+                old_tip: current,
+                candidate,
+                ancestor_id: ancestor,
+                ancestor_height: height,
+                replacement_height: height
+                    .checked_add(plan.path.replacement.len() as u64)
+                    .ok_or("owner fault replacement height overflow")?,
+            })?;
         let replay = match self.store.begin_prevalidated_replacement(preview, |index| {
             state
                 .branches
@@ -452,6 +470,12 @@ impl Driver {
         if self.store.engine().state().tip() != active.replay.tip() {
             state.stopped = Some("reorganization_final_state_differs");
             return Err("replacement final identity differs".into());
+        }
+        #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+        if let Err(error) = self.store.complete_owner_fault() {
+            state.stopped = Some("owner_fault_boundary_not_reached");
+            state.active = Some(active);
+            return Err(error);
         }
         let now = Instant::now();
         while state

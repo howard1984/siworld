@@ -301,10 +301,7 @@ impl Ring {
                 Ok(metadata)
                     if metadata.is_file()
                         && !metadata.file_type().is_symlink()
-                        && metadata.len() <= limit =>
-                {
-                    ()
-                }
+                        && metadata.len() <= limit => {}
                 Ok(_) => return Err("native_event_existing_log_rejected"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     first_absent.get_or_insert(index);
