@@ -468,6 +468,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         )?
     };
     #[cfg(unix)]
+    checkpoint_host.enable_async_preparation(&shared.budget)?;
+    #[cfg(unix)]
     if std::env::var_os("SIWORLD_ENG2_WALLET_EXPORT").is_some_and(|value| value == "1") {
         let owner = shared
             .owner
@@ -611,6 +613,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     })();
     shared.phase("stopping")?;
     shared.cancel.cancel();
+    #[cfg(unix)]
+    let result = result.and(checkpoint_host.stop_preparation());
     #[cfg(unix)]
     drop(submission);
     let network_result = network

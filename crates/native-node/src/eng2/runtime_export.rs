@@ -2,7 +2,7 @@
 //! This module neither initializes keys nor creates a listener or service loop.
 use super::{
     certificate::{AuthorizationWitness, Certificate, Statement, Vote},
-    commitment::{self, Component, ComponentId, Descriptor},
+    commitment::{self, Component, ComponentId},
     header::Header,
     snapshot::{ImportLimits, SnapshotState},
     state_components::Binding,
@@ -17,6 +17,12 @@ use crate::{
 use libcrux_ml_dsa::ml_dsa_65::MLDSA65SigningKey;
 use libcrux_ml_dsa::ml_dsa_65::{self, MLDSA65Signature, MLDSA65VerificationKey};
 use serde_json::{Value, json};
+
+pub mod archive_work;
+#[cfg(unix)]
+mod preparation;
+#[cfg(test)]
+use super::commitment::Descriptor;
 
 pub const CHECKPOINT_INTERVAL: u64 = 12;
 pub const LEGACY_CHECKPOINT_INTERVAL: u64 = 72;
@@ -65,6 +71,7 @@ pub struct PreparedCheckpoint {
     statement: Statement,
     witness: AuthorizationWitness,
     snapshot: Vec<u8>,
+    _snapshot_reservation: Option<crate::p2p::Reservation>,
 }
 pub struct CertifiedCheckpoint {
     prepared: PreparedCheckpoint,
@@ -193,6 +200,7 @@ impl PreparedCheckpoint {
             statement,
             witness,
             snapshot,
+            _snapshot_reservation: None,
         };
         value.check_prefix(store)?;
         Ok(value)
@@ -270,13 +278,12 @@ impl PreparedCheckpoint {
             rules_commitment: rules,
             parent: authorization.parent,
         };
-        let current = state.canonical_components(current_binding, limits.chain)?;
-        let descriptors = execution_descriptors(state, &current, limits)?;
+        let witness = state.checkpoint_witness(current_binding, limits.chain)?;
         if commitment::aggregate_descriptors(
             state.network(),
             state.height(),
             authorization.parent,
-            &descriptors,
+            &witness.descriptors,
         )
         .map_err(|_| "invalid checkpoint authorization descriptors")?
             != authorization.execution_commitment
@@ -296,10 +303,6 @@ impl PreparedCheckpoint {
         statement
             .encode()
             .map_err(|_| "invalid prepared checkpoint statement")?;
-        let witness = AuthorizationWitness {
-            descriptors,
-            governance: current[7].clone(),
-        };
         witness
             .encode(limits.chain.max_component_bytes)
             .map_err(|_| "invalid prepared checkpoint witness")?;
@@ -313,6 +316,7 @@ impl PreparedCheckpoint {
             statement,
             witness,
             snapshot,
+            _snapshot_reservation: None,
         };
         prepared.check_current(store)?;
         Ok(Some(prepared))
@@ -439,6 +443,7 @@ impl CertifiedCheckpoint {
         self.prepared.check_current(store)
     }
 }
+#[cfg(test)]
 fn execution_descriptors(
     state: &SnapshotState,
     raw: &[Vec<u8>; 11],

@@ -222,6 +222,41 @@ impl SnapshotState {
         }
         Ok(bytes)
     }
+    /// The current accepted execution witness uses the same compact components
+    /// as native validation. It does not encode permanent reconstruction data.
+    pub(crate) fn checkpoint_witness(
+        &self,
+        binding: Binding,
+        limits: Limits,
+    ) -> Result<super::certificate::AuthorizationWitness, String> {
+        self.check_context()?;
+        let chain = ExecutionComponents::from_local_state_for_fee_mode(
+            &self.chain,
+            &self.nullifiers,
+            binding,
+            SnapshotTip::Materialized(self.tip()),
+            limits,
+            self.fee_mode,
+        )?;
+        let members = self
+            .chain
+            .config
+            .fund_allocation
+            .as_ref()
+            .ok_or("missing fund allocation")?
+            .basis_points()
+            .len();
+        let external = VersionedLedgers {
+            economics: &self.economics,
+            fund: &self.fund,
+            governance: &self.governance,
+        }
+        .components(self.network(), self.height(), members, limits)?;
+        Ok(super::certificate::AuthorizationWitness {
+            descriptors: chain.descriptors(external),
+            governance: self.governance.canonical_component_bytes()?,
+        })
+    }
     pub fn execution_commitment(&self, binding: Binding, limits: Limits) -> Result<Hash, String> {
         self.check_context()?;
         let chain = ExecutionComponents::from_local_state_for_fee_mode(
