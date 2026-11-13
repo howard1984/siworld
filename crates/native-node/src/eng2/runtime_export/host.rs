@@ -156,6 +156,42 @@ impl Alarm {
         }
     }
 }
+/// Fixed diagnostic origins for a failed tick. No error text or input is exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickFailureReason {
+    Context,
+    InputBounds,
+    Preparation,
+    Proposal,
+    Vote,
+    VoteWithoutCandidate,
+    Certificate,
+    CertificatePreparationPending,
+    CandidatePreparation,
+    VoteSigning,
+    CertificatePublication,
+    StatusPublication,
+    CurrentProjection,
+}
+impl TickFailureReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::InputBounds => "input_bounds",
+            Self::Preparation => "preparation",
+            Self::Proposal => "proposal",
+            Self::Vote => "vote",
+            Self::VoteWithoutCandidate => "vote_without_candidate",
+            Self::Certificate => "certificate",
+            Self::CertificatePreparationPending => "certificate_preparation_pending",
+            Self::CandidatePreparation => "candidate_preparation",
+            Self::VoteSigning => "vote_signing",
+            Self::CertificatePublication => "certificate_publication",
+            Self::StatusPublication => "status_publication",
+            Self::CurrentProjection => "current_projection",
+        }
+    }
+}
 // Only the resident entry point can construct the production readiness gate.
 // Public observation never accepts an asserted boolean or a caller-made permit.
 struct SigningGuard<'a> {
@@ -256,6 +292,7 @@ pub struct Host {
     last_now: Option<u64>,
     last_exported: Option<(u64, Hash, Option<u64>)>,
     last_status: Option<Status>,
+    tick_failure: Option<TickFailureReason>,
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
@@ -269,6 +306,10 @@ struct ResidentPreparation {
     certificate_only: bool,
 }
 impl Host {
+    /// The failed operation's bounded origin; the original Result is unchanged.
+    pub fn tick_failure_reason(&self) -> Option<TickFailureReason> {
+        self.tick_failure
+    }
     /// The accepted, durably published capability only; pending proposals and
     /// votes cannot be exposed as signed bootstrap state.
     pub fn latest_checkpoint(&self) -> Option<&CertifiedCheckpoint> {
@@ -304,6 +345,7 @@ impl Host {
             last_now: None,
             last_exported: None,
             last_status: None,
+            tick_failure: None,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -557,6 +599,7 @@ impl Host {
         network: &crate::eng2::resident::peers::NetworkStatus,
         observer: &crate::eng2::checkpoint_observer::Observer,
     ) -> Result<Tick, String> {
+        self.tick_failure = Some(TickFailureReason::Context);
         let readiness = ResidentSigningReadiness {
             head: ResidentSigningReadiness::head(store)?,
             network,
@@ -575,7 +618,22 @@ impl Host {
         incoming: &[Incoming],
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<Tick, String> {
+        self.tick_failure = Some(TickFailureReason::Context);
+        let result = self.tick_step(store, now, incoming, readiness);
+        if result.is_ok() {
+            self.tick_failure = None;
+        }
+        result
+    }
+    fn tick_step(
+        &mut self,
+        store: &Store,
+        now: u64,
+        incoming: &[Incoming],
+        readiness: Option<&dyn SigningReadiness>,
+    ) -> Result<Tick, String> {
         store.ensure_exportable()?;
+        self.tick_failure = Some(TickFailureReason::InputBounds);
         if incoming.len() > MAX_MESSAGES_PER_TICK
             || now >= (1u64 << 53)
             || self.last_now.is_some_and(|last| now < last)
@@ -631,10 +689,12 @@ impl Host {
             self.votes = std::array::from_fn(|_| None);
         }
         let mut newly_published = false;
+        self.tick_failure = Some(TickFailureReason::Preparation);
         self.advance_preparation(store, readiness)?;
         for item in incoming {
             match item {
                 Incoming::Proposal(proposal) => {
+                    self.tick_failure = Some(TickFailureReason::Proposal);
                     if super::pending_obsolete(
                         proposal.statement.checkpoint_height,
                         self.export.latest_height(),
@@ -645,12 +705,16 @@ impl Host {
                     self.accept_proposal(store, proposal)?;
                 }
                 Incoming::Vote { statement, vote } => {
+                    self.tick_failure = Some(TickFailureReason::Vote);
                     if super::pending_obsolete(
                         statement.checkpoint_height,
                         self.export.latest_height(),
                         state.height(),
                     ) {
                         continue;
+                    }
+                    if self.pending.is_none() {
+                        self.tick_failure = Some(TickFailureReason::VoteWithoutCandidate);
                     }
                     let pending = self
                         .pending
@@ -677,6 +741,7 @@ impl Host {
                     certificate,
                     witness,
                 } => {
+                    self.tick_failure = Some(TickFailureReason::Certificate);
                     if let Some(latest) = &self.latest
                         && latest.certificate.statement == certificate.statement
                     {
@@ -730,8 +795,10 @@ impl Host {
                             Some(prepared) => prepared,
                             None => {
                                 self.schedule_peer_preparation(store, &proposal, true)?;
-                                // The resident preserves unacknowledged mailbox
-                                // input while the owned keyless worker runs.
+                                // Failed input remains eligible for peer replay
+                                // while the owned keyless worker runs.
+                                self.tick_failure =
+                                    Some(TickFailureReason::CertificatePreparationPending);
                                 return Err("checkpoint certificate preparation is pending".into());
                             }
                         }
@@ -745,6 +812,7 @@ impl Host {
                     };
                     // Publication time is a local observation, never authenticated
                     // by a peer's unsigned wall-clock metadata.
+                    self.tick_failure = Some(TickFailureReason::CertificatePublication);
                     let certified = prepared.certify(store, certificate.votes.clone(), now)?;
                     if self
                         .export
@@ -758,6 +826,7 @@ impl Host {
                 }
             }
         }
+        self.tick_failure = Some(TickFailureReason::CandidatePreparation);
         let current_signer = self
             .signer
             .as_ref()
@@ -779,6 +848,7 @@ impl Host {
                 .flatten();
             }
         }
+        self.tick_failure = Some(TickFailureReason::VoteSigning);
         if let Some(pending) = &self.pending
             && current_signer
             && self
@@ -814,6 +884,7 @@ impl Host {
             .take(2)
             .cloned()
             .collect::<Vec<_>>();
+        self.tick_failure = Some(TickFailureReason::CertificatePublication);
         if available.len() == 2 && self.pending.is_some() && due {
             let prepared = self
                 .pending
@@ -835,6 +906,7 @@ impl Host {
             }
             self.votes = std::array::from_fn(|_| None);
         }
+        self.tick_failure = Some(TickFailureReason::StatusPublication);
         let paused = self.export.pruning_paused(now)?;
         let signing_alarm = self.signer.as_ref().and_then(|_| {
             readiness.map_or(Some(Alarm::WaitingForPeerHead), |gate| gate.alarm(store))
@@ -867,6 +939,7 @@ impl Host {
             self.export.write_status(&bytes)?;
             self.last_status = Some(status.clone());
         }
+        self.tick_failure = Some(TickFailureReason::CurrentProjection);
         let export_head = (state.height(), state.tip(), self.export.latest_height());
         let exported_current = self.last_exported != Some(export_head);
         if exported_current {
