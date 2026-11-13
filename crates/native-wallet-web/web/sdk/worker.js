@@ -5,6 +5,7 @@ import { WalletAccounts, accountIndex, captureBirthday } from './wallet-accounts
 import { CommitmentSession } from './commitment-session.js';
 import { Eng2WalletSession } from './eng2-wallet-session.js';
 import { createEng2Custody } from './eng2-custody-storage.js';
+import { failureContext, workerFailure } from './diagnostics.js';
 import { eng2ReadOnlyProfile, sessionConfiguration, assertWalletOperation } from './runtime-profile.js';
 await init({module_or_path:new URL('./core/wallet_bg.wasm',import.meta.url)});
 if (core.initThreadPool) {
@@ -77,6 +78,6 @@ async function handle(data, revision) {
     }
     self.postMessage({ id, result });
   } catch (error) {
-    self.postMessage({ id, error: typeof error === 'string' ? error : error.message || 'Wallet operation failed. Preserve pending payments and retry only their stored packets.' });
+    self.postMessage(workerFailure(id,action,failureContext(error,'dispatch')));
   } finally { args.fill(null); }
 };

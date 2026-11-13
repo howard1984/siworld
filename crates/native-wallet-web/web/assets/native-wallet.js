@@ -5,6 +5,7 @@ import { VAULT } from '../sdk/vault-network.js';
 import { backup, bytes, parseBackup, records, save, selectedWallet, savedWalletLabel, MAX_BACKUP } from '../sdk/storage.js';
 import { ENGINEERING } from '../sdk/network.js';
 import { ProofProgress } from '../sdk/proof-progress.js';
+import { failureFromReply } from '../sdk/diagnostics.js';
 
 const $ = selector => document.querySelector(selector);
 const walletKind = ENGINEERING.name === 'siworld-eng-2' ? 'engineering-v2' : 'V1';
@@ -38,7 +39,7 @@ function startWorker() {
     if (!request) return;
     if (data.progress) { request.onProgress?.(data.progress); return; }
     pending.delete(data.id);
-    data.error ? request.reject(new Error(data.error)) : request.resolve(data.result);
+    data.error ? request.reject(failureFromReply(data)) : request.resolve(data.result);
   };
   worker.onerror = () => { for (const request of pending.values()) request.reject(new Error('The local wallet core stopped. Lock and reopen the page.')); pending.clear(); capability(false); message('The local wallet core stopped. Preserve pending payments and reopen the encrypted wallet.', true); };
 }

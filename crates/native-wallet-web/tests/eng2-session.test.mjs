@@ -1,4 +1,5 @@
 import {test} from 'node:test';
+import {failureDiagnostic} from '../web/sdk/diagnostics.js';
 import assert from 'node:assert/strict';
 import {Eng2Session,eng2Confirmations} from '../web/sdk/eng2-session.js';
 import {eng2Context,eng2Namespace,eng2Head} from '../web/sdk/eng2-context.js';
@@ -352,4 +353,43 @@ test('default head decoding uses the failover source without accepting a foreign
   assert.equal(calls.filter(url=>url.startsWith(pin.api)).length,1);assert.ok(calls.slice(1).every(url=>url.startsWith(backup)));
   let heads=0;session.binary=async(url,options)=>{if(url.endsWith('/head')){heads++;return {bytes:enc({...head(),profile:'9'.repeat(64)})};}return binary(url,options);};
   await assert.rejects(session.sync(),/pinned context/);assert.equal(heads,1);assert.equal(session.metadata.height,1);assert.equal(session.ready,false);
+});
+
+
+test('receipt transport failures retain status, selected source and the precise execution stage',async()=>{
+  const f=fixture();await f.session.initialize();
+  const failure=Object.freeze(Object.assign(new Error('Synthetic opaque transport failure.',{cause:new DOMException('Synthetic nested timeout.','TimeoutError')}),{status:503}));
+  const binary=f.session.binary;
+  f.session.binary=async(url,options)=>{if(url.includes('/receipts/'))throw failure;return binary(url,options);};
+  await assert.rejects(f.session.sync(),error=>{
+    const diagnostic=failureDiagnostic(error,'sync');
+    return error===failure&&diagnostic.chain[0].http_status===503&&diagnostic.chain[1].kind==='TimeoutError'
+      &&diagnostic.chain[0].contexts.some(row=>row.stage==='public-source'&&row.source===1&&row.attempt===3)
+      &&diagnostic.chain[0].contexts.some(row=>row.stage==='receipt-fetch');
+  });
+  assert.equal(f.current().height,0);assert.equal(f.commits(),0);
+});
+
+test('native receipt failure survives an abort cleanup failure and leaves the accepted state unchanged',async()=>{
+  const f=fixture();await f.session.initialize();f.setCorrupt();
+  f.wallet.abort_eng2_candidate=()=>{throw new TypeError('Synthetic cleanup failure.');};
+  await assert.rejects(f.session.sync(),error=>{
+    const diagnostic=failureDiagnostic(error,'sync');
+    return error.message==='Synthetic native receipt authentication rejected.'
+      &&diagnostic.chain[0].contexts.some(row=>row.stage==='receipt-apply')
+      &&diagnostic.chain[0].contexts.some(row=>row.stage==='candidate-abort'&&row.related_kind==='TypeError');
+  });
+  assert.equal(f.current().height,0);assert.equal(f.commits(),0);
+});
+
+test('a durable adoption failure retains its original cause while requiring a reopen',async()=>{
+  const f=fixture();await f.session.initialize();
+  const failure=new Error('Synthetic native commit failure.',{cause:new WebAssembly.RuntimeError('Synthetic trap.')});
+  f.wallet.commit_eng2_candidate=()=>{throw failure;};
+  await assert.rejects(f.session.sync(),error=>{
+    const diagnostic=failureDiagnostic(error,'sync');
+    return error.cause===failure&&diagnostic.chain[0].contexts.some(row=>row.stage==='reopen-required')
+      &&diagnostic.chain[1].contexts.some(row=>row.stage==='candidate-commit')&&diagnostic.chain[2].kind==='RuntimeError';
+  });
+  assert.equal(f.session.invalidated,true);assert.equal(f.commits(),0);assert.equal(f.current().height,0);
 });

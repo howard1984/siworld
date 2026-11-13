@@ -2,7 +2,9 @@
 //! Network orchestration remains external; these operations never start a node.
 use super::*;
 mod audit;
+mod replay;
 pub use audit::audit;
+pub use replay::replay_prefix;
 
 const MARKER: &str = "reorg-production-ceiling.json";
 const PURPOSE: &str = "isolated-native-reorganization";

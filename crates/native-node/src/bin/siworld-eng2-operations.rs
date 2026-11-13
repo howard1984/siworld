@@ -1,7 +1,9 @@
 //! Local operation preparation and explicitly framed internal-rehearsal signing.
 use siworld_native_node::{
     eng2_governance::SignerRole,
-    eng2_operations::{MAX_INPUT_BYTES, execute, public_bytes, sign_claim, sign_governance},
+    eng2_operations::{
+        MAX_INPUT_BYTES, execute, public_bytes, sign_claim, sign_governance, windowed,
+    },
 };
 use std::io::{self, Read};
 use zeroize::Zeroizing;
@@ -26,12 +28,21 @@ fn run() -> Result<serde_json::Value, &'static str> {
         return execute(&input).map_err(|_| "public operation rejected");
     }
     let role = match args.as_slice() {
-        [command, _, _] if command == "--sign-claim-pipe" => None,
-        [command, _, role, _] if command == "--sign-governance-pipe" => Some(match role.as_str() {
-            "founder" => SignerRole::Founder,
-            "revocation" => SignerRole::Revocation,
-            _ => return Err("unsupported owner role"),
-        }),
+        [command, _, _]
+            if command == "--sign-claim-pipe" || command == "--sign-windowed-claim-pipe" =>
+        {
+            None
+        }
+        [command, _, role, _]
+            if command == "--sign-governance-pipe"
+                || command == "--sign-windowed-governance-pipe" =>
+        {
+            Some(match role.as_str() {
+                "founder" => SignerRole::Founder,
+                "revocation" => SignerRole::Revocation,
+                _ => return Err("unsupported owner role"),
+            })
+        }
         _ => return Err("unsupported arguments"),
     };
     let network = public_fixed::<32>(&args[1])?;
@@ -62,9 +73,15 @@ fn run() -> Result<serde_json::Value, &'static str> {
     if stdin.read(&mut trailing).map_err(|_| "input read failed")? != 0 {
         return Err("trailing input");
     }
-    match role {
-        Some(role) => sign_governance(&input, network, role, authority, seed),
-        None => sign_claim(&input, network, authority, seed),
+    match (args[0].as_str(), role) {
+        ("--sign-windowed-governance-pipe", Some(role)) => {
+            windowed::sign_governance(&input, network, role, authority, seed)
+        }
+        ("--sign-windowed-claim-pipe", None) => {
+            windowed::sign_claim(&input, network, authority, seed)
+        }
+        (_, Some(role)) => sign_governance(&input, network, role, authority, seed),
+        (_, None) => sign_claim(&input, network, authority, seed),
     }
     .map_err(|_| "local signing rejected")
 }

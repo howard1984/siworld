@@ -74,3 +74,36 @@ claim G1/G2 acceptance. The command rejects nonfixture controls, imported or
 missing proof history, more than 96 blocks, an existing output directory and a
 node whose resident still holds the lease. The source canonical database and
 index are not rewritten by this audit.
+
+## Native material prefix replay
+
+The owner-local rehearsal command
+`--partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json` loads a prefix of
+unchanged public frames exported by `--partition-audit`. The destination must
+already have its own identity, an authenticated empty store, the exact same
+synthetic genesis, and production paused at height zero. Heights are bounded
+by the 96-block rehearsal ceiling.
+
+The command checks the export manifest, genesis, rules, proof profile, ordered
+frame names, sizes and SHA-256 digests. It independently verifies the entire
+selected prefix before the first append, then rereads each frame and passes it
+through ordinary native `Store::append`. Each append retains the normal durable
+transaction and rollback-point creation. An authenticated reopen must match
+the verified prefix head. No proof or block is generated or modified. If source
+files change during append, any already committed blocks remain an ordinary
+valid prefix; the command does not roll back or replace an existing database.
+
+One naturally mined pair of branches can supply several replay cases without
+changing signed or proved bytes. With a common block at height one, retain A
+through height 26 and B through height 27. For rollback depth `d`, select A
+through `1 + d` and B through `2 + d`; the latter has greater work under minimum
+fixed difficulty. The depths 1, 6, 7, 23, 24 and 25 therefore use the same
+immutable branch materials. The original partition and material generation
+must be recorded separately from this replay matrix.
+
+Preparing node stores does not qualify peer discovery, authenticated branch
+transfer, connection restoration, reorganization or propagation. Those checks
+must run through normal peer connections after the prepared nodes start, with
+independent native audits and state comparisons afterward. A replay matrix is
+not evidence of six independently mined live partitions, and it does not reduce
+the storage required by the participating canonical databases.

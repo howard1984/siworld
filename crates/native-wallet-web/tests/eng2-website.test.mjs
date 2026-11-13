@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
+import {failureContext,workerFailure} from '../web/sdk/diagnostics.js';
 import {runInNewContext} from 'node:vm';
 import {createEng2Custody} from '../web/sdk/eng2-custody-storage.js';
 import {eng2ReadOnlyProfile,sessionConfiguration,assertWalletOperation} from '../web/sdk/runtime-profile.js';
@@ -55,7 +56,7 @@ test('eng2 worker dispatch cannot select V1 endpoints or enable mutation through
  assert.doesNotThrow(()=>assertWalletOperation('submit',{name:'siworld-eng-1'}));
 });
 test('website worker uses the eng2 owner and isolated registry without constructing V1 history',async()=>{
- const messages=[],calls=[];
+ const messages=[],calls=[];let injectedFailure=null;
  const info={network:pin.network,account:0,full_address:'synthetic-public-fixture'};
  const wallet={public_info:()=>JSON.stringify(info),free(){}};
  class Accounts {
@@ -67,7 +68,7 @@ test('website worker uses the eng2 owner and isolated registry without construct
  class Session {
   constructor(active,context){assert.equal(active,wallet);assert.equal(context.genesis,pin.genesis);calls.push('eng2-session');}
   async initialize(){return {height:0,send_supported:false};}
-  async sync(){return {height:1,send_supported:false};}
+  async sync(){if(injectedFailure)throw injectedFailure;return {height:1,send_supported:false};}
   async summary(){return {height:1,send_supported:false,journal:true};}
   cancelSync(){calls.push('cancel-sync');}
   release(){calls.push('release-owner');}
@@ -79,7 +80,7 @@ test('website worker uses the eng2 owner and isolated registry without construct
   self,init:async()=>{},core:{BrowserWallet:{unlock:()=>wallet},inspect_address:()=>{}},
   ENGINEERING:pin,Eng2WalletSession:Session,LightSession:forbidden,CommitmentSession:forbidden,
   WalletAccounts:Accounts,AddressDirectory:class {},createEng2Custody,eng2ReadOnlyProfile,sessionConfiguration,assertWalletOperation,
-  accountIndex:()=>{},captureBirthday:()=>{},URL,location:new URL('http://127.0.0.1:8890'),
+  failureContext,workerFailure,accountIndex:()=>{},captureBirthday:()=>{},URL,location:new URL('http://127.0.0.1:8890'),
  });
  assert.equal(messages.shift().ready,true);
  let id=0;
@@ -88,6 +89,11 @@ test('website worker uses the eng2 owner and isolated registry without construct
  assert.deepEqual((await request('accounts-init')).result,[]);
  assert.equal((await request('online-init',[pin])).result.send_supported,false);
  assert.equal((await request('sync')).result.height,1);
+ injectedFailure=Object.freeze(Object.assign(new Error('Synthetic private failure.',{cause:new DOMException('Synthetic private cause.','TimeoutError')}),{status:503}));
+ const rejected=await request('sync');
+ assert.equal(rejected.diagnostic.action,'sync');assert.equal(rejected.diagnostic.chain[0].http_status,503);
+ assert.equal(rejected.diagnostic.chain[1].kind,'TimeoutError');assert.equal(rejected.diagnostic.chain[0].contexts.at(-1).stage,'dispatch');
+ assert.ok(!JSON.stringify(rejected.diagnostic).includes('Synthetic private'));injectedFailure=null;
  assert.match((await request('prepare')).error,/unavailable/);
  assert.match((await request('submit')).error,/unavailable/);
  assert.equal((await request('journal')).result.journal,true);

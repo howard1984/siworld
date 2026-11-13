@@ -43,3 +43,6 @@ pub mod wallet_history;
 
 #[cfg(feature = "eng2-runtime")]
 pub(crate) mod transaction_exchange;
+
+/// Candidate authorization framing; legacy body and genesis selection are unchanged.
+pub mod windowed_authorization;

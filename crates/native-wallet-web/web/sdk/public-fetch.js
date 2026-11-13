@@ -1,3 +1,4 @@
+import {failureContext} from './diagnostics.js';
 const retryStatuses = new Set([429,502,503,504]);
 
 function wait(milliseconds,signal) {
@@ -19,7 +20,7 @@ export function publicTransportFailure(error,timeout) {
 export async function publicJSON(request,url,options={},io={}) {
   const {bytes} = await publicGet(request,url,options,io);
   try { return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)); }
-  catch { throw new Error('Malformed engineering service response.'); }
+  catch (cause) { throw failureContext(new Error('Malformed engineering service response.',{cause}),'json-decode'); }
 }
 
 // Retry transport failures only. Decoding and native authentication stay with
@@ -34,7 +35,8 @@ export async function publicGet(request,url,options={},io={}) {
     try { return await request(url,{...settings,method:'GET',signal:combined}); }
     catch (error) {
       signal?.throwIfAborted();
-      if (attempt === 2 || !publicTransportFailure(error,timeout)) throw error;
+      const failure=failureContext(error,'public-request',{attempt:attempt+1,timed_out:timeout.aborted});
+      if (attempt === 2 || !publicTransportFailure(error,timeout)) throw failure;
       await (io.wait || wait)(attempt === 0 ? 500 : 1000,signal);
     }
   }

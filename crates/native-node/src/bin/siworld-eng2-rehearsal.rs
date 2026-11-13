@@ -52,6 +52,22 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    if args.len() == 5 && args[0] == "--partition-replay-prefix" && args[4] == "--json" {
+        let height = args[3]
+            .to_str()
+            .ok_or("invalid replay prefix height")?
+            .parse()
+            .map_err(|_| "invalid replay prefix height")?;
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::replay_prefix(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                height
+            )?
+        );
+        return Ok(());
+    }
     if args.len() == 4 && args[0] == "--partition-audit" && args[3] == "--json" {
         println!(
             "{}",
@@ -95,7 +111,7 @@ fn run() -> Result<(), String> {
         || args[3] != "--blocks"
         || args[5] != "--json"
     {
-        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json".into());
+        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json".into());
     }
     let blocks = args[4]
         .to_str()

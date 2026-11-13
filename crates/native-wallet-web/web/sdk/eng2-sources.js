@@ -1,5 +1,6 @@
 import {eng2Context} from './eng2-context.js';
 import {publicGet} from './public-fetch.js';
+import {failureContext} from './diagnostics.js';
 
 // Only transport failures rotate independently pinned origins. Successful bytes
 // retain the caller's native authentication, byte bounds and selected-head pin.
@@ -11,8 +12,10 @@ export function eng2PublicGet(request,configuration,io={}) {
     const start=preferred;let attempt=0;
     return publicGet(async(_url,settings)=>{
       const index=(start+attempt++)%context.apis.length;
-      const result=await request(context.apis[index]+target.pathname+target.search,settings);
-      preferred=index;return result;
+      try {
+        const result=await request(context.apis[index]+target.pathname+target.search,settings);
+        preferred=index;return result;
+      } catch(error) {throw failureContext(error,'public-source',{source:index+1,attempt});}
     },url,options,io);
   };
 }

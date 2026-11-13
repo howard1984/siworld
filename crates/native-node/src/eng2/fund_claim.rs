@@ -466,6 +466,70 @@ mod tests {
         assert_eq!(ledger, after_first_debit);
     }
 
+    #[test]
+    fn restored_fund_state_reincludes_unchanged_claim_without_global_consumption() {
+        let network = [1; 32];
+        let destination = address(network, 40);
+        let config = Config::development(network, 0).unwrap();
+        let claim = signed_window(network, &destination);
+        let signed_bytes = claim.encode().unwrap();
+        let mut state = genesis_governance(network, destination);
+        let mut ledger =
+            crate::eng2_fund::FundLedger::new(network, config.fund_allocation.clone().unwrap())
+                .unwrap();
+        for height in 1..=25 {
+            state.apply_block(height, &[]).unwrap();
+            ledger
+                .advance(height, if height == 1 { 1_000_000 } else { 0 })
+                .unwrap();
+        }
+        let savepoint = (state.clone(), ledger.clone());
+        let first = AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 25)
+            .unwrap()
+            .debit(&mut ledger)
+            .unwrap();
+        let consumed = ledger.clone();
+        assert!(
+            AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 25)
+                .unwrap()
+                .debit(&mut ledger)
+                .is_err()
+        );
+        assert_eq!(ledger, consumed);
+
+        // Restoring both state components removes only this branch's debit.
+        (state, ledger) = savepoint.clone();
+        for height in 26..=288 {
+            state.apply_block(height, &[]).unwrap();
+            ledger.advance(height, 0).unwrap();
+        }
+        let replacement = AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 288)
+            .unwrap()
+            .debit(&mut ledger)
+            .unwrap();
+        assert_eq!(first.height(), 25);
+        assert_eq!(replacement.height(), 288);
+        assert_eq!(ledger.balance(0).unwrap().spent, 17);
+        assert_eq!(claim.encode().unwrap(), signed_bytes);
+        let consumed = ledger.clone();
+        assert!(
+            AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 288)
+                .unwrap()
+                .debit(&mut ledger)
+                .is_err()
+        );
+        assert_eq!(ledger, consumed);
+
+        (state, ledger) = savepoint;
+        for height in 26..=289 {
+            state.apply_block(height, &[]).unwrap();
+            ledger.advance(height, 0).unwrap();
+        }
+        let expired = (state.clone(), ledger.clone());
+        assert!(AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 289).is_err());
+        assert_eq!((state, ledger), expired);
+    }
+
     fn signed_governance(
         network: Hash,
         sequence: u64,

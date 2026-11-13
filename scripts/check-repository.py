@@ -32,7 +32,7 @@ DOCUMENTS = {
     "v1-browser-wallet.md", "windows-native-miner.md", "native-proof-storage.md",
     "checkpoint-rejection-acceptance.md", "checkpoint-rejection-ci.md",
     "engineering-checkpoint-roster-transition.md", "offline-validation.md",
-    "eng2-protocol.md", "eng2-reorganization.md", "g2-reorganization-acceptance.md", "eng2-anchor-archive.md", "eng2-block-body.md",
+    "eng2-protocol.md", "eng2-reorganization.md", "windowed-authorizations.md", "g2-reorganization-acceptance.md", "eng2-anchor-archive.md", "eng2-block-body.md",
     "eng2-incremental-state-roots.md", "eng2-internal-genesis.md", "eng2-material-custody.md",
     "eng2-isolated-sync-staging.md", "eng2-public-fund-claims.md",
     "eng2-snapshot-import.md", "eng2-operation-files.md", "eng2-resident-runtime.md",
@@ -69,6 +69,8 @@ EXPLORER_FILES = {
     "tools/explorer/tests/projection.test.mjs",
 }
 PUBLIC_TEXT_ASSETS = {
+    'crates/native-wallet-web/web/sdk/diagnostics.js',
+    'crates/native-wallet-web/tests/diagnostics.test.mjs',
     'crates/native-wallet-web/networks/eng2-readonly.json',
     'crates/native-wallet-web/releases/eng2-readonly.json',
     'crates/native-wallet-web/tests/eng2-admission.test.mjs',
