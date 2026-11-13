@@ -11,6 +11,34 @@ fn run() -> Result<(), String> {
         return Err("native rehearsal execution requires an owner-operated environment".into());
     }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 8 && args[0] == "--qualification-audit-history" && args[7] == "--json" {
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::qualification::full_history::export(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                (
+                    std::path::Path::new(&args[3]),
+                    args[4].to_str().ok_or("invalid history budget SHA-256")?
+                ),
+                (
+                    std::path::Path::new(&args[5]),
+                    args[6].to_str().ok_or("invalid history binding SHA-256")?
+                ),
+            )?
+        );
+        return Ok(());
+    }
+    if args.len() == 11 && args[0] == "--qualification-compare-history" && args[10] == "--json" {
+        println!("{}", siworld_native_node::eng2::rehearsal::partition::qualification::persisted_state::compare_history(
+            std::path::Path::new(&args[1]),
+            (std::path::Path::new(&args[2]), args[3].to_str().ok_or("invalid history manifest SHA-256")?),
+            (std::path::Path::new(&args[4]), args[5].to_str().ok_or("invalid history expectations SHA-256")?),
+            (std::path::Path::new(&args[6]), args[7].to_str().ok_or("invalid history binding SHA-256")?),
+            (std::path::Path::new(&args[8]), args[9].to_str().ok_or("invalid history budget SHA-256")?),
+        )?);
+        return Ok(());
+    }
     if args.len() == 9 && args[0] == "--qualification-compare-state" && args[8] == "--json" {
         println!(
             "{}",
@@ -227,7 +255,7 @@ fn run() -> Result<(), String> {
         || args[3] != "--blocks"
         || args[5] != "--json"
     {
-        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json; or --qualification-compare-state NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json; or --qualification-send-input IDENTITY_NODE PLAN PLAN_SHA256 BINDING BINDING_SHA256 --json (native-p2p owner build); or --qualification-audit NODE NEW_OUTPUT BINDING BINDING_SHA256 --json; or --qualification-replay-prefix EXPORT MANIFEST_SHA256 EMPTY_NODE HEIGHT BINDING BINDING_SHA256 --json; or --qualification-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH BINDING BINDING_SHA256 --json (Unix owner only); or --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json (Unix owner only)".into());
+        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json; or --qualification-audit-history NODE NEW_OUTPUT BUDGET BUDGET_SHA256 BINDING BINDING_SHA256 --json; or --qualification-compare-history NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 BUDGET BUDGET_SHA256 --json; or --qualification-compare-state NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json; or --qualification-send-input IDENTITY_NODE PLAN PLAN_SHA256 BINDING BINDING_SHA256 --json (native-p2p owner build); or --qualification-audit NODE NEW_OUTPUT BINDING BINDING_SHA256 --json; or --qualification-replay-prefix EXPORT MANIFEST_SHA256 EMPTY_NODE HEIGHT BINDING BINDING_SHA256 --json; or --qualification-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH BINDING BINDING_SHA256 --json (Unix owner only); or --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json (Unix owner only)".into());
     }
     let blocks = args[4]
         .to_str()

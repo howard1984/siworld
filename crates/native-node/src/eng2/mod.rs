@@ -2,6 +2,8 @@
 //!
 //! These modules do not activate a network or change the native V1 transition.
 
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod accept_observation;
 pub mod admission;
 pub mod archive;
 pub mod body;

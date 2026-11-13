@@ -26,6 +26,14 @@ pub trait Owner: Send {
     fn block_size(&self, height: u64) -> Result<Option<usize>, String>;
     fn block(&self, height: u64) -> Result<(Header, Body), String>;
     fn accept(&mut self, header: &Header, body: &Body) -> Result<(), String>;
+    #[cfg(feature = "eng2-runtime")]
+    fn accept_received(
+        &mut self,
+        header: &Header,
+        received: &super::transport::ReceivedBody,
+    ) -> Result<(), String> {
+        self.accept(header, &received.body)
+    }
     /// Opt in only when exact canonical and independent raw-branch queries are
     /// wired. Advertising this does not assert that any competitor is valid.
     fn exact_exchange_enabled(&self) -> bool {
@@ -341,6 +349,9 @@ fn pull<S: Read + Write, O: Owner>(
             .ok_or(Error::Unavailable)?;
         used_requests += 1;
         // The transport reservation stays live during full native admission.
+        #[cfg(feature = "eng2-runtime")]
+        with_owner(owner, |o| o.accept_received(&header, &received))?;
+        #[cfg(not(feature = "eng2-runtime"))]
         with_owner(owner, |o| o.accept(&header, &received.body))?;
         drop(received);
         accepted += 1;

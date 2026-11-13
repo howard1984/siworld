@@ -308,6 +308,58 @@ pub struct NativeVerifier {
     issuance: crate::issuance::IssuanceVerifier,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RejectedNativeRelation {
+    Transaction,
+    Settlement,
+    Issuance,
+}
+
+/// Constructed only after a completed native verifier returns rejection.
+/// Private fields prevent callers from attributing arbitrary local errors.
+#[derive(Debug)]
+pub(crate) struct NativeRejectionEvidence {
+    relation: RejectedNativeRelation,
+}
+
+impl NativeRejectionEvidence {
+    fn original_error(self) -> &'static str {
+        match self.kind() {
+            RejectedNativeRelation::Transaction => "native transaction proof verification failed",
+            RejectedNativeRelation::Settlement => "native settlement proof verification failed",
+            RejectedNativeRelation::Issuance => "native issuance proof verification failed",
+        }
+    }
+
+    pub(crate) fn kind(self) -> RejectedNativeRelation {
+        self.relation
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NativePreparation {
+    Context,
+    Structure,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeVerificationFailure {
+    Preparation(String, NativePreparation),
+    Rejected(NativeRejectionEvidence),
+}
+
+impl NativeVerificationFailure {
+    fn into_original(self) -> String {
+        match self {
+            Self::Preparation(
+                original,
+                NativePreparation::Context | NativePreparation::Structure,
+            ) => original,
+            Self::Rejected(evidence) => evidence.original_error().into(),
+        }
+    }
+}
+
 impl NativeVerifier {
     pub fn new() -> Result<Self, String> {
         let tp = Relation::Transaction.params();
@@ -358,7 +410,27 @@ impl NativeVerifier {
     }
 
     pub fn verify_issuance(&self, record: &crate::issuance::IssuanceRecord) -> Result<(), String> {
-        self.issuance.verify(record)
+        self.verify_issuance_typed(record)
+            .map_err(NativeVerificationFailure::into_original)
+    }
+
+    pub(crate) fn verify_issuance_typed(
+        &self,
+        record: &crate::issuance::IssuanceRecord,
+    ) -> Result<(), NativeVerificationFailure> {
+        use crate::issuance::IssuanceVerificationFailure;
+        self.issuance
+            .verify_typed(record)
+            .map_err(|error| match error {
+                IssuanceVerificationFailure::Preparation(original) => {
+                    NativeVerificationFailure::Preparation(original, NativePreparation::Structure)
+                }
+                IssuanceVerificationFailure::Rejected(_evidence) => {
+                    NativeVerificationFailure::Rejected(NativeRejectionEvidence {
+                        relation: RejectedNativeRelation::Issuance,
+                    })
+                }
+            })
     }
 
     pub fn verify_transaction(
@@ -369,13 +441,30 @@ impl NativeVerifier {
         root: &Digest,
         proof: &[u8],
     ) -> Result<(), String> {
-        check_context(context)?;
-        PublicTransaction::decode(&public.encode())
-            .map_err(|e| format!("public transaction: {e:?}"))?;
-        let proof = self
-            .transaction_shape
-            .decode(proof)
-            .map_err(|e| e.to_string())?;
+        self.verify_transaction_typed(public, context, fee, root, proof)
+            .map_err(NativeVerificationFailure::into_original)
+    }
+
+    pub(crate) fn verify_transaction_typed(
+        &self,
+        public: &PublicTransaction,
+        context: &ProofContext,
+        fee: &Digest,
+        root: &Digest,
+        proof: &[u8],
+    ) -> Result<(), NativeVerificationFailure> {
+        check_context(context).map_err(|original| {
+            NativeVerificationFailure::Preparation(original, NativePreparation::Context)
+        })?;
+        PublicTransaction::decode(&public.encode()).map_err(|e| {
+            NativeVerificationFailure::Preparation(
+                format!("public transaction: {e:?}"),
+                NativePreparation::Structure,
+            )
+        })?;
+        let proof = self.transaction_shape.decode(proof).map_err(|e| {
+            NativeVerificationFailure::Preparation(e.to_string(), NativePreparation::Structure)
+        })?;
         let statement = public.statement(context, fee, root);
         verify_with_preprocessed(
             &self.transaction_cfg,
@@ -384,7 +473,11 @@ impl NativeVerifier {
             &statement,
             Some(&self.transaction_vk),
         )
-        .map_err(|_| "native transaction proof verification failed".into())
+        .map_err(|_| {
+            NativeVerificationFailure::Rejected(NativeRejectionEvidence {
+                relation: RejectedNativeRelation::Transaction,
+            })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -397,11 +490,27 @@ impl NativeVerifier {
         rewards: &[Digest],
         proof: &[u8],
     ) -> Result<(), String> {
-        let public = settlement_statement(fees, plan, network, list_hash, rewards)?;
-        let proof = self
-            .settlement_shape
-            .decode(proof)
-            .map_err(|e| e.to_string())?;
+        self.verify_settlement_typed(fees, plan, network, list_hash, rewards, proof)
+            .map_err(NativeVerificationFailure::into_original)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn verify_settlement_typed(
+        &self,
+        fees: &[Digest],
+        plan: &RewardPlan,
+        network: [u8; 32],
+        list_hash: [u8; 32],
+        rewards: &[Digest],
+        proof: &[u8],
+    ) -> Result<(), NativeVerificationFailure> {
+        let public =
+            settlement_statement(fees, plan, network, list_hash, rewards).map_err(|original| {
+                NativeVerificationFailure::Preparation(original, NativePreparation::Context)
+            })?;
+        let proof = self.settlement_shape.decode(proof).map_err(|e| {
+            NativeVerificationFailure::Preparation(e.to_string(), NativePreparation::Structure)
+        })?;
         verify_with_preprocessed(
             &self.settlement_cfg,
             &self.settlement_air,
@@ -409,7 +518,11 @@ impl NativeVerifier {
             &public,
             Some(&self.settlement_vk),
         )
-        .map_err(|_| "native settlement proof verification failed".into())
+        .map_err(|_| {
+            NativeVerificationFailure::Rejected(NativeRejectionEvidence {
+                relation: RejectedNativeRelation::Settlement,
+            })
+        })
     }
 }
 

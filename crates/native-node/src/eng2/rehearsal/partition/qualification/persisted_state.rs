@@ -4,7 +4,7 @@
 //! transaction statement does not disclose whether its slots contain payments;
 //! wallet balances require a separate authenticated wallet scan.
 use super::super::{MAX_HEIGHT, actual_state, bounded_bytes, replay};
-use super::Context;
+use super::{Context, full_history};
 use crate::{
     eng2::{execution::Engine, genesis::Genesis, state_components::Limits, store::Observation},
     eng2_governance::canonical_address,
@@ -120,10 +120,13 @@ fn canonical_hex(value: &str, bytes: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn parse_expectations(bytes: &[u8]) -> Result<Expectations, String> {
+    parse_expectations_inner(bytes, MAX_HEIGHT)
+}
+fn parse_expectations_inner(bytes: &[u8], maximum_height: u64) -> Result<Expectations, String> {
     let value: Expectations = serde_json::from_slice(bytes)
         .map_err(|_| "persisted state expectations schema rejected")?;
     if value.version != 1
-        || !(1..=MAX_HEIGHT).contains(&value.state.height)
+        || !(1..=maximum_height).contains(&value.state.height)
         || !canonical_hex(&value.state.tip, 32)
         || value.included_operations.len() > MAX_ASSERTIONS
         || value.absent_operations.len() > MAX_ASSERTIONS
@@ -285,6 +288,28 @@ pub fn compare(
     expectations: (&Path, &str),
     binding: (&Path, &str),
 ) -> Result<Value, String> {
+    compare_inner(directory, source, expectations, binding, None)
+}
+
+/// Compare complete paged history under an independent finite, SHA-pinned
+/// budget. Pages never replace the genesis prefix or accepted-state seal.
+pub fn compare_history(
+    directory: &Path,
+    source: (&Path, &str),
+    expectations: (&Path, &str),
+    binding: (&Path, &str),
+    budget: (&Path, &str),
+) -> Result<Value, String> {
+    compare_inner(directory, source, expectations, binding, Some(budget))
+}
+fn compare_inner(
+    directory: &Path,
+    source: (&Path, &str),
+    expectations: (&Path, &str),
+    binding: (&Path, &str),
+    budget_input: Option<(&Path, &str)>,
+) -> Result<Value, String> {
+    let started = Instant::now();
     let context = Context::load(binding.0, binding.1)?;
     if directory.canonicalize().ok().as_deref() != Some(directory)
         || source.0.canonicalize().ok().as_deref() != Some(source.0)
@@ -295,46 +320,108 @@ pub fn compare(
     }
     let expectations_bytes = bounded_bytes(expectations.0, MAX_EXPECTATIONS)?;
     context.check_manifest_pin(&expectations_bytes, expectations.1)?;
-    let expected = parse_expectations(&expectations_bytes)?;
+    let budget = budget_input
+        .map(|input| full_history::Budget::load(&context, input))
+        .transpose()?;
+    let expected = if let Some((budget, _)) = &budget {
+        parse_expectations_inner(&expectations_bytes, budget.height)?
+    } else {
+        parse_expectations(&expectations_bytes)?
+    };
+    if budget
+        .as_ref()
+        .is_some_and(|(budget, _)| budget.height != expected.state.height)
+    {
+        return Err("full history expectation height differs from exact budget".into());
+    }
     let encoded = bounded_bytes(&source.0.join("genesis.bin"), 1024 * 1024)?;
     let selected = Genesis::decode(&encoded)?;
     context.check_genesis(&selected)?;
     if bounded_bytes(&directory.join("genesis.bin"), 1024 * 1024)? != encoded {
         return Err("actual node and pinned export genesis differ".into());
     }
-    let manifest_bytes = bounded_bytes(&source.0.join("manifest.json"), MAX_MANIFEST)?;
+    let manifest_maximum = if budget.is_some() {
+        full_history::MAX_INDEX_BYTES
+    } else {
+        MAX_MANIFEST
+    };
+    let manifest_bytes = bounded_bytes(&source.0.join("manifest.json"), manifest_maximum)?;
     context.check_manifest_pin(&manifest_bytes, source.1)?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|_| "persisted state source manifest rejected")?;
-    let records = replay::manifest_records_inner(
-        &manifest,
-        &selected,
-        expected.state.height,
-        Some(&context),
-    )?;
+    let complete = budget
+        .as_ref()
+        .map(|(budget, _)| {
+            full_history::Source::open(
+                &manifest,
+                &selected,
+                &context,
+                *budget,
+                budget_input.ok_or("full history budget absent")?.1,
+            )
+        })
+        .transpose()?;
+    let records = if complete.is_none() {
+        Some(replay::manifest_records_inner(
+            &manifest,
+            &selected,
+            expected.state.height,
+            Some(&context),
+        )?)
+    } else {
+        None
+    };
+    let walk = |visitor: &mut dyn FnMut(&Value) -> Result<(), String>| -> Result<(), String> {
+        if let Some(complete) = &complete {
+            complete.walk(source.0, started, visitor)
+        } else {
+            for record in records.ok_or("comparison records missing")? {
+                if started.elapsed().as_secs() >= DEADLINE_SECONDS {
+                    return Err("persisted state comparison deadline".into());
+                }
+                visitor(record)?;
+            }
+            Ok(())
+        }
+    };
     let _lease = crate::service::Lease::acquire(directory)?;
     let limits = Limits {
         max_leaves: 1_000_000,
         max_nullifiers: 1_000_000,
         max_component_bytes: 64 * 1024 * 1024,
     };
+    if complete.is_some() {
+        full_history::check_database(directory)?;
+    }
     let database = directory.join("chain.redb");
-    let store = Observation::open(&database, Genesis::decode(&encoded)?, limits)?;
+    let open = || {
+        if let Some((budget, _)) = &budget {
+            Observation::open_full_history(
+                &database,
+                Genesis::decode(&encoded)?,
+                limits,
+                budget.height,
+            )
+        } else {
+            Observation::open(&database, Genesis::decode(&encoded)?, limits)
+        }
+    };
+    let store = open()?;
     if store.engine().state().height() != expected.state.height {
         return Err("authenticated actual height differs from independent expectations".into());
     }
-    let started = Instant::now();
     let verifier = NativeVerifier::new()?;
     let mut reference = Engine::new(Genesis::decode(&encoded)?, limits)?;
     let mut found = vec![false; expected.included_operations.len()];
     let mut final_header = None;
-    for record in records {
-        if started.elapsed().as_secs() >= DEADLINE_SECONDS {
-            return Err("persisted state comparison deadline".into());
-        }
+    let mut final_record = None;
+    walk(&mut |record| {
         let (header, body) =
             replay::read_frame(source.0, record, &selected, reference.body_policy())?;
         reference.apply(&header, &body, &verifier)?;
+        if complete.is_some() {
+            actual_state::observe(&reference, &reference, &header, record)?;
+        }
         if store
             .header(header.height)?
             .encode()
@@ -382,13 +469,15 @@ pub fn compare(
             )?;
         }
         final_header = Some(header);
-    }
+        final_record = Some(record.clone());
+        Ok(())
+    })?;
     if found.iter().any(|seen| !seen) {
         return Err("expected canonical operation missing".into());
     }
     let header = final_header.ok_or("persisted comparison prefix empty")?;
-    let record = records
-        .last()
+    let record = final_record
+        .as_ref()
         .ok_or("persisted comparison oracle missing")?;
     let observation = actual_state::observe(store.engine(), &reference, &header, record)?;
     let observed = public_state(store.engine())?;
@@ -410,22 +499,26 @@ pub fn compare(
         return Err("actual nullifier inclusion or orphan removal differs".into());
     }
     drop(store);
-    let reopened = Observation::open(&database, Genesis::decode(&encoded)?, limits)?;
+    let reopened = open()?;
     actual_state::observe(reopened.engine(), &reference, &header, record)?;
     if public_state(reopened.engine())? != observed {
         return Err("actual business state changed on second authenticated reopen".into());
     }
     if bounded_bytes(&source.0.join("genesis.bin"), 1024 * 1024)? != encoded
-        || bounded_bytes(&source.0.join("manifest.json"), MAX_MANIFEST)? != manifest_bytes
+        || bounded_bytes(&source.0.join("manifest.json"), manifest_maximum)? != manifest_bytes
         || bounded_bytes(expectations.0, MAX_EXPECTATIONS)? != expectations_bytes
     {
         return Err("pinned comparison inputs changed during observation".into());
     }
-    for record in records {
-        if started.elapsed().as_secs() >= DEADLINE_SECONDS {
-            return Err("persisted state comparison deadline".into());
-        }
+    walk(&mut |record| {
         replay::read_frame(source.0, record, &selected, reopened.engine().body_policy())?;
+        Ok(())
+    })?;
+    if let (Some(input), Some((budget, original))) = (budget_input, budget.as_ref()) {
+        if bounded_bytes(input.0, 4096)? != *original {
+            return Err("full history budget changed during comparison".into());
+        }
+        budget.tick(started)?;
     }
     let has = |kind| {
         expected
@@ -436,6 +529,8 @@ pub fn compare(
     Ok(
         json!({"scope":"owner-nonfixture-authenticated-persisted-state-comparison",
         "qualification":context.receipt(),"source_manifest_sha256":source.1,
+        "complete_paged_history":complete.is_some(),"entire_prefix_from_genesis":true,
+        "all_replayed_component_oracles_checked":complete.is_some(),
         "expectations_sha256":expectations.1,"authenticated_read_only_opens":2,
         "rollback_maintenance_performed":false,"database_repair_performed":false,
         "full_complete_header_prefix_equal_native_reference":true,

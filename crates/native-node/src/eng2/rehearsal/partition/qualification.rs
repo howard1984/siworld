@@ -5,9 +5,12 @@ use sha2::{Digest as _, Sha256};
 
 pub(super) const AUDIT_SCOPE: &str = "read-only-owner-nonfixture-native-audit";
 const MAX_BINDING_BYTES: usize = 8192;
+pub mod full_history;
 #[cfg(feature = "native-p2p")]
 pub mod invalid_peer;
 pub mod persisted_state;
+#[cfg(unix)]
+pub mod positive_business;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

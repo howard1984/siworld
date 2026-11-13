@@ -313,6 +313,12 @@ fn export_status(
         "historical_proof_replay":false
     });
     status["native_block_events"] = shared.block_events.diagnostic();
+    let (enabled, dropped, error) = owner.accept_observation_diagnostic();
+    status["native_accept_observation"] = json!({
+        "enabled":enabled,"dropped_events":dropped,
+        "error_code":error.map(super::accept_observation::DiagnosticError::code),
+        "coverage_established":false,"scope":"ordinary-forward-admission",
+    });
     service::atomic_json(&directory.join(service::STATUS_FILE), &status)
 }
 
@@ -482,18 +488,35 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         &genesis,
         &running_binary,
     )?);
+    let event_node = identity
+        .descriptor()
+        .ok()
+        .map(|descriptor| descriptor.fingerprint());
     let block_events = Arc::new(block_events::Recorder::new(
         directory,
         genesis.config().network,
         genesis.id(),
-        identity
-            .descriptor()
-            .ok()
-            .map(|descriptor| descriptor.fingerprint()),
+        event_node,
         &run.run_id,
         &running_binary,
     ));
     driver.observe_commits(block_events.clone());
+    // The same actual startup inputs initialize both diagnostic bindings.
+    // An unavailable sink never changes resident admission or readiness.
+    match super::accept_observation::RunIdentity::from_resident(
+        genesis.config().network,
+        genesis.id(),
+        event_node,
+        &run.run_id,
+        &running_binary,
+    ) {
+        Some(binding) => {
+            if !driver.attach_accept_observer(binding, block_events.clone()) {
+                block_events.accept_binding_unavailable();
+            }
+        }
+        None => block_events.accept_binding_unavailable(),
+    }
     #[cfg(unix)]
     let operations = operations::Mailbox::open(
         directory,

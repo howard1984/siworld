@@ -18,6 +18,27 @@ pub(super) fn authenticate(
     limits: Limits,
     identity: &crate::identity::NativeIdentity,
 ) -> Result<Authenticated, String> {
+    authenticate_inner(txn, genesis, limits, identity, None)
+}
+
+fn bounded_history_height(head: &[u8], expected: Option<u64>) -> Result<u64, String> {
+    if head.len() != 72 {
+        return Err("invalid restart head width".into());
+    }
+    let height = u64::from_le_bytes(head[..8].try_into().expect("checked restart height"));
+    if expected.is_some_and(|expected| !(1..=16_384).contains(&expected) || height != expected) {
+        return Err("full history accepted height differs from exact finite budget".into());
+    }
+    Ok(height)
+}
+
+fn authenticate_inner(
+    txn: &redb::ReadTransaction,
+    genesis: Genesis,
+    limits: Limits,
+    identity: &crate::identity::NativeIdentity,
+    expected_history_height: Option<u64>,
+) -> Result<Authenticated, String> {
     let meta = txn
         .open_table(META)
         .map_err(|_| "versioned restart metadata missing")?;
@@ -36,10 +57,9 @@ pub(super) fn authenticate(
         .map_err(|_| "restart head unavailable")?
         .ok_or("restart head missing")?;
     let head_bytes = head_bytes.value();
-    if head_bytes.len() != 72 {
-        return Err("invalid restart head width".into());
-    }
-    let height = u64::from_le_bytes(head_bytes[..8].try_into().expect("checked restart height"));
+    // The fixed-width head is the only height-dependent input read before the
+    // full-history bound. Do not move this check below index/state traversal.
+    let height = bounded_history_height(head_bytes, expected_history_height)?;
     let blocks = txn
         .open_table(BLOCKS)
         .map_err(|_| "restart canonical table missing")?;
@@ -185,6 +205,27 @@ pub struct Observation {
 #[cfg(feature = "eng2-rehearsal")]
 impl Observation {
     pub fn open(path: &Path, genesis: Genesis, limits: Limits) -> Result<Self, String> {
+        Self::open_inner(path, genesis, limits, None)
+    }
+    /// Refuse a different or excessive full-history height immediately after
+    /// reading the fixed-width durable head, before authenticating its prefix.
+    pub fn open_full_history(
+        path: &Path,
+        genesis: Genesis,
+        limits: Limits,
+        height: u64,
+    ) -> Result<Self, String> {
+        if !(1..=16_384).contains(&height) {
+            return Err("full history declared height exceeds finite bound".into());
+        }
+        Self::open_inner(path, genesis, limits, Some(height))
+    }
+    fn open_inner(
+        path: &Path,
+        genesis: Genesis,
+        limits: Limits,
+        expected_history_height: Option<u64>,
+    ) -> Result<Self, String> {
         let directory = path
             .parent()
             .ok_or("observation parent directory missing")?;
@@ -211,7 +252,13 @@ impl Observation {
         let transaction = database
             .begin_read()
             .map_err(|_| "observation read transaction unavailable")?;
-        let authenticated = authenticate(&transaction, genesis, limits, &identity)?;
+        let authenticated = authenticate_inner(
+            &transaction,
+            genesis,
+            limits,
+            &identity,
+            expected_history_height,
+        )?;
         drop(transaction);
         Ok(Self {
             database,
@@ -220,6 +267,61 @@ impl Observation {
     }
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+    /// Return unchanged complete public frames only; imported or pruned history
+    /// cannot satisfy a full-history audit.
+    pub fn full_frame_count(&self) -> Result<u64, String> {
+        self.database
+            .begin_read()
+            .map_err(|_| "observation frame transaction unavailable")?
+            .open_table(BLOCKS)
+            .map_err(|_| "observation full history unavailable")?
+            .len()
+            .map_err(|_| "observation frame count unavailable".into())
+    }
+    pub fn full_frame(&self, height: u64) -> Result<Vec<u8>, String> {
+        if height == 0 || height > self.engine.state().height() {
+            return Err("observation frame height is not accepted".into());
+        }
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "observation frame transaction unavailable")?;
+        let index = transaction
+            .open_table(INDEX)
+            .map_err(|_| "observation compact index unavailable")?;
+        let compact = index
+            .get(height)
+            .map_err(|_| "observation compact header read failed")?
+            .ok_or("observation compact header missing")?;
+        let (header, body_bytes) = decode_compact(compact.value(), self.engine.state().network())?;
+        let table = transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "observation full history unavailable")?;
+        let row = table
+            .get(height)
+            .map_err(|_| "observation frame read failed")?
+            .ok_or("observation complete frame missing")?;
+        let frame = row.value();
+        let maximum = HEADER_BYTES
+            .checked_add(self.engine.body_policy().max_body_bytes)
+            .ok_or("observation frame bound overflow")?;
+        if header.height != height
+            || body_bytes > self.engine.body_policy().max_body_bytes
+            || frame.len()
+                != HEADER_BYTES
+                    .checked_add(body_bytes)
+                    .ok_or("observation frame length overflow")?
+            || frame.len() < HEADER_BYTES
+            || frame.len() > maximum
+            || frame[..HEADER_BYTES]
+                != header
+                    .encode()
+                    .map_err(|_| "observation header encoding failed")?
+        {
+            return Err("observation full frame differs from authenticated header or bound".into());
+        }
+        Ok(frame.to_vec())
     }
     pub fn header(&self, height: u64) -> Result<Header, String> {
         if height == 0 || height > self.engine.state().height() {
@@ -241,5 +343,36 @@ impl Observation {
             return Err("observation header context or body bound differs".into());
         }
         Ok(header)
+    }
+}
+
+#[cfg(test)]
+mod bounded_history_tests {
+    use super::bounded_history_height;
+    fn head(height: u64) -> [u8; 72] {
+        let mut value = [0; 72];
+        value[..8].copy_from_slice(&height.to_le_bytes());
+        value
+    }
+    #[test]
+    fn bounded_history_fixed_head_rejects_actual_height_before_prefix_work() {
+        assert_eq!(bounded_history_height(&head(97), Some(97)).unwrap(), 97);
+        assert_eq!(
+            bounded_history_height(&head(16_384), Some(16_384)).unwrap(),
+            16_384
+        );
+        for (actual, declared) in [
+            (98, 97),
+            (96, 97),
+            (16_385, 97),
+            (u64::MAX, 97),
+            (16_385, 16_385),
+            (0, 0),
+        ] {
+            assert!(bounded_history_height(&head(actual), Some(declared)).is_err());
+        }
+        assert!(bounded_history_height(&[0; 71], Some(97)).is_err());
+        // The existing unbounded authentication entry retains its prior rule.
+        assert_eq!(bounded_history_height(&head(16_385), None).unwrap(), 16_385);
     }
 }

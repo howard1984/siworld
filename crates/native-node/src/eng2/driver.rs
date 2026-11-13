@@ -105,6 +105,8 @@ pub struct Driver {
     bootstrap_receipt_height: u64,
     reorganization: Option<reorganization::Reorganization>,
     template_generation: u64,
+    #[cfg(feature = "eng2-runtime")]
+    accept_observation: super::accept_observation::Observation,
 }
 impl Driver {
     /// The caller explicitly creates or resumes the store and loads only the
@@ -126,6 +128,8 @@ impl Driver {
             bootstrap_receipt_height: 0,
             reorganization: None,
             template_generation: 0,
+            #[cfg(feature = "eng2-runtime")]
+            accept_observation: super::accept_observation::Observation::default(),
         })
     }
     fn ensure_activities_allowed(&self) -> Result<(), String> {
@@ -247,8 +251,22 @@ impl Driver {
     /// Return only after the exact native block is durably committed. Archive
     /// failures are independently observable and do not undo accepted history.
     pub fn accept(&mut self, header: &Header, body: &Body) -> Result<CommittedBlock, String> {
-        // A restart may know a preferred header before its body arrived. Keep
-        // production paused, but permit ordinary fully verified forward sync.
+        #[cfg(feature = "eng2-runtime")]
+        {
+            self.accept_observed(header, body, None)
+        }
+        #[cfg(not(feature = "eng2-runtime"))]
+        {
+            self.check_forward_admission()?;
+            let committed = match self.store.append(header, body, &self.verifier) {
+                Ok(committed) => committed,
+                Err(original) => return Err(self.after_append_error(original)),
+            };
+            self.finish_accepted(header, body, committed)
+        }
+    }
+    fn check_forward_admission(&self) -> Result<(), String> {
+        // A preferred header without its body still permits ordinary forward sync.
         if self
             .reorganization
             .as_ref()
@@ -256,18 +274,61 @@ impl Driver {
         {
             return Err("canonical switching pauses forward admission".into());
         }
-        self.store.ensure_exportable()?;
-        let committed = match self.store.append(header, body, &self.verifier) {
+        self.store.ensure_exportable()
+    }
+    fn after_append_error(&mut self, original: String) -> String {
+        if self.store.ensure_exportable().is_err()
+            && let Some(state) = &mut self.reorganization
+        {
+            state.stopped = Some("reorganization_canonical_store_unavailable");
+        }
+        original
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn accept_observed(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        frame: Option<super::accept_observation::FrameIdentity>,
+    ) -> Result<CommittedBlock, String> {
+        self.check_forward_admission()?;
+        let attempt = frame.and_then(|frame| self.accept_observation.begin(header, Some(frame)));
+        let committed = match self.store.append_diagnosed(header, body, &self.verifier) {
             Ok(committed) => committed,
-            Err(error) => {
-                if self.store.ensure_exportable().is_err()
-                    && let Some(state) = &mut self.reorganization
-                {
-                    state.stopped = Some("reorganization_canonical_store_unavailable");
-                }
-                return Err(error);
+            Err(failure) => {
+                // Observe this actual typed rejection before returning the same
+                // original error and retaining the original availability handling.
+                self.accept_observation.rejected(attempt.as_ref(), &failure);
+                return Err(self.after_append_error(failure.into_original()));
             }
         };
+        self.finish_accepted(header, body, committed)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn attach_accept_observer(
+        &mut self,
+        run: super::accept_observation::RunIdentity,
+        observer: std::sync::Arc<dyn super::accept_observation::Observer>,
+    ) -> bool {
+        self.accept_observation.attach(run, observer)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn accept_observation_diagnostic(
+        &self,
+    ) -> (
+        bool,
+        u64,
+        Option<super::accept_observation::DiagnosticError>,
+    ) {
+        let (dropped, error) = self.accept_observation.diagnostic();
+        (self.accept_observation.enabled(), dropped, error)
+    }
+    fn finish_accepted(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        committed: CommittedBlock,
+    ) -> Result<CommittedBlock, String> {
         if let Some(state) = &mut self.reorganization
             && let Err(error) = state.branches.retain_committed(
                 header,
@@ -614,6 +675,15 @@ impl super::network::Owner for Driver {
     }
     fn accept(&mut self, header: &Header, body: &Body) -> Result<(), String> {
         Driver::accept(self, header, body).map(|_| ())
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn accept_received(
+        &mut self,
+        header: &Header,
+        received: &super::transport::ReceivedBody,
+    ) -> Result<(), String> {
+        self.accept_observed(header, &received.body, received.observation)
+            .map(|_| ())
     }
 }
 

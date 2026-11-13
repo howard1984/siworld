@@ -749,6 +749,37 @@ impl Store {
             );
         }
         let staged = self.engine.stage(header, body, verifier)?;
+        self.append_staged(header, body, staged)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn append_diagnosed(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        verifier: &NativeVerifier,
+    ) -> Result<CommittedBlock, super::accept_observation::Failure> {
+        use super::accept_observation::{CommitKnowledge, Failure, OtherClass, Phase};
+        if !self.usable {
+            return Err(Failure::other(
+                "versioned store requires verified reopen after publication failure".into(),
+                OtherClass::Storage,
+                Phase::Storage,
+                CommitKnowledge::Unknown,
+            ));
+        }
+        // Every actual native verifier rejection precedes the write transaction.
+        let staged = self.engine.stage_diagnosed(header, body, verifier)?;
+        // This unchanged writer may fail before or after the durable commit.
+        // Such an error has no native token and no unchanged-chain assertion.
+        self.append_staged(header, body, staged)
+            .map_err(Failure::unclassified)
+    }
+    fn append_staged(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        staged: super::execution::StagedBlock,
+    ) -> Result<CommittedBlock, String> {
         let mut bytes = header
             .encode()
             .map_err(|_| "invalid versioned header")?

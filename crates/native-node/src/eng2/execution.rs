@@ -17,6 +17,17 @@ use crate::{
     wire::{Hash, RewardRecord},
 };
 
+#[cfg(feature = "eng2-runtime")]
+fn precommit_failure(original: String) -> super::accept_observation::Failure {
+    use super::accept_observation::{CommitKnowledge, Failure, OtherClass, Phase};
+    Failure::other(
+        original,
+        OtherClass::CandidateValidation,
+        Phase::Execution,
+        CommitKnowledge::NotReached,
+    )
+}
+
 /// The fixed body slot is unused under `LegacyMiner`, is not appended to the
 /// commitment tree and cannot carry a payment or alternate fee destination.
 pub fn legacy_fee_output() -> RewardRecord {
@@ -191,6 +202,31 @@ impl Engine {
         )?
         .verify_transactions(verifier)?
         .legacy_delta(verifier, self.limits)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn stage_diagnosed(
+        &self,
+        header: &Header,
+        body: &body::Body,
+        verifier: &NativeVerifier,
+    ) -> Result<StagedBlock, super::accept_observation::Failure> {
+        if self.state.fee_mode() != self.genesis.fee_mode()
+            || self.genesis.fee_mode() != FeeMode::LegacyMiner
+        {
+            return Err(precommit_failure(
+                "native engine fee mode differs from sealed genesis".into(),
+            ));
+        }
+        PreparedBlock::prepare(
+            &self.state,
+            header,
+            body,
+            self.binding(self.state.tip()),
+            self.body_policy(),
+        )
+        .map_err(precommit_failure)?
+        .verify_transactions_diagnosed(verifier)?
+        .legacy_delta_diagnosed(verifier, self.limits)
     }
     pub(super) fn publish(&mut self, staged: StagedBlock) -> Result<CommittedBlock, String> {
         let StagedBlock {
@@ -457,6 +493,32 @@ impl<'a> PreparedBlock<'a> {
             ledgers: self.ledgers,
         })
     }
+    #[cfg(feature = "eng2-runtime")]
+    fn verify_transactions_diagnosed(
+        self,
+        verifier: &NativeVerifier,
+    ) -> Result<NativeTransactions<'a>, super::accept_observation::Failure> {
+        let mut actions = self.actions.verify_native_diagnosed(verifier)?;
+        for output in &self.ledgers.outputs {
+            if output.network() != self.header.network || output.height() != self.header.height {
+                return Err(precommit_failure(
+                    "debited isolated fund output context differs".into(),
+                ));
+            }
+            actions
+                .append_authorized_output(output.commitment())
+                .map_err(precommit_failure)?;
+        }
+        Ok(NativeTransactions {
+            parent: self.parent,
+            header: self.header,
+            body: self.body,
+            binding: self.binding,
+            header_use: self.header_use,
+            actions,
+            ledgers: self.ledgers,
+        })
+    }
 }
 impl NativeTransactions<'_> {
     pub fn parent(&self) -> &SnapshotState {
@@ -535,6 +597,72 @@ impl NativeTransactions<'_> {
             && commitment != self.header.execution_commitment
         {
             return Err("native execution commitment differs from complete checked state".into());
+        }
+        Ok(StagedBlock {
+            network: self.header.network,
+            height: self.header.height,
+            id: identity,
+            delta,
+            ledgers: self.ledgers,
+            nullifiers,
+            commitment,
+        })
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn legacy_delta_diagnosed(
+        self,
+        verifier: &NativeVerifier,
+        limits: Limits,
+    ) -> Result<StagedBlock, super::accept_observation::Failure> {
+        if self.parent.fee_mode() != FeeMode::LegacyMiner
+            || self.body.fee_output != legacy_fee_output()
+        {
+            return Err(precommit_failure(
+                "legacy settlement is not selected by this genesis".into(),
+            ));
+        }
+        let mut fees = self.actions.fees().to_vec();
+        fees.extend(
+            crate::state::tail_slots(
+                self.header.network,
+                self.header.height,
+                self.body.transactions.len(),
+            )
+            .map_err(precommit_failure)?
+            .iter()
+            .map(|slot| slot.commitment),
+        );
+        verifier.verify_settlement_diagnosed(
+            &fees,
+            &self.ledgers.settlement.plan,
+            self.header.network,
+            self.body.list_digest(),
+            self.actions.rewards(),
+            &self.body.settlement_proof,
+        )?;
+        let identity = match self.header_use {
+            HeaderUse::Mined => self
+                .header
+                .id()
+                .map_err(|_| precommit_failure("invalid native header identity".into()))?,
+            HeaderUse::Template => [0; 32],
+        };
+        let delta = self
+            .actions
+            .finish(identity, |height| FeeMode::LegacyMiner.base_fee(height))
+            .map_err(precommit_failure)?;
+        let (commitment, nullifiers) = delta
+            .preview(&self.parent.chain)
+            .map_err(precommit_failure)?
+            .versioned_execution(self.parent, self.ledgers.view(), self.binding, limits)
+            .map_err(precommit_failure)?
+            .into_parts();
+        if matches!(self.header_use, HeaderUse::Mined)
+            && commitment != self.header.execution_commitment
+        {
+            return Err(precommit_failure(
+                "native execution commitment differs from complete checked state".into(),
+            ));
         }
         Ok(StagedBlock {
             network: self.header.network,

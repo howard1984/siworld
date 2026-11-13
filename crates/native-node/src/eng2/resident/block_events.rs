@@ -1,6 +1,7 @@
 //! Bounded observations at native production and canonical durable-commit edges.
 //!
 //! Events are diagnostics, never admission, readiness or finality decisions.
+use crate::eng2::accept_observation::{DiagnosticError, Observer, Rejection};
 use crate::eng2::{header::Header, store::CommitObserver};
 use crate::wire::Hash;
 use serde_json::{Value, json};
@@ -114,6 +115,95 @@ impl Recorder {
 
     pub(super) fn produced(&self, header: &Header) {
         self.header(Kind::Produced, header);
+    }
+
+    pub(super) fn accept_binding_unavailable(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            self.disable(&mut state, "native_rejection_binding_unavailable");
+        } else {
+            self.report("native_event_lock_poisoned");
+        }
+    }
+
+    fn native_rejection(&self, event: &Rejection<'_>) -> Result<(), DiagnosticError> {
+        let Ok(mut state) = self.state.lock() else {
+            self.report("native_event_lock_poisoned");
+            return Err(DiagnosticError::Output);
+        };
+        let Some(sequence) = state.sequence.checked_add(1) else {
+            self.fail(&mut state, "native_event_sequence_exhausted");
+            return Err(DiagnosticError::Output);
+        };
+        state.sequence = sequence;
+        if state.end_written {
+            self.fail(&mut state, "native_event_stream_closed");
+            return Err(DiagnosticError::Output);
+        }
+        // Compare with this existing recorder's actual startup binding, not
+        // merely with a caller's claim that a different binding is equivalent.
+        if event.run.network() != self.binding.network
+            || event.run.genesis() != self.binding.genesis
+            || Some(event.run.node()) != self.binding.node
+            || crate::local::hex(&event.run.run()) != self.binding.run
+            || crate::local::hex(&event.run.binary()) != self.binding.binary
+        {
+            self.fail(&mut state, "native_rejection_binding_mismatch");
+            return Err(DiagnosticError::Binding);
+        }
+        let receiver = crate::local::hex(&event.run.node());
+        let frame = crate::local::hex(&event.frame.frame_id());
+        let elapsed = event
+            .event_instant
+            .checked_duration_since(self.started)
+            .map(|value| value.as_nanos().to_string());
+        let kind = "native-proof-rejected";
+        let mut value = json!({
+            "version":1,"record":"block-event","event_source":"native-runtime-hook","kind":kind,
+            "network_id":crate::local::hex(&self.binding.network),
+            "genesis_id":crate::local::hex(&self.binding.genesis),
+            "source_commit":self.binding.source,"source_commit_origin":"compile-time-declaration",
+            "source_commit_externally_verified":false,"binary_sha256":self.binding.binary,
+            "node_id":receiver,"receiver_node_id":receiver,"run_id":self.binding.run,
+            "sequence":sequence,"block_id":crate::local::hex(&event.frame.header_id()),
+            "height":event.frame.height(),"event_unix_ms":event.event_unix_ms,
+            "elapsed_monotonic_ns":elapsed,
+        });
+        value["peer_id"] = json!(crate::local::hex(&event.frame.peer_id()));
+        value["frame_id"] = json!(frame);
+        value["body_commitment"] = json!(crate::local::hex(&event.frame.body_commitment()));
+        value["body_bytes"] = json!(event.frame.body_bytes());
+        value["owner_attempt"] = json!(event.attempt);
+        value["native_error_code"] = json!(event.native.code());
+        value["owner_dropped_before"] = json!(event.dropped_before);
+        value["stream_dropped_before"] = json!(state.dropped);
+        value["clock_offset_ms"] = Value::Null;
+        value["clock_uncertainty_ms"] = Value::Null;
+        value["clock_calibration_measured"] = json!(false);
+        value["deduplication_key"] =
+            json!([kind, receiver, self.binding.run, event.attempt, frame]);
+        let result = serde_json::to_vec(&value)
+            .map_err(|_| "native_event_encoding_failed")
+            .and_then(|mut bytes| {
+                bytes.push(b'\n');
+                if bytes.len() > RECORD_BYTES {
+                    return Err("native_event_record_limit");
+                }
+                state
+                    .log
+                    .as_mut()
+                    .ok_or("native_event_log_disabled")?
+                    .append(&bytes)
+            });
+        match result {
+            Ok(()) => {
+                state.written = state.written.saturating_add(1);
+                Ok(())
+            }
+            Err(error) => {
+                self.fail(&mut state, error);
+                Err(DiagnosticError::Output)
+            }
+        }
     }
 
     fn header(&self, kind: Kind, header: &Header) {
@@ -265,6 +355,11 @@ impl Recorder {
 impl CommitObserver for Recorder {
     fn committed(&self, header: &Header) {
         self.header(Kind::Accepted, header);
+    }
+}
+impl Observer for Recorder {
+    fn rejected(&self, event: &Rejection<'_>) -> Result<(), DiagnosticError> {
+        self.native_rejection(event)
     }
 }
 fn wall_ms() -> Option<u64> {

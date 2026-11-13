@@ -16,6 +16,7 @@ DOCUMENTS = {
     "native-block-events.md",
     "native-hiding-proof-v2.md",
     "complete-fee-child.md",
+    "eng2-full-history.md",
     "00-decisions.md", "11-risks-open-questions.md", "bht-security-accounting.md", "d8-dependency-patch.md",
     "README.md", "whitepaper.md", "architecture.md", "protocol.md",
     "cryptography.md", "security-model.md", "node-operations.md", "rpc.md",

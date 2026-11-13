@@ -51,6 +51,8 @@ pub enum Request {
 pub struct ReceivedBody {
     pub body: Body,
     pub reservation: p2p::Reservation,
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) observation: Option<super::accept_observation::FrameIdentity>,
 }
 
 #[derive(Clone, Copy)]
@@ -393,7 +395,19 @@ impl<S: Read + Write> Peer<S> {
             .map_err(|_| p2p::Error::InvalidProtocol)?;
         let body = Body::decode(&encoded, header.network, header.height, self.policy)
             .map_err(|_| p2p::Error::InvalidProtocol)?;
-        Ok(Some(ReceivedBody { body, reservation }))
+        #[cfg(feature = "eng2-runtime")]
+        let observation = super::accept_observation::FrameIdentity::after_authenticated_decode(
+            self.session.peer(),
+            header,
+            &encoded,
+            self.policy.max_body_bytes,
+        );
+        Ok(Some(ReceivedBody {
+            body,
+            reservation,
+            #[cfg(feature = "eng2-runtime")]
+            observation,
+        }))
     }
     pub(crate) fn application_network(&self) -> Hash {
         self.session.binding().network
