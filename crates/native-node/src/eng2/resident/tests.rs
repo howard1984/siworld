@@ -141,8 +141,7 @@ fn miner_configuration_is_outbound_only_with_explicit_existing_signer_selection(
 }
 #[cfg(unix)]
 #[test]
-fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_digest() {
-    use crate::identity::PeerPin;
+fn legacy_checkpoint_routing_only_selects_advertisements_without_peer_admission() {
     let directory = directory();
     let remote_directory = super::tests::directory();
     let genesis = genesis();
@@ -157,32 +156,39 @@ fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_diges
     assert!(current.legacy_checkpoint_peers.is_empty());
     value["legacy_checkpoint_peers"] = json!([fingerprint]);
     service::atomic_json(&path, &value).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    let pin = PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding()).unwrap();
     let pin_path = directory.join(format!("peer-{fingerprint}.pin"));
-    let mut wrong_binding = pin.encode();
-    wrong_binding[6] ^= 1;
-    fs::write(&pin_path, wrong_binding).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    fs::remove_file(&pin_path).unwrap();
-    pin.persist(&directory).unwrap();
+    assert!(!pin_path.exists());
     let legacy = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
     assert!(
         legacy
             .legacy_checkpoint_peers
             .contains(&descriptor.fingerprint())
     );
+    assert!(!pin_path.exists());
     // Ingress routing must not add readiness references or outbound destinations.
     assert_eq!(legacy.peers.len(), current.peers.len());
     assert!(legacy.peers.is_empty());
     assert_ne!(legacy.digest, current.digest);
+    value["peers"] = json!([{
+        "endpoint":"127.0.0.1:9000", "dial":false, "fingerprint":fingerprint,
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]);
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    value["peers"] = json!([]);
     for invalid in [
         Value::Null,
         json!(true),
         json!(["bad"]),
         json!([fingerprint, fingerprint]),
-        json!([crate::local::hex(&[0; 32])]),
-        json!([crate::local::hex(&[9; 32])]),
+        json!([crate::local::hex(
+            &identity.descriptor().unwrap().fingerprint()
+        )]),
+        Value::Array(
+            (0u8..17)
+                .map(|index| json!(crate::local::hex(&[index; 32])))
+                .collect(),
+        ),
     ] {
         value["legacy_checkpoint_peers"] = invalid;
         service::atomic_json(&path, &value).unwrap();
