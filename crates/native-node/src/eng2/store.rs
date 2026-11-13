@@ -49,6 +49,12 @@ pub(crate) const PERMANENT_RECEIPTS: TableDefinition<u64, &[u8]> =
 pub(crate) const PERMANENT_RECEIPT_IDS: TableDefinition<u64, &[u8]> =
     TableDefinition::new("eng2-permanent-receipt-ids-v1");
 
+/// Arm only the explicitly selected owner-local full-frame crash test child.
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+pub(crate) fn arm_full_frame_crash_boundary() {
+    crash_tests::arm_full_frame();
+}
+
 pub struct Store {
     database: Database,
     #[cfg(windows)]

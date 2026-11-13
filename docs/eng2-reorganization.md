@@ -107,3 +107,100 @@ must run through normal peer connections after the prepared nodes start, with
 independent native audits and state comparisons afterward. A replay matrix is
 not evidence of six independently mined live partitions, and it does not reduce
 the storage required by the participating canonical databases.
+
+## Full-frame local Driver cases
+
+On Unix, an owner-operated build with `eng2-rehearsal` exposes:
+
+```text
+siworld-eng2-rehearsal --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json
+```
+
+Both manifest SHA-256 values must come from completed independent native corpus
+acceptance. The exports must retain all unchanged native frames at heights 26
+and 27 respectively, share the exact first block and diverge at height 2. The
+command accepts only depths 1, 6, 7, 23, 24 and 25. For depth `d`, the old prefix
+ends at `d + 1` and the competing prefix ends at `d + 2`. Header verification
+independently computes 512-bit cumulative work and requires greater competing
+work. Each selected frame is decoded with the native bounds and its pinned
+length, SHA-256, identity, parent and execution commitment are checked.
+
+The destination must be absent and separate from both public exports. The
+command creates an independent identity, an authenticated empty store and a
+local production ceiling of zero. It admits the old prefix through ordinary
+`Driver::accept`, retains the complete competing frames in the independent
+branch archive, and invokes the normal Driver prevalidation, ancestor restore
+and one append per owner turn. It creates no proofs and starts no network or
+mining process. Source genesis, manifests and complete frame hashes are checked
+before and after the case; source databases and custody are never opened.
+
+After each old-prefix append, ancestor restore and replacement append, the
+observer compares all eleven actual canonical component byte strings against
+an independent Engine advanced with native verification. It also compares each
+component length and BLAKE3 digest with the pinned audit record, plus exact
+height, block identity, parent, execution commitment and full cumulative work.
+Each observation is written to a separate create-only file. A final authenticated
+store reopen repeats the comparison after releasing the mutable Driver owner.
+Intermediate store reopen, process crashes, peer healing, wallet scanning and
+checkpoint authority journals are separate acceptance work.
+
+Depth 25 must reject before the restore barrier, preserve the old height-26
+state, keep owner activities paused and report the manual-recovery depth alarm.
+This refusal case checks the competing header work and unchanged complete frame
+material; replacement native execution is supplied by the independently
+accepted corpus rather than a forced depth-25 Driver execution. A successful
+case writes `case-complete.json`; an incomplete directory must be preserved as
+failed evidence and cannot be adopted for another case. The internal 900-second
+deadline is cooperative, so an external owner-controlled resource and process
+supervisor remains necessary. These case receipts do not establish complete
+network qualification.
+
+### Test-only named crash recovery entrypoints
+
+A Unix library test build with `eng2-rehearsal` also has two ignored, explicitly
+selected entrypoints:
+
+```text
+eng2::rehearsal::partition::driver_case::crash_cases::full_frame_driver_crash_child
+eng2::rehearsal::partition::driver_case::crash_cases::full_frame_driver_resume
+```
+
+They require `SIWORLD_FULL_FRAME_SOURCE_A`, `SIWORLD_FULL_FRAME_MANIFEST_A_SHA256`,
+`SIWORLD_FULL_FRAME_SOURCE_B`, `SIWORLD_FULL_FRAME_MANIFEST_B_SHA256`,
+`SIWORLD_FULL_FRAME_DIRECTORY`, `SIWORLD_FULL_FRAME_DEPTH` and
+`SIWORLD_FULL_FRAME_BINARY_SHA256`. The binary fingerprint must identify the
+executing test harness, independently pinned before invocation. Named edges
+use the existing `SIWORLD_REORG_CRASH_POINT`, `SIWORLD_REORG_CRASH_HEIGHT` and
+`SIWORLD_REORG_CRASH_MARKER` parameters. The marker must be a canonical sibling
+path outside the case and both source exports.
+
+The crash child additionally requires `SIWORLD_REORG_CRASH_CHILD=1` and
+`SIWORLD_REORG_CRASH_FULL_FRAME=1`. It exclusively writes its invocation binding
+beside the future marker. A test-only atomic gate leaves all initial A-prefix
+append hooks disarmed. The gate is armed only after normal A admission and full
+B material retention, immediately before the first reorganization tick. Existing
+store commit hooks then park at the selected named replacement boundary. An
+external owner must retain the exact child handle, verify its exclusive fsynced
+marker, send SIGKILL only to that child and reap it. These entrypoints do not
+send signals or adopt existing processes.
+
+The recovery entrypoint requires the same invocation binding and marker, an
+existing incomplete case and `SIWORLD_REORG_CRASH_CHILD` absent or different
+from `1`. It never arms crash hooks. The expected durable prefix is determined
+by the selected commit edge: old A before the restore commit, shared height 1
+after that commit, B at height `h - 1` before append `h`, or B at height `h`
+after its commit. Before reconstructing the Driver or opening the branch archive,
+recovery authenticates that exact store prefix and compares its complete header
+sequence and all eleven actual components with independently executed native
+replay and the pinned audit oracle.
+
+Recovery opens the existing independent branch archive and uses ordinary Driver
+turns to reach the retained best B branch. It verifies each observed B prefix
+and the final authenticated store reopen. Recovery observations are create-only;
+a second invocation must fail rather than overwrite prior acceptance evidence.
+No source database, wallet or seed is opened, no old header is rewritten, and no
+new proof or mining process is created. Failed quick-repair opens remain failed
+acceptance evidence; the helper does not enable full database repair. The named
+crash entries accept depths 1, 6, 7, 23 and 24. Depth 25 remains a separate
+restore-before refusal case. No parent batch controller, process-kill result,
+power-loss result or complete crash matrix is implied by these entrypoints.

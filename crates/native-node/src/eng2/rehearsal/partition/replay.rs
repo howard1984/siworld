@@ -7,7 +7,7 @@ use sha2::{Digest as _, Sha256};
 const MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const REPLAY_DEADLINE_SECONDS: u64 = 900;
 
-fn manifest_records<'a>(
+pub(super) fn manifest_records<'a>(
     manifest: &'a Value,
     selected: &Genesis,
     height: u64,
@@ -52,7 +52,7 @@ fn manifest_records<'a>(
             .into_iter()
             .any(|field| {
                 record[field].as_str().is_none_or(|value| {
-                    value.len() != 64
+                    value.len() != if field == "cumulative_work" { 128 } else { 64 }
                         || !value
                             .bytes()
                             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -65,7 +65,7 @@ fn manifest_records<'a>(
     Ok(&records[..height as usize])
 }
 
-fn read_frame(
+pub(super) fn read_frame(
     source: &Path,
     record: &Value,
     selected: &Genesis,
@@ -196,7 +196,7 @@ mod tests {
             "independent_native_replay":true,"durable_head_verified":true,
             "blocks":[{"height":1,"frame":"block-0001.frame","frame_bytes":200,
             "id":"00".repeat(32),"parent":"00".repeat(32),
-            "execution_commitment":"00".repeat(32),"cumulative_work":"00".repeat(32),
+            "execution_commitment":"00".repeat(32),"cumulative_work":"00".repeat(64),
             "frame_sha256":"00".repeat(32)}]})
     }
 
@@ -205,6 +205,9 @@ mod tests {
         let selected = genesis(&[42; 32], [23; 32]).unwrap();
         let original = manifest(&selected);
         assert_eq!(manifest_records(&original, &selected, 1).unwrap().len(), 1);
+        let mut narrow_work = original.clone();
+        narrow_work["blocks"][0]["cumulative_work"] = json!("00".repeat(32));
+        assert!(manifest_records(&narrow_work, &selected, 1).is_err());
         for height in [0, 2, 97, u64::MAX] {
             assert!(manifest_records(&original, &selected, height).is_err());
         }

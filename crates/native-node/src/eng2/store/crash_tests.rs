@@ -10,9 +10,30 @@ use std::{
     time::{Duration, Instant},
 };
 
+// Full-frame cases first construct A through normal append. Keep those append
+// hooks disarmed until every competing frame has been retained for the switch.
+static FULL_FRAME_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn arm_full_frame() {
+    if std::env::var("SIWORLD_REORG_CRASH_FULL_FRAME").as_deref() == Ok("1") {
+        assert_eq!(
+            std::env::var("SIWORLD_REORG_CRASH_CHILD").as_deref(),
+            Ok("1")
+        );
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+        FULL_FRAME_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// This rendezvous exists only in an explicitly selected local test build.
 /// The parent kills a parked worker; normal process shutdown never runs.
 pub(super) fn boundary(point: &str, height: u64) {
+    if std::env::var("SIWORLD_REORG_CRASH_FULL_FRAME").as_deref() == Ok("1")
+        && !FULL_FRAME_ARMED.load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+
     if std::env::var("SIWORLD_REORG_CRASH_CHILD").as_deref() != Ok("1")
         || std::env::var("SIWORLD_REORG_CRASH_POINT").as_deref() != Ok(point)
         || std::env::var("SIWORLD_REORG_CRASH_HEIGHT").ok().as_deref()
