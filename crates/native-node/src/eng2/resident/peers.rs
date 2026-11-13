@@ -267,8 +267,9 @@ fn checkpoint_phase(
         .budget
         .reserve(3 * (maximum + 4096))
         .map_err(|_| "checkpoint control phase budget exhausted")?;
+    let _legacy_checkpoints = shared.legacy_checkpoint_peers.contains(&peer.peer());
     #[cfg(unix)]
-    let outgoing = shared.mailbox.outgoing()?;
+    let outgoing = shared.mailbox.outgoing(_legacy_checkpoints)?;
     #[cfg(not(unix))]
     let outgoing = Vec::new();
     let network = owner_before(shared, &deadline)?.head()?.network;

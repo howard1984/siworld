@@ -215,6 +215,7 @@ struct Shared {
     network: Arc<peers::NetworkStatus>,
     production: Mutex<ProductionStatus>,
     checkpoint_observer: Mutex<super::checkpoint_observer::Observer>,
+    legacy_checkpoint_peers: std::collections::BTreeSet<Hash>,
     budget: p2p::Budget,
     _pool_charge: p2p::Reservation,
     #[cfg(unix)]
@@ -432,6 +433,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             ..Default::default()
         }),
         checkpoint_observer: Mutex::new(super::checkpoint_observer::Observer::default()),
+        legacy_checkpoint_peers: config.legacy_checkpoint_peers.clone(),
         budget: budget.clone(),
         _pool_charge: budget
             .reserve(2 * crate::pool::MAX_BYTES)

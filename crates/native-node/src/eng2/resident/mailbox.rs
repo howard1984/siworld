@@ -35,10 +35,32 @@ pub(super) struct Batch {
     _charges: Vec<(p2p::Reservation, p2p::Reservation)>,
     digests: Vec<Hash>,
 }
+struct Outbound {
+    bytes: Vec<u8>,
+    legacy_compatible: bool,
+}
+fn legacy_compatible(message: &Incoming) -> bool {
+    let statement = match message {
+        Incoming::Proposal(proposal) => &proposal.statement,
+        Incoming::Vote { statement, .. } => statement,
+        Incoming::Certified { certificate, .. } => &certificate.statement,
+    };
+    // This is only a recipient advertisement policy. It never authorizes a
+    // checkpoint or changes signature, quorum, confirmation or chain checks.
+    statement.checkpoint_height > 0
+        && statement
+            .authorization_height
+            .checked_sub(super::super::runtime_export::CHECKPOINT_CONFIRMATIONS)
+            .is_some_and(|confirmed| {
+                confirmed / super::super::runtime_export::LEGACY_CHECKPOINT_INTERVAL
+                    * super::super::runtime_export::LEGACY_CHECKPOINT_INTERVAL
+                    == statement.checkpoint_height
+            })
+}
 pub struct CheckpointMailbox {
     budget: p2p::Budget,
     incoming: Mutex<Inbox>,
-    outgoing: Mutex<(Vec<Vec<u8>>, Option<p2p::Reservation>)>,
+    outgoing: Mutex<(Vec<Outbound>, Option<p2p::Reservation>)>,
 }
 impl CheckpointMailbox {
     pub fn new(budget: p2p::Budget) -> Self {
@@ -193,7 +215,12 @@ impl CheckpointMailbox {
             .map_err(|_| "checkpoint outgoing budget exhausted")?;
         let bytes = messages
             .iter()
-            .map(|m| m.encode(limits().chain.max_component_bytes))
+            .map(|message| -> Result<Outbound, String> {
+                Ok(Outbound {
+                    bytes: message.encode(limits().chain.max_component_bytes)?,
+                    legacy_compatible: legacy_compatible(message),
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         *self
             .outgoing
@@ -202,13 +229,16 @@ impl CheckpointMailbox {
         Ok(())
     }
     /// The caller reserves a bounded per-peer control phase before cloning.
-    pub fn outgoing(&self) -> Result<Vec<Vec<u8>>, String> {
+    pub fn outgoing(&self, legacy_only: bool) -> Result<Vec<Vec<u8>>, String> {
         Ok(self
             .outgoing
             .lock()
             .map_err(|_| "checkpoint outbox lock poisoned")?
             .0
-            .clone())
+            .iter()
+            .filter(|message| !legacy_only || message.legacy_compatible)
+            .map(|message| message.bytes.clone())
+            .collect())
     }
 }
 
