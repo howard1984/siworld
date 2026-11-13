@@ -76,7 +76,13 @@ impl PreparedCheckpoint {
         }
         let (anchor, authorization, roster) =
             Self::proposal_context(store, &statement, &witness, limits)?;
-        let (snapshot, reservation) = archive.into_snapshot();
+        // The witness governance vector is the only separate dynamic metadata;
+        // roster keys, headers, descriptors, statement and certificate are inline.
+        // Charge capacities rather than encoded lengths, including spare bytes.
+        let retained_metadata = std::mem::size_of::<CertifiedCheckpoint>()
+            .checked_add(witness.governance.capacity())
+            .ok_or("checkpoint retained metadata byte bound overflow")?;
+        let (snapshot, reservation) = archive.into_snapshot(retained_metadata)?;
         let value = Self {
             network: state.network(),
             genesis: engine.genesis().id(),

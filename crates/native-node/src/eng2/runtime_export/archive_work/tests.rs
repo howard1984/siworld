@@ -205,3 +205,66 @@ fn cancellation_and_drop_drain_owned_worker_and_release_shared_budget() {
             .is_err()
     );
 }
+
+#[test]
+fn retained_archive_releases_workspace_for_the_next_validation() {
+    let probe_budget = Budget::new(64 * 1024 * 1024);
+    let probe = fixture(&probe_budget);
+    let workspace = 64 * 1024 * 1024 - probe_budget.available().unwrap();
+    let mut metadata = Vec::with_capacity(8192);
+    metadata.resize(4096, 0u8);
+    assert!(metadata.capacity() > metadata.len());
+    let retained = probe.archive.capacity() + metadata.capacity();
+    drop(probe);
+    let maximum = workspace + retained;
+    let budget = Budget::new(maximum);
+    let work = fixture(&budget);
+    assert!(budget.reserve(workspace).is_err());
+    let validated = work.validate(&AtomicBool::new(false)).unwrap();
+    // A completed validation still owns its decoded state and full workspace.
+    assert_eq!(budget.available().unwrap(), retained);
+    let (snapshot, reservation) = validated.into_snapshot(metadata.capacity()).unwrap();
+    assert_eq!(budget.available().unwrap(), maximum - retained);
+    // Keeping the previous real encoded snapshot no longer retains its expired
+    // validation workspace. A second actual native reconstruction can proceed.
+    let next = fixture(&budget);
+    let validated = next.validate(&AtomicBool::new(false)).unwrap();
+    assert_eq!(validated.snapshot_bytes(), snapshot);
+    assert_eq!(budget.available().unwrap(), 0);
+    drop(validated);
+    assert_eq!(budget.available().unwrap(), maximum - retained);
+    assert!(budget.reserve(maximum - retained + 1).is_err());
+    assert_eq!(snapshot.capacity() + metadata.capacity(), retained);
+    drop((snapshot, metadata, reservation));
+    assert_eq!(budget.available().unwrap(), maximum);
+}
+
+#[test]
+fn retained_archive_failures_release_charges_without_borrowing_live_bytes() {
+    let maximum = 64 * 1024 * 1024;
+    let budget = Budget::new(maximum);
+    let mut work = fixture(&budget);
+    let last = work.archive.len() - 1;
+    work.archive[last] ^= 1;
+    assert!(work.validate(&AtomicBool::new(false)).is_err());
+    assert_eq!(budget.available().unwrap(), maximum);
+    let validated = fixture(&budget).validate(&AtomicBool::new(false)).unwrap();
+    assert!(validated.into_snapshot(usize::MAX).is_err());
+    assert_eq!(budget.available().unwrap(), maximum);
+    let validated = fixture(&budget).validate(&AtomicBool::new(false)).unwrap();
+    assert!(validated.into_snapshot(maximum).is_err());
+    assert_eq!(budget.available().unwrap(), maximum);
+    let mut metadata = Vec::with_capacity(8192);
+    metadata.resize(4096, 0u8);
+    assert!(metadata.capacity() > metadata.len());
+    let validated = fixture(&budget).validate(&AtomicBool::new(false)).unwrap();
+    let (snapshot, mut reservation) = validated.into_snapshot(metadata.capacity()).unwrap();
+    let retained = snapshot.capacity() + metadata.capacity();
+    assert_eq!(budget.available().unwrap(), maximum - retained);
+    assert!(reservation.shrink_to(retained + 1).is_err());
+    assert_eq!(budget.available().unwrap(), maximum - retained);
+    // Spare allocation capacity remains charged even when it is not payload.
+    assert!(budget.reserve(maximum - retained + 1).is_err());
+    drop((snapshot, metadata, reservation));
+    assert_eq!(budget.available().unwrap(), maximum);
+}

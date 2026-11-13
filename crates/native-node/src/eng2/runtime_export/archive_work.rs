@@ -189,8 +189,31 @@ impl ArchiveWork {
     }
 }
 impl ValidatedArchive {
-    pub(super) fn into_snapshot(self) -> (Vec<u8>, Reservation) {
-        (self.archive, self._reservation)
+    pub(super) fn into_snapshot(
+        self,
+        retained_metadata_bytes: usize,
+    ) -> Result<(Vec<u8>, Reservation), String> {
+        let Self {
+            archive,
+            state,
+            _reservation: mut reservation,
+            ..
+        } = self;
+        // Native reconstruction has completed. Release its decoded state before
+        // returning workspace, but keep the encoded snapshot and its metadata
+        // charged for their complete retained lifetime, including Host::latest.
+        drop(state);
+        let Some(retained) = archive.capacity().checked_add(retained_metadata_bytes) else {
+            drop(archive);
+            drop(reservation);
+            return Err("checkpoint retained archive byte bound overflow".into());
+        };
+        if reservation.shrink_to(retained).is_err() {
+            drop(archive);
+            drop(reservation);
+            return Err("checkpoint retained archive exceeds its reservation".into());
+        }
+        Ok((archive, reservation))
     }
     /// Reacquire the original canonical owner before calling this method.
     /// Normal canonical extension preserves an immutable anchor and captured

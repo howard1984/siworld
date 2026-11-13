@@ -141,6 +141,20 @@ pub struct Reservation {
     bytes: usize,
 }
 impl Reservation {
+    /// Return temporary workspace while retaining the charge for live buffers.
+    /// This operation cannot acquire bytes or change the shared maximum.
+    pub(crate) fn shrink_to(&mut self, bytes: usize) -> Result<(), Error> {
+        if bytes > self.bytes {
+            return Err(Error::ResourceExhausted);
+        }
+        let mut usage = self.budget.usage.lock().map_err(|_| Error::Unavailable)?;
+        usage.bytes = usage
+            .bytes
+            .checked_sub(self.bytes - bytes)
+            .ok_or(Error::Unavailable)?;
+        self.bytes = bytes;
+        Ok(())
+    }
     #[cfg(feature = "native-p2p")]
     pub(crate) fn covers(&self, budget: &Budget, bytes: usize) -> bool {
         Arc::ptr_eq(&self.budget, &budget.0) && self.bytes >= bytes
