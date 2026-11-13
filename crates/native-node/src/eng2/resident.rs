@@ -573,12 +573,12 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             .owner
             .lock()
             .map_err(|_| "resident owner lock poisoned")?;
-        let mut host = super::runtime_export::host::Host::open_retained(
+        let mut host = super::runtime_export::host::Host::open_resident(
             &root,
             owner.store(),
             limits(),
             config.checkpoint_key.as_deref(),
-            |height, id| owner.retained_header(height, id),
+            &shared.budget,
         )?;
         if !owner.activities_allowed() {
             host.pause_reorganization_exports()?;
@@ -586,8 +586,6 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         }
         host
     };
-    #[cfg(unix)]
-    checkpoint_host.enable_async_preparation(&shared.budget)?;
     #[cfg(unix)]
     if std::env::var_os("SIWORLD_ENG2_WALLET_EXPORT").is_some_and(|value| value == "1") {
         let owner = shared
@@ -694,54 +692,64 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                         .lock()
                         .map_err(|_| "resident owner lock poisoned")?;
                     if owner.activities_allowed() {
-                        checkpoint_host.reconcile_retained(owner.store(), |height, id| {
-                            owner.retained_header(height, id)
-                        })?;
-                        let incoming = shared.mailbox.drain()?;
-                        let tick = {
-                            let observer = shared
-                                .checkpoint_observer
-                                .lock()
-                                .map_err(|_| "checkpoint observer lock poisoned")?;
-                            checkpoint_host.tick_resident(
-                                owner.store(),
-                                unix_ms()? / 1000,
-                                &incoming.messages,
-                                &shared.network,
-                                &observer,
-                            )
-                        };
-                        match tick {
-                            Ok(tick) => {
-                                shared.mailbox.acknowledge(&incoming)?;
-                                shared.mailbox.publish(&tick.messages())?;
-                                checkpoint_error = None;
-                                checkpoint_tick_reason = None;
-                                if bootstrap_service
-                                    && owner
-                                        .refresh_bootstrap(
-                                            checkpoint_host.latest_checkpoint(),
-                                            &shared.budget,
-                                        )
-                                        .is_err()
-                                {
-                                    checkpoint_error = Some("signed_bootstrap_unavailable");
+                        let restored = checkpoint_host
+                            .reconcile_retained_async(owner.store(), || {
+                                owner.capture_checkpoint_headers()
+                            });
+                        if !matches!(restored, Ok(true)) {
+                            // Restoration failure pauses only advertisements and
+                            // signing; canonical validation and peers keep running.
+                            shared.mailbox.publish(&[])?;
+                            checkpoint_error = Some("checkpoint_retained_restoration_unavailable");
+                            checkpoint_tick_reason = Some("retained_restoration");
+                        } else {
+                            let incoming = shared.mailbox.drain()?;
+                            let tick = {
+                                let observer = shared
+                                    .checkpoint_observer
+                                    .lock()
+                                    .map_err(|_| "checkpoint observer lock poisoned")?;
+                                checkpoint_host.tick_resident(
+                                    owner.store(),
+                                    unix_ms()? / 1000,
+                                    &incoming.messages,
+                                    &shared.network,
+                                    &observer,
+                                )
+                            };
+                            match tick {
+                                Ok(tick) => {
+                                    shared.mailbox.acknowledge(&incoming)?;
+                                    shared.mailbox.publish(&tick.messages())?;
+                                    checkpoint_error = None;
+                                    checkpoint_tick_reason = None;
+                                    if bootstrap_service
+                                        && owner
+                                            .refresh_bootstrap(
+                                                checkpoint_host.latest_checkpoint(),
+                                                &shared.budget,
+                                            )
+                                            .is_err()
+                                    {
+                                        checkpoint_error = Some("signed_bootstrap_unavailable");
+                                    }
+                                }
+                                Err(_) => {
+                                    checkpoint_error =
+                                        Some("checkpoint_tick_rejected_or_unavailable");
+                                    checkpoint_tick_reason = checkpoint_host
+                                        .tick_failure_reason()
+                                        .map(super::runtime_export::host::TickFailureReason::code);
                                 }
                             }
-                            Err(_) => {
-                                checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable");
-                                checkpoint_tick_reason = checkpoint_host
-                                    .tick_failure_reason()
-                                    .map(super::runtime_export::host::TickFailureReason::code);
+                            let head = owner.head()?;
+                            if shared.network.ready_at((head.height, head.id))? {
+                                let _ = checkpoint_host.tick_wallet_export(
+                                    owner.store(),
+                                    unix_ms()? / 1000,
+                                    &shared.budget,
+                                );
                             }
-                        }
-                        let head = owner.head()?;
-                        if shared.network.ready_at((head.height, head.id))? {
-                            let _ = checkpoint_host.tick_wallet_export(
-                                owner.store(),
-                                unix_ms()? / 1000,
-                                &shared.budget,
-                            );
                         }
                     }
                 }

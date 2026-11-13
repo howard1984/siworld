@@ -160,7 +160,41 @@ pub struct BranchStore {
     limits: Limits,
     selection_revision: u64,
 }
+/// A pinned immutable header view for bounded retained-checkpoint inspection.
+pub(crate) struct CheckpointHeaders {
+    transaction: redb::ReadTransaction,
+    network: Hash,
+}
+impl CheckpointHeaders {
+    pub(crate) fn header(&self, height: u64, id: Hash) -> Result<Option<Header>, String> {
+        let table = self
+            .transaction
+            .open_table(HEADERS)
+            .map_err(|_| "captured retained headers unavailable")?;
+        let entry = table
+            .get(id.as_slice())
+            .map_err(|_| "captured retained header lookup failed")?
+            .map(|row| Entry::decode(row.value(), &self.network))
+            .transpose()?;
+        if entry
+            .as_ref()
+            .is_some_and(|entry| entry.header.height != height)
+        {
+            return Err("captured retained header height differs".into());
+        }
+        Ok(entry.map(|entry| entry.header))
+    }
+}
 impl BranchStore {
+    pub(crate) fn capture_checkpoint_headers(&self) -> Result<CheckpointHeaders, String> {
+        Ok(CheckpointHeaders {
+            transaction: self
+                .database
+                .begin_read()
+                .map_err(|_| "retained checkpoint read unavailable")?,
+            network: self.rules.network,
+        })
+    }
     /// In-process cache invalidation only, reset on reopen. It changes after a
     /// committed eligibility mutation, never for duplicate bodies or execution
     /// status upgrades. Selection itself remains a bounded full-header scan.

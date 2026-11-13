@@ -284,6 +284,7 @@ pub(super) fn synthetic_candidate() -> PreparedCheckpoint {
         },
         snapshot: super::super::snapshot::encode_components(&raw, limits()).unwrap(),
         _snapshot_reservation: None,
+        _native_identity: None,
     }
 }
 #[test]

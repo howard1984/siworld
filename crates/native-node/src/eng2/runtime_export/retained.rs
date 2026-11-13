@@ -18,7 +18,7 @@ struct SavedContext {
 /// returned frame and identity is checked before it can establish retirement.
 /// At most 24 old-branch links may precede a canonical common point. A prefix
 /// temporarily below the authorization head is subject to the same bound.
-fn authorization(
+pub(super) fn authorization(
     network: Hash,
     head: u64,
     statement: &Statement,
@@ -129,6 +129,7 @@ pub(super) fn candidate(
         witness,
         snapshot,
         _snapshot_reservation: None,
+        _native_identity: None,
     };
     prepared.check_current(store)?;
     Ok(Restored::Current(prepared))
@@ -176,6 +177,7 @@ pub(super) fn publication(
         witness,
         snapshot,
         _snapshot_reservation: None,
+        _native_identity: None,
     };
     prepared.check_prefix(store)?;
     Ok(Restored::Current(CertifiedCheckpoint {

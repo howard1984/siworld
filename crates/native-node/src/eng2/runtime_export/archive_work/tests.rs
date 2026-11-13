@@ -89,6 +89,8 @@ pub(super) fn fixture(budget: &Budget) -> ArchiveWork {
         suffix: Vec::new(),
         limits: limits(),
         reservation,
+        deferred: None,
+        input_digest: [0; 32],
     }
 }
 fn complete(worker: &mut ArchiveWorker) -> Result<ValidatedArchive, String> {

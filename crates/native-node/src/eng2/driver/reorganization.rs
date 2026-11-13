@@ -190,6 +190,14 @@ impl Driver {
             .retain_body(header, body, policy)
     }
 
+    pub(crate) fn capture_checkpoint_headers(
+        &self,
+    ) -> Result<Option<crate::eng2::branches::CheckpointHeaders>, String> {
+        self.reorganization
+            .as_ref()
+            .map(|state| state.branches.capture_checkpoint_headers())
+            .transpose()
+    }
     pub(super) fn branch_header(&self, id: Hash) -> Result<Option<Header>, String> {
         self.reorganization
             .as_ref()

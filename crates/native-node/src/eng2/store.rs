@@ -82,6 +82,210 @@ pub struct Store {
     #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
     owner_fault: Option<super::owner_fault::Controller>,
 }
+/// An immutable database transaction captured without reading snapshot bodies.
+/// All archive/body allocation and decoding belongs to the existing worker.
+pub(crate) struct CheckpointArchiveRead {
+    transaction: redb::ReadTransaction,
+    network: Hash,
+    head: u64,
+    imported_prefix: u64,
+    policy: super::body::Policy,
+}
+
+#[derive(Clone)]
+pub(crate) struct CheckpointRevision {
+    instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    revision: u64,
+    height: u64,
+    tip: Hash,
+}
+impl CheckpointRevision {
+    pub(crate) fn check(&self, store: &Store) -> Result<(), String> {
+        store.ensure_exportable()?;
+        if !std::sync::Arc::ptr_eq(&self.instance, &store.revision)
+            || self.revision != store.revision.load(std::sync::atomic::Ordering::Acquire)
+            || self.height != store.engine.state().height()
+            || self.tip != store.engine.state().tip()
+        {
+            return Err("checkpoint captured canonical revision changed".into());
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct CheckpointRestoreRead {
+    archive: CheckpointArchiveRead,
+    genesis: Vec<u8>,
+    genesis_id: Hash,
+    rules: Hash,
+    authorization: Option<Header>,
+    roster: Hash,
+    epoch: u64,
+    revision: CheckpointRevision,
+    _context_memory: crate::p2p::Reservation,
+}
+impl CheckpointRestoreRead {
+    pub(crate) fn network(&self) -> Hash {
+        self.archive.network
+    }
+    pub(crate) fn head(&self) -> u64 {
+        self.archive.head
+    }
+    pub(crate) fn genesis_id(&self) -> Hash {
+        self.genesis_id
+    }
+    pub(crate) fn rules(&self) -> Hash {
+        self.rules
+    }
+    pub(crate) fn genesis_bytes(&self) -> &[u8] {
+        &self.genesis
+    }
+    pub(crate) fn authorization(&self) -> Option<&Header> {
+        self.authorization.as_ref()
+    }
+    pub(crate) fn roster(&self) -> Hash {
+        self.roster
+    }
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub(crate) fn revision(&self) -> CheckpointRevision {
+        self.revision.clone()
+    }
+    pub(crate) fn header(&self, height: u64) -> Result<Header, String> {
+        self.archive.compact(height).map(|value| value.0)
+    }
+    pub(crate) fn archive(
+        &self,
+        height: u64,
+        limits: super::snapshot::ImportLimits,
+        budget: &crate::p2p::Budget,
+    ) -> Result<CapturedArchiveBytes, String> {
+        self.archive.read(height, limits, budget)
+    }
+}
+
+pub(crate) struct CapturedArchiveBytes {
+    pub(crate) base: Header,
+    pub(crate) archive: Vec<u8>,
+    pub(crate) suffix: Vec<(Header, Body)>,
+    pub(crate) reservation: crate::p2p::Reservation,
+    pub(crate) input_digest: Hash,
+}
+impl CheckpointArchiveRead {
+    pub(crate) fn compact(&self, height: u64) -> Result<(Header, usize), String> {
+        if height == 0 || height > self.head {
+            return Err("captured checkpoint header is outside the accepted prefix".into());
+        }
+        let table = self
+            .transaction
+            .open_table(INDEX)
+            .map_err(|_| "captured checkpoint index unavailable")?;
+        let row = table
+            .get(height)
+            .map_err(|_| "captured checkpoint index read failed")?
+            .ok_or("captured checkpoint header missing")?;
+        let value = decode_compact(row.value(), self.network)?;
+        if value.0.height != height || value.1 > self.policy.max_body_bytes {
+            return Err("captured checkpoint index context differs".into());
+        }
+        Ok(value)
+    }
+    pub(crate) fn read(
+        &self,
+        height: u64,
+        limits: super::snapshot::ImportLimits,
+        budget: &crate::p2p::Budget,
+    ) -> Result<CapturedArchiveBytes, String> {
+        let table = self
+            .transaction
+            .open_table(ANCHORS)
+            .map_err(|_| "captured checkpoint archive unavailable")?;
+        let lower = height
+            .saturating_sub(crate::eng2::runtime_export::LEGACY_CHECKPOINT_INTERVAL - 1)
+            .max(1);
+        let mut entries = table
+            .range(lower..=height)
+            .map_err(|_| "captured checkpoint archive range unavailable")?;
+        let (key, bytes) = entries
+            .next_back()
+            .ok_or("captured checkpoint archive missing within bounded migration window")?
+            .map_err(|_| "captured checkpoint archive read failed")?;
+        let base_height = key.value();
+        if bytes.value().len() > limits.max_snapshot_bytes {
+            return Err("captured checkpoint archive exceeds byte bound".into());
+        }
+        let base = self.compact(base_height)?.0;
+        let suffix_bytes = (base_height + 1..=height).try_fold(0usize, |total, h| {
+            total
+                .checked_add(self.compact(h)?.1)
+                .ok_or_else(|| "captured checkpoint suffix byte bound overflow".to_owned())
+        })?;
+        let reservation = super::runtime_export::archive_work::ArchiveWork::reserve(
+            bytes.value().len(),
+            suffix_bytes,
+            budget,
+        )?;
+        let mut input = blake3::Hasher::new_derive_key(
+            "siworld eng2 checkpoint captured reconstruction input v1",
+        );
+        input.update(
+            &base
+                .encode()
+                .map_err(|_| "captured archive base header invalid")?,
+        );
+        input.update(&(bytes.value().len() as u64).to_le_bytes());
+        input.update(bytes.value());
+        let archive = bytes.value().to_vec();
+        let blocks = self
+            .transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "captured checkpoint blocks unavailable")?;
+        let mut suffix = Vec::new();
+        suffix
+            .try_reserve_exact((height - base_height) as usize)
+            .map_err(|_| "captured checkpoint suffix allocation failed")?;
+        for h in base_height + 1..=height {
+            if h <= self.imported_prefix {
+                return Err(
+                    "captured checkpoint proof body unavailable before imported prefix".into(),
+                );
+            }
+            let (expected, length) = self.compact(h)?;
+            let row = blocks
+                .get(h)
+                .map_err(|_| "captured checkpoint block read failed")?
+                .ok_or("captured checkpoint block missing")?;
+            let raw = row.value();
+            if raw.len() != HEADER_BYTES + length
+                || raw.get(..HEADER_BYTES)
+                    != Some(
+                        expected
+                            .encode()
+                            .map_err(|_| "captured checkpoint header invalid")?
+                            .as_slice(),
+                    )
+            {
+                return Err("captured checkpoint body differs from accepted index".into());
+            }
+            input.update(&(raw.len() as u64).to_le_bytes());
+            input.update(raw);
+            let body = Body::decode(&raw[HEADER_BYTES..], self.network, h, self.policy)?;
+            if body.commitment(self.policy)? != expected.body_commitment {
+                return Err("captured checkpoint body commitment differs".into());
+            }
+            suffix.push((expected, body));
+        }
+        Ok(CapturedArchiveBytes {
+            base,
+            archive,
+            suffix,
+            reservation,
+            input_digest: *input.finalize().as_bytes(),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyAvailability {
     Unavailable,
@@ -649,9 +853,8 @@ impl Store {
         txn.commit()
             .map_err(|_| "checkpoint archive durable commit failed".into())
     }
-    /// Capture immutable archive and at most 71 accepted native suffix blocks.
-    /// Capture is read-only and reserves shared workspace before copying bytes;
-    /// native reconstruction and proof replay run outside the canonical owner.
+    /// Pin a read-only transaction and compact immutable context only. Large
+    /// archive/body reads, allocation and native validation run in the worker.
     pub fn capture_checkpoint_archive(
         &self,
         height: u64,
@@ -663,50 +866,79 @@ impl Store {
             return Err("invalid checkpoint preparation archive height".into());
         }
         let anchor = self.header(height)?;
-        let txn = self
+        let transaction = self
             .database
             .begin_read()
             .map_err(|_| "checkpoint preparation archive read unavailable")?;
-        let table = txn
-            .open_table(ANCHORS)
-            .map_err(|_| "checkpoint preparation archive table unavailable")?;
-        let lower = height
-            .saturating_sub(crate::eng2::runtime_export::LEGACY_CHECKPOINT_INTERVAL - 1)
-            .max(1);
-        let mut entries = table
-            .range(lower..=height)
-            .map_err(|_| "checkpoint preparation archive range unavailable")?;
-        let (key, bytes) = entries
-            .next_back()
-            .ok_or("checkpoint preparation archive missing within bounded migration window")?
-            .map_err(|_| "checkpoint preparation archive read failed")?;
-        let base_height = key.value();
-        if bytes.value().len() > limits.max_snapshot_bytes {
-            return Err("checkpoint preparation archive exceeds byte bound".into());
-        }
-        let base = self.header(base_height)?;
-        let suffix_bytes = (base_height + 1..=height).try_fold(0usize, |total, h| {
-            total
-                .checked_add(self.block_size(h)?)
-                .ok_or_else(|| "checkpoint suffix byte bound overflow".to_owned())
-        })?;
-        let reservation = super::runtime_export::archive_work::ArchiveWork::reserve(
-            bytes.value().len(),
-            suffix_bytes,
-            budget,
-        )?;
-        let suffix = (base_height + 1..=height)
-            .map(|h| self.block(h))
-            .collect::<Result<Vec<_>, _>>()?;
-        super::runtime_export::archive_work::ArchiveWork::capture(
-            self,
-            anchor,
-            base,
-            bytes.value(),
-            suffix,
-            reservation,
-            limits,
+        let read = CheckpointArchiveRead {
+            transaction,
+            network: self.engine.state().network(),
+            head: self.engine.state().height(),
+            imported_prefix: self.imported_prefix,
+            policy: self.engine.body_policy(),
+        };
+        super::runtime_export::archive_work::ArchiveWork::capture_deferred(
+            self, anchor, read, limits, budget,
         )
+    }
+    pub(crate) fn capture_checkpoint_restore(
+        &self,
+        budget: &crate::p2p::Budget,
+    ) -> Result<CheckpointRestoreRead, String> {
+        self.ensure_exportable()?;
+        let memory = budget
+            .reserve(1024 * 1024 + std::mem::size_of::<CheckpointRestoreRead>())
+            .map_err(|_| "checkpoint restore context budget unavailable")?;
+        let genesis = self.engine.genesis().encode()?;
+        if genesis.len() > 1024 * 1024 {
+            return Err("checkpoint restore genesis exceeds byte bound".into());
+        }
+        let head = self.engine.state().height();
+        let authorization = if head == 0 {
+            None
+        } else {
+            Some(self.header(head)?)
+        };
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|_| "checkpoint restore read transaction unavailable")?;
+        Ok(CheckpointRestoreRead {
+            archive: CheckpointArchiveRead {
+                transaction,
+                network: self.engine.state().network(),
+                head,
+                imported_prefix: self.imported_prefix,
+                policy: self.engine.body_policy(),
+            },
+            genesis,
+            genesis_id: self.engine.genesis().id(),
+            rules: self.engine.genesis().rules_commitment(),
+            authorization,
+            roster: self
+                .engine
+                .state()
+                .governance()
+                .active_roster()
+                .digest(self.engine.state().network()),
+            epoch: self
+                .engine
+                .state()
+                .governance()
+                .active_roster()
+                .epoch_sequence,
+            revision: self.checkpoint_revision()?,
+            _context_memory: memory,
+        })
+    }
+    pub(crate) fn checkpoint_revision(&self) -> Result<CheckpointRevision, String> {
+        self.ensure_exportable()?;
+        Ok(CheckpointRevision {
+            instance: self.revision.clone(),
+            revision: self.revision.load(std::sync::atomic::Ordering::Acquire),
+            height: self.engine.state().height(),
+            tip: self.engine.state().tip(),
+        })
     }
     /// Reconstruct and recheck a prior explicitly archived actual state. The
     /// checkpoint publisher separately requires 24 later confirmations.

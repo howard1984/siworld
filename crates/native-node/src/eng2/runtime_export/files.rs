@@ -3,7 +3,7 @@ use super::*;
 use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, renameat, unlinkat};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
@@ -12,11 +12,11 @@ mod generations;
 mod wallet;
 pub use generations::{WalletPolicy, WalletProgress, WalletPublisher};
 
-struct SavedPublication {
-    certificate: Certificate,
-    witness: AuthorizationWitness,
-    snapshot: Vec<u8>,
-    published: u64,
+pub(super) struct SavedPublication {
+    pub(super) certificate: Certificate,
+    pub(super) witness: AuthorizationWitness,
+    pub(super) snapshot: Vec<u8>,
+    pub(super) published: u64,
 }
 fn publication_name(height: u64) -> String {
     format!("checkpoint-publication-{height:020}.json")
@@ -30,6 +30,7 @@ pub struct PublicExport {
     latest: Option<(u64, Hash, u64)>,
     cached_head: Option<(u64, Hash)>,
     blocks: Vec<Value>,
+    material_generation: std::cell::Cell<u64>,
 }
 impl PublicExport {
     /// The host creates its dedicated directory. All subsequent filesystem
@@ -72,6 +73,7 @@ impl PublicExport {
             latest: None,
             cached_head: None,
             blocks: Vec::new(),
+            material_generation: std::cell::Cell::new(0),
         };
         value.check_root()?;
         value.write_once(
@@ -129,6 +131,44 @@ impl PublicExport {
             .ok_or("eligible checkpoint disappeared")?;
         self.write_once(&name, &encode_candidate(&prepared, limits)?)?;
         Ok(Some(prepared))
+    }
+    pub(super) fn retained_reader(
+        &self,
+        budget: &crate::p2p::Budget,
+    ) -> Result<RetainedReader, String> {
+        self.check_root()?;
+        let memory = budget
+            .reserve(64 * 1024)
+            .map_err(|_| "checkpoint retained reader metadata budget unavailable")?;
+        let mut material =
+            blake3::Hasher::new_derive_key("siworld eng2 checkpoint retained material v1");
+        material.update(&self.network);
+        material.update(&self.genesis);
+        material.update(&self.rules);
+        let root = self
+            .root
+            .metadata()
+            .map_err(|_| "checkpoint retained root metadata unavailable")?;
+        material.update(&root.dev().to_le_bytes());
+        material.update(&root.ino().to_le_bytes());
+        Ok(RetainedReader {
+            export: Self {
+                root: self
+                    .root
+                    .try_clone()
+                    .map_err(|_| "checkpoint retained directory duplicate failed")?,
+                network: self.network,
+                genesis: self.genesis,
+                rules: self.rules,
+                latest: None,
+                cached_head: None,
+                blocks: Vec::new(),
+                material_generation: std::cell::Cell::new(0),
+            },
+            budget: budget.clone(),
+            memory: std::cell::RefCell::new(vec![memory]),
+            material: std::cell::RefCell::new(material),
+        })
     }
     pub fn latest_height(&self) -> Option<u64> {
         self.latest.map(|row| row.0)
@@ -272,6 +312,14 @@ impl PublicExport {
         bytes: &[u8],
         limits: ImportLimits,
     ) -> Result<SavedPublication, String> {
+        self.read_publication_using(bytes, limits, |name, bound| self.read(name, bound))
+    }
+    fn read_publication_using(
+        &self,
+        bytes: &[u8],
+        limits: ImportLimits,
+        mut read: impl FnMut(&str, usize) -> Result<Vec<u8>, String>,
+    ) -> Result<SavedPublication, String> {
         let cursor: Value =
             serde_json::from_slice(bytes).map_err(|_| "checkpoint publication cursor malformed")?;
         const FIELDS: [&str; 14] = [
@@ -311,7 +359,7 @@ impl PublicExport {
         if certificate_name != format!("{}.certificate-eng2.bin", crate::local::hex(&digest)) {
             return Err("checkpoint certificate filename differs from its digest".into());
         }
-        let certificate = self.read(
+        let certificate = read(
             &certificate_name,
             super::super::certificate::CERTIFICATE_BYTES,
         )?;
@@ -330,8 +378,8 @@ impl PublicExport {
         }
         let witness_name = artifact_name(&cursor, "witness_file", ".witness-eng2.bin")?;
         let snapshot_name = artifact_name(&cursor, "snapshot_file", ".snapshot-eng2.bin")?;
-        let witness = self.read(&witness_name, witness_bound(limits)?)?;
-        let snapshot = self.read(&snapshot_name, limits.max_snapshot_bytes)?;
+        let witness = read(&witness_name, witness_bound(limits)?)?;
+        let snapshot = read(&snapshot_name, limits.max_snapshot_bytes)?;
         if witness_name != format!("{}.witness-eng2.bin", blake3::hash(&witness).to_hex())
             || snapshot_name != format!("{}.snapshot-eng2.bin", blake3::hash(&snapshot).to_hex())
             || cursor["snapshot_bytes"].as_u64() != Some(snapshot.len() as u64)
@@ -352,6 +400,13 @@ impl PublicExport {
         })
     }
     fn retained_votes(&self, statement: &Statement) -> Result<Vec<Vote>, String> {
+        self.retained_votes_using(statement, |name, bound| self.read_optional(name, bound))
+    }
+    fn retained_votes_using(
+        &self,
+        statement: &Statement,
+        mut read: impl FnMut(&str, usize) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<Vec<Vote>, String> {
         let encoded = statement
             .encode()
             .map_err(|_| "checkpoint journal statement invalid")?;
@@ -361,7 +416,7 @@ impl PublicExport {
                 "vote-{:020}-{:020}-{slot}.eng2.bin",
                 statement.roster_sequence, statement.checkpoint_height
             );
-            if let Some(bytes) = self.read_optional(
+            if let Some(bytes) = read(
                 &name,
                 encoded.len() + 1 + super::super::certificate::SIGNATURE_BYTES,
             )? {
@@ -428,6 +483,7 @@ impl PublicExport {
     }
     fn remove_cursor(&self, name: &str) -> Result<(), String> {
         if self.read_optional(name, 8192)?.is_some() {
+            self.note_material_write(name)?;
             match unlinkat(&self.root, name, AtFlags::empty()) {
                 Ok(()) | Err(rustix::io::Errno::NOENT) => (),
                 Err(_) => return Err("checkpoint cursor withdrawal failed".into()),
@@ -670,6 +726,43 @@ impl PublicExport {
         self.read_optional(name, limit)?
             .ok_or_else(|| "eng2 public artifact missing".into())
     }
+    pub(super) fn material_generation(&self) -> u64 {
+        self.material_generation.get()
+    }
+    fn note_material_write(&self, name: &str) -> Result<(), String> {
+        if name == "checkpoint-eng2.json"
+            || name.starts_with("candidate-")
+            || name.starts_with("vote-")
+            || name.starts_with("checkpoint-publication-")
+            || name.ends_with(".snapshot-eng2.bin")
+            || name.ends_with(".witness-eng2.bin")
+            || name.ends_with(".certificate-eng2.bin")
+        {
+            self.material_generation.set(
+                self.material_generation
+                    .get()
+                    .checked_add(1)
+                    .ok_or("checkpoint material generation exhausted")?,
+            );
+        }
+        Ok(())
+    }
+    pub(super) fn forget_publication(&mut self) {
+        self.latest = None;
+    }
+    pub(super) fn retire_checked_cursor(
+        &mut self,
+        height: u64,
+        expected: &[u8],
+    ) -> Result<(), String> {
+        if self.read_optional("checkpoint-eng2.json", 8192)?.as_deref() != Some(expected) {
+            return Err("checkpoint retired cursor changed after authentication".into());
+        }
+        self.write_once(&publication_name(height), expected)?;
+        self.remove_cursor("checkpoint-eng2.json")?;
+        self.latest = None;
+        Ok(())
+    }
     fn write_once(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
         if let Some(existing) = self.read_optional(name, bytes.len())? {
             return if existing == bytes {
@@ -678,6 +771,7 @@ impl PublicExport {
                 Err("eng2 immutable public artifact differs".into())
             };
         }
+        self.note_material_write(name)?;
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)
             .map_err(|_| "eng2 immutable temporary identity unavailable")?;
@@ -741,6 +835,7 @@ impl PublicExport {
         Err("eng2 immutable atomic publication is unsupported on this platform".into())
     }
     fn replace(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.note_material_write(name)?;
         // Refuse a symlink, shared file or permission change at the old cursor.
         self.read_optional(name, MAX_PROJECTION_BYTES)?;
         let mut random = [0; 16];
@@ -768,6 +863,161 @@ impl PublicExport {
         result
     }
 }
+/// Read-only operations exposed to the one owned validation worker. No writer,
+/// signer, Store or mutable cursor API is available through this wrapper.
+pub(super) struct RetainedReader {
+    export: PublicExport,
+    budget: crate::p2p::Budget,
+    memory: std::cell::RefCell<Vec<crate::p2p::Reservation>>,
+    material: std::cell::RefCell<blake3::Hasher>,
+}
+impl RetainedReader {
+    fn observe(&self, name: &str, bytes: Option<&[u8]>) {
+        let mut hash = self.material.borrow_mut();
+        hash.update(&(name.len() as u64).to_le_bytes());
+        hash.update(name.as_bytes());
+        hash.update(&[u8::from(bytes.is_some())]);
+        if let Some(bytes) = bytes {
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(blake3::hash(bytes).as_bytes());
+        }
+    }
+    pub(super) fn material_identity(&self) -> Hash {
+        *self.material.borrow().clone().finalize().as_bytes()
+    }
+    pub(super) fn read_optional(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
+        self.export.check_root()?;
+        let descriptor = match openat(
+            &self.export.root,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(value) => value,
+            Err(rustix::io::Errno::NOENT) => {
+                self.observe(name, None);
+                return Ok(None);
+            }
+            Err(_) => return Err("checkpoint retained artifact open failed".into()),
+        };
+        let mut file = fs::File::from(descriptor);
+        let before = file
+            .metadata()
+            .map_err(|_| "checkpoint retained metadata unavailable")?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != rustix::process::geteuid().as_raw()
+            || before.permissions().mode() & 0o777 != 0o600
+            || before.len() > limit as u64
+        {
+            return Err("checkpoint retained artifact type, permissions or bound invalid".into());
+        }
+        let length =
+            usize::try_from(before.len()).map_err(|_| "checkpoint retained length overflow")?;
+        let mut charge = length
+            .checked_mul(2)
+            .ok_or("checkpoint retained workspace overflow")?;
+        if name.ends_with(".witness-eng2.bin") {
+            charge = length
+                .checked_mul(16)
+                .ok_or("checkpoint retained witness workspace overflow")?;
+        } else if name.starts_with("candidate-") {
+            const PREFIX: usize = 6 + super::super::certificate::STATEMENT_BYTES;
+            let mut framing = [0; PREFIX + 16];
+            file.read_exact(&mut framing)
+                .map_err(|_| "checkpoint retained candidate framing unavailable")?;
+            let witness = usize::try_from(u64::from_le_bytes(
+                framing[PREFIX..PREFIX + 8]
+                    .try_into()
+                    .expect("fixed witness length"),
+            ))
+            .map_err(|_| "checkpoint retained witness length overflow")?;
+            charge = charge
+                .checked_add(
+                    witness
+                        .checked_mul(14)
+                        .ok_or("checkpoint retained witness workspace overflow")?,
+                )
+                .ok_or("checkpoint retained workspace overflow")?;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|_| "checkpoint retained candidate rewind failed")?;
+        }
+        let reservation = self
+            .budget
+            .reserve(charge)
+            .map_err(|_| "checkpoint retained artifact budget unavailable")?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| "checkpoint retained allocation failed")?;
+        bytes.resize(length, 0);
+        file.read_exact(&mut bytes)
+            .map_err(|_| "checkpoint retained artifact read failed")?;
+        let mut trailing = [0; 1];
+        if file
+            .read(&mut trailing)
+            .map_err(|_| "checkpoint retained trailing read failed")?
+            != 0
+        {
+            return Err("checkpoint retained artifact length changed".into());
+        }
+        let after = file
+            .metadata()
+            .map_err(|_| "checkpoint retained metadata disappeared")?;
+        if before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.uid() != after.uid()
+            || before.permissions().mode() != after.permissions().mode()
+            || after.nlink() != 1
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err("checkpoint retained artifact changed while reading".into());
+        }
+        if bytes.capacity() > charge {
+            return Err("checkpoint retained capacity exceeds reservation".into());
+        }
+        self.observe(name, Some(&bytes));
+        self.memory.borrow_mut().push(reservation);
+        Ok(Some(bytes))
+    }
+    pub(super) fn read_publication(
+        &self,
+        bytes: &[u8],
+        limits: ImportLimits,
+    ) -> Result<SavedPublication, String> {
+        self.export
+            .read_publication_using(bytes, limits, |name, bound| {
+                self.read_optional(name, bound)?
+                    .ok_or_else(|| "checkpoint retained dependency missing".into())
+            })
+    }
+    pub(super) fn votes(&self, statement: &Statement) -> Result<Vec<Vote>, String> {
+        self.export
+            .retained_votes_using(statement, |name, bound| self.read_optional(name, bound))
+    }
+    pub(super) fn candidate(
+        &self,
+        epoch: u64,
+        height: u64,
+        limits: ImportLimits,
+    ) -> Result<Option<(Statement, AuthorizationWitness, Vec<u8>)>, String> {
+        self.read_optional(&candidate_name(epoch, height), candidate_bound(limits)?)?
+            .map(|bytes| decode_candidate_parts(&bytes, self.export.network, limits))
+            .transpose()
+    }
+    pub(super) fn withdrawn(&self, height: u64) -> Result<Option<Vec<u8>>, String> {
+        self.read_optional(&publication_name(height), 8192)
+    }
+}
+
 fn candidate_name(epoch: u64, height: u64) -> String {
     format!("candidate-{epoch:020}-{height:020}.eng2.bin")
 }

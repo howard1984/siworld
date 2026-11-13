@@ -39,6 +39,8 @@ pub use files::{PublicExport, WalletPolicy, WalletProgress, WalletPublisher};
 pub mod host;
 #[cfg(unix)]
 mod retained;
+#[cfg(unix)]
+mod retained_work;
 
 /// The newest eligible actual archive height; no height is synthesized.
 pub fn eligible_checkpoint(head: u64) -> Option<u64> {
@@ -74,6 +76,7 @@ pub struct PreparedCheckpoint {
     witness: AuthorizationWitness,
     snapshot: Vec<u8>,
     _snapshot_reservation: Option<crate::p2p::Reservation>,
+    _native_identity: Option<archive_work::NativeArchiveIdentity>,
 }
 pub struct CertifiedCheckpoint {
     prepared: PreparedCheckpoint,
@@ -136,6 +139,7 @@ impl PreparedCheckpoint {
             witness,
             snapshot,
             _snapshot_reservation: None,
+            _native_identity: None,
         };
         value.check_prefix(store)?;
         Ok(value)
@@ -252,6 +256,7 @@ impl PreparedCheckpoint {
             witness,
             snapshot,
             _snapshot_reservation: None,
+            _native_identity: None,
         };
         prepared.check_current(store)?;
         Ok(Some(prepared))

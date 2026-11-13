@@ -34,6 +34,43 @@ pub struct ArchiveWork {
     suffix: Vec<(Header, crate::eng2::body::Body)>,
     limits: ImportLimits,
     reservation: Reservation,
+    deferred: Option<(crate::eng2::store::CheckpointArchiveRead, Budget)>,
+    input_digest: Hash,
+}
+
+/// Private evidence for the exact native-validated archive bytes and captured
+/// reconstruction input. It carries no signature or publication authority.
+#[derive(Clone)]
+pub(super) struct NativeArchiveIdentity {
+    anchor: Header,
+    network: Hash,
+    genesis: Hash,
+    rules: Hash,
+    input: Hash,
+    snapshot: Hash,
+    snapshot_bytes: usize,
+    lineage: Arc<()>,
+}
+impl NativeArchiveIdentity {
+    pub(super) fn same_live_validation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lineage, &other.lineage)
+            && self.anchor == other.anchor
+            && self.network == other.network
+            && self.genesis == other.genesis
+            && self.rules == other.rules
+            && self.input == other.input
+            && self.snapshot == other.snapshot
+            && self.snapshot_bytes == other.snapshot_bytes
+    }
+    pub(super) fn matches(&self, work: &ArchiveWork, snapshot: &[u8]) -> Result<bool, String> {
+        Ok(self.anchor == work.context.anchor
+            && self.network == work.context.network
+            && self.genesis == work.context.genesis
+            && self.rules == work.context.rules
+            && self.input == work.native_input_identity()?
+            && self.snapshot_bytes == snapshot.len()
+            && self.snapshot == *blake3::hash(snapshot).as_bytes())
+    }
 }
 
 /// A complete native reconstruction, still requiring current owner checks.
@@ -43,55 +80,126 @@ pub struct ValidatedArchive {
     state: SnapshotState,
     archive: Vec<u8>,
     _reservation: Reservation,
+    identity: NativeArchiveIdentity,
 }
 impl ArchiveWork {
     #[cfg(all(test, feature = "eng2-runtime"))]
     pub(crate) fn component_fixture_for_test(budget: &Budget) -> Self {
         tests::fixture(budget)
     }
-    pub(crate) fn capture(
+    #[cfg(all(test, feature = "eng2-runtime"))]
+    pub(super) fn component_fixture_with_changed_archive_for_test(budget: &Budget) -> Self {
+        let mut work = tests::fixture(budget);
+        work.archive[10] ^= 1;
+        work
+    }
+    pub(crate) fn capture_deferred(
         store: &Store,
         anchor: Header,
-        base: Header,
-        bytes: &[u8],
-        suffix: Vec<(Header, crate::eng2::body::Body)>,
-        reservation: Reservation,
+        read: crate::eng2::store::CheckpointArchiveRead,
         limits: ImportLimits,
+        budget: &Budget,
     ) -> Result<Self, String> {
         store.ensure_exportable()?;
+        // Reserve bounded immutable context before encoding genesis. No large
+        // archive/body bytes are inspected or copied under the canonical owner.
+        let reservation = budget
+            .reserve(1024 * 1024 + std::mem::size_of::<Self>())
+            .map_err(|_| "checkpoint capture context budget unavailable")?;
         let engine = store.engine();
-        let state = engine.state();
-        if bytes.len() > limits.max_snapshot_bytes
-            || anchor.height == 0
-            || anchor.height > state.height()
-            || store.header(anchor.height)? != anchor
-            || base.height > anchor.height
-            || anchor.height - base.height >= super::LEGACY_CHECKPOINT_INTERVAL
-            || suffix.len() as u64 != anchor.height - base.height
-            || store.header(base.height)? != base
-        {
-            return Err("checkpoint archive capture exceeds its height or byte bound".into());
-        }
         let genesis = engine.genesis().encode()?;
         if genesis.len() > 1024 * 1024 {
             return Err("checkpoint archive genesis exceeds byte bound".into());
         }
         Ok(Self {
             context: Context {
-                network: state.network(),
+                network: engine.state().network(),
                 genesis: engine.genesis().id(),
                 rules: engine.genesis().rules_commitment(),
-                anchor,
-                authorization: store.header(state.height())?,
-                roster: state.governance().active_roster().digest(state.network()),
+                anchor: anchor.clone(),
+                authorization: store.header(engine.state().height())?,
+                roster: engine
+                    .state()
+                    .governance()
+                    .active_roster()
+                    .digest(engine.state().network()),
             },
             genesis,
-            archive: bytes.to_vec(),
-            base,
-            suffix,
+            archive: Vec::new(),
+            base: anchor,
+            suffix: Vec::new(),
             limits,
             reservation,
+            deferred: Some((read, budget.clone())),
+            input_digest: [0; 32],
         })
+    }
+    pub(super) fn from_restore_read(
+        read: &crate::eng2::store::CheckpointRestoreRead,
+        height: u64,
+        limits: ImportLimits,
+        budget: &Budget,
+    ) -> Result<Self, String> {
+        let anchor = read.header(height)?;
+        let captured = read.archive(height, limits, budget)?;
+        Ok(Self {
+            context: Context {
+                network: read.network(),
+                genesis: read.genesis_id(),
+                rules: read.rules(),
+                anchor,
+                authorization: read
+                    .authorization()
+                    .ok_or("positive checkpoint authorization missing")?
+                    .clone(),
+                roster: read.roster(),
+            },
+            genesis: read.genesis_bytes().to_vec(),
+            archive: captured.archive,
+            base: captured.base,
+            suffix: captured.suffix,
+            limits,
+            reservation: captured.reservation,
+            deferred: None,
+            input_digest: captured.input_digest,
+        })
+    }
+    fn native_input_identity(&self) -> Result<Hash, String> {
+        let mut hash =
+            blake3::Hasher::new_derive_key("siworld eng2 checkpoint native input identity v1");
+        hash.update(blake3::hash(&self.genesis).as_bytes());
+        hash.update(
+            &self
+                .context
+                .anchor
+                .encode()
+                .map_err(|_| "checkpoint input anchor invalid")?,
+        );
+        for bound in [
+            self.limits.max_snapshot_bytes,
+            self.limits.chain.max_component_bytes,
+            self.limits.chain.max_leaves,
+            self.limits.chain.max_nullifiers,
+        ] {
+            hash.update(&(bound as u64).to_le_bytes());
+        }
+        if self.input_digest == [0; 32] {
+            // Test-local component input has no database capture. It still
+            // binds its complete snapshot bytes and cannot grant Store access.
+            if !self.suffix.is_empty() {
+                return Err("checkpoint captured suffix identity missing".into());
+            }
+            hash.update(
+                &self
+                    .base
+                    .encode()
+                    .map_err(|_| "checkpoint input base invalid")?,
+            );
+            hash.update(blake3::hash(&self.archive).as_bytes());
+        } else {
+            hash.update(&self.input_digest);
+        }
+        Ok(*hash.finalize().as_bytes())
     }
     fn charge(bytes: usize) -> Result<usize, String> {
         bytes
@@ -115,10 +223,19 @@ impl ArchiveWork {
             .reserve(charge)
             .map_err(|_| "checkpoint archive preparation budget unavailable".into())
     }
-    fn validate(self, cancelled: &AtomicBool) -> Result<ValidatedArchive, String> {
+    pub(super) fn validate(mut self, cancelled: &AtomicBool) -> Result<ValidatedArchive, String> {
         if cancelled.load(Ordering::Acquire) {
             return Err("checkpoint archive preparation cancelled".into());
         }
+        if let Some((read, budget)) = self.deferred.take() {
+            let captured = read.read(self.context.anchor.height, self.limits, &budget)?;
+            self.base = captured.base;
+            self.archive = captured.archive;
+            self.suffix = captured.suffix;
+            self.reservation = captured.reservation;
+            self.input_digest = captured.input_digest;
+        }
+        let input_identity = self.native_input_identity()?;
         let genesis = Genesis::decode(&self.genesis)?;
         if genesis.id() != self.context.genesis
             || genesis.rules_commitment() != self.context.rules
@@ -180,15 +297,29 @@ impl ArchiveWork {
         if cancelled.load(Ordering::Acquire) {
             return Err("checkpoint archive preparation cancelled".into());
         }
+        let identity = NativeArchiveIdentity {
+            anchor: self.context.anchor.clone(),
+            network: self.context.network,
+            genesis: self.context.genesis,
+            rules: self.context.rules,
+            input: input_identity,
+            snapshot: *blake3::hash(&archive).as_bytes(),
+            snapshot_bytes: archive.len(),
+            lineage: Arc::new(()),
+        };
         Ok(ValidatedArchive {
             context: self.context,
             state,
             archive,
             _reservation: self.reservation,
+            identity,
         })
     }
 }
 impl ValidatedArchive {
+    pub(super) fn identity(&self) -> NativeArchiveIdentity {
+        self.identity.clone()
+    }
     pub(super) fn into_snapshot(
         self,
         retained_metadata_bytes: usize,
@@ -246,10 +377,16 @@ impl ValidatedArchive {
 
 /// At most one owned full-validation task and one retained result. Stopping or
 /// dropping drains that task; no detached worker can outlive this owner.
+enum WorkerResult {
+    Archive(Box<ValidatedArchive>),
+    #[cfg(unix)]
+    Retained(Box<super::retained_work::ValidatedRetained>),
+}
 #[derive(Default)]
 pub struct ArchiveWorker {
     cancelled: Arc<AtomicBool>,
-    worker: Option<JoinHandle<Result<ValidatedArchive, String>>>,
+    worker: Option<JoinHandle<Result<WorkerResult, String>>>,
+    completed: Option<WorkerResult>,
 }
 impl ArchiveWorker {
     #[cfg(all(test, feature = "eng2-runtime"))]
@@ -261,7 +398,7 @@ impl ArchiveWorker {
         self.start_inner(work, before)
     }
     pub fn is_busy(&self) -> bool {
-        self.worker.is_some()
+        self.worker.is_some() || self.completed.is_some()
     }
     pub fn start(&mut self, work: ArchiveWork) -> Result<(), String> {
         self.start_inner(work, |_| {})
@@ -271,40 +408,98 @@ impl ArchiveWorker {
         work: ArchiveWork,
         before: impl FnOnce(&AtomicBool) + Send + 'static,
     ) -> Result<(), String> {
-        if self.worker.is_some() {
-            return Err("checkpoint archive preparation is already in flight".into());
+        self.spawn(move |cancelled| {
+            before(cancelled);
+            work.validate(cancelled)
+                .map(|value| WorkerResult::Archive(Box::new(value)))
+        })
+    }
+    fn spawn(
+        &mut self,
+        job: impl FnOnce(&AtomicBool) -> Result<WorkerResult, String> + Send + 'static,
+    ) -> Result<(), String> {
+        if self.is_busy() {
+            return Err("checkpoint worker already owns a task or result".into());
         }
         self.cancelled.store(false, Ordering::Release);
         let cancelled = self.cancelled.clone();
         self.worker = Some(
             std::thread::Builder::new()
                 .name("eng2-checkpoint-archive".into())
-                .spawn(move || {
-                    before(&cancelled);
-                    work.validate(&cancelled)
-                })
+                .spawn(move || job(&cancelled))
                 .map_err(|_| "checkpoint archive worker creation failed")?,
         );
         Ok(())
     }
-    pub fn try_complete(&mut self) -> Result<Option<ValidatedArchive>, String> {
-        if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            return Ok(None);
+    #[cfg(unix)]
+    pub(super) fn start_retained(
+        &mut self,
+        work: super::retained_work::RetainedWork,
+    ) -> Result<(), String> {
+        self.spawn(move |cancelled| {
+            work.validate(cancelled)
+                .map(|value| WorkerResult::Retained(Box::new(value)))
+        })
+    }
+    #[cfg(all(test, unix, feature = "eng2-runtime"))]
+    pub(super) fn start_retained_with_test_hook(
+        &mut self,
+        work: super::retained_work::RetainedWork,
+        before: impl FnOnce(&AtomicBool) + Send + 'static,
+    ) -> Result<(), String> {
+        self.spawn(move |cancelled| {
+            before(cancelled);
+            work.validate(cancelled)
+                .map(|value| WorkerResult::Retained(Box::new(value)))
+        })
+    }
+    fn poll(&mut self) -> Result<(), String> {
+        if self.completed.is_some() || !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Ok(());
         }
-        self.worker
-            .take()
-            .ok_or("checkpoint archive worker disappeared")?
-            .join()
-            .map_err(|_| "checkpoint archive worker panicked")?
-            .map(Some)
+        self.completed = Some(
+            self.worker
+                .take()
+                .ok_or("checkpoint worker disappeared")?
+                .join()
+                .map_err(|_| "checkpoint archive worker panicked")??,
+        );
+        Ok(())
+    }
+    pub fn try_complete(&mut self) -> Result<Option<ValidatedArchive>, String> {
+        self.poll()?;
+        match self.completed.take() {
+            Some(WorkerResult::Archive(value)) => Ok(Some(*value)),
+            #[cfg(unix)]
+            Some(value @ WorkerResult::Retained(_)) => {
+                self.completed = Some(value);
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+    #[cfg(unix)]
+    pub(super) fn try_complete_retained(
+        &mut self,
+    ) -> Result<Option<super::retained_work::ValidatedRetained>, String> {
+        self.poll()?;
+        match self.completed.take() {
+            Some(WorkerResult::Retained(value)) => Ok(Some(*value)),
+            Some(value @ WorkerResult::Archive(_)) => {
+                self.completed = Some(value);
+                Ok(None)
+            }
+            None => Ok(None),
+        }
     }
     pub fn cancel(&mut self) {
         self.cancelled.store(true, Ordering::Release);
     }
-    /// Cancellation is checked before and after complete native reconstruction.
-    /// An in-progress native check is drained, never abandoned or interrupted.
+    /// Called only after canonical-owner access has ended. Native work is
+    /// drained rather than interrupted or detached.
     pub fn stop(&mut self) -> Result<(), String> {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancel();
+        self.completed = None;
         if let Some(worker) = self.worker.take() {
             let _ = worker
                 .join()

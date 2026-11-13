@@ -355,3 +355,137 @@ fn withdrawal_preserves_original_publication_time_and_immutable_dependencies() {
             .is_err()
     );
 }
+
+#[test]
+fn retained_reader_inspects_all_actual_material_with_unchanged_length_and_mtime() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-material");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let candidate = synthetic_candidate();
+    let witness = candidate
+        .witness
+        .encode(limits().chain.max_component_bytes)
+        .unwrap();
+    let encoded = encode_candidate(&candidate, limits()).unwrap();
+    let rows = [
+        ("checkpoint-eng2.json", b"cursor-record".to_vec()),
+        (
+            "candidate-00000000000000000000-00000000000000000012.eng2.bin",
+            encoded,
+        ),
+        (
+            "checkpoint-publication-00000000000000000012.json",
+            b"withdrawn-record".to_vec(),
+        ),
+        ("material.certificate-eng2.bin", vec![8; 64]),
+        ("material.witness-eng2.bin", witness),
+        ("material.snapshot-eng2.bin", vec![7; 4096]),
+        (
+            "vote-00000000000000000000-00000000000000000012-0.eng2.bin",
+            vec![0; 64],
+        ),
+        (
+            "vote-00000000000000000000-00000000000000000012-1.eng2.bin",
+            vec![1; 64],
+        ),
+        (
+            "vote-00000000000000000000-00000000000000000012-2.eng2.bin",
+            vec![2; 64],
+        ),
+    ];
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    for (name, bytes) in rows {
+        export.write_once(name, &bytes).unwrap();
+        let path = root.join(name);
+        let metadata = fs::metadata(&path).unwrap();
+        let reader = export.retained_reader(&budget).unwrap();
+        assert_eq!(
+            reader.read_optional(name, bytes.len()).unwrap(),
+            Some(bytes.clone())
+        );
+        let original = reader.material_identity();
+        drop(reader);
+        let mut changed = bytes;
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&path, &changed).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(metadata.accessed().unwrap())
+                    .set_modified(metadata.modified().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            metadata.modified().unwrap()
+        );
+        let reader = export.retained_reader(&budget).unwrap();
+        assert_eq!(
+            reader.read_optional(name, changed.len()).unwrap(),
+            Some(changed)
+        );
+        assert_ne!(reader.material_identity(), original);
+        drop(reader);
+        assert_eq!(budget.available().unwrap(), 64 * 1024 * 1024);
+    }
+    let reader = export.retained_reader(&budget).unwrap();
+    reader.read_optional("absent-vote", 64).unwrap();
+    let absent = reader.material_identity();
+    drop(reader);
+    export.write_once("absent-vote", &[0; 64]).unwrap();
+    let reader = export.retained_reader(&budget).unwrap();
+    reader.read_optional("absent-vote", 64).unwrap();
+    assert_ne!(reader.material_identity(), absent);
+}
+
+#[test]
+fn retained_reader_reserves_before_large_read_and_releases_every_guard() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-budget");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    export
+        .write_once("bounded.snapshot-eng2.bin", &[4; 8192])
+        .unwrap();
+    let budget = crate::p2p::Budget::new(64 * 1024 + 8192);
+    let reader = export.retained_reader(&budget).unwrap();
+    assert_eq!(budget.available().unwrap(), 8192);
+    assert!(
+        reader
+            .read_optional("bounded.snapshot-eng2.bin", 8192)
+            .is_err()
+    );
+    assert_eq!(budget.available().unwrap(), 8192);
+    drop(reader);
+    assert_eq!(budget.available().unwrap(), 64 * 1024 + 8192);
+    let budget = crate::p2p::Budget::new(64 * 1024 + 16384);
+    let reader = export.retained_reader(&budget).unwrap();
+    let bytes = reader
+        .read_optional("bounded.snapshot-eng2.bin", 8192)
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.available().unwrap(), 0);
+    drop(bytes);
+    drop(reader);
+    assert_eq!(budget.available().unwrap(), 64 * 1024 + 16384);
+}
+
+#[test]
+fn material_generation_rejects_same_head_own_writes_and_exhaustion() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("material-generation");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let original = export.material_generation();
+    export.write_once("vote-0.eng2.bin", &[7; 64]).unwrap();
+    assert!(export.material_generation() > original);
+    let unchanged = export.material_generation();
+    export.write_once("vote-0.eng2.bin", &[7; 64]).unwrap();
+    export.write_status(b"{}").unwrap();
+    assert_eq!(export.material_generation(), unchanged);
+    export.material_generation.set(u64::MAX);
+    assert!(export.write_once("vote-1.eng2.bin", &[8; 64]).is_err());
+    assert!(!root.join("vote-1.eng2.bin").exists());
+}

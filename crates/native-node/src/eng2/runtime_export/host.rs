@@ -289,6 +289,7 @@ pub struct Host {
     limits: ImportLimits,
     pending: Option<PreparedCheckpoint>,
     votes: [Option<Vote>; 3],
+    journaled_vote: Option<(Statement, Vote)>,
     latest: Option<CertifiedCheckpoint>,
     last_now: Option<u64>,
     last_exported: Option<(u64, Hash, Option<u64>)>,
@@ -300,6 +301,9 @@ pub struct Host {
     retired_through: Option<u64>,
     retained_head: Option<(u64, Hash)>,
     preparation: Option<ResidentPreparation>,
+    restore_required: bool,
+    retained_ready: bool,
+    last_retained_material: Option<Hash>,
 }
 struct ResidentPreparation {
     budget: crate::p2p::Budget,
@@ -309,6 +313,7 @@ struct ResidentPreparation {
     certificate_only: bool,
     generation: u64,
     request_generation: u64,
+    retained_request: bool,
 }
 impl ResidentPreparation {
     /// Invalidate without joining: the caller may own the canonical Store.
@@ -336,7 +341,11 @@ impl Host {
     /// The accepted, durably published capability only; pending proposals and
     /// votes cannot be exposed as signed bootstrap state.
     pub fn latest_checkpoint(&self) -> Option<&CertifiedCheckpoint> {
-        self.latest.as_ref()
+        if self.restore_required && !self.retained_ready {
+            None
+        } else {
+            self.latest.as_ref()
+        }
     }
     /// Explicit opt-in only. `existing_key=None` creates a nonsigning observer;
     /// a missing or invalid requested key is rejected rather than initialized.
@@ -364,6 +373,7 @@ impl Host {
             limits,
             pending,
             votes: std::array::from_fn(|_| None),
+            journaled_vote: None,
             latest,
             last_now: None,
             last_exported: None,
@@ -375,6 +385,9 @@ impl Host {
             retired_through: None,
             retained_head: None,
             preparation: None,
+            restore_required: false,
+            retained_ready: true,
+            last_retained_material: None,
         })
     }
     /// Open retained local publications without granting an obsolete
@@ -397,6 +410,7 @@ impl Host {
             limits,
             pending: None,
             votes: std::array::from_fn(|_| None),
+            journaled_vote: None,
             latest: None,
             last_now: None,
             last_exported: None,
@@ -408,6 +422,9 @@ impl Host {
             retired_through: None,
             retained_head: None,
             preparation: None,
+            restore_required: false,
+            retained_ready: true,
+            last_retained_material: None,
         };
         value.reconcile_retained(store, retained)?;
         Ok(value)
@@ -561,6 +578,7 @@ impl Host {
     /// Signer journals remain untouched; the resident skips signing ticks until
     /// switching finishes and authenticated readiness has been re-established.
     pub fn pause_reorganization_exports(&mut self) -> Result<(), String> {
+        self.retained_ready = false;
         if let Some(preparation) = &mut self.preparation {
             preparation.invalidate()?;
         }
@@ -592,6 +610,7 @@ impl Host {
             certificate_only: false,
             generation: 0,
             request_generation: 0,
+            retained_request: false,
         });
         Ok(())
     }
@@ -808,6 +827,9 @@ impl Host {
         if !self.wallet_requested {
             return Ok(None);
         }
+        if self.restore_required && !self.retained_ready {
+            return Err("wallet publication waits for retained authentication".into());
+        }
         let result = self
             .wallet
             .as_mut()
@@ -853,7 +875,13 @@ impl Host {
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<Tick, String> {
         self.tick_failure = Some(TickFailureReason::Context);
+        let material_generation = self.export.material_generation();
         let result = self.tick_step(store, now, incoming, readiness);
+        if self.restore_required && material_generation != self.export.material_generation() {
+            // Durable own writes invalidate earlier material observations
+            // synchronously; a later task must inspect the new actual bytes.
+            self.pause_reorganization_exports()?;
+        }
         if result.is_ok() {
             self.tick_failure = None;
         }
@@ -867,6 +895,9 @@ impl Host {
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<Tick, String> {
         store.ensure_exportable()?;
+        if self.restore_required && !self.retained_ready {
+            return Err("checkpoint retained restoration unavailable".into());
+        }
         self.tick_failure = Some(TickFailureReason::InputBounds);
         if incoming.len() > MAX_MESSAGES_PER_TICK
             || now >= (1u64 << 53)
@@ -1125,6 +1156,11 @@ impl Host {
                         self.limits,
                     )
                 })?;
+                if let Some(vote) = &self.votes[slot] {
+                    // Only this successful durable local operation establishes
+                    // journal provenance. Incoming peer votes remain in memory.
+                    self.journaled_vote = Some((pending.statement.clone(), vote.clone()));
+                }
             }
         }
         let available = self
@@ -1268,3 +1304,5 @@ mod readiness_tests;
 mod tests;
 
 mod codec;
+
+mod restoration;
