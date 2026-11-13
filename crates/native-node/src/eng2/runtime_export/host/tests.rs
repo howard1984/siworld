@@ -103,7 +103,17 @@ fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating
         status
     );
     assert!(host.tick(&store, 100_000, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
     assert!(host.tick(&store, 1u64 << 53, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
+    assert!(host.tick(&store, 100_002, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(store.engine().state().tip(), state_before);
     assert!(!fs::read_dir(&root).unwrap().any(|entry| {
         entry
@@ -140,7 +150,15 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         )
         .is_err()
     );
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
     assert!(host.tick(&store, 100_001, &[proposal]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::Proposal)
+    );
     let vote = Incoming::Vote {
         statement: candidate.statement.clone(),
         vote: Box::new(Vote {
@@ -149,6 +167,10 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         }),
     };
     assert!(host.tick(&store, 100_002, &[vote]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::VoteWithoutCandidate)
+    );
     let mut witness = candidate.witness;
     witness.governance = vec![0; limits().chain.max_component_bytes + 1];
     assert!(
@@ -164,6 +186,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     );
     assert_eq!(store.engine().state().height(), 0);
     let result = host.tick(&store, 100_004, &[]).unwrap();
+    assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(result.status.signer_slot, None);
     assert!(result.status.pruning_paused);
     assert!(result.vote.is_none());

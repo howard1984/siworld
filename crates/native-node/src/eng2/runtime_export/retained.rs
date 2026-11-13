@@ -128,6 +128,7 @@ pub(super) fn candidate(
         statement,
         witness,
         snapshot,
+        _snapshot_reservation: None,
     };
     prepared.check_current(store)?;
     Ok(Restored::Current(prepared))
@@ -174,6 +175,7 @@ pub(super) fn publication(
         statement: certificate.statement.clone(),
         witness,
         snapshot,
+        _snapshot_reservation: None,
     };
     prepared.check_prefix(store)?;
     Ok(Restored::Current(CertifiedCheckpoint {

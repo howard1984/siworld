@@ -49,6 +49,16 @@ pub(crate) struct CheckpointReady<'a> {
     _guard: std::sync::MutexGuard<'a, StatusInner>,
 }
 impl NetworkStatus {
+    #[cfg(test)]
+    pub(crate) fn expire_checkpoint_round_for_test(&self, peer: Hash) {
+        self.inner
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut(&peer)
+            .unwrap()
+            .last_round = Some(Instant::now() - Duration::from_secs(31));
+    }
     /// Only independently pinned configuration identities can establish or block
     /// checkpoint readiness. Open miner ingress supplies no reference evidence.
     pub(crate) fn new(checkpoint_references: impl IntoIterator<Item = Hash>) -> Self {
