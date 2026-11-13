@@ -31,12 +31,19 @@ checkpoint-rejection-acceptance = []
 checkpoint-stale-acceptance = []
 # Owner-operated native block/wallet rehearsal. CI must not select this feature.
 eng2-rehearsal = []
+# Explicit isolated proof-verifier executable; does not enable block admission.
+complete-fee-verifier = []
 # Explicit owner-operated resident entry point; excluded from CI build features.
 eng2-runtime = ["native-p2p"]
 
 [[bin]]
 name = "siworld-eng2-genesis"
 path = "src/bin/siworld-eng2-genesis.rs"
+
+[[bin]]
+name = "siworld-fee-verifier"
+path = "src/bin/siworld-fee-verifier.rs"
+required-features = ["complete-fee-verifier"]
 
 [[bin]]
 name = "siworld-eng2-node"

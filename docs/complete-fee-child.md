@@ -74,15 +74,65 @@ public data, reconstructs the statement and rebuilds the existing deterministic
 preprocessing locally. This setup remains a substantial resource operation; no
 fixed-root-only verifier is installed by the adapter.
 
+## Opt-in verifier executable
+
+The `complete-fee-verifier` feature adds only the `siworld-fee-verifier` binary.
+It does not enable the engineering resident, a network listener or block
+admission. Build the target explicitly:
+
+```sh
+cargo build --offline --locked --release --manifest-path crates/native-node/Cargo.toml --features complete-fee-verifier --bin siworld-fee-verifier -j1
+```
+
+The parent pins four public configuration identifiers in this exact order:
+
+```text
+siworld-fee-verifier --network NETWORK --genesis GENESIS --rules RULES --profile PROFILE
+```
+
+Each value must contain exactly 64 lowercase hexadecimal digits and represent
+a nonzero 32-byte identifier. Unknown, repeated, reordered, missing or extra
+arguments and noncanonical values fail before request-file access. These local
+arguments select the expected configuration; they do not authenticate or
+register it. The relation is fixed to CompleteFee and the AIR source identity
+comes from the compiled source closure, never from a request or another option.
+
+The existing `FeeGuard` supplies both paths through its cleared child environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `SIWORLD_FEE_GUARD_REQUEST` | The guard's staged, bounded request file |
+| `SIWORLD_FEE_GUARD_RECEIPT` | The guard's create-only bound receipt file |
+
+Both paths are required, nonempty and distinct. No positional paths, alternate
+configuration file or discovery mode are accepted. The parent remains
+responsible for the private scratch directory and the fixed `ChildCommand`.
+
+The executable calls `TrustedFactory::run_child` once. Its entry point emits no
+diagnostics and suppresses panic diagnostics. The guard redirects the complete child process
+standard output and standard error to null. A
+completed Verified or Rejected receipt returns a successful process exit;
+argument, input, setup, local-configuration or output failure returns a fixed
+failure exit without manufacturing a semantic rejection receipt. The parent
+must inspect the bound receipt rather than infer proof validity from exit status.
+The existing guard owns startup, timeout, output bounds and child cleanup.
+
+Compilation and pure argument/path tests do not establish a successful proof
+verification, installed-executable provenance, process/resource acceptance or
+joint disclosure. The executable grants no canonical admission capability and
+does not activate a protocol, change keys, create a proof or access wallet or
+chain state.
+
 ## Process outcome and admission boundary
 
 `PreparedRequest` borrows the original native-checked input and takes its sole
 fee frame directly from that held body's settlement-proof field. The factory
 accepts no external proof slice, including another proof of the same statement.
-The existing `FeeGuard` stages that request and supervises one child. The factory provides a
-library child entry point that creates no subprocess and emits no logs. A
-platform integration must select and pin a fixed executable and mode; no such
-executable mode is activated here.
+The existing `FeeGuard` stages that request and supervises one child. The factory
+provides a library child entry point that creates no subprocess and emits no
+logs. The opt-in executable above calls that entry point. A platform integration
+must select and pin the exact executable, arguments and environment before use;
+no Engine, Store or resident entry point selects it automatically.
 
 The child emits a Verified or Rejected receipt only after configured statement
 reconstruction and exact verifier-identity comparison. Invalid proof bodies and
