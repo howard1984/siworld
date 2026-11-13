@@ -17,13 +17,56 @@ use super::*;
 use crate::producer::MiningSettings;
 mod request;
 
+fn below_rehearsal_ceiling(
+    directory: &Path,
+    shared: &Shared,
+    required: bool,
+) -> Result<bool, String> {
+    #[cfg(feature = "eng2-rehearsal")]
+    {
+        let owner = shared
+            .owner
+            .lock()
+            .map_err(|_| "resident owner lock poisoned")?;
+        let ceiling = crate::eng2::rehearsal::partition::production_ceiling(
+            directory,
+            owner.engine().genesis(),
+        )?;
+        if required && ceiling.is_none() {
+            return Err("partition production budget disappeared".into());
+        }
+        Ok(ceiling.is_none_or(|maximum| owner.engine().state().height() < maximum))
+    }
+    #[cfg(not(feature = "eng2-rehearsal"))]
+    {
+        let _ = (directory, shared, required);
+        Ok(true)
+    }
+}
+
 fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> Result<(), String> {
     let _charge = shared
         .budget
         .reserve(256 * 1024 * 1024)
         .map_err(|_| "resident production budget unavailable")?;
     let prover = NativeProver::new()?;
+    #[cfg(feature = "eng2-rehearsal")]
+    let ceiling_required = {
+        let owner = shared
+            .owner
+            .lock()
+            .map_err(|_| "resident owner lock poisoned")?;
+        crate::eng2::rehearsal::partition::production_ceiling(directory, owner.engine().genesis())?
+            .is_some()
+    };
+    #[cfg(not(feature = "eng2-rehearsal"))]
+    let ceiling_required = false;
     while !shared.cancel.is_cancelled() {
+        if !below_rehearsal_ceiling(directory, shared, ceiling_required)? {
+            shared.phase("rehearsal_paused")?;
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         if !shared.mining_ready()? {
             shared.phase("networking")?;
             std::thread::sleep(Duration::from_millis(100));
@@ -151,7 +194,10 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         };
         shared.phase("mining")?;
         loop {
-            if shared.cancel.is_cancelled() || !shared.mining_ready()? {
+            if shared.cancel.is_cancelled()
+                || !shared.mining_ready()?
+                || !below_rehearsal_ceiling(directory, shared, ceiling_required)?
+            {
                 break;
             }
             let current_template = {
@@ -191,6 +237,24 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                             .owner
                             .lock()
                             .map_err(|_| "resident owner lock poisoned")?;
+                        #[cfg(feature = "eng2-rehearsal")]
+                        {
+                            let ceiling = crate::eng2::rehearsal::partition::production_ceiling(
+                                directory,
+                                owner.engine().genesis(),
+                            )?;
+                            if ceiling_required && ceiling.is_none() {
+                                return Err("partition production budget disappeared".into());
+                            }
+                            if ceiling
+                                .is_some_and(|maximum| owner.engine().state().height() >= maximum)
+                            {
+                                if submission.is_some() {
+                                    submission.fail("rehearsal_production_paused");
+                                }
+                                break;
+                            }
+                        }
                         if shared.checkpoint_conflict()? {
                             if submission.is_some() {
                                 submission.fail("checkpoint_current_quorum_conflict");

@@ -11,6 +11,57 @@ fn run() -> Result<(), String> {
         return Err("native rehearsal execution requires an owner-operated environment".into());
     }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 3 && args[0] == "--partition-init" && args[2] == "--json" {
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::initialize(std::path::Path::new(
+                &args[1]
+            ))?
+        );
+        return Ok(());
+    }
+    if args.len() == 5 && args[0] == "--partition-node" && args[4] == "--json" {
+        let index = args[3]
+            .to_str()
+            .ok_or("invalid partition reward index")?
+            .parse()
+            .map_err(|_| "invalid partition reward index")?;
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::initialize_node(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                index
+            )?
+        );
+        return Ok(());
+    }
+    if args.len() == 4 && args[0] == "--partition-height" && args[3] == "--json" {
+        let height = args[2]
+            .to_str()
+            .ok_or("invalid partition height")?
+            .parse()
+            .map_err(|_| "invalid partition height")?;
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::set_production_ceiling(
+                std::path::Path::new(&args[1]),
+                height
+            )?
+        );
+        return Ok(());
+    }
+
+    if args.len() == 4 && args[0] == "--partition-audit" && args[3] == "--json" {
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::audit(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2])
+            )?
+        );
+        return Ok(());
+    }
     if args.len() == 4 && args[0] == "--check-continuation" && args[3] == "--json" {
         println!(
             "{}",
@@ -44,7 +95,7 @@ fn run() -> Result<(), String> {
         || args[3] != "--blocks"
         || args[5] != "--json"
     {
-        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json".into());
+        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json".into());
     }
     let blocks = args[4]
         .to_str()

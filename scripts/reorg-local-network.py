@@ -239,12 +239,19 @@ def summary(values):
 
 def calibrated_time(clocks, node, timestamp):
     clock = clocks.get(node)
-    if clock is None:
+    if clock is None or clock == []:
         return None, None, "clock_calibration_missing"
-    corrected = timestamp - clock["offset_ms"]
-    if abs(corrected - clock["calibrated_unix_ms"]) > MAX_CLOCK_AGE_MS:
+    candidates = clock if isinstance(clock, list) else [clock]
+    qualified = []
+    for sample in candidates:
+        corrected = timestamp - sample["offset_ms"]
+        distance = abs(corrected - sample["calibrated_unix_ms"])
+        if distance <= MAX_CLOCK_AGE_MS:
+            qualified.append((distance, corrected, sample["uncertainty_ms"]))
+    if not qualified:
         return None, None, "clock_calibration_stale"
-    return corrected, clock["uncertainty_ms"], None
+    _, corrected, uncertainty = min(qualified)
+    return corrected, uncertainty, None
 
 
 def propagation(plan, samples):
@@ -258,11 +265,14 @@ def propagation(plan, samples):
     clocks = samples.get("clocks", {})
     require(isinstance(clocks, dict) and set(clocks) <= set(runs), "clock_node_rejected")
     for node, clock in clocks.items():
-        require(isinstance(clock, dict), "clock_record_required")
-        require(clock.get("run_id") == runs[node], "clock_run_mismatch")
-        milliseconds(clock["offset_ms"], signed=True)
-        require(milliseconds(clock["uncertainty_ms"]) <= 86400000, "clock_uncertainty_rejected")
-        milliseconds(clock["calibrated_unix_ms"])
+        records = clock if isinstance(clock, list) else [clock]
+        require(0 < len(records) <= 1000, "bounded_clock_history_required")
+        for record in records:
+            require(isinstance(record, dict), "clock_record_required")
+            require(record.get("run_id") == runs[node], "clock_run_mismatch")
+            milliseconds(record["offset_ms"], signed=True)
+            require(milliseconds(record["uncertainty_ms"]) <= 86400000, "clock_uncertainty_rejected")
+            milliseconds(record["calibrated_unix_ms"])
     blocks = samples.get("blocks")
     require(isinstance(blocks, list) and len(blocks) <= MAX_PROPAGATION_BLOCKS and
             len(blocks) * len(runs) <= MAX_ACCEPTANCE_EVENTS, "event_block_limit")

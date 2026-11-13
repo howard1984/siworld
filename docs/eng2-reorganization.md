@@ -36,3 +36,41 @@ The resident reports reorganization depth and ancestor. Depth above six or the f
 ## Qualification limits
 
 Offline modules and explicit owner-operated tests are separate from deployment and multi-miner qualification. Existing old-profile proofs can test complete native execution without generating new proofs, but they do not qualify a new proof profile. Full depth coverage, fault injection across nodes, state and wallet reconciliation, propagation measurements and a continuous 12-hour multi-miner run remain separate acceptance gates. Hardware recommendations do not substitute for these measurements.
+
+## Isolated native branch production
+
+The owner-local `eng2-rehearsal` build provides explicit setup commands for
+fresh competing branches. `--partition-init NEW_CAMPAIGN --json` creates a
+private synthetic seed and minimum-difficulty genesis. `--partition-node
+CAMPAIGN NEW_NODE INDEX --json` creates an independently authenticated empty
+store and distinct reward destination beneath that campaign. Neither command
+starts a process, connects to a peer, or imports existing chain data.
+
+The rehearsal and runtime features together support `--partition-height NODE
+HEIGHT --json` through the rehearsal executable. This selects a local production
+ceiling from zero through 96. New nodes start at zero. The resident retains its
+ordinary authenticated peer-readiness checks, validates incoming blocks and
+continues networking when production reaches the ceiling. The ceiling is checked
+before proof work, nonce-search slices and durable block commit. Invalid or
+removed controls fail closed after a bounded campaign has started. Consensus
+rules and proof profiles are unchanged; the control requires a fixture genesis,
+maximum target and zero configured PoW iterations. Ordinary runtime builds do
+not compile this control.
+
+Partition qualification must record the exact source and binary hashes, the
+common ancestor, both independently produced branches, transport fault schedule,
+and per-block native execution and durable acceptance. Use the loopback relay
+operator separately to create and heal partitions. A head comparison alone does
+not establish full-state or wallet equivalence. The setup commands do not grant
+G1 or G2 qualification and must not be used to reinitialize an existing network.
+
+After an owned synthetic node stops, `--partition-audit NODE NEW_OUTPUT --json`
+acquires its service lease and opens the canonical database read-only. It
+independently verifies every retained native block, compares the resulting tip
+and execution commitment with the durable head, and exports exact public block
+frames. The manifest records per-block parent, cumulative work, execution root
+and all eleven canonical state-component hashes. It does not scan a wallet or
+claim G1/G2 acceptance. The command rejects nonfixture controls, imported or
+missing proof history, more than 96 blocks, an existing output directory and a
+node whose resident still holds the lease. The source canonical database and
+index are not rewritten by this audit.

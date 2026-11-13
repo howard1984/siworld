@@ -145,8 +145,10 @@ and local event-count limits are rejected. Plans contain at most 64 nodes;
 expected node/block pairs and acceptance records are each bounded by 50000,
 with at most 10000 blocks and a 1 MiB input document.
 
-The `clocks` object maps node identifiers to `run_id`, `offset_ms`,
-`uncertainty_ms` and `calibrated_unix_ms`. The offset convention is local
+The `clocks` object maps node identifiers to a sample containing `run_id`,
+`offset_ms`, `uncertainty_ms` and `calibrated_unix_ms`, or a bounded history of
+at most 1000 such samples. The nearest nonstale valid sample is selected for
+each event. The offset convention is local
 clock minus reference clock: subtract the offset before comparing events.
 The accepted-minus-produced point estimate is accompanied by conservative
 lower and upper bounds using the sum of both clock uncertainties. A
@@ -192,3 +194,73 @@ and `fault_injected: false`. PID reuse protection, an owned child-process
 handle, named native boundary rendezvous, and authorized fault execution
 remain prerequisites for the later isolated campaign. A matching status
 snapshot or supplied start token alone cannot authorize killing a process.
+
+
+## Direct-child rehearsal controller
+
+`scripts/reorg-campaign.py` provides `topology`, `partition`, `heal` and
+`run-node`. It accepts only the isolated run marker, frozen private executable
+with mode 0500 and matching SHA-256, exact argument digest, owned directories,
+and literal loopback topology from the plan. Partition controls are atomically
+replaced individually; a change across several relays is not atomic. A direct
+peer that bypasses the declared relays is rejected.
+
+The controller holds the actual `Popen` object and a new process group. It does
+not adopt PIDs or existing services. The default `status` mode validates a fresh
+status PID/network/genesis and the matching run receipt's binary and configuration
+digests. A restart must observe a new actual run identifier before returning.
+Status observations establish neither production/acceptance events nor exact
+transaction-boundary faults. Read-only database audit requires the owned node to
+stop normally first. `stop_native` invokes the frozen native `stop` command with
+the directory and exact run identifier and waits for its held child to exit;
+forced termination cannot substitute for this audit prerequisite.
+
+The optional `ipc` mode requires explicit native support for an inherited
+socketpair, authenticated hello, ordered events, bounded clock replies, and
+named boundary park/resume. Frames are limited to 16384 bytes and an absolute
+five-second partial-frame deadline. The control token is ephemeral and excluded
+from recorded events. The supported names cover restore/append before commit,
+after commit, after publication and after capture, plus replacement prevalidation
+and branch archive commit. A fault requires the exact armed boundary, height,
+run and owned process; the controller then kills and reaps only that owned group.
+A synthetic implementation of this protocol does not qualify a native boundary.
+
+Child stdout, sanitized events and resource observations remain in the private
+run directory. A resource guard samples owned-group RSS, all output bytes,
+host disk, pressure-based available memory and monotonic progress. It does not
+provide operating-system hard RSS limits. macOS observations preserve both
+`vm_stat` and `memory_pressure -Q`; available bytes use the pressure-reported
+free percentage and physical memory. Free, speculative and inactive pages are
+not simply added together. Linux uses kernel `MemAvailable`. A missing or denied
+sample stops rather than treating memory or RSS as zero.
+
+For the bounded depth campaign, startup requires at least 96 GiB free disk and
+8 GiB pressure-based available memory. Stop below 32 GiB free disk or 8 GiB
+available memory, above 16 GiB output per depth or 64 GiB for the campaign, or
+above 12 GiB aggregate sampled RSS. The two active producer groups may use
+4 GiB each; the paused third producer and each nonmining service may use 1 GiB
+each. Each miner has Rayon configured to four workers and composition hiding
+to two; these settings do not describe the total thread count. Startup is
+limited to 120 seconds, no-progress time to 180 seconds, each depth to
+1800 seconds and the six-depth sequence to 10800 seconds. Sampling failure,
+a native error or incomplete owned-group cleanup stops the sequence. No automatic
+retry or budget increase is permitted. `run-node` is a bounded single-depth
+observation command, not the 12-hour continuous qualification runner.
+
+Checkpoint peer pins use the native public-identity interface. Write the target
+node's `identity-public` JSON, containing exactly `version`, `fingerprint` and
+`descriptor`, to a private campaign file, then pass that JSON and fingerprint to
+`peer-pin` with the expected genesis. A raw descriptor binary or a larger setup
+result is not accepted as a peer-pin file. Peer configuration must refer to the
+same initialized target identity; never copy a production identity into the run.
+
+Before healing a partition, stop owned nodes normally and export both canonical
+branches with the native read-only audit. Preserve raw frames, manifests,
+component hashes, ancestry and cumulative work before the losing branch can be
+removed from canonical indices. Restart the same directories at the fixed
+production caps, heal relays, stop normally again, and independently audit all
+resulting states. A 25-block protection case expects manual recovery, stopped
+production/signing and an alert; it must not be scored as failed merely because
+it deliberately does not switch or converge. These material-production runs do
+not substitute for the final candidate's full-state, boundary-crash or continuous
+convergence qualification.

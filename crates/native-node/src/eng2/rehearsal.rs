@@ -37,6 +37,7 @@ use std::{
 use zeroize::{Zeroize, Zeroizing};
 
 mod continuation;
+pub mod partition;
 pub use continuation::{check_continuation, continue_run};
 
 const PAYMENT_HEIGHT: u64 = 26;
