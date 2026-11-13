@@ -16,6 +16,9 @@ const SPEND_UNSIGNED_BYTES: usize =
 const SIGNED_BYTES: usize = ENCODED_BYTES - crate::fund_spend::SIGNATURE_BYTES;
 const MAGIC: &[u8; 4] = b"SW2F";
 
+mod windowed;
+pub use windowed::WindowedFundClaim;
+
 /// All fields, including the single payment's encapsulation coins, are public.
 /// The `spend.signature` authenticates this format, not the V1 spend message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,17 +135,29 @@ impl AuthorizedFundClaim {
         {
             return Err("public fund claim block context differs".into());
         }
+        Self::verify_authenticated(
+            claim,
+            config,
+            frozen,
+            height,
+            &claim.signing_message(),
+            SIGNATURE_CONTEXT,
+        )
+    }
+    fn verify_authenticated(
+        claim: &PublicFundClaim,
+        config: &Config,
+        frozen: &GovernanceState,
+        height: u64,
+        message: &[u8],
+        context: &[u8],
+    ) -> Result<Self, String> {
         let spend = &claim.spend;
         let key = config
             .fund_verifying_keys
             .get(usize::from(spend.account))
             .ok_or("fund member has no immutable claim authority")?;
-        let note = spend.verify_signed_message(
-            config.network,
-            key,
-            &claim.signing_message(),
-            SIGNATURE_CONTEXT,
-        )?;
+        let note = spend.verify_signed_message(config.network, key, message, context)?;
         let destination = frozen.active_fund_destination(spend.account)?;
         let commitment = native::multi_asset::Hasher::new().note_cm(&note);
         let payment = PaymentCiphertext {
@@ -315,6 +330,140 @@ mod tests {
     }
     fn signed(network: Hash, destination: &PaymentAddress) -> PublicFundClaim {
         signed_with_context(network, destination, EncryptionContext::new(network))
+    }
+
+    fn signed_window(network: Hash, destination: &PaymentAddress) -> WindowedFundClaim {
+        let mut result = WindowedFundClaim {
+            claim: signed_at(
+                network,
+                destination,
+                EncryptionContext::new(network),
+                1,
+                0,
+                17,
+            ),
+            valid_until: 288,
+        };
+        result.claim.spend.signature = *ml_dsa_65::sign(
+            &ml_dsa_65::generate_key_pair([83; 32]).signing_key,
+            &result.signing_message().unwrap(),
+            WindowedFundClaim::signature_context(),
+            [21; 32],
+        )
+        .unwrap()
+        .as_ref();
+        result
+    }
+
+    #[test]
+    fn windowed_claim_uses_unchanged_payload_through_288_inclusive_heights() {
+        let network = [1; 32];
+        let destination = address(network, 40);
+        let config = Config::development(network, 0).unwrap();
+        let claim = signed_window(network, &destination);
+        let bytes = claim.encode().unwrap();
+        assert_eq!(WindowedFundClaim::decode(&bytes).unwrap(), claim);
+        assert!(PublicFundClaim::decode(&bytes).is_err());
+        assert!(WindowedFundClaim::decode(&claim.claim.encode()).is_err());
+        let mut state = genesis_governance(network, destination);
+        for height in 1..=289 {
+            state.apply_block(height, &[]).unwrap();
+            if [1, 2, 287, 288].contains(&height) {
+                let authority =
+                    AuthorizedFundClaim::verify_windowed(&claim, &config, &state, height).unwrap();
+                assert_eq!(authority.height(), height);
+                assert_eq!(authority.amount(), 17);
+            }
+        }
+        assert!(AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 289).is_err());
+        assert_eq!(claim.encode().unwrap(), bytes);
+        assert!(AuthorizedFundClaim::verify(&claim.claim, &config, &state, 289).is_err());
+    }
+
+    #[test]
+    fn windowed_claim_authenticates_interval_and_current_destination() {
+        let network = [1; 32];
+        let destination = address(network, 40);
+        let config = Config::development(network, 0).unwrap();
+        let claim = signed_window(network, &destination);
+        let state = governance(network, destination);
+        let mut changed_end = claim.clone();
+        changed_end.valid_until = 289;
+        assert!(AuthorizedFundClaim::verify_windowed(&changed_end, &config, &state, 1).is_err());
+        let mut changed_start = claim.clone();
+        changed_start.claim.height = 2;
+        changed_start.valid_until = 289;
+        let mut next = state.clone();
+        next.apply_block(2, &[]).unwrap();
+        assert!(AuthorizedFundClaim::verify_windowed(&changed_start, &config, &next, 2).is_err());
+        let other_destination = governance(network, address(network, 41));
+        assert!(
+            AuthorizedFundClaim::verify_windowed(&claim, &config, &other_destination, 1).is_err()
+        );
+        assert!(AuthorizedFundClaim::verify(&claim.claim, &config, &state, 1).is_err());
+        let legacy = signed(network, &address(network, 40));
+        assert!(AuthorizedFundClaim::verify(&legacy, &config, &state, 1).is_ok());
+        let mut wrongly_reused_legacy = claim.clone();
+        wrongly_reused_legacy.claim = legacy;
+        assert!(
+            AuthorizedFundClaim::verify_windowed(&wrongly_reused_legacy, &config, &state, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windowed_claim_rejects_short_zero_overflow_and_noncanonical_windows() {
+        let mut claim = signed_window([1; 32], &address([1; 32], 40));
+        let bytes = claim.encode().unwrap();
+        claim.valid_until = 287;
+        assert!(claim.encode().is_err());
+        claim.claim.height = 0;
+        claim.valid_until = 288;
+        assert!(claim.encode().is_err());
+        claim.claim.height = u64::MAX - 286;
+        claim.valid_until = u64::MAX;
+        assert!(claim.encode().is_err());
+        claim.claim.height = u64::MAX - 287;
+        assert!(claim.encode().is_ok());
+        let mut short = bytes.clone();
+        short[46..54].copy_from_slice(&287u64.to_le_bytes());
+        assert!(WindowedFundClaim::decode(&short).is_err());
+        assert!(WindowedFundClaim::decode(&bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(WindowedFundClaim::decode(&trailing).is_err());
+    }
+
+    #[test]
+    fn windowed_claim_debit_at_last_height_rejects_replay_atomically() {
+        let network = [1; 32];
+        let destination = address(network, 40);
+        let config = Config::development(network, 0).unwrap();
+        let claim = signed_window(network, &destination);
+        let mut state = genesis_governance(network, destination);
+        let mut ledger =
+            crate::eng2_fund::FundLedger::new(network, config.fund_allocation.clone().unwrap())
+                .unwrap();
+        for height in 1..=288 {
+            state.apply_block(height, &[]).unwrap();
+            ledger
+                .advance(height, if height == 1 { 1_000_000 } else { 0 })
+                .unwrap();
+        }
+        let output = AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 288)
+            .unwrap()
+            .debit(&mut ledger)
+            .unwrap();
+        assert_eq!(output.height(), 288);
+        assert_eq!(ledger.balance(0).unwrap().spent, 17);
+        let after_first_debit = ledger.clone();
+        assert!(
+            AuthorizedFundClaim::verify_windowed(&claim, &config, &state, 288)
+                .unwrap()
+                .debit(&mut ledger)
+                .is_err()
+        );
+        assert_eq!(ledger, after_first_debit);
     }
 
     fn signed_governance(

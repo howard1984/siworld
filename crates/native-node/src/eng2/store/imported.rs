@@ -212,10 +212,14 @@ impl VerifiedImport {
         let genesis = Genesis::decode(&encoded)?;
         let limits = self.engine.limits();
         let mut store = Store::create(&candidate, genesis, limits)?;
-        let transaction = store
+        let mut transaction = store
             .database
             .begin_write()
             .map_err(|_| "import candidate transaction unavailable")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|_| "import candidate durability unavailable")?;
+        transaction.set_quick_repair(true);
         let mut digest = [0; 32];
         for (i, row) in self.receipts.iter().enumerate() {
             check()?;

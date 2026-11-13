@@ -237,6 +237,9 @@ pub struct WalletPublisher {
     last_now: Option<u64>,
 }
 impl WalletPublisher {
+    pub fn invalidate_advertisement(&mut self) {
+        self.published = None;
+    }
     pub fn open(
         export: &PublicExport,
         store: &Store,

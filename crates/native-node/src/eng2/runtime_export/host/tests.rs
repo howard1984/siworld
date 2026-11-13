@@ -210,3 +210,116 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
     assert_eq!(host.wallet_export_state(), Some(false));
     assert!(host.tick(&store, 1001, &[]).is_ok());
 }
+
+#[test]
+fn reorganization_withdraws_wallet_cursor_and_republishes_same_complete_head() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-pause");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    assert!(
+        host.tick_wallet_export(&store, 1000, &budget)
+            .unwrap()
+            .unwrap()
+            .published
+    );
+    assert!(root.join("wallet-head.json").exists());
+    host.pause_reorganization_exports().unwrap();
+    assert!(!root.join("wallet-head.json").exists());
+    assert_eq!(host.wallet_export_state(), Some(true));
+    host.pause_reorganization_exports().unwrap();
+    assert!(
+        host.tick_wallet_export(&store, 1001, &budget)
+            .unwrap()
+            .unwrap()
+            .published
+    );
+    assert!(root.join("wallet-head.json").exists());
+    assert_eq!(host.wallet_export_state(), Some(false));
+}
+
+#[test]
+fn retained_open_keeps_malformed_records_fail_closed() {
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("retained-open");
+    let mut host = Host::open_retained(&root, &store, limits(), None, |_, _| {
+        panic!("empty actual genesis has no retained checkpoint")
+    })
+    .unwrap();
+    host.reconcile_retained(&store, |_, _| panic!("unchanged head is cached"))
+        .unwrap();
+    assert!(host.latest_checkpoint().is_none());
+    drop(host);
+    let path = root.join("checkpoint-eng2.json");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"{}").unwrap();
+    file.sync_all().unwrap();
+    assert!(Host::open(&root, &store, limits(), None).is_err());
+    assert!(Host::open_retained(&root, &store, limits(), None, |_, _| Ok(None)).is_err());
+    assert_eq!(fs::read(path).unwrap(), b"{}");
+}
+
+#[test]
+fn ancestor_barrier_retires_later_authorizations_and_preserves_earlier_ones() {
+    // Injected trusted synthetic capabilities exercise barrier behavior only.
+    // They are never accepted by Store or offered as native checkpoint evidence.
+    fn checkpoint() -> CertifiedCheckpoint {
+        let prepared = synthetic_candidate();
+        let message = prepared.statement.encode().unwrap();
+        let vote = |slot: u8, seed: u8| Vote {
+            slot,
+            signature: *ml_dsa_65::sign(
+                &ml_dsa_65::generate_key_pair([seed; 32]).signing_key,
+                &message,
+                Statement::signing_context(),
+                [42; 32],
+            )
+            .unwrap()
+            .as_ref(),
+        };
+        let certificate = Certificate {
+            statement: prepared.statement.clone(),
+            votes: [vote(0, 3), vote(1, 4)],
+        };
+        CertifiedCheckpoint {
+            prepared,
+            certificate,
+            published: 100_000,
+        }
+    }
+    let directory = Directory::new();
+    let store = directory.store();
+    let retained_root = directory.private("earlier-authorization");
+    let mut kept = Host::open(&retained_root, &store, limits(), None).unwrap();
+    kept.latest = Some(checkpoint());
+    kept.pending = Some(synthetic_candidate());
+    kept.pause_reorganization_exports_at(96).unwrap();
+    assert_eq!(kept.latest_checkpoint().unwrap().published, 100_000);
+    assert!(kept.pending.is_some());
+    assert_eq!(kept.retired_through, None);
+    let root = directory.private("later-authorization");
+    let mut retired = Host::open(&root, &store, limits(), None).unwrap();
+    retired.latest = Some(checkpoint());
+    retired.pending = Some(synthetic_candidate());
+    retired.pause_reorganization_exports_at(95).unwrap();
+    assert!(retired.latest_checkpoint().is_none());
+    assert!(retired.pending.is_none());
+    assert!(retired.votes.iter().all(Option::is_none));
+    assert!(retired.anchor_retired(72));
+    assert!(!retired.anchor_retired(84));
+    let publication = root.join("checkpoint-publication-00000000000000000072.json");
+    let original = fs::read(&publication).unwrap();
+    let value: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(value["published_unix_seconds"], 100_000);
+    retired.pause_reorganization_exports_at(95).unwrap();
+    assert_eq!(fs::read(publication).unwrap(), original);
+}

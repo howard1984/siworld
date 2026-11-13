@@ -237,7 +237,14 @@ impl Shared {
             .conflicted())
     }
     fn mining_ready(&self) -> Result<bool, String> {
-        Ok(self.network.snapshot()?.ready && !self.checkpoint_conflict()?)
+        let owner = self
+            .owner
+            .lock()
+            .map_err(|_| "resident owner lock poisoned")?;
+        let head = owner.head()?;
+        Ok(owner.activities_allowed()
+            && self.network.ready_at((head.height, head.id))?
+            && !self.checkpoint_conflict()?)
     }
     fn phase(&self, phase: &'static str) -> Result<(), String> {
         self.production
@@ -262,7 +269,10 @@ fn export_status(
         .owner
         .lock()
         .map_err(|_| "resident owner lock poisoned")?;
-    let head = owner.head()?;
+    let head = match owner.head() {
+        Ok(head) => head,
+        Err(_) => return export_unavailable_status(directory, run_id, started, sequence),
+    };
     let production = shared
         .production
         .lock()
@@ -273,20 +283,26 @@ fn export_status(
         .lock()
         .map_err(|_| "checkpoint observer lock poisoned")?;
     let conflict = observer.conflicted();
-    let ready = connections.ready && !conflict;
+    let ready =
+        owner.activities_allowed() && shared.network.ready_at((head.height, head.id))? && !conflict;
+    let event = owner.last_reorganization();
     service::atomic_json(
         &directory.join(service::STATUS_FILE),
         &json!({
             "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
             "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
             "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
-            "state_available":true,"ready":ready,"sync_status":if conflict {"checkpoint_current_quorum_conflict"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+            "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {"checkpoint_current_quorum_conflict"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
             "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
             "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
             "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
             "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
+            "reorganization_status":owner.reorganization_status(),"reorganization_alarm":owner.reorganization_alarm(),
+            "reorganization_depth":event.map(|event| event.depth),
+            "reorganization_ancestor_height":event.map(|event| event.ancestor_height),
+            "template_generation":owner.template_generation(),
             "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
             "signed_bootstrap_available":owner.bootstrap_available(),
             "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
@@ -294,6 +310,26 @@ fn export_status(
             "operations_error":operations_error(shared),
             "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
             "historical_proof_replay":false
+        }),
+    )
+}
+
+fn export_unavailable_status(
+    directory: &Path,
+    run_id: &str,
+    started: Instant,
+    sequence: u64,
+) -> Result<(), String> {
+    service::atomic_json(
+        &directory.join(service::STATUS_FILE),
+        &json!({
+            "schema_version":2, "run_id":run_id, "process_id":std::process::id(), "sequence":sequence,
+            "phase":"manual_recovery_required", "state_available":false, "ready":false,
+            "sync_status":"canonical_state_unavailable", "height":null, "tip":null,
+            "reorganization_status":"manual_recovery_required", "reorganization_alarm":"canonical_state_unavailable",
+            "wallet_export_paused":true, "signed_bootstrap_available":false,
+            "error_code":"canonical_state_unavailable", "updated_unix_ms":unix_ms()?,
+            "elapsed_monotonic_ms":started.elapsed().as_millis().to_string(), "historical_proof_replay":false,
         }),
     )
 }
@@ -405,8 +441,31 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         limits().chain,
     )?;
     check_windows_admission(cfg!(windows), store.imported_checkpoint_height())?;
-    let driver = Driver::new(store, NativeVerifier::new()?, limits())?;
     let budget = p2p::Budget::new(MEMORY_BYTES);
+    let mut driver = Driver::new(store, NativeVerifier::new()?, limits())?;
+    let header_rules = super::selection::HeaderRules {
+        network: genesis.config().network,
+        genesis: genesis.id(),
+        genesis_timestamp: genesis.config().genesis_timestamp,
+        genesis_target: genesis.config().genesis_target,
+        target_interval: genesis.config().target_interval,
+        pow_iterations: genesis.config().pow_iterations,
+        max_headers: 1_000_000,
+    };
+    let branch_limits = super::branches::Limits {
+        maximum_headers: 1_100_000,
+        maximum_body_bytes: 64 * 1024 * 1024 * 1024,
+    };
+    let branch_path = directory.join("branches.redb");
+    let branches = if branch_path
+        .try_exists()
+        .map_err(|_| "branch archive path unavailable")?
+    {
+        super::branches::BranchStore::open(&branch_path, header_rules, branch_limits)?
+    } else {
+        super::branches::BranchStore::create(&branch_path, header_rules, branch_limits)?
+    };
+    driver.enable_reorganization_with_budget(branches, budget.clone())?;
     let run = service::RunIdentity::new(
         genesis.config().network,
         binary_hash()?,
@@ -458,12 +517,18 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             .owner
             .lock()
             .map_err(|_| "resident owner lock poisoned")?;
-        super::runtime_export::host::Host::open(
+        let mut host = super::runtime_export::host::Host::open_retained(
             &root,
             owner.store(),
             limits(),
             config.checkpoint_key.as_deref(),
-        )?
+            |height, id| owner.retained_header(height, id),
+        )?;
+        if !owner.activities_allowed() {
+            host.pause_reorganization_exports()?;
+            shared.mailbox.publish(&[])?;
+        }
+        host
     };
     #[cfg(unix)]
     if std::env::var_os("SIWORLD_ENG2_WALLET_EXPORT").is_some_and(|value| value == "1") {
@@ -478,6 +543,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             super::runtime_export::WalletPolicy::default(),
             &shared.budget,
         );
+        // Opening the publisher only restores private cursors and its lease;
+        // publication waits for both the activity gate and a fresh peer round.
+        if !owner.activities_allowed() {
+            checkpoint_host.pause_reorganization_exports()?;
+        }
     }
     #[cfg(not(unix))]
     if config.checkpoint_key.is_some() {
@@ -530,52 +600,84 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             if producer.as_ref().is_some_and(|worker| worker.is_finished()) {
                 return Err("resident producer exited unexpectedly".into());
             }
+            {
+                let mut owner = shared
+                    .owner
+                    .lock()
+                    .map_err(|_| "resident owner lock poisoned")?;
+                let _switch_result = owner.reorganization_tick(|ancestor_height| {
+                    shared.network.invalidate_head_evidence()?;
+                    #[cfg(unix)]
+                    {
+                        checkpoint_host.pause_reorganization_exports_at(ancestor_height)?;
+                        shared.mailbox.publish(&[])?;
+                    }
+                    #[cfg(not(unix))]
+                    let _ = ancestor_height;
+                    Ok(())
+                });
+                if !owner.activities_allowed() {
+                    #[cfg(unix)]
+                    {
+                        checkpoint_host.pause_reorganization_exports()?;
+                        shared.mailbox.publish(&[])?;
+                    }
+                }
+            }
             if last_checkpoint.elapsed() >= Duration::from_secs(1) {
                 #[cfg(unix)]
                 {
-                    let incoming = shared.mailbox.drain()?;
                     let mut owner = shared
                         .owner
                         .lock()
                         .map_err(|_| "resident owner lock poisoned")?;
-                    let tick = {
-                        let observer = shared
-                            .checkpoint_observer
-                            .lock()
-                            .map_err(|_| "checkpoint observer lock poisoned")?;
-                        checkpoint_host.tick_resident(
-                            owner.store(),
-                            unix_ms()? / 1000,
-                            &incoming.messages,
-                            &shared.network,
-                            &observer,
-                        )
-                    };
-                    match tick {
-                        Ok(tick) => {
-                            shared.mailbox.acknowledge(&incoming)?;
-                            shared.mailbox.publish(&tick.messages())?;
-                            checkpoint_error = None;
-                            if bootstrap_service
-                                && owner
-                                    .refresh_bootstrap(
-                                        checkpoint_host.latest_checkpoint(),
-                                        &shared.budget,
-                                    )
-                                    .is_err()
-                            {
-                                checkpoint_error = Some("signed_bootstrap_unavailable");
+                    if owner.activities_allowed() {
+                        checkpoint_host.reconcile_retained(owner.store(), |height, id| {
+                            owner.retained_header(height, id)
+                        })?;
+                        let incoming = shared.mailbox.drain()?;
+                        let tick = {
+                            let observer = shared
+                                .checkpoint_observer
+                                .lock()
+                                .map_err(|_| "checkpoint observer lock poisoned")?;
+                            checkpoint_host.tick_resident(
+                                owner.store(),
+                                unix_ms()? / 1000,
+                                &incoming.messages,
+                                &shared.network,
+                                &observer,
+                            )
+                        };
+                        match tick {
+                            Ok(tick) => {
+                                shared.mailbox.acknowledge(&incoming)?;
+                                shared.mailbox.publish(&tick.messages())?;
+                                checkpoint_error = None;
+                                if bootstrap_service
+                                    && owner
+                                        .refresh_bootstrap(
+                                            checkpoint_host.latest_checkpoint(),
+                                            &shared.budget,
+                                        )
+                                        .is_err()
+                                {
+                                    checkpoint_error = Some("signed_bootstrap_unavailable");
+                                }
+                            }
+                            Err(_) => {
+                                checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable")
                             }
                         }
-                        Err(_) => {
-                            checkpoint_error = Some("checkpoint_tick_rejected_or_unavailable")
+                        let head = owner.head()?;
+                        if shared.network.ready_at((head.height, head.id))? {
+                            let _ = checkpoint_host.tick_wallet_export(
+                                owner.store(),
+                                unix_ms()? / 1000,
+                                &shared.budget,
+                            );
                         }
                     }
-                    let _ = checkpoint_host.tick_wallet_export(
-                        owner.store(),
-                        unix_ms()? / 1000,
-                        &shared.budget,
-                    );
                 }
                 last_checkpoint = Instant::now();
             }

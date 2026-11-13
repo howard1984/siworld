@@ -12,6 +12,16 @@ mod generations;
 mod wallet;
 pub use generations::{WalletPolicy, WalletProgress, WalletPublisher};
 
+struct SavedPublication {
+    certificate: Certificate,
+    witness: AuthorizationWitness,
+    snapshot: Vec<u8>,
+    published: u64,
+}
+fn publication_name(height: u64) -> String {
+    format!("checkpoint-publication-{height:020}.json")
+}
+
 pub struct PublicExport {
     root: fs::File,
     network: Hash,
@@ -25,6 +35,28 @@ impl PublicExport {
     /// The host creates its dedicated directory. All subsequent filesystem
     /// operations remain relative to this opened directory descriptor.
     pub fn open(root: &Path, store: &Store, limits: ImportLimits) -> Result<Self, String> {
+        let mut value = Self::open_unrestored(root, store)?;
+        if let Some(checkpoint) = value.restore_latest(store, limits)? {
+            value.remember_publication(&checkpoint)?;
+        }
+        Ok(value)
+    }
+    pub(super) fn remember_publication(
+        &mut self,
+        checkpoint: &CertifiedCheckpoint,
+    ) -> Result<(), String> {
+        let bytes = checkpoint
+            .certificate
+            .encode()
+            .map_err(|_| "invalid restored certificate")?;
+        self.latest = Some((
+            checkpoint.certificate.statement.checkpoint_height,
+            *blake3::hash(&bytes).as_bytes(),
+            checkpoint.published,
+        ));
+        Ok(())
+    }
+    pub(super) fn open_unrestored(root: &Path, store: &Store) -> Result<Self, String> {
         store.ensure_exportable()?;
         let root = OpenOptions::new()
             .read(true)
@@ -32,7 +64,7 @@ impl PublicExport {
             .open(root)
             .map_err(|_| "eng2 export directory unavailable")?;
         let engine = store.engine();
-        let mut value = Self {
+        let value = Self {
             root,
             network: engine.state().network(),
             genesis: engine.genesis().id(),
@@ -51,17 +83,6 @@ impl PublicExport {
             ]
             .concat(),
         )?;
-        if let Some(checkpoint) = value.restore_latest(store, limits)? {
-            let certificate = checkpoint
-                .certificate
-                .encode()
-                .map_err(|_| "invalid restored certificate")?;
-            value.latest = Some((
-                checkpoint.certificate.statement.checkpoint_height,
-                *blake3::hash(&certificate).as_bytes(),
-                checkpoint.published,
-            ));
-        }
         Ok(value)
     }
     fn check_root(&self) -> Result<(), String> {
@@ -210,8 +231,31 @@ impl PublicExport {
         let Some(bytes) = self.read_optional("checkpoint-eng2.json", 8192)? else {
             return Ok(None);
         };
-        let cursor: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| "checkpoint publication cursor malformed")?;
+        let saved = self.read_publication(&bytes, limits)?;
+        let prepared = PreparedCheckpoint::restore_prefix(
+            store,
+            saved.certificate.statement.clone(),
+            saved.witness,
+            saved.snapshot,
+            limits,
+        )?;
+        saved
+            .certificate
+            .check_signatures(prepared.roster.keys())
+            .map_err(|_| "checkpoint publication signatures invalid")?;
+        Ok(Some(CertifiedCheckpoint {
+            prepared,
+            certificate: saved.certificate,
+            published: saved.published,
+        }))
+    }
+    fn read_publication(
+        &self,
+        bytes: &[u8],
+        limits: ImportLimits,
+    ) -> Result<SavedPublication, String> {
+        let cursor: Value =
+            serde_json::from_slice(bytes).map_err(|_| "checkpoint publication cursor malformed")?;
         const FIELDS: [&str; 14] = [
             "version",
             "network",
@@ -278,25 +322,174 @@ impl PublicExport {
         }
         let witness = AuthorizationWitness::decode(&witness, limits.chain.max_component_bytes)
             .map_err(|_| "invalid checkpoint publication witness")?;
-        let prepared = PreparedCheckpoint::restore_prefix(
-            store,
-            statement.clone(),
-            witness,
-            snapshot,
-            limits,
-        )?;
-        certificate
-            .check_signatures(prepared.roster.keys())
-            .map_err(|_| "checkpoint publication signatures invalid")?;
         let published = cursor["published_unix_seconds"]
             .as_u64()
             .filter(|v| *v < (1u64 << 53))
             .ok_or("checkpoint publication time invalid")?;
-        Ok(Some(CertifiedCheckpoint {
-            prepared,
+        Ok(SavedPublication {
             certificate,
+            witness,
+            snapshot,
             published,
-        }))
+        })
+    }
+    fn retained_votes(&self, statement: &Statement) -> Result<Vec<Vote>, String> {
+        let encoded = statement
+            .encode()
+            .map_err(|_| "checkpoint journal statement invalid")?;
+        let mut votes = Vec::new();
+        for slot in 0..3 {
+            let name = format!(
+                "vote-{:020}-{:020}-{slot}.eng2.bin",
+                statement.roster_sequence, statement.checkpoint_height
+            );
+            if let Some(bytes) = self.read_optional(
+                &name,
+                encoded.len() + 1 + super::super::certificate::SIGNATURE_BYTES,
+            )? {
+                votes.push(decode_vote(&encoded, slot, &bytes)?);
+            }
+        }
+        Ok(votes)
+    }
+    pub(super) fn restore_latest_retained(
+        &self,
+        store: &Store,
+        limits: ImportLimits,
+        retained: &mut impl FnMut(u64, Hash) -> Result<Option<Header>, String>,
+    ) -> Result<super::retained::Restored<CertifiedCheckpoint>, String> {
+        self.check_store(store)?;
+        let Some(bytes) = self.read_optional("checkpoint-eng2.json", 8192)? else {
+            return Ok(super::retained::Restored::Absent);
+        };
+        let saved = self.read_publication(&bytes, limits)?;
+        let votes = self.retained_votes(&saved.certificate.statement)?;
+        super::retained::publication(
+            store,
+            saved.certificate,
+            saved.witness,
+            saved.snapshot,
+            saved.published,
+            &votes,
+            limits,
+            retained,
+        )
+    }
+    /// Keep the first publication time outside the mutable advertisement. This
+    /// is an immutable publication dependency, not a switch recovery journal.
+    pub(super) fn withdraw_checkpoint(
+        &mut self,
+        checkpoint: &CertifiedCheckpoint,
+    ) -> Result<(), String> {
+        let cursor = self.publication_cursor(checkpoint)?;
+        if let Some(old) = self.read_optional("checkpoint-eng2.json", 8192)? {
+            let actual: Value = serde_json::from_slice(&old)
+                .map_err(|_| "checkpoint cursor malformed before withdrawal")?;
+            let expected: Value = serde_json::from_slice(&cursor)
+                .map_err(|_| "checkpoint cursor construction invalid")?;
+            if actual != expected {
+                return Err("checkpoint cursor differs before withdrawal".into());
+            }
+        }
+        self.write_once(
+            &publication_name(checkpoint.certificate.statement.checkpoint_height),
+            &cursor,
+        )?;
+        self.remove_cursor("checkpoint-eng2.json")?;
+        self.latest = None;
+        Ok(())
+    }
+    pub(super) fn remove_retired_checkpoint_cursor(&mut self, height: u64) -> Result<(), String> {
+        let bytes = self
+            .read_optional("checkpoint-eng2.json", 8192)?
+            .ok_or("checked retired checkpoint cursor disappeared")?;
+        self.write_once(&publication_name(height), &bytes)?;
+        self.remove_cursor("checkpoint-eng2.json")?;
+        self.latest = None;
+        Ok(())
+    }
+    fn remove_cursor(&self, name: &str) -> Result<(), String> {
+        if self.read_optional(name, 8192)?.is_some() {
+            match unlinkat(&self.root, name, AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => (),
+                Err(_) => return Err("checkpoint cursor withdrawal failed".into()),
+            }
+            fsync(&self.root).map_err(|_| "checkpoint cursor withdrawal sync failed")?;
+        }
+        Ok(())
+    }
+    fn publication_cursor(&self, checkpoint: &CertifiedCheckpoint) -> Result<Vec<u8>, String> {
+        let certificate = checkpoint
+            .certificate
+            .encode()
+            .map_err(|_| "checkpoint certificate malformed")?;
+        let witness = checkpoint
+            .witness()
+            .encode(usize::MAX)
+            .map_err(|_| "checkpoint witness encoding invalid")?;
+        let digest = *blake3::hash(&certificate).as_bytes();
+        let statement = &checkpoint.certificate.statement;
+        let snapshot_name = format!(
+            "{}.snapshot-eng2.bin",
+            blake3::hash(checkpoint.snapshot_bytes()).to_hex()
+        );
+        let witness_name = format!("{}.witness-eng2.bin", blake3::hash(&witness).to_hex());
+        let certificate_name = format!("{}.certificate-eng2.bin", crate::local::hex(&digest));
+        serde_json::to_vec(&json!({"version":2,"network":crate::local::hex(&self.network),"genesis":crate::local::hex(&self.genesis),
+            "rules_commitment":crate::local::hex(&self.rules),"height":statement.checkpoint_height,"checkpoint_block":crate::local::hex(&statement.checkpoint_block),
+            "authorization_height":statement.authorization_height,"authorization_block":crate::local::hex(&statement.authorization_block),
+            "published_unix_seconds":checkpoint.published,"certificate_digest":crate::local::hex(&digest),"certificate_file":certificate_name,
+            "witness_file":witness_name,"snapshot_file":snapshot_name,"snapshot_bytes":checkpoint.snapshot_bytes().len()}))
+            .map_err(|_| "checkpoint cursor encoding failed".into())
+    }
+    pub(super) fn resume_candidate_retained(
+        &self,
+        store: &Store,
+        limits: ImportLimits,
+        retained: &mut impl FnMut(u64, Hash) -> Result<Option<Header>, String>,
+    ) -> Result<super::retained::Restored<PreparedCheckpoint>, String> {
+        use super::retained::Restored;
+        self.check_store(store)?;
+        let state = store.engine().state();
+        let Some(height) = eligible_checkpoint(state.height()) else {
+            return Ok(Restored::Absent);
+        };
+        let epoch = state.governance().active_roster().epoch_sequence;
+        let mut candidate = Restored::Absent;
+        if let Some(bytes) =
+            self.read_optional(&candidate_name(epoch, height), candidate_bound(limits)?)?
+        {
+            let (statement, witness, snapshot) =
+                decode_candidate_parts(&bytes, state.network(), limits)?;
+            if statement.checkpoint_height != height || statement.roster_sequence != epoch {
+                return Err("saved checkpoint candidate filename context differs".into());
+            }
+            let votes = self.retained_votes(&statement)?;
+            candidate = super::retained::candidate(
+                store, statement, witness, snapshot, &votes, limits, retained,
+            )?;
+        }
+        if let Some(bytes) = self.read_optional(&publication_name(height), 8192)? {
+            let saved = self.read_publication(&bytes, limits)?;
+            if saved.certificate.statement.checkpoint_height != height {
+                return Err("checkpoint publication filename height differs".into());
+            }
+            let votes = self.retained_votes(&saved.certificate.statement)?;
+            // Even a still-current original certificate is retired here: a
+            // withdrawn cursor must not cause certification with a new time.
+            let _checked = super::retained::publication(
+                store,
+                saved.certificate,
+                saved.witness,
+                saved.snapshot,
+                saved.published,
+                &votes,
+                limits,
+                retained,
+            )?;
+            return Ok(Restored::Retired(height));
+        }
+        Ok(candidate)
     }
     /// Snapshot dependencies precede the cursor. A duplicate certificate never
     /// refreshes the local pruning-staleness clock or overwrites public content.
@@ -333,11 +526,8 @@ impl PublicExport {
         self.write_once(&snapshot_name, checkpoint.snapshot_bytes())?;
         self.write_once(&witness_name, &witness)?;
         self.write_once(&certificate_name, &certificate)?;
-        let cursor=serde_json::to_vec(&json!({"version":2,"network":crate::local::hex(&self.network),"genesis":crate::local::hex(&self.genesis),
-            "rules_commitment":crate::local::hex(&self.rules),"height":statement.checkpoint_height,"checkpoint_block":crate::local::hex(&statement.checkpoint_block),
-            "authorization_height":statement.authorization_height,"authorization_block":crate::local::hex(&statement.authorization_block),
-            "published_unix_seconds":checkpoint.published,"certificate_digest":crate::local::hex(&digest),"certificate_file":certificate_name,
-            "witness_file":witness_name,"snapshot_file":snapshot_name,"snapshot_bytes":checkpoint.snapshot_bytes().len()})).map_err(|_| "checkpoint cursor encoding failed")?;
+        let cursor = self.publication_cursor(checkpoint)?;
+        self.write_once(&publication_name(statement.checkpoint_height), &cursor)?;
         checkpoint.check_current(store)?;
         self.replace("checkpoint-eng2.json", &cursor)?;
         self.latest = Some((statement.checkpoint_height, digest, checkpoint.published));
@@ -612,6 +802,15 @@ fn decode_candidate(
     bytes: &[u8],
     limits: ImportLimits,
 ) -> Result<PreparedCheckpoint, String> {
+    let (statement, witness, snapshot) =
+        decode_candidate_parts(bytes, store.engine().state().network(), limits)?;
+    PreparedCheckpoint::restore(store, statement, witness, snapshot, limits)
+}
+fn decode_candidate_parts(
+    bytes: &[u8],
+    network: Hash,
+    limits: ImportLimits,
+) -> Result<(Statement, AuthorizationWitness, Vec<u8>), String> {
     let prefix = 6 + super::super::certificate::STATEMENT_BYTES;
     if bytes.len() > candidate_bound(limits)?
         || bytes.len() < prefix + 16
@@ -619,7 +818,7 @@ fn decode_candidate(
     {
         return Err("checkpoint candidate encoding invalid".into());
     }
-    let statement = Statement::decode(&bytes[6..prefix], store.engine().state().network())
+    let statement = Statement::decode(&bytes[6..prefix], network)
         .map_err(|_| "checkpoint candidate statement malformed")?;
     let witness_len = usize::try_from(u64::from_le_bytes(
         bytes[prefix..prefix + 8].try_into().expect("fixed length"),
@@ -645,13 +844,7 @@ fn decode_candidate(
         limits.chain.max_component_bytes,
     )
     .map_err(|_| "checkpoint candidate witness malformed")?;
-    PreparedCheckpoint::restore(
-        store,
-        statement,
-        witness,
-        bytes[witness_end..].to_vec(),
-        limits,
-    )
+    Ok((statement, witness, bytes[witness_end..].to_vec()))
 }
 fn decode_vote(statement: &[u8], slot: u8, bytes: &[u8]) -> Result<Vote, String> {
     if bytes.len() != statement.len() + 1 + super::super::certificate::SIGNATURE_BYTES

@@ -22,6 +22,21 @@ use std::path::Path;
 mod commitment_tests;
 mod imported;
 mod receipts;
+mod replacement;
+pub use replacement::{
+    PrevalidatedReplacement, ReplacementBudget, ReplacementFailure, ReplacementReplay,
+};
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+mod crash_tests;
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+mod long_replacement_tests;
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+mod replacement_tests;
+mod restoration;
+#[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+mod restoration_tests;
+mod rollback;
+pub use rollback::{RETAINED_STATES as ROLLBACK_RETAINED_STATES, RollbackPoint};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("eng2-canonical-meta-v1");
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("eng2-canonical-blocks-v1");
@@ -45,6 +60,7 @@ pub struct Store {
     restart: Option<super::restart::Context>,
     imported_prefix: u64,
     import_seed: Hash,
+    revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyAvailability {
@@ -89,6 +105,9 @@ impl Store {
             .map_err(|_| "versioned database initialization failed")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "versioned database durability unavailable")?;
+        // Record allocator state with two-phase commits so an interrupted
+        // process can reopen without permitting a full database repair.
+        txn.set_quick_repair(true);
         {
             let mut meta = txn
                 .open_table(META)
@@ -116,6 +135,7 @@ impl Store {
             restart: None,
             imported_prefix: 0,
             import_seed: [0; 32],
+            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
     /// Independently reconstruct every committed block and execution root and
@@ -177,6 +197,7 @@ impl Store {
             .map_err(|_| "versioned metadata read failed")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "versioned audit durability unavailable")?;
+        txn.set_quick_repair(true);
         let meta = txn
             .open_table(META)
             .map_err(|_| "versioned metadata missing")?;
@@ -243,6 +264,7 @@ impl Store {
             restart: None,
             imported_prefix: 0,
             import_seed: [0; 32],
+            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
     pub fn engine(&self) -> &Engine {
@@ -494,8 +516,10 @@ impl Store {
             }),
             imported_prefix,
             import_seed,
+            revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         result.ensure_exportable()?;
+        result.remember_rollback_state()?;
         Ok(result)
     }
     /// Explicitly authenticate this already verified local head for later fast
@@ -545,6 +569,7 @@ impl Store {
             .map_err(|_| "restart qualification unavailable")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "restart qualification durability unavailable")?;
+        txn.set_quick_repair(true);
         let mut leaves = [0; 32];
         let mut spends = [0; 32];
         {
@@ -600,6 +625,7 @@ impl Store {
         txn.commit()
             .map_err(|_| "restart qualification durable commit failed")?;
         self.restart = Some(context);
+        self.remember_rollback_state()?;
         self.usable = true;
         Ok(())
     }
@@ -686,6 +712,7 @@ impl Store {
             .map_err(|_| "checkpoint archive transaction unavailable")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "checkpoint archive durability unavailable")?;
+        txn.set_quick_repair(true);
         {
             let mut table = txn
                 .open_table(ANCHORS)
@@ -817,6 +844,7 @@ impl Store {
             .map_err(|_| "versioned block transaction unavailable")?;
         txn.set_durability(Durability::Immediate)
             .map_err(|_| "versioned block durability unavailable")?;
+        txn.set_quick_repair(true);
         {
             let mut index = txn
                 .open_table(INDEX)
@@ -911,16 +939,159 @@ impl Store {
         // Ambiguous I/O failures poison this handle; never continue production
         // until a fresh verified reopen reconciles the durable commit boundary.
         self.usable = false;
+        self.advance_revision()?;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("append_before_commit", header.height);
         txn.commit()
             .map_err(|_| "versioned canonical durable commit failed")?;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("append_after_commit", header.height);
         let result = self.engine.publish(staged)?;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("append_after_publish", header.height);
         if let (Some(context), Some((leaves, spends, index))) = (&mut self.restart, next_restart) {
             context.leaves = leaves;
             context.spends = spends;
             context.index = index;
         }
+        if self.restart.is_some() {
+            self.remember_rollback_state()?;
+        }
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("append_after_capture", header.height);
         self.usable = true;
         Ok(result)
+    }
+    /// Restore one retained ancestor as a separately committed valid prefix.
+    /// The owner must pause mining, signing and wallet exports for the complete
+    /// branch change. Subsequent blocks use the ordinary fully verified append.
+    /// Original branch bytes must already be retained outside this database.
+    pub fn restore_ancestor(&mut self, height: u64, block_id: Hash) -> Result<(), String> {
+        self.check_readable()?;
+        let depth = self
+            .engine
+            .state()
+            .height()
+            .checked_sub(height)
+            .ok_or("rollback ancestor is above accepted head")?;
+        if depth > 24 {
+            return Err("rollback depth exceeds retained transition limit".into());
+        }
+        let context = self
+            .restart
+            .as_ref()
+            .ok_or("rollback requires authenticated committed-state recovery")?;
+        let point = rollback::read(&self.database)?
+            .into_iter()
+            .find(|point| point.height == height && point.block_id == block_id)
+            .ok_or("rollback ancestor savepoint is unavailable")?;
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|_| "rollback ancestor transaction unavailable")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|_| "rollback ancestor durability unavailable")?;
+        transaction.set_quick_repair(true);
+        let saved = transaction
+            .get_persistent_savepoint(point.savepoint)
+            .map_err(|_| "rollback ancestor point is no longer retained")?;
+        transaction
+            .restore_savepoint(&saved)
+            .map_err(|_| "rollback ancestor restoration failed")?;
+        let restored = restoration::verify(
+            &transaction,
+            self.engine.genesis(),
+            self.engine.limits(),
+            &context.identity,
+            point,
+            self.imported_prefix,
+            self.import_seed,
+        )?;
+        // A verification failure above aborts the whole restore transaction.
+        // Ambiguous commit failures below require verified reopen, never reuse.
+        self.usable = false;
+        self.advance_revision()?;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("restore_before_commit", height);
+        transaction
+            .commit()
+            .map_err(|_| "rollback ancestor durable commit failed")?;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("restore_after_commit", height);
+        self.engine = restored.engine;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("restore_after_publish", height);
+        let context = self.restart.as_mut().expect("checked restart context");
+        context.leaves = restored.leaves;
+        context.spends = restored.spends;
+        context.index = restored.index;
+        // Redb invalidates later IDs. Capture this verified ancestor again in
+        // a new clean transaction, and resolve (height, id) on every later use.
+        self.remember_rollback_state()?;
+        #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+        crash_tests::boundary("restore_after_capture", height);
+        self.usable = true;
+        Ok(())
+    }
+    fn advance_revision(&self) -> Result<(), String> {
+        let mut previous = self.revision.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let next = previous
+                .checked_add(1)
+                .ok_or("canonical store revision exhausted")?;
+            match self.revision.compare_exchange_weak(
+                previous,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => previous = actual,
+            }
+        }
+    }
+    /// Return only the actual locally retained rollback states. An upgraded or
+    /// checkpoint-imported database can initially have fewer than 25 points.
+    pub fn rollback_points(&self) -> Result<Vec<RollbackPoint>, String> {
+        self.check_readable()?;
+        rollback::read(&self.database)
+    }
+    fn remember_rollback_state(&self) -> Result<(), String> {
+        let height = self.engine.state().height();
+        let commitment = if height == 0 {
+            [0; 32]
+        } else {
+            // This internal call also runs while publication is deliberately
+            // poisoned, so read the exact durable head rather than public APIs.
+            let txn = self
+                .database
+                .begin_read()
+                .map_err(|_| "rollback canonical head read unavailable")?;
+            let table = txn
+                .open_table(INDEX)
+                .map_err(|_| "rollback canonical index unavailable")?;
+            let value = table
+                .get(height)
+                .map_err(|_| "rollback canonical header read failed")?
+                .ok_or("rollback canonical header missing")?;
+            let (header, _) = decode_compact(value.value(), self.engine.state().network())?;
+            if header.height != height
+                || header
+                    .id()
+                    .map_err(|_| "rollback header identity rejected")?
+                    != self.engine.state().tip()
+            {
+                return Err("rollback canonical header differs from accepted state".into());
+            }
+            header.execution_commitment
+        };
+        rollback::remember(
+            &self.database,
+            height,
+            self.engine.state().tip(),
+            commitment,
+        )
     }
     /// Return canonical public header/body bytes for explicit independent replay.
     pub fn block(&self, height: u64) -> Result<(Header, Body), String> {
@@ -1161,6 +1332,64 @@ mod tests {
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         directory
+    }
+    #[test]
+    fn authenticated_genesis_retains_same_rollback_point_after_restart() {
+        let directory = private_directory("rollback-restart");
+        let selected = genesis();
+        let identity =
+            crate::identity::NativeIdentity::initialize(&directory, selected.peer_binding())
+                .unwrap();
+        let limits = Limits {
+            max_leaves: 1024,
+            max_nullifiers: 1024,
+            max_component_bytes: 1024 * 1024,
+        };
+        let path = directory.join("chain.redb");
+        let mut store = Store::create(&path, selected, limits).unwrap();
+        assert!(store.rollback_points().unwrap().is_empty());
+        store.enable_authenticated_restart(identity).unwrap();
+        let points = store.rollback_points().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].height, 0);
+        assert_eq!(points[0].block_id, store.engine().state().tip());
+        drop(store);
+        let resumed = Store::resume_existing(&path, genesis(), limits).unwrap();
+        assert_eq!(resumed.rollback_points().unwrap(), points);
+        drop(resumed);
+        fs_remove_fixture(directory);
+    }
+    #[test]
+    fn restoring_authenticated_genesis_recaptures_point_for_repeated_restoration() {
+        let directory = private_directory("rollback-recapture");
+        let selected = genesis();
+        let identity =
+            crate::identity::NativeIdentity::initialize(&directory, selected.peer_binding())
+                .unwrap();
+        let limits = Limits {
+            max_leaves: 1024,
+            max_nullifiers: 1024,
+            max_component_bytes: 1024 * 1024,
+        };
+        let path = directory.join("chain.redb");
+        let mut store = Store::create(&path, selected, limits).unwrap();
+        store.enable_authenticated_restart(identity).unwrap();
+        let first = store.rollback_points().unwrap()[0];
+        store.restore_ancestor(0, first.block_id).unwrap();
+        let second = store.rollback_points().unwrap()[0];
+        assert_ne!(first.savepoint, second.savepoint);
+        store.restore_ancestor(0, second.block_id).unwrap();
+        let third = store.rollback_points().unwrap()[0];
+        assert_ne!(second.savepoint, third.savepoint);
+        assert_eq!(third.block_id, first.block_id);
+        assert!(store.restore_ancestor(1, first.block_id).is_err());
+        assert!(store.restore_ancestor(0, [0xff; 32]).is_err());
+        store.ensure_exportable().unwrap();
+        drop(store);
+        let store = Store::resume_existing(&path, genesis(), limits).unwrap();
+        assert_eq!(store.rollback_points().unwrap(), vec![third]);
+        drop(store);
+        fs_remove_fixture(directory);
     }
     #[test]
     fn restart_header_authentication_rejects_an_older_substituted_header_without_reading_proofs() {

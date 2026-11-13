@@ -22,6 +22,10 @@ const BODY_CHUNK: u8 = 6;
 const UNAVAILABLE: u8 = 7;
 const GET_TIP: u8 = 8;
 const ROUND_DONE: u8 = 9;
+const GET_HEADER_BY_ID: u8 = 15;
+const UNAVAILABLE_ID: u8 = 16;
+const EXACT_CAPABILITIES: u8 = 17;
+const EXACT_VERSION: u16 = 1;
 const CHUNK_BYTES: usize = p2p::MAX_CONTROL_BYTES - 9;
 
 /// Immutable application binding is checked by the encrypted handshake and
@@ -36,6 +40,7 @@ pub enum Request {
     RoundDone,
     Tip { height: u64, id: Hash },
     Header { height: u64 },
+    HeaderById { height: u64, id: Hash },
     Body { height: u64, id: Hash },
     BootstrapManifest { bundle: Option<Hash> },
     BootstrapChunk(ChunkRequest),
@@ -48,11 +53,19 @@ pub struct ReceivedBody {
     pub reservation: p2p::Reservation,
 }
 
+#[derive(Clone, Copy)]
+struct CompetingHead {
+    local: (u64, Hash),
+    remote: (u64, Hash),
+}
+
 /// No public plaintext or unauthenticated constructor is provided. Discard
 /// the peer after an exchange error: a partial stream must not be reused.
 pub struct Peer<S> {
     session: p2p::Session<S>,
     policy: Policy,
+    exact_blocks: Option<bool>,
+    competing_head: Option<CompetingHead>,
 }
 impl<S: Read + Write> Peer<S> {
     pub fn new(
@@ -67,7 +80,12 @@ impl<S: Read + Write> Peer<S> {
         {
             return Err(p2p::Error::InvalidProtocol);
         }
-        Ok(Self { session, policy })
+        Ok(Self {
+            session,
+            policy,
+            exact_blocks: None,
+            competing_head: None,
+        })
     }
     pub fn genesis_id(&self) -> Hash {
         self.session.binding().genesis
@@ -77,6 +95,15 @@ impl<S: Read + Write> Peer<S> {
     }
     pub fn role(&self) -> p2p::Role {
         self.session.role()
+    }
+    /// Scheduling hint only, scoped to an unchanged pair of advertised tips.
+    /// It never establishes validity or bypasses discovery accounting.
+    pub(crate) fn remember_competing_head(&mut self, local: (u64, Hash), remote: (u64, Hash)) {
+        self.competing_head = Some(CompetingHead { local, remote });
+    }
+    pub(crate) fn competing_head_matches(&self, local: (u64, Hash), remote: (u64, Hash)) -> bool {
+        self.competing_head
+            .is_some_and(|known| known.local == local && known.remote == remote)
     }
 
     pub fn fetch_tip(&mut self, request: u64) -> Result<(u64, Hash), p2p::Error> {
@@ -109,6 +136,14 @@ impl<S: Read + Write> Peer<S> {
         bytes[1..].copy_from_slice(&height.to_le_bytes());
         self.send(request, &bytes)
     }
+    pub fn send_unavailable_id(
+        &mut self,
+        request: u64,
+        height: u64,
+        id: Hash,
+    ) -> Result<(), p2p::Error> {
+        self.send_identity(UNAVAILABLE_ID, request, height, id)
+    }
     /// Consume only request/notice messages; response frames arriving outside
     /// the matching exchange are rejected rather than buffered without a cap.
     pub fn receive_request(&mut self) -> Result<(u64, Request), p2p::Error> {
@@ -123,6 +158,12 @@ impl<S: Read + Write> Peer<S> {
             Some(GET_HEADER) if bytes.len() == 9 => Request::Header {
                 height: number(&bytes[1..9]),
             },
+            Some(GET_HEADER_BY_ID) if bytes.len() == 41 && number(&bytes[1..9]) != 0 => {
+                Request::HeaderById {
+                    height: number(&bytes[1..9]),
+                    id: digest(&bytes[9..41]),
+                }
+            }
             Some(GET_BODY) if bytes.len() == 41 => Request::Body {
                 height: number(&bytes[1..9]),
                 id: digest(&bytes[9..41]),
@@ -166,6 +207,81 @@ impl<S: Read + Write> Peer<S> {
         let header = Header::decode(&bytes[1..], &self.session.binding().network)
             .map_err(|_| p2p::Error::InvalidProtocol)?;
         if header.height != height {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        Ok(Some(header))
+    }
+    /// Height zero is not a block header. Legacy ordinary responders answer
+    /// this already-known request with UNAVAILABLE(0), without closing the round.
+    /// A positive answer is scoped to this authenticated session only.
+    pub fn probe_exact_blocks(&mut self, request: u64) -> Result<bool, p2p::Error> {
+        if let Some(available) = self.exact_blocks {
+            return Ok(available);
+        }
+        let mut query = [0; 9];
+        query[0] = GET_HEADER;
+        self.send(request, &query)?;
+        let (received, bytes, _charge) = self.receive()?;
+        if received != request {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        let available = if bytes.len() == 9 && bytes[0] == UNAVAILABLE && number(&bytes[1..]) == 0 {
+            false
+        } else if bytes.len() == 4
+            && bytes[0] == EXACT_CAPABILITIES
+            && u16::from_le_bytes(bytes[1..3].try_into().unwrap()) == EXACT_VERSION
+            && bytes[3] <= 1
+        {
+            bytes[3] == 1
+        } else {
+            return Err(p2p::Error::InvalidProtocol);
+        };
+        self.exact_blocks = Some(available);
+        Ok(available)
+    }
+    pub fn exact_blocks_supported(&self) -> bool {
+        self.exact_blocks == Some(true)
+    }
+    pub fn send_exact_capabilities(
+        &mut self,
+        request: u64,
+        available: bool,
+    ) -> Result<(), p2p::Error> {
+        self.send(request, &[EXACT_CAPABILITIES, 1, 0, u8::from(available)])
+    }
+    /// Fetch an exact ancestor or competitor. Height is an additional binding,
+    /// never a replacement for the requested block identity. This exchange does
+    /// not qualify proof-of-work, ancestry, native proofs or execution state.
+    pub fn fetch_header_by_id(
+        &mut self,
+        request: u64,
+        height: u64,
+        id: Hash,
+    ) -> Result<Option<Header>, p2p::Error> {
+        if !self.exact_blocks_supported() {
+            return Err(p2p::Error::Unconfigured);
+        }
+        if height == 0 {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        self.send_identity(GET_HEADER_BY_ID, request, height, id)?;
+        let (received, bytes, _charge) = self.receive()?;
+        if received != request {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        if bytes.len() == 41 && bytes[0] == UNAVAILABLE_ID {
+            return if number(&bytes[1..9]) == height && digest(&bytes[9..41]) == id {
+                Ok(None)
+            } else {
+                Err(p2p::Error::InvalidProtocol)
+            };
+        }
+        if bytes.len() != 1 + super::header::HEADER_BYTES || bytes[0] != HEADER {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        let header = Header::decode(&bytes[1..], &self.session.binding().network)
+            .map_err(|_| p2p::Error::InvalidProtocol)?;
+        if header.height != height || header.id().map_err(|_| p2p::Error::InvalidProtocol)? != id {
             return Err(p2p::Error::InvalidProtocol);
         }
         Ok(Some(header))
@@ -559,6 +675,112 @@ mod tests {
                 peer.fetch_header(request, height),
                 Err(p2p::Error::InvalidProtocol)
             );
+        }
+    }
+    #[test]
+    fn exact_requests_write_nothing_before_a_live_positive_probe() {
+        let g = genesis();
+        let b = binding(&g);
+        let mut peer = Peer::new(session(vec![], b, p2p::Budget::default()), &g, policy()).unwrap();
+        assert_eq!(
+            peer.fetch_header_by_id(2, 1, [8; 32]),
+            Err(p2p::Error::Unconfigured)
+        );
+        assert!(peer.session.test_channel().output.is_empty());
+        let mut peer = Peer::new(
+            session(
+                frame(1, &[EXACT_CAPABILITIES, 1, 0, 1], b),
+                b,
+                p2p::Budget::default(),
+            ),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        assert!(peer.probe_exact_blocks(1).unwrap());
+        let length = peer.session.test_channel().output.len();
+        assert!(peer.probe_exact_blocks(3).unwrap());
+        assert_eq!(peer.session.test_channel().output.len(), length);
+        let peer = Peer::new(session(vec![], b, p2p::Budget::default()), &g, policy()).unwrap();
+        assert!(!peer.exact_blocks_supported());
+    }
+    #[test]
+    fn capability_probe_rejects_cross_request_version_flags_and_trailing_bytes() {
+        let g = genesis();
+        let b = binding(&g);
+        for (request, message) in [
+            (2, vec![EXACT_CAPABILITIES, 1, 0, 1]),
+            (1, vec![EXACT_CAPABILITIES, 2, 0, 1]),
+            (1, vec![EXACT_CAPABILITIES, 1, 0, 2]),
+            (1, vec![EXACT_CAPABILITIES, 1, 0, 1, 0]),
+        ] {
+            let mut peer = Peer::new(
+                session(frame(request, &message, b), b, p2p::Budget::default()),
+                &g,
+                policy(),
+            )
+            .unwrap();
+            assert_eq!(peer.probe_exact_blocks(1), Err(p2p::Error::InvalidProtocol));
+            assert!(!peer.exact_blocks_supported());
+        }
+    }
+    #[test]
+    fn exact_header_exchange_binds_request_height_and_identity() {
+        let g = genesis();
+        let (_, header) = body_header(&g);
+        let b = binding(&g);
+        let id = header.id().unwrap();
+        let mut message = vec![HEADER];
+        message.extend_from_slice(&header.encode().unwrap());
+        for (request, height, wanted, valid) in [
+            (10, header.height, id, true),
+            (11, header.height, id, false),
+            (10, header.height + 1, id, false),
+            (10, header.height, [19; 32], false),
+        ] {
+            let mut peer = Peer::new(
+                session(frame(10, &message, b), b, p2p::Budget::default()),
+                &g,
+                policy(),
+            )
+            .unwrap();
+            peer.exact_blocks = Some(true);
+            let result = peer.fetch_header_by_id(request, height, wanted);
+            if valid {
+                assert_eq!(result.unwrap(), Some(header.clone()));
+            } else {
+                assert_eq!(result, Err(p2p::Error::InvalidProtocol));
+            }
+        }
+    }
+    #[test]
+    fn exact_missing_header_binds_identity_and_rejects_height_only_missing() {
+        let g = genesis();
+        let b = binding(&g);
+        let id = [7; 32];
+        let mut exact = vec![UNAVAILABLE_ID];
+        exact.extend_from_slice(&1u64.to_le_bytes());
+        exact.extend_from_slice(&id);
+        let mut height_only = vec![UNAVAILABLE];
+        height_only.extend_from_slice(&1u64.to_le_bytes());
+        for (message, wanted, valid) in [
+            (exact.clone(), id, true),
+            (exact, [8; 32], false),
+            (height_only, id, false),
+        ] {
+            let mut peer = Peer::new(
+                session(frame(9, &message, b), b, p2p::Budget::default()),
+                &g,
+                policy(),
+            )
+            .unwrap();
+            peer.exact_blocks = Some(true);
+            let result = peer.fetch_header_by_id(9, 1, wanted);
+            if valid {
+                assert_eq!(result.unwrap(), None);
+            } else {
+                assert_eq!(result, Err(p2p::Error::InvalidProtocol));
+            }
         }
     }
     #[test]

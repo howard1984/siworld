@@ -259,6 +259,8 @@ pub struct Host {
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
+    retired_through: Option<u64>,
+    retained_head: Option<(u64, Hash)>,
 }
 impl Host {
     /// The accepted, durably published capability only; pending proposals and
@@ -299,7 +301,151 @@ impl Host {
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
+            retired_through: None,
+            retained_head: None,
         })
+    }
+    /// Open retained local publications without granting an obsolete
+    /// authorization signing or publication authority. Corruption, missing old
+    /// headers and invalid signatures remain errors. The strict `open` is unchanged.
+    pub fn open_retained(
+        root: &Path,
+        store: &Store,
+        limits: ImportLimits,
+        existing_key: Option<&Path>,
+        retained: impl FnMut(u64, Hash) -> Result<Option<Header>, String>,
+    ) -> Result<Self, String> {
+        let export = PublicExport::open_unrestored(root, store)?;
+        let signer = existing_key
+            .map(|path| ExistingSigner::load(path, store))
+            .transpose()?;
+        let mut value = Self {
+            export,
+            signer,
+            limits,
+            pending: None,
+            votes: std::array::from_fn(|_| None),
+            latest: None,
+            last_now: None,
+            last_exported: None,
+            last_status: None,
+            wallet: None,
+            wallet_requested: false,
+            wallet_paused: false,
+            retired_through: None,
+            retained_head: None,
+        };
+        value.reconcile_retained(store, retained)?;
+        Ok(value)
+    }
+    fn retire_anchor(&mut self, height: u64) {
+        self.retired_through = Some(self.retired_through.map_or(height, |old| old.max(height)));
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| self.anchor_retired(pending.statement.checkpoint_height))
+        {
+            self.pending = None;
+            self.votes = std::array::from_fn(|_| None);
+        }
+    }
+    fn anchor_retired(&self, height: u64) -> bool {
+        self.retired_through
+            .is_some_and(|retired| height <= retired)
+    }
+    /// Call under the canonical owner lock after a transition or on retained
+    /// startup, before a signing/publication tick. Immutable evidence is never
+    /// deleted; only fully validated obsolete mutable advertisements are retired.
+    pub fn reconcile_retained(
+        &mut self,
+        store: &Store,
+        mut retained: impl FnMut(u64, Hash) -> Result<Option<Header>, String>,
+    ) -> Result<(), String> {
+        use super::retained::Restored;
+        store.ensure_exportable()?;
+        let head = (
+            store.engine().state().height(),
+            store.engine().state().tip(),
+        );
+        if self.retained_head == Some(head) {
+            return Ok(());
+        }
+        match self
+            .export
+            .restore_latest_retained(store, self.limits, &mut retained)?
+        {
+            Restored::Absent => {
+                self.latest = None;
+            }
+            Restored::Current(checkpoint) => {
+                self.export.remember_publication(&checkpoint)?;
+                self.latest = Some(checkpoint);
+            }
+            Restored::Retired(height) => {
+                self.export.remove_retired_checkpoint_cursor(height)?;
+                self.latest = None;
+                self.last_exported = None;
+                self.retire_anchor(height);
+            }
+        }
+        match self
+            .export
+            .resume_candidate_retained(store, self.limits, &mut retained)?
+        {
+            Restored::Absent => (),
+            Restored::Current(candidate) => {
+                if !self.anchor_retired(candidate.statement.checkpoint_height)
+                    && !super::pending_obsolete(
+                        candidate.statement.checkpoint_height,
+                        self.export.latest_height(),
+                        store.engine().state().height(),
+                    )
+                {
+                    let unchanged = self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|old| old.statement == candidate.statement);
+                    self.pending = Some(candidate);
+                    if !unchanged {
+                        self.votes = std::array::from_fn(|_| None);
+                    }
+                }
+            }
+            Restored::Retired(height) => self.retire_anchor(height),
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|candidate| self.anchor_retired(candidate.statement.checkpoint_height))
+        {
+            self.pending = None;
+            self.votes = std::array::from_fn(|_| None);
+        }
+        self.retained_head = Some(head);
+        Ok(())
+    }
+    /// The barrier runs before ancestor restoration. Authorizations at or below
+    /// the ancestor retain their original valid advertisement and publication
+    /// time. Later authorizations are withdrawn and cannot be signed again at
+    /// the same anchor, including after a failed restore followed by restart.
+    pub fn pause_reorganization_exports_at(&mut self, ancestor_height: u64) -> Result<(), String> {
+        self.pause_reorganization_exports()?;
+        self.retained_head = None;
+        if let Some(checkpoint) = &self.latest
+            && checkpoint.prepared.authorization.height > ancestor_height
+        {
+            self.export.withdraw_checkpoint(checkpoint)?;
+            let height = checkpoint.certificate.statement.checkpoint_height;
+            self.latest = None;
+            self.last_exported = None;
+            self.retire_anchor(height);
+        }
+        if let Some(pending) = &self.pending
+            && pending.authorization.height > ancestor_height
+        {
+            self.retire_anchor(pending.statement.checkpoint_height);
+        }
+        Ok(())
     }
     /// Explicit wallet opt-in, independent of checkpoint signing and admission.
     /// An opening failure pauses only this export; no new Store is opened.
@@ -316,6 +462,17 @@ impl Host {
         self.wallet_paused = true;
         self.wallet = Some(WalletPublisher::open(&self.export, store, policy, budget)?);
         self.wallet_paused = false;
+        Ok(())
+    }
+    /// Called under the canonical owner lock before restoring any savepoint.
+    /// Signer journals remain untouched; the resident skips signing ticks until
+    /// switching finishes and authenticated readiness has been re-established.
+    pub fn pause_reorganization_exports(&mut self) -> Result<(), String> {
+        self.export.pause_wallet_head()?;
+        if let Some(wallet) = &mut self.wallet {
+            wallet.invalidate_advertisement();
+        }
+        self.wallet_paused = self.wallet_requested;
         Ok(())
     }
     pub fn wallet_export_state(&self) -> Option<bool> {
@@ -432,6 +589,14 @@ impl Host {
         }
         let mut newly_published = false;
         for item in incoming {
+            let height = match item {
+                Incoming::Proposal(proposal) => proposal.statement.checkpoint_height,
+                Incoming::Vote { statement, .. } => statement.checkpoint_height,
+                Incoming::Certified { certificate, .. } => certificate.statement.checkpoint_height,
+            };
+            if self.anchor_retired(height) {
+                continue;
+            }
             match item {
                 Incoming::Proposal(proposal) => {
                     if super::pending_obsolete(
@@ -537,6 +702,8 @@ impl Host {
         // independently checked proposal, avoiding competing authorization heads.
         if self.pending.is_none()
             && due
+            && eligible_checkpoint(state.height())
+                .is_some_and(|height| !self.anchor_retired(height))
             && current_signer
             && self.signer.as_ref().is_some_and(|s| s.slot == 0)
         {
@@ -546,6 +713,7 @@ impl Host {
             .flatten();
         }
         if let Some(pending) = &self.pending
+            && !self.anchor_retired(pending.statement.checkpoint_height)
             && current_signer
             && self
                 .export

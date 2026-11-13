@@ -625,3 +625,21 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
         .unwrap()
     }
 }
+
+#[test]
+fn unavailable_status_replaces_stale_ready_without_claiming_a_head() {
+    let directory = directory();
+    service::atomic_json(
+        &directory.join(service::STATUS_FILE),
+        &json!({"ready":true,"height":123}),
+    )
+    .unwrap();
+    export_unavailable_status(&directory, "test-run", Instant::now(), 2).unwrap();
+    let value: Value =
+        serde_json::from_slice(&fs::read(directory.join(service::STATUS_FILE)).unwrap()).unwrap();
+    assert_eq!(value["ready"], false);
+    assert_eq!(value["state_available"], false);
+    assert_eq!(value["height"], Value::Null);
+    assert_eq!(value["reorganization_alarm"], "canonical_state_unavailable");
+    fs::remove_dir_all(directory).unwrap();
+}

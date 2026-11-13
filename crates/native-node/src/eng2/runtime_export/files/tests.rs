@@ -261,3 +261,97 @@ fn concurrent_immutable_publications_install_one_complete_record_without_clobber
             .is_some_and(|extension| extension == "tmp")
     }));
 }
+
+#[test]
+fn withdrawal_preserves_original_publication_time_and_immutable_dependencies() {
+    // Synthetic signed export records test file behavior, not native execution.
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("withdrawal");
+    let mut export = PublicExport::open(&root, &store, limits()).unwrap();
+    let prepared = synthetic_candidate();
+    let message = prepared.statement.encode().unwrap();
+    let vote = |slot: u8, seed: u8| Vote {
+        slot,
+        signature: *ml_dsa_65::sign(
+            &ml_dsa_65::generate_key_pair([seed; 32]).signing_key,
+            &message,
+            Statement::signing_context(),
+            [42; 32],
+        )
+        .unwrap()
+        .as_ref(),
+    };
+    let certificate = Certificate {
+        statement: prepared.statement.clone(),
+        votes: [vote(0, 3), vote(1, 4)],
+    };
+    certificate
+        .check_signatures(prepared.roster.keys())
+        .unwrap();
+    let mut checkpoint = CertifiedCheckpoint {
+        prepared,
+        certificate,
+        published: 100_000,
+    };
+    let cursor = export.publication_cursor(&checkpoint).unwrap();
+    let value: Value = serde_json::from_slice(&cursor).unwrap();
+    let certificate = checkpoint.certificate.encode().unwrap();
+    let witness = checkpoint
+        .witness()
+        .encode(limits().chain.max_component_bytes)
+        .unwrap();
+    for (key, bytes) in [
+        ("certificate_file", certificate.as_slice()),
+        ("witness_file", witness.as_slice()),
+        ("snapshot_file", checkpoint.snapshot_bytes()),
+    ] {
+        export
+            .write_once(value[key].as_str().unwrap(), bytes)
+            .unwrap();
+    }
+    let journal_name = format!(
+        "vote-{:020}-{:020}-0.eng2.bin",
+        checkpoint.certificate.statement.roster_sequence,
+        checkpoint.certificate.statement.checkpoint_height
+    );
+    let journal = [
+        message.as_slice(),
+        &[0],
+        checkpoint.certificate.votes[0].signature.as_slice(),
+    ]
+    .concat();
+    export.write_once(&journal_name, &journal).unwrap();
+    export.replace("checkpoint-eng2.json", &cursor).unwrap();
+    export.remember_publication(&checkpoint).unwrap();
+    export.withdraw_checkpoint(&checkpoint).unwrap();
+    assert!(!root.join("checkpoint-eng2.json").exists());
+    assert_eq!(export.latest_height(), None);
+    let record = publication_name(checkpoint.certificate.statement.checkpoint_height);
+    assert_eq!(export.read(&record, 8192).unwrap(), cursor);
+    assert_eq!(export.read(&journal_name, journal.len()).unwrap(), journal);
+    assert_eq!(
+        export
+            .retained_votes(&checkpoint.certificate.statement)
+            .unwrap()
+            .len(),
+        1
+    );
+    for key in ["certificate_file", "witness_file", "snapshot_file"] {
+        assert!(root.join(value[key].as_str().unwrap()).is_file());
+    }
+    // Repeating a barrier keeps the exact original record. A later attempt to
+    // relabel the same anchor with a newer publication time is rejected.
+    export.withdraw_checkpoint(&checkpoint).unwrap();
+    checkpoint.published += 100;
+    assert!(export.withdraw_checkpoint(&checkpoint).is_err());
+    assert_eq!(export.read(&record, 8192).unwrap(), cursor);
+    let mut corrupted = journal.clone();
+    corrupted[0] ^= 1;
+    fs::write(root.join(&journal_name), &corrupted).unwrap();
+    assert!(
+        export
+            .retained_votes(&checkpoint.certificate.statement)
+            .is_err()
+    );
+}

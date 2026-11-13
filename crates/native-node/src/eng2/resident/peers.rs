@@ -15,6 +15,7 @@ struct Connection {
     last_round: Option<Instant>,
     caught_up: bool,
     checkpoint_head: Option<(u64, Hash)>,
+    completed_head: Option<(u64, Hash)>,
 }
 #[derive(Default)]
 struct StatusInner {
@@ -28,6 +29,7 @@ pub(crate) struct NetworkStatus {
 }
 pub(super) struct Snapshot {
     pub connections: usize,
+    #[cfg(test)]
     pub ready: bool,
     pub last_round_age_ms: Option<String>,
     pub rounds: u64,
@@ -69,6 +71,7 @@ impl NetworkStatus {
                 last_round: None,
                 caught_up: false,
                 checkpoint_head: None,
+                completed_head: None,
             },
         );
         Ok(Connected {
@@ -105,6 +108,7 @@ impl NetworkStatus {
         entry.last_round = Some(Instant::now());
         entry.caught_up = accepted < ROUND_BLOCKS;
         entry.checkpoint_head = if entry.caught_up { checked_head } else { None };
+        entry.completed_head = entry.checkpoint_head;
         status.rounds = status
             .rounds
             .checked_add(1)
@@ -143,6 +147,32 @@ impl NetworkStatus {
         }
         Ok(CheckpointReady { _guard: guard })
     }
+    /// A completed round for another tip cannot authorize work on this one.
+    pub(super) fn ready_at(&self, head: (u64, Hash)) -> Result<bool, String> {
+        let status = self
+            .inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?;
+        Ok(status.connections.values().any(|connection| {
+            connection.completed_head == Some(head)
+                && connection.caught_up
+                && connection
+                    .last_round
+                    .is_some_and(|time| time.elapsed() <= READY_FRESHNESS)
+        }))
+    }
+    pub(super) fn invalidate_head_evidence(&self) -> Result<(), String> {
+        let mut status = self
+            .inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?;
+        for connection in status.connections.values_mut() {
+            connection.completed_head = None;
+            connection.checkpoint_head = None;
+            connection.caught_up = false;
+        }
+        Ok(())
+    }
     pub(super) fn snapshot(&self) -> Result<Snapshot, String> {
         let status = self
             .inner
@@ -150,6 +180,7 @@ impl NetworkStatus {
             .map_err(|_| "connection registry lock poisoned")?;
         Ok(Snapshot {
             connections: status.connections.len(),
+            #[cfg(test)]
             ready: status.connections.values().any(|c| {
                 c.caught_up && c.last_round.is_some_and(|t| t.elapsed() <= READY_FRESHNESS)
             }),
@@ -267,11 +298,18 @@ fn checkpoint_phase(
         .budget
         .reserve(3 * (maximum + 4096))
         .map_err(|_| "checkpoint control phase budget exhausted")?;
-    #[cfg(unix)]
-    let outgoing = shared.mailbox.outgoing()?;
-    #[cfg(not(unix))]
-    let outgoing = Vec::new();
-    let network = owner_before(shared, &deadline)?.head()?.network;
+    let (network, outgoing) = {
+        let owner = owner_before(shared, &deadline)?;
+        #[cfg(unix)]
+        let outgoing = if owner.activities_allowed() {
+            shared.mailbox.outgoing()?
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(unix))]
+        let outgoing = Vec::new();
+        (owner.head()?.network, outgoing)
+    };
     let incoming = if initiator {
         checkpoint_exchange::initiate_before(peer, &outgoing, network, &deadline)
     } else {
@@ -283,6 +321,9 @@ fn checkpoint_phase(
             // Canonical owner → observer order also protects producer commit:
             // no block can commit between validating and latching a conflict.
             let owner = owner_before(shared, &deadline)?;
+            if !owner.activities_allowed() {
+                continue;
+            }
             let mut observer = shared
                 .checkpoint_observer
                 .lock()
@@ -485,6 +526,22 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mining_readiness_requires_current_completed_head_and_switch_revalidation() {
+        let status = Arc::new(NetworkStatus::default());
+        let connection = status.connected([5; 32]).unwrap();
+        let old = (5, [6; 32]);
+        status.round([5; 32], 0, Some(old)).unwrap();
+        assert!(status.ready_at(old).unwrap());
+        assert!(!status.ready_at((6, [7; 32])).unwrap());
+        status.begin_round([5; 32]).unwrap();
+        assert!(status.ready_at(old).unwrap());
+        status.invalidate_head_evidence().unwrap();
+        assert!(!status.ready_at(old).unwrap());
+        status.round([5; 32], 0, Some(old)).unwrap();
+        drop(connection);
+        assert!(!status.ready_at(old).unwrap());
+    }
     #[test]
     fn checkpoint_ready_guard_pins_exact_head_and_expires_without_changing_mining_readiness() {
         let status = Arc::new(NetworkStatus::new([[1; 32]]));

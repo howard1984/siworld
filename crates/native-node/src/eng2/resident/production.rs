@@ -30,16 +30,20 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             continue;
         }
         shared.phase("refilling")?;
-        let task = {
+        let (generation, task) = {
             let mut owner = shared
                 .owner
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
-            if owner.ready_positions() < crate::pool::MIN_READY {
+            if !owner.activities_allowed() {
+                continue;
+            }
+            let task = if owner.ready_positions() < crate::pool::MIN_READY {
                 owner.prepare_padding()?
             } else {
                 None
-            }
+            };
+            (owner.template_generation(), task)
         };
         if let Some(task) = task {
             let padding = task.prove(&prover)?;
@@ -52,12 +56,14 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .map_err(|_| "resident owner lock poisoned")?;
             // A long catch-up can expire the witnessed snapshot while a proof
             // runs. Such work is discarded, with no fallback or queue reuse.
-            if owner
-                .engine()
-                .state()
-                .chain()
-                .snapshot(padding.transaction.record.snapshot)
-                .is_ok()
+            if owner.activities_allowed()
+                && owner.template_generation() == generation
+                && owner
+                    .engine()
+                    .state()
+                    .chain()
+                    .snapshot(padding.transaction.record.snapshot)
+                    .is_ok()
             {
                 owner.insert_padding(padding)?;
             }
@@ -67,12 +73,12 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             continue;
         }
         shared.phase("preparing")?;
-        let (prepared, mut submission) = {
+        let (generation, prepared, mut submission) = {
             let mut owner = shared
                 .owner
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
-            if owner.ready_positions() < crate::pool::MIN_READY {
+            if !owner.activities_allowed() || owner.ready_positions() < crate::pool::MIN_READY {
                 continue;
             }
             let timestamp = (unix_ms()? / 1000).max(
@@ -103,7 +109,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             } else {
                 owner.prepare_block(crate::pool::MIN_READY, timestamp, settings)?
             };
-            (prepared, submission)
+            (owner.template_generation(), prepared, submission)
         };
         let proved = match prepared.prove(&prover) {
             Ok(proved) => proved,
@@ -123,7 +129,10 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .owner
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
-            if owner.head()?.id != proved.parent() {
+            if !owner.activities_allowed()
+                || owner.template_generation() != generation
+                || owner.head()?.id != proved.parent()
+            {
                 if submission.is_some() {
                     submission.fail("stale_parent");
                 }
@@ -145,14 +154,16 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             if shared.cancel.is_cancelled() || !shared.mining_ready()? {
                 break;
             }
-            if shared
-                .owner
-                .lock()
-                .map_err(|_| "resident owner lock poisoned")?
-                .head()?
-                .id
-                != work.parent()
-            {
+            let current_template = {
+                let owner = shared
+                    .owner
+                    .lock()
+                    .map_err(|_| "resident owner lock poisoned")?;
+                owner.activities_allowed()
+                    && owner.template_generation() == generation
+                    && owner.head()?.id == work.parent()
+            };
+            if !current_template {
                 if submission.is_some() {
                     submission.fail("stale_parent");
                 }
@@ -186,7 +197,10 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                             }
                             break;
                         }
-                        if owner.head()?.id != block.header.parent {
+                        if !owner.activities_allowed()
+                            || owner.template_generation() != generation
+                            || owner.head()?.id != block.header.parent
+                        {
                             if submission.is_some() {
                                 submission.fail("stale_parent");
                             }
