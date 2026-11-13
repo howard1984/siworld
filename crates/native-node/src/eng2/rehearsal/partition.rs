@@ -1,7 +1,6 @@
 //! Synthetic custody and bounded production controls for loopback partitions.
 //! Network orchestration remains external; these operations never start a node.
 use super::*;
-#[cfg(unix)]
 mod actual_state;
 mod audit;
 #[cfg(unix)]
@@ -10,6 +9,7 @@ mod corpus;
 mod driver_case;
 #[cfg(unix)]
 pub use driver_case::driver_case;
+pub mod qualification;
 mod replay;
 pub use audit::audit;
 pub use replay::replay_prefix;

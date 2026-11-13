@@ -244,6 +244,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                     work = next;
                 }
                 Search::Found(block) => {
+                    shared.block_events.produced(&block.header);
                     let attempts = block
                         .header
                         .nonce

@@ -41,6 +41,16 @@ pub fn driver_case(
     directory: &Path,
     depth: u64,
 ) -> Result<Value, String> {
+    driver_case_inner((source_a, pin_a, source_b, pin_b), directory, depth, None)
+}
+
+pub(super) fn driver_case_inner(
+    sources: (&Path, &str, &Path, &str),
+    directory: &Path,
+    depth: u64,
+    qualification: Option<&super::qualification::Context>,
+) -> Result<Value, String> {
+    let (source_a, pin_a, source_b, pin_b) = sources;
     owner_local()?;
     if ![1, 6, 7, 23, 24, 25].contains(&depth)
         || source_a == source_b
@@ -52,8 +62,17 @@ pub fn driver_case(
         return Err("separate public corpora, fresh destination and exact depth required".into());
     }
     let started = Instant::now();
-    let a = Corpus::open(source_a, pin_a, 26)?;
-    let b = Corpus::open(source_b, pin_b, 27)?;
+    let (a, b) = if let Some(context) = qualification {
+        (
+            Corpus::open_inner(source_a, pin_a, 26, Some(context))?,
+            Corpus::open_inner(source_b, pin_b, 27, Some(context))?,
+        )
+    } else {
+        (
+            Corpus::open(source_a, pin_a, 26)?,
+            Corpus::open(source_b, pin_b, 27)?,
+        )
+    };
     if a.genesis != b.genesis
         || a.record(1)? != b.record(1)?
         || a.record(2)?["id"] == b.record(2)?["id"]
@@ -94,11 +113,19 @@ pub fn driver_case(
     create_private(directory)?;
     let _lease = crate::service::Lease::acquire(directory)?;
     private_write(&directory.join("genesis.bin"), &a.genesis)?;
-    let marker = ceiling_value(reference.genesis(), 0)?;
-    private_write(
-        &directory.join(MARKER),
-        &serde_json::to_vec(&marker).map_err(|_| "paused production marker encoding failed")?,
-    )?;
+    if let Some(context) = qualification {
+        private_write(
+            &directory.join("qualification-case.json"),
+            &serde_json::to_vec_pretty(&context.receipt())
+                .map_err(|_| "qualification case binding encoding failed")?,
+        )?;
+    } else {
+        let marker = ceiling_value(reference.genesis(), 0)?;
+        private_write(
+            &directory.join(MARKER),
+            &serde_json::to_vec(&marker).map_err(|_| "paused production marker encoding failed")?,
+        )?;
+    }
     let observations = directory.join("observations");
     create_private(&observations)?;
     private_write(
@@ -272,7 +299,7 @@ pub fn driver_case(
     a.unchanged(policy)?;
     b.unchanged(policy)?;
     check_time(started)?;
-    let receipt = json!({"schema":1,"scope":"owner-native-full-frame-driver-case",
+    let mut receipt = json!({"schema":1,"scope":"owner-native-full-frame-driver-case",
         "depth":depth,"old_height":old_height,"replacement_height":new_height,
         "common_ancestor":1,"normal_switch_completed":depth <= 24,"depth25_refused":depth == 25,
         "actual_state_observed_after_every_restore_and_append":depth <= 24,
@@ -283,6 +310,10 @@ pub fn driver_case(
         "proofs_generated":false,"mining_started":false,"peer_heal_tested":false,
         "crash_tested":false,"wallet_scanned":false,"checkpoint_authority_tested":false,
         "g1_passed":false,"g2_passed":false,"elapsed_ms":started.elapsed().as_millis().to_string()});
+    if let Some(context) = qualification {
+        receipt["scope"] = json!("owner-nonfixture-native-full-frame-driver-case");
+        receipt["qualification"] = context.receipt();
+    }
     private_write(
         &directory.join("case-complete.json"),
         &serde_json::to_vec_pretty(&receipt).map_err(|_| "Driver case receipt encoding failed")?,

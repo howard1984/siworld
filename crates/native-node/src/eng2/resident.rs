@@ -19,6 +19,7 @@ use std::{
 #[cfg(any(unix, test))]
 use std::fs;
 
+mod block_events;
 mod bootstrap;
 mod config;
 pub use bootstrap::bootstrap_signed;
@@ -211,6 +212,7 @@ struct ProductionStatus {
 }
 struct Shared {
     owner: Arc<Mutex<Driver>>,
+    block_events: Arc<block_events::Recorder>,
     cancel: p2p::Cancellation,
     network: Arc<peers::NetworkStatus>,
     production: Mutex<ProductionStatus>,
@@ -287,32 +289,31 @@ fn export_status(
     let ready =
         owner.activities_allowed() && shared.network.ready_at((head.height, head.id))? && !conflict;
     let event = owner.last_reorganization();
-    service::atomic_json(
-        &directory.join(service::STATUS_FILE),
-        &json!({
-            "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
-            "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
-            "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
-            "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {"checkpoint_current_quorum_conflict"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
-            "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
-            "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
-            "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
-            "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
-            "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
-            "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
-            "reorganization_status":owner.reorganization_status(),"reorganization_alarm":owner.reorganization_alarm(),
-            "reorganization_depth":event.map(|event| event.depth),
-            "reorganization_ancestor_height":event.map(|event| event.ancestor_height),
-            "template_generation":owner.template_generation(),
-            "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
-            "signed_bootstrap_available":owner.bootstrap_available(),
-            "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
-            "checkpoint_observed_height":observer.observed_height(),"checkpoint_conflict":conflict,
-            "operations_error":operations_error(shared),
-            "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
-            "historical_proof_replay":false
-        }),
-    )
+    let mut status = json!({
+        "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
+        "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
+        "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
+        "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {"checkpoint_current_quorum_conflict"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+        "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
+        "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
+        "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
+        "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
+        "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
+        "checkpoint_error":checkpoint_error,"checkpoint_archive_error":owner.last_archive_error(),
+        "reorganization_status":owner.reorganization_status(),"reorganization_alarm":owner.reorganization_alarm(),
+        "reorganization_depth":event.map(|event| event.depth),
+        "reorganization_ancestor_height":event.map(|event| event.ancestor_height),
+        "template_generation":owner.template_generation(),
+        "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
+        "signed_bootstrap_available":owner.bootstrap_available(),
+        "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
+        "checkpoint_observed_height":observer.observed_height(),"checkpoint_conflict":conflict,
+        "operations_error":operations_error(shared),
+        "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
+        "historical_proof_replay":false
+    });
+    status["native_block_events"] = shared.block_events.diagnostic();
+    service::atomic_json(&directory.join(service::STATUS_FILE), &status)
 }
 
 fn export_unavailable_status(
@@ -467,12 +468,25 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         super::branches::BranchStore::create(&branch_path, header_rules, branch_limits)?
     };
     driver.enable_reorganization_with_budget(branches, budget.clone())?;
+    let running_binary = binary_hash()?;
     let run = service::RunIdentity::new(
         genesis.config().network,
-        binary_hash()?,
+        running_binary.clone(),
         config.digest.clone(),
         unix_ms()?,
     )?;
+    let block_events = Arc::new(block_events::Recorder::new(
+        directory,
+        genesis.config().network,
+        genesis.id(),
+        identity
+            .descriptor()
+            .ok()
+            .map(|descriptor| descriptor.fingerprint()),
+        &run.run_id,
+        &running_binary,
+    ));
+    driver.observe_commits(block_events.clone());
     #[cfg(unix)]
     let operations = operations::Mailbox::open(
         directory,
@@ -483,6 +497,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     .ok();
     let shared = Arc::new(Shared {
         owner: Arc::new(Mutex::new(driver)),
+        block_events,
         cancel: p2p::Cancellation::default(),
         network: Arc::new(peers::NetworkStatus::new(
             config.peers.iter().map(|peer| peer.expected.fingerprint()),
@@ -724,6 +739,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         .transpose()?
         .transpose();
     let result = result.and(network_result).and(producer_result.map(|_| ()));
+    shared.block_events.finish();
     shared.phase(if result.is_ok() { "stopped" } else { "error" })?;
     export_status(
         directory,

@@ -16,6 +16,14 @@ pub(super) struct Corpus {
 }
 impl Corpus {
     pub(super) fn open(source: &Path, pin: &str, height: u64) -> Result<Self, String> {
+        Self::open_inner(source, pin, height, None)
+    }
+    pub(super) fn open_inner(
+        source: &Path,
+        pin: &str,
+        height: u64,
+        qualification: Option<&super::qualification::Context>,
+    ) -> Result<Self, String> {
         if source.canonicalize().ok().as_deref() != Some(source)
             || pin.len() != 64
             || !pin
@@ -26,14 +34,22 @@ impl Corpus {
         }
         let genesis = bounded_bytes(&source.join("genesis.bin"), 1024 * 1024)?;
         let selected = Genesis::decode(&genesis)?;
-        ceiling_value(&selected, 0)?;
+        if let Some(context) = qualification {
+            context.check_genesis(&selected)?;
+        } else {
+            ceiling_value(&selected, 0)?;
+        }
         let manifest_bytes = bounded_bytes(&source.join("manifest.json"), 2 * 1024 * 1024)?;
         if crate::local::hex(&Sha256::digest(&manifest_bytes)) != pin {
             return Err("public corpus manifest SHA-256 differs".into());
         }
         let manifest: Value = serde_json::from_slice(&manifest_bytes)
             .map_err(|_| "public corpus manifest rejected")?;
-        replay::manifest_records(&manifest, &selected, height)?;
+        if let Some(context) = qualification {
+            replay::manifest_records_inner(&manifest, &selected, height, Some(context))?;
+        } else {
+            replay::manifest_records(&manifest, &selected, height)?;
+        }
         if manifest["height"] != height {
             return Err("public corpus must contain the exact audited source height".into());
         }

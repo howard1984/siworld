@@ -204,3 +204,83 @@ acceptance evidence; the helper does not enable full database repair. The named
 crash entries accept depths 1, 6, 7, 23 and 24. Depth 25 remains a separate
 restore-before refusal case. No parent batch controller, process-kill result,
 power-loss result or complete crash matrix is implied by these entrypoints.
+
+## Nonfixture history qualification
+
+The owner-operated rehearsal executable provides separate qualification commands
+for existing nonfixture engineering history. These commands neither initialize a
+network nor generate proofs, mine blocks or start residents. The synthetic
+partition commands and their fixture production controls retain their existing
+requirements. The qualification commands reject fixture genesis and zero PoW
+iterations; they do not create a production-ceiling marker.
+
+Each invocation takes a public binding JSON file and its independently supplied
+SHA-256. The file has exactly these fields:
+
+```json
+{
+  "version": 1,
+  "network_id": "<64 lowercase hexadecimal characters>",
+  "genesis_id": "<64 lowercase hexadecimal characters>",
+  "rules_commitment": "<64 lowercase hexadecimal characters>",
+  "proof_profile": "<64 lowercase hexadecimal characters>",
+  "source_commit": "<40 lowercase hexadecimal characters>",
+  "binary_sha256": "<64 lowercase hexadecimal characters>"
+}
+```
+
+Identity values must be nonzero. Unknown and duplicate fields are rejected. The
+binding is limited to 8 KiB. The executable must have been built with
+`SIWORLD_BUILD_COMMIT` matching `source_commit`, and its actual SHA-256 and
+compiled proof profile must match the supplied pins. The selected genesis must
+match the network, genesis and rules pins. A compiled source declaration does
+not prove build provenance: the owner must independently bind the source
+archive, toolchain, build manifest and executable. Receipts explicitly record
+`source_commit_externally_verified=false`. Separate executables from the same
+source, such as an audit executable and a test harness, have separate binding
+files and binary hashes.
+
+```text
+siworld-eng2-rehearsal --qualification-audit NODE NEW_OUTPUT BINDING BINDING_SHA256 --json
+siworld-eng2-rehearsal --qualification-replay-prefix EXPORT MANIFEST_SHA256 EMPTY_NODE HEIGHT BINDING BINDING_SHA256 --json
+siworld-eng2-rehearsal --qualification-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH BINDING BINDING_SHA256 --json
+```
+
+The audit requires a canonical absolute node directory, acquires its exclusive
+service lease and opens its canonical database read-only. It requires complete
+retained native history through at most 96 blocks, independently verifies every
+block and compares the final head and execution commitment with durable
+metadata. It exports the exact unchanged frames and an independently pinnable
+manifest, including the eleven component digests at every height. The output
+must be a fresh separate directory. This read-only replay audit does not
+authenticate the source's accepted-state restart seal. It reads public block
+history and does not load source identity custody.
+
+Prefix replay requires an existing authenticated empty stopped destination with
+its own local identity. The source manifest SHA-256 is checked before mutation.
+The manifest must have the nonfixture audit scope and the same declared source,
+network, genesis, rules and proof profile. Every prefix is prevalidated through
+ordinary native execution, then appended through the ordinary Store path. The
+actual eleven component byte vectors are compared with an independent native
+reference at each committed prefix and after an authenticated final reopen. No
+source database, identity or synthetic campaign seed is copied. The destination
+service lease remains held throughout replay and reopen. Starting or bounding
+subsequent production is a separate owner operation.
+
+The Unix Driver case retains the existing six depths: 1, 6, 7, 23, 24 and 25.
+It requires exact audited A26/B27 histories with a shared H1 and distinct H2.
+Each selected replacement prefix must have independently verified greater
+cumulative work. Original full frames are retained and passed through the
+normal native prevalidation, ancestor restore and incremental append path.
+Depth 25 must stop before restoration with the existing manual-recovery alarm.
+Each case creates only its own fresh identity and authenticated Store, records
+a separate qualification binding, compares actual component bytes with native
+replay and the pinned oracle, and performs a final authenticated reopen. It
+never creates a synthetic production marker or starts a network process.
+
+These commands do not expose the test-only crash hooks in a resident executable.
+Existing ignored Store crash entrypoints still require their original fixture
+context. Live resident fault injection, authenticated malformed-peer inputs,
+nonempty business-state and wallet reconciliation, peer healing and a complete
+continuous multi-miner run remain separate requirements. No command result
+asserts G1 or G2 acceptance.

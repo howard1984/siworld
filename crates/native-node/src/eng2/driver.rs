@@ -138,6 +138,13 @@ impl Driver {
     pub fn store(&self) -> &Store {
         &self.store
     }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn observe_commits(
+        &mut self,
+        observer: std::sync::Arc<dyn super::store::CommitObserver>,
+    ) {
+        self.store.observe_commits(observer);
+    }
     /// Explicit service-role maintenance. At most one missing permanent receipt
     /// is materialized per tick; this preserves bodies and all accepted state.
     pub fn refresh_bootstrap(

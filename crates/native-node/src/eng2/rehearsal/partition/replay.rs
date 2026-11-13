@@ -12,6 +12,22 @@ pub(super) fn manifest_records<'a>(
     selected: &Genesis,
     height: u64,
 ) -> Result<&'a [Value], String> {
+    manifest_records_inner(manifest, selected, height, None)
+}
+
+pub(super) fn manifest_records_inner<'a>(
+    manifest: &'a Value,
+    selected: &Genesis,
+    height: u64,
+    qualification: Option<&super::qualification::Context>,
+) -> Result<&'a [Value], String> {
+    let scope = if let Some(context) = qualification {
+        context.check_genesis(selected)?;
+        context.check_manifest(manifest)?;
+        super::qualification::AUDIT_SCOPE
+    } else {
+        "read-only-synthetic-native-partition-audit"
+    };
     let source_height = manifest["height"]
         .as_u64()
         .ok_or("replay source height missing")?;
@@ -20,7 +36,7 @@ pub(super) fn manifest_records<'a>(
         || source_height < height
         || source_height > MAX_HEIGHT
         || manifest["schema"] != 1
-        || manifest["scope"] != "read-only-synthetic-native-partition-audit"
+        || manifest["scope"] != scope
         || manifest["genesis_id"] != crate::local::hex(&selected.id())
         || manifest["network_id"] != crate::local::hex(&selected.config().network)
         || manifest["rules_commitment"] != crate::local::hex(&selected.rules_commitment())
@@ -109,25 +125,45 @@ pub(super) fn read_frame(
 /// then read and verified again by normal Store::append. No proof is generated.
 /// A source change during append can leave only a normally committed valid prefix.
 pub fn replay_prefix(source: &Path, directory: &Path, height: u64) -> Result<Value, String> {
+    replay_prefix_inner(source, directory, height, None)
+}
+
+pub(super) fn replay_prefix_inner(
+    source: &Path,
+    directory: &Path,
+    height: u64,
+    qualification: Option<(&super::qualification::Context, &str)>,
+) -> Result<Value, String> {
     owner_local()?;
     if source.canonicalize().ok().as_deref() != Some(source)
         || directory.canonicalize().ok().as_deref() != Some(directory)
-        || source == directory
+        || source.starts_with(directory)
+        || directory.starts_with(source)
     {
         return Err("separate canonical replay source and node directories required".into());
     }
     let encoded = bounded_bytes(&source.join("genesis.bin"), 1024 * 1024)?;
     let selected = Genesis::decode(&encoded)?;
-    ceiling_value(&selected, 0)?;
-    if bounded_bytes(&directory.join("genesis.bin"), 1024 * 1024)? != encoded
-        || production_ceiling(directory, &selected)? != Some(0)
-    {
+    if let Some((context, _)) = qualification {
+        context.check_genesis(&selected)?;
+    } else {
+        ceiling_value(&selected, 0)?;
+        if production_ceiling(directory, &selected)? != Some(0) {
+            return Err("replay destination production must be paused".into());
+        }
+    }
+    if bounded_bytes(&directory.join("genesis.bin"), 1024 * 1024)? != encoded {
         return Err("replay destination genesis or paused production differs".into());
     }
     let manifest_bytes = bounded_bytes(&source.join("manifest.json"), MAX_MANIFEST_BYTES)?;
     let manifest: Value =
         serde_json::from_slice(&manifest_bytes).map_err(|_| "replay source manifest rejected")?;
-    let records = manifest_records(&manifest, &selected, height)?;
+    let records = if let Some((context, pin)) = qualification {
+        context.check_manifest_pin(&manifest_bytes, pin)?;
+        manifest_records_inner(&manifest, &selected, height, Some(context))?
+    } else {
+        manifest_records(&manifest, &selected, height)?
+    };
     let _lease = crate::service::Lease::acquire(directory)?;
     let limits = Limits {
         max_leaves: 1_000_000,
@@ -148,6 +184,9 @@ pub fn replay_prefix(source: &Path, directory: &Path, height: u64) -> Result<Val
         }
         let (header, body) = read_frame(source, record, &selected, preflight.body_policy())?;
         preflight.apply(&header, &body, &verifier)?;
+        if qualification.is_some() {
+            super::actual_state::observe(&preflight, &preflight, &header, record)?;
+        }
         if record["cumulative_work"]
             != crate::local::hex(&preflight.state().chain().cumulative_work.to_big_endian())
         {
@@ -155,32 +194,64 @@ pub fn replay_prefix(source: &Path, directory: &Path, height: u64) -> Result<Val
         }
     }
     let expected_tip = preflight.state().tip();
+    drop(preflight);
+    let mut reference = qualification
+        .map(|_| Engine::new(Genesis::decode(&encoded)?, limits))
+        .transpose()?;
     for record in records {
         if started.elapsed().as_secs() >= REPLAY_DEADLINE_SECONDS {
             return Err("native prefix replay deadline".into());
         }
         let (header, body) = read_frame(source, record, &selected, store.engine().body_policy())?;
         store.append(&header, &body, &verifier)?;
+        if let Some(reference) = reference.as_mut() {
+            reference.apply(&header, &body, &verifier)?;
+            super::actual_state::observe(store.engine(), reference, &header, record)?;
+        }
     }
     if store.engine().state().height() != height || store.engine().state().tip() != expected_tip {
         return Err("native prefix replay committed head differs".into());
     }
     drop(store);
-    let reopened = Store::resume_existing(&database, selected, limits)?;
+    let reopened = Store::resume_existing(&database, Genesis::decode(&encoded)?, limits)?;
     if reopened.engine().state().height() != height
         || reopened.engine().state().tip() != expected_tip
     {
         return Err("native prefix replay authenticated reopen differs".into());
     }
-    Ok(
-        json!({"scope":"synthetic-native-prefix-replay","height":height,
+    if let Some(reference) = &reference {
+        let record = records.last().ok_or("qualification replay prefix empty")?;
+        let (header, _) = read_frame(source, record, &selected, reopened.engine().body_policy())?;
+        super::actual_state::observe(reopened.engine(), reference, &header, record)?;
+        if bounded_bytes(&source.join("genesis.bin"), 1024 * 1024)? != encoded
+            || bounded_bytes(&source.join("manifest.json"), MAX_MANIFEST_BYTES)? != manifest_bytes
+        {
+            return Err("qualification source context changed during replay".into());
+        }
+        for record in records {
+            if started.elapsed().as_secs() >= REPLAY_DEADLINE_SECONDS {
+                return Err("native prefix replay deadline".into());
+            }
+            read_frame(source, record, &selected, reopened.engine().body_policy())?;
+        }
+    }
+    let scope = if qualification.is_some() {
+        "owner-nonfixture-native-prefix-replay"
+    } else {
+        "synthetic-native-prefix-replay"
+    };
+    let mut result = json!({"scope":scope,"height":height,
         "tip":crate::local::hex(&expected_tip),
         "source_manifest_sha256":crate::local::hex(&Sha256::digest(&manifest_bytes)),
         "native_preflight":true,"ordinary_store_append":true,"authenticated_reopen":true,
         "source_frames_changed":false,"proofs_generated":false,"nodes_started":false,
         "peer_heal_tested":false,"g1_passed":false,"g2_passed":false,
-        "elapsed_ms":started.elapsed().as_millis().to_string()}),
-    )
+        "elapsed_ms":started.elapsed().as_millis().to_string()});
+    if let Some((context, _)) = qualification {
+        result["qualification"] = context.receipt();
+        result["actual_eleven_component_bytes_equal_native_reference"] = json!(true);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

@@ -11,6 +11,61 @@ fn run() -> Result<(), String> {
         return Err("native rehearsal execution requires an owner-operated environment".into());
     }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 6 && args[0] == "--qualification-audit" && args[5] == "--json" {
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::qualification::audit(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                std::path::Path::new(&args[3]),
+                args[4].to_str().ok_or("invalid binding SHA-256")?
+            )?
+        );
+        return Ok(());
+    }
+    if args.len() == 8 && args[0] == "--qualification-replay-prefix" && args[7] == "--json" {
+        let height = args[4]
+            .to_str()
+            .ok_or("invalid qualification prefix height")?
+            .parse()
+            .map_err(|_| "invalid qualification prefix height")?;
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::qualification::replay_prefix(
+                std::path::Path::new(&args[1]),
+                args[2].to_str().ok_or("invalid source manifest SHA-256")?,
+                std::path::Path::new(&args[3]),
+                height,
+                std::path::Path::new(&args[5]),
+                args[6].to_str().ok_or("invalid binding SHA-256")?
+            )?
+        );
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if args.len() == 10 && args[0] == "--qualification-driver-case" && args[9] == "--json" {
+        let depth = args[6]
+            .to_str()
+            .ok_or("invalid qualification Driver depth")?
+            .parse()
+            .map_err(|_| "invalid qualification Driver depth")?;
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::qualification::driver_case(
+                (
+                    std::path::Path::new(&args[1]),
+                    args[2].to_str().ok_or("invalid first manifest SHA-256")?,
+                    std::path::Path::new(&args[3]),
+                    args[4].to_str().ok_or("invalid second manifest SHA-256")?
+                ),
+                std::path::Path::new(&args[5]),
+                depth,
+                std::path::Path::new(&args[7]),
+                args[8].to_str().ok_or("invalid binding SHA-256")?
+            )?
+        );
+        return Ok(());
+    }
     #[cfg(unix)]
     if args.len() == 8 && args[0] == "--partition-driver-case" && args[7] == "--json" {
         let pin_a = args[2]
@@ -137,7 +192,7 @@ fn run() -> Result<(), String> {
         || args[3] != "--blocks"
         || args[5] != "--json"
     {
-        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json; or --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json (Unix owner only)".into());
+        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json; or --qualification-audit NODE NEW_OUTPUT BINDING BINDING_SHA256 --json; or --qualification-replay-prefix EXPORT MANIFEST_SHA256 EMPTY_NODE HEIGHT BINDING BINDING_SHA256 --json; or --qualification-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH BINDING BINDING_SHA256 --json (Unix owner only); or --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json (Unix owner only)".into());
     }
     let blocks = args[4]
         .to_str()

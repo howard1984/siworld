@@ -22,11 +22,24 @@ const COMPONENTS: [&str; 11] = [
 /// Acquire the normal service lease, then replay a read-only database snapshot.
 /// Only a new output directory is written; source blocks and indexes are intact.
 pub fn audit(directory: &Path, output: &Path) -> Result<Value, String> {
+    audit_inner(directory, output, None)
+}
+
+pub(super) fn audit_inner(
+    directory: &Path,
+    output: &Path,
+    qualification: Option<&super::qualification::Context>,
+) -> Result<Value, String> {
     owner_local()?;
+    if output.starts_with(directory) || directory.starts_with(output) {
+        return Err("audit source and output must be separate".into());
+    }
     let _lease = crate::service::Lease::acquire(directory)?;
     let encoded = bounded_bytes(&directory.join("genesis.bin"), 1024 * 1024)?;
     let selected = Genesis::decode(&encoded)?;
-    if production_ceiling(directory, &selected)?.is_none() {
+    if let Some(context) = qualification {
+        context.check_genesis(&selected)?;
+    } else if production_ceiling(directory, &selected)?.is_none() {
         return Err("partition audit requires its synthetic node marker".into());
     }
     let limits = Limits {
@@ -140,12 +153,21 @@ pub fn audit(directory: &Path, output: &Path) -> Result<Value, String> {
     if expected != durable {
         return Err("partition durable head differs from independent complete replay".into());
     }
-    let result = json!({"schema":1,"scope":"read-only-synthetic-native-partition-audit","genesis_id":crate::local::hex(&engine.genesis().id()),
+    let scope = if qualification.is_some() {
+        super::qualification::AUDIT_SCOPE
+    } else {
+        "read-only-synthetic-native-partition-audit"
+    };
+    let mut result = json!({"schema":1,"scope":scope,"genesis_id":crate::local::hex(&engine.genesis().id()),
         "network_id":crate::local::hex(&engine.state().network()),"rules_commitment":crate::local::hex(&engine.genesis().rules_commitment()),
         "proof_profile":crate::local::hex(&crate::proofs::protocol_profile_fingerprint()),"height":height,"tip":crate::local::hex(&engine.state().tip()),
         "independent_native_replay":true,"durable_head_verified":true,"source_block_bytes_changed":false,
         "final_components":components,"blocks":records,"elapsed_ms":started.elapsed().as_millis().to_string(),
         "wallet_scanned":false,"g1_passed":false,"g2_passed":false});
+    if let Some(context) = qualification {
+        result["qualification"] = context.receipt();
+        result["authenticated_restart_seal_checked"] = json!(false);
+    }
     private_write(
         &output.join("manifest.json"),
         &serde_json::to_vec_pretty(&result).map_err(|_| "partition manifest encoding failed")?,

@@ -55,6 +55,13 @@ pub(crate) fn arm_full_frame_crash_boundary() {
     crash_tests::arm_full_frame();
 }
 
+/// A best-effort diagnostic observation after native verification and the
+/// canonical database commit. It has no admission or rollback authority.
+#[cfg(feature = "eng2-runtime")]
+pub(crate) trait CommitObserver: Send + Sync {
+    fn committed(&self, header: &Header);
+}
+
 pub struct Store {
     database: Database,
     #[cfg(windows)]
@@ -67,6 +74,8 @@ pub struct Store {
     imported_prefix: u64,
     import_seed: Hash,
     revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "eng2-runtime")]
+    commit_observer: Option<std::sync::Arc<dyn CommitObserver>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyAvailability {
@@ -142,6 +151,8 @@ impl Store {
             imported_prefix: 0,
             import_seed: [0; 32],
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "eng2-runtime")]
+            commit_observer: None,
         })
     }
     /// Independently reconstruct every committed block and execution root and
@@ -271,10 +282,16 @@ impl Store {
             imported_prefix: 0,
             import_seed: [0; 32],
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "eng2-runtime")]
+            commit_observer: None,
         })
     }
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn observe_commits(&mut self, observer: std::sync::Arc<dyn CommitObserver>) {
+        self.commit_observer = Some(observer);
     }
     /// Resume the exact locally authenticated last committed state. This never
     /// verifies historical transaction or settlement proofs and never silently
@@ -523,6 +540,8 @@ impl Store {
             imported_prefix,
             import_seed,
             revision: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "eng2-runtime")]
+            commit_observer: None,
         };
         result.ensure_exportable()?;
         result.remember_rollback_state()?;
@@ -950,6 +969,10 @@ impl Store {
         crash_tests::boundary("append_before_commit", header.height);
         txn.commit()
             .map_err(|_| "versioned canonical durable commit failed")?;
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(observer) = &self.commit_observer {
+            observer.committed(header);
+        }
         #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
         crash_tests::boundary("append_after_commit", header.height);
         let result = self.engine.publish(staged)?;

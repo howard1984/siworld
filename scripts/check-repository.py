@@ -13,6 +13,7 @@ ROOT_FILES = {
     "SECURITY.md", ".gitleaks.toml",
 }
 DOCUMENTS = {
+    "native-block-events.md",
     "native-hiding-proof-v2.md",
     "complete-fee-child.md",
     "00-decisions.md", "11-risks-open-questions.md", "bht-security-accounting.md", "d8-dependency-patch.md",
