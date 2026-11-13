@@ -70,6 +70,8 @@ fn small_lookup_air_roundtrip_checks_fresh_verifier_and_adversarial_batch_fields
         .unwrap();
     let frame = verifier.shape.encode(&proof).unwrap();
     assert!(frame.len() <= super::super::MAX_FEE_PROOF_BYTES);
+    assert!(frame.len() <= verifier.shape().maximum_complete_frame_bytes());
+    assert!(verifier.shape().maximum_complete_frame_bytes() <= super::super::MAX_FEE_PROOF_BYTES);
     let fresh =
         CompleteFeeBatchVerifier::from_authenticated_air(SmallLookupAir, 9, binding()).unwrap();
     fresh.verify(&frame, &[F::ONE]).unwrap();

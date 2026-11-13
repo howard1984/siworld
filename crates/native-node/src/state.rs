@@ -864,6 +864,7 @@ pub fn tail_slots(network: Hash, height: u64, count: usize) -> Result<Vec<Settle
 }
 
 #[cfg(all(test, siworld_native_node))]
+#[path = "state/tests.rs"]
 mod tests;
 
 #[cfg(test)]

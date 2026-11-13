@@ -1130,4 +1130,5 @@ impl WalletPayment {
 pub mod issuance;
 
 #[cfg(all(test, siworld_native_node))]
+#[path = "wallet/tests.rs"]
 mod tests;

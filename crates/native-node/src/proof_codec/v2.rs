@@ -10,6 +10,9 @@ pub mod backend;
 #[path = "v2/batch.rs"]
 pub mod batch;
 
+#[path = "v2/complete_fee/mod.rs"]
+pub mod complete_fee;
+
 #[cfg(not(target_family = "wasm"))]
 #[path = "v2/fee_guard.rs"]
 pub mod fee_guard;

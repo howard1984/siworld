@@ -136,7 +136,7 @@ pub struct CompleteFeeBatchShape {
     folds: Vec<FoldShape>,
 }
 impl CompleteFeeBatchShape {
-    fn from_trusted<A: Air<InteractionSymbolicBuilder<F, E>>>(
+    pub(super) fn from_trusted<A: Air<InteractionSymbolicBuilder<F, E>>>(
         air: &A,
         common: &CommonData<Config>,
         cfg: &Config,
@@ -302,6 +302,61 @@ impl CompleteFeeBatchShape {
         result.identity.profile = *h.finalize().as_bytes();
         Ok(result)
     }
+    /// Upper bound for canonical framing under this exact locally trusted shape.
+    /// Authentication paths use their admitted worst-case pruned length. This
+    /// is structural accounting, not a proof-generation or memory measurement.
+    pub fn maximum_complete_frame_bytes(&self) -> usize {
+        fn varint(mut value: usize) -> usize {
+            let mut bytes = 1;
+            while value >= 128 {
+                value >>= 7;
+                bytes += 1;
+            }
+            bytes
+        }
+        fn cap(roots: usize) -> usize {
+            varint(roots) + roots * DIGEST_ELEMENTS * 4
+        }
+        fn ext(values: usize) -> usize {
+            varint(values) + values * EXTENSION_DEGREE * 4
+        }
+        fn base(values: usize) -> usize {
+            varint(values) + values * 4
+        }
+        fn salts(matrices: usize) -> usize {
+            varint(QUERIES) + QUERIES * (varint(matrices) + matrices * base(SALTS))
+        }
+        let mut bytes = FRAME_BYTES + 4 * cap(self.input_roots) + 2;
+        bytes += varint(1) + ext(self.main) + 1 + usize::from(self.main_next) * ext(self.main);
+        bytes += 1 + ext(self.pre) + 1 + usize::from(self.pre_next) * ext(self.pre);
+        bytes += varint(self.chunks) + self.chunks * ext(EXTENSION_DEGREE);
+        bytes += 1 + ext(EXTENSION_DEGREE) + 2 * ext(self.permutation);
+        bytes += varint(self.rounds.len());
+        for round in &self.rounds {
+            bytes += varint(round.matrices)
+                + round.matrices * (varint(round.points) + round.points * ext(round.random_values));
+        }
+        bytes += 4 + varint(self.folds.len());
+        for fold in &self.folds {
+            bytes += cap(fold.cap_roots);
+        }
+        bytes += varint(self.folds.len()) + self.folds.len() * 4;
+        bytes += varint(self.rounds.len());
+        for round in &self.rounds {
+            bytes += varint(QUERIES)
+                + QUERIES * (varint(round.matrices) + round.matrices * base(round.width));
+            bytes += salts(round.matrices) + cap(self.input_path_hashes);
+        }
+        bytes += varint(self.folds.len());
+        for fold in &self.folds {
+            bytes += varint(QUERIES) + QUERIES * ext(fold.siblings);
+            bytes += salts(1) + cap(fold.path_hashes);
+        }
+        bytes += ext(1) + 4 + varint(1) + 1 + EXTENSION_DEGREE * 4;
+        bytes += varint(1) + varint(self.degree_bits) + 1 + 4 + 4;
+        bytes
+    }
+
     pub fn identity(&self) -> Identity {
         self.identity
     }

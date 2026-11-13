@@ -138,10 +138,33 @@ declared decoded vectors at 32 MiB. Other native decoders retain their existing
 
 A synthetic 256-row lookup AIR exercises an actual full-profile batch proof,
 newly rebuilt verification, changed public statements and malformed fields.
-This is codec and backend evidence. The actual complete-fee AIR, authenticated
-network registry, engine admission and normal/priority fee blocks still require
-integration and qualification. No AIR compression or security-parameter
-reduction is required by the fee size limit.
+This is codec and backend evidence. A separate inactive fixed-capacity adapter
+composes the fee sum, subsidy-only reward outputs, ML-KEM encapsulation,
+payment-key derivation and ChaCha20-Poly1305 delivery constraints into one AIR.
+It retains the historical fee commitment tag 136 and eight-field blinding layout.
+Individual transaction validation must authenticate fee-tier validity; untrusted
+sidecar priority or padding labels grant no authority to the sum relation.
+
+The adapter reconstructs its statement from 576 ordered fee commitments, reward
+commitments, the complete destination address, payment ciphertext and authenticated
+block context. Its 7590 statement-dependent preprocessing values become 64
+additional constrained main columns. The producer checks the exact 1024-row,
+7604-column legacy trace geometry before extending it to 7668 columns, writes
+the derived values only on their declared support and zeros all remaining rows.
+The retained constraint and lookup bodies remain active through the mapping.
+The complete source closure, genesis, rules, codec and locally rebuilt key are
+bound in the expected profile. No proof selects an AIR, key or public vector.
+
+The verifier currently rebuilds the full deterministic preprocessing locally.
+A separately installed fixed-root verifier and cold setup resources remain
+unqualified. The manual complete-fee measurement example uses synthetic fee
+openings; its fresh verification mode reconstructs public data without creating
+private openings and requires externally pinned manifest and frame hashes.
+It exercises neither native transaction-proof admission nor real network fee
+blocks. Full-profile size and resource measurements, authenticated network
+registration, isolated engine admission, joint disclosure analysis and ordinary
+and priority wallet blocks remain qualification gates. No AIR compression or
+security-parameter reduction is required by the fee size limit.
 
 The V2 fee receiver checks the outer declared length before reading proof bytes
 or allocating a body. After reading the fixed header it checks the authenticated

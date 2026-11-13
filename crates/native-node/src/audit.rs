@@ -204,6 +204,7 @@ pub fn replay_blocks(
 }
 
 #[cfg(all(test, siworld_native_node))]
+#[path = "audit/tests.rs"]
 pub(crate) mod tests;
 
 #[cfg(all(test, siworld_native_node))]

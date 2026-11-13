@@ -670,4 +670,5 @@ impl IssuanceVerifier {
     }
 }
 #[cfg(all(test, siworld_native_node))]
+#[path = "issuance/tests.rs"]
 mod tests;

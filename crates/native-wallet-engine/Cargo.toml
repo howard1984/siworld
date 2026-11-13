@@ -13,6 +13,7 @@ siworld-core = { path = "../core" }
 p3-air = "=0.9.0-rc.2"
 p3-batch-stark = "=0.9.0-rc.2"
 p3-lookup = "=0.9.0-rc.2"
+p3-keccak-air = "=0.9.0-rc.2"
 p3-challenger = "=0.9.0-rc.2"
 p3-dft = "=0.9.0-rc.2"
 p3-koala-bear = "=0.9.0-rc.2"
@@ -31,6 +32,8 @@ serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 blake3 = { version = "1.8.3", features = ["zeroize"] }
 libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["mldsa65"] }
 libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+libcrux-sha3 = "=0.0.11"
+num-bigint = "=0.4.8"
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 sha2 = "=0.10.9"
 getrandom = "0.4"
