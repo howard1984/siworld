@@ -18,6 +18,7 @@ pub(super) struct Configuration {
     pub mining: bool,
     pub peers: Vec<Destination>,
     pub checkpoint_key: Option<PathBuf>,
+    pub legacy_checkpoint_peers: BTreeSet<Hash>,
     pub digest: String,
 }
 fn unhex<const N: usize>(value: &Value) -> Result<[u8; N], String> {
@@ -47,7 +48,10 @@ impl Configuration {
         let object = value
             .as_object()
             .ok_or("resident configuration requires an object")?;
-        if object.len() != 7 || value["version"] != 2 || value["engineering"] != true {
+        if object.len() != 7 + usize::from(object.contains_key("legacy_checkpoint_peers"))
+            || value["version"] != 2
+            || value["engineering"] != true
+        {
             return Err("explicit version 2 engineering configuration required".into());
         }
         let role = match value["role"].as_str() {
@@ -156,12 +160,30 @@ impl Configuration {
                 expected,
             });
         }
+        let mut legacy_checkpoint_peers = BTreeSet::new();
+        if let Some(entries) = object.get("legacy_checkpoint_peers") {
+            let entries = entries
+                .as_array()
+                .ok_or("legacy checkpoint peers require an array")?;
+            if entries.len() > 16 {
+                return Err("legacy checkpoint peer limit".into());
+            }
+            // This set only suppresses incompatible advertisements after peer
+            // authentication. Configured destinations still require PeerPins.
+            for entry in entries {
+                let fingerprint = unhex::<32>(entry)?;
+                if fingerprint == local || !legacy_checkpoint_peers.insert(fingerprint) {
+                    return Err("duplicate or local legacy checkpoint peer".into());
+                }
+            }
+        }
         Ok(Self {
             role,
             listen,
             mining,
             peers,
             checkpoint_key,
+            legacy_checkpoint_peers,
             digest: crate::local::hex(&Sha256::digest(&bytes)),
         })
     }

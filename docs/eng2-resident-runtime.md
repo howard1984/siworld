@@ -55,6 +55,23 @@ key; the host separately validates that key against the verified local roster.
 Each configured peer specifies an endpoint, a `dial` boolean, a fingerprint and
 a descriptor matching an independently persisted service pin. Duplicate
 identities, endpoints, self-connections and unpinned targets are rejected.
+An optional top-level `legacy_checkpoint_peers` array defaults to empty. Each
+entry is an administrator-selected fingerprint; the array is limited to 16
+distinct, nonlocal identities. This advertisement selection does not require or
+create a peer pin, an outbound destination or a checkpoint-readiness reference.
+It grants no admission or signing authority. Before it can affect a connection,
+the peer must complete the existing hybrid handshake with a descriptor bound to
+the current genesis; selection then compares the authenticated peer fingerprint.
+It restricts checkpoint advertisements to each authenticated selected peer
+to statements accepted by the earlier 72-block publisher rule, including its
+24-block confirmation calculation. This filters proposals, votes and
+certificates without rewriting their bytes or changing certificate admission,
+signatures, quorum, chain validation or block/transaction exchange. Other peers
+receive the current 12-block publisher stream. The setting is included in the
+configuration digest. It does not negotiate a capability or upgrade the peer;
+while the current checkpoint is incompatible, the checkpoint phase sends an
+empty batch and ordinary peer rounds continue. The old peer is not qualified
+as a source of the latest 12-block checkpoint by this compatibility policy.
 Ordinary miners may connect to service nodes without manual registration. They
 still complete the encrypted hybrid handshake and all consensus verification.
 Services do not admit an unknown validator through the open miner route.

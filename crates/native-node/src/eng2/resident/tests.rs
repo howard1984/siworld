@@ -141,6 +141,66 @@ fn miner_configuration_is_outbound_only_with_explicit_existing_signer_selection(
 }
 #[cfg(unix)]
 #[test]
+fn legacy_checkpoint_routing_only_selects_advertisements_without_peer_admission() {
+    let directory = directory();
+    let remote_directory = super::tests::directory();
+    let genesis = genesis();
+    let identity = NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap();
+    let remote = NativeIdentity::initialize(&remote_directory, genesis.peer_binding()).unwrap();
+    let descriptor = remote.descriptor().unwrap();
+    let fingerprint = crate::local::hex(&descriptor.fingerprint());
+    let path = directory.join("peers.json");
+    let mut value = json!({"version":2,"engineering":true,"role":"validator","listen":null,"mining":false,"checkpoint_key":null,"peers":[]});
+    service::atomic_json(&path, &value).unwrap();
+    let current = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
+    assert!(current.legacy_checkpoint_peers.is_empty());
+    value["legacy_checkpoint_peers"] = json!([fingerprint]);
+    service::atomic_json(&path, &value).unwrap();
+    let pin_path = directory.join(format!("peer-{fingerprint}.pin"));
+    assert!(!pin_path.exists());
+    let legacy = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
+    assert!(
+        legacy
+            .legacy_checkpoint_peers
+            .contains(&descriptor.fingerprint())
+    );
+    assert!(!pin_path.exists());
+    // Ingress routing must not add readiness references or outbound destinations.
+    assert_eq!(legacy.peers.len(), current.peers.len());
+    assert!(legacy.peers.is_empty());
+    assert_ne!(legacy.digest, current.digest);
+    value["peers"] = json!([{
+        "endpoint":"127.0.0.1:9000", "dial":false, "fingerprint":fingerprint,
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]);
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    value["peers"] = json!([]);
+    for invalid in [
+        Value::Null,
+        json!(true),
+        json!(["bad"]),
+        json!([fingerprint, fingerprint]),
+        json!([crate::local::hex(
+            &identity.descriptor().unwrap().fingerprint()
+        )]),
+        Value::Array(
+            (0u8..17)
+                .map(|index| json!(crate::local::hex(&[index; 32])))
+                .collect(),
+        ),
+    ] {
+        value["legacy_checkpoint_peers"] = invalid;
+        service::atomic_json(&path, &value).unwrap();
+        assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    }
+    drop(identity);
+    drop(remote);
+    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(remote_directory).unwrap();
+}
+#[cfg(unix)]
+#[test]
 fn observer_resident_starts_from_committed_state_and_stops_only_its_selected_run() {
     let directory = directory();
     let genesis = genesis();

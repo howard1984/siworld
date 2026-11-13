@@ -63,6 +63,70 @@ fn original(budget: &p2p::Budget, message: &Incoming) -> p2p::Reservation {
     budget.reserve(length * 3 + 65536).unwrap()
 }
 #[test]
+fn legacy_recipient_filter_preserves_bytes_without_changing_the_current_outbox() {
+    let budget = p2p::Budget::new(8 * 1024 * 1024);
+    let mailbox = CheckpointMailbox::new(budget.clone());
+    for checkpoint in [12, 60, 72, 84, 132, 144, 660, 720, 732] {
+        let mut packets = messages();
+        for packet in &mut packets {
+            let statement = match packet {
+                Incoming::Proposal(proposal) => &mut proposal.statement,
+                Incoming::Vote { statement, .. } => statement,
+                Incoming::Certified { certificate, .. } => &mut certificate.statement,
+            };
+            statement.checkpoint_height = checkpoint;
+            statement.authorization_height = checkpoint + 24;
+        }
+        mailbox.publish(&packets).unwrap();
+        let original = packets
+            .iter()
+            .map(|message| message.encode(131072).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(mailbox.outgoing(false).unwrap(), original);
+        let legacy = mailbox.outgoing(true).unwrap();
+        assert_eq!(legacy.len(), if checkpoint % 72 == 0 { 3 } else { 0 });
+        for bytes in legacy {
+            assert!(original.contains(&bytes));
+            let decoded = Incoming::decode(&bytes, [1; 32], 131072).unwrap();
+            let statement = match decoded {
+                Incoming::Proposal(proposal) => proposal.statement,
+                Incoming::Vote { statement, .. } => statement,
+                Incoming::Certified { certificate, .. } => certificate.statement,
+            };
+            // Exact eligibility required by the unchanged legacy observer.
+            assert_eq!(
+                Some(statement.checkpoint_height),
+                statement
+                    .authorization_height
+                    .checked_sub(24)
+                    .map(|height| height / 72 * 72)
+                    .filter(|height| *height > 0)
+            );
+        }
+        // Selection for one recipient cannot consume or replace another's view.
+        assert_eq!(mailbox.outgoing(false).unwrap(), original);
+    }
+}
+#[test]
+fn legacy_filter_checks_authorization_height_instead_of_height_multiple_alone() {
+    let mut packet = vote(0);
+    for (checkpoint, authorization, expected) in [
+        (72, 95, false),
+        (72, 96, true),
+        (72, 167, true),
+        (72, 168, false),
+        (0, 24, false),
+        (72, 0, false),
+        (u64::MAX, 0, false),
+    ] {
+        if let Incoming::Vote { statement, .. } = &mut packet {
+            statement.checkpoint_height = checkpoint;
+            statement.authorization_height = authorization;
+        }
+        assert_eq!(legacy_compatible(&packet), expected);
+    }
+}
+#[test]
 fn eight_peers_replaying_three_packets_each_second_do_not_fill_the_inbox() {
     let budget = p2p::Budget::new(8 * 1024 * 1024);
     let before = budget.available().unwrap();
