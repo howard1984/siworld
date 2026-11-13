@@ -40,6 +40,7 @@ pub struct ArchiveWork {
 
 /// Private evidence for the exact native-validated archive bytes and captured
 /// reconstruction input. It carries no signature or publication authority.
+#[cfg(feature = "eng2-runtime")]
 #[derive(Clone)]
 pub(super) struct NativeArchiveIdentity {
     anchor: Header,
@@ -51,6 +52,7 @@ pub(super) struct NativeArchiveIdentity {
     snapshot_bytes: usize,
     lineage: Arc<()>,
 }
+#[cfg(feature = "eng2-runtime")]
 impl NativeArchiveIdentity {
     pub(super) fn same_live_validation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.lineage, &other.lineage)
@@ -80,6 +82,7 @@ pub struct ValidatedArchive {
     state: SnapshotState,
     archive: Vec<u8>,
     _reservation: Reservation,
+    #[cfg(feature = "eng2-runtime")]
     identity: NativeArchiveIdentity,
 }
 impl ArchiveWork {
@@ -134,6 +137,7 @@ impl ArchiveWork {
             input_digest: [0; 32],
         })
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn from_restore_read(
         read: &crate::eng2::store::CheckpointRestoreRead,
         height: u64,
@@ -235,7 +239,7 @@ impl ArchiveWork {
             self.reservation = captured.reservation;
             self.input_digest = captured.input_digest;
         }
-        let input_identity = self.native_input_identity()?;
+        let _input_identity = self.native_input_identity()?;
         let genesis = Genesis::decode(&self.genesis)?;
         if genesis.id() != self.context.genesis
             || genesis.rules_commitment() != self.context.rules
@@ -297,12 +301,13 @@ impl ArchiveWork {
         if cancelled.load(Ordering::Acquire) {
             return Err("checkpoint archive preparation cancelled".into());
         }
+        #[cfg(feature = "eng2-runtime")]
         let identity = NativeArchiveIdentity {
             anchor: self.context.anchor.clone(),
             network: self.context.network,
             genesis: self.context.genesis,
             rules: self.context.rules,
-            input: input_identity,
+            input: _input_identity,
             snapshot: *blake3::hash(&archive).as_bytes(),
             snapshot_bytes: archive.len(),
             lineage: Arc::new(()),
@@ -312,11 +317,13 @@ impl ArchiveWork {
             state,
             archive,
             _reservation: self.reservation,
+            #[cfg(feature = "eng2-runtime")]
             identity,
         })
     }
 }
 impl ValidatedArchive {
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn identity(&self) -> NativeArchiveIdentity {
         self.identity.clone()
     }
@@ -379,7 +386,7 @@ impl ValidatedArchive {
 /// dropping drains that task; no detached worker can outlive this owner.
 enum WorkerResult {
     Archive(Box<ValidatedArchive>),
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "eng2-runtime"))]
     Retained(Box<super::retained_work::ValidatedRetained>),
 }
 #[derive(Default)]
@@ -431,7 +438,7 @@ impl ArchiveWorker {
         );
         Ok(())
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "eng2-runtime"))]
     pub(super) fn start_retained(
         &mut self,
         work: super::retained_work::RetainedWork,
@@ -470,7 +477,7 @@ impl ArchiveWorker {
         self.poll()?;
         match self.completed.take() {
             Some(WorkerResult::Archive(value)) => Ok(Some(*value)),
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "eng2-runtime"))]
             Some(value @ WorkerResult::Retained(_)) => {
                 self.completed = Some(value);
                 Ok(None)
@@ -478,7 +485,7 @@ impl ArchiveWorker {
             None => Ok(None),
         }
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "eng2-runtime"))]
     pub(super) fn try_complete_retained(
         &mut self,
     ) -> Result<Option<super::retained_work::ValidatedRetained>, String> {

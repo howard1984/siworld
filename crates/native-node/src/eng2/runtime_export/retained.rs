@@ -129,6 +129,7 @@ pub(super) fn candidate(
         witness,
         snapshot,
         _snapshot_reservation: None,
+        #[cfg(feature = "eng2-runtime")]
         _native_identity: None,
     };
     prepared.check_current(store)?;
@@ -177,6 +178,7 @@ pub(super) fn publication(
         witness,
         snapshot,
         _snapshot_reservation: None,
+        #[cfg(feature = "eng2-runtime")]
         _native_identity: None,
     };
     prepared.check_prefix(store)?;

@@ -92,6 +92,7 @@ pub(crate) struct CheckpointArchiveRead {
     policy: super::body::Policy,
 }
 
+#[cfg(feature = "eng2-runtime")]
 #[derive(Clone)]
 pub(crate) struct CheckpointRevision {
     instance: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -99,6 +100,7 @@ pub(crate) struct CheckpointRevision {
     height: u64,
     tip: Hash,
 }
+#[cfg(feature = "eng2-runtime")]
 impl CheckpointRevision {
     pub(crate) fn check(&self, store: &Store) -> Result<(), String> {
         store.ensure_exportable()?;
@@ -113,6 +115,7 @@ impl CheckpointRevision {
     }
 }
 
+#[cfg(feature = "eng2-runtime")]
 pub(crate) struct CheckpointRestoreRead {
     archive: CheckpointArchiveRead,
     genesis: Vec<u8>,
@@ -124,6 +127,7 @@ pub(crate) struct CheckpointRestoreRead {
     revision: CheckpointRevision,
     _context_memory: crate::p2p::Reservation,
 }
+#[cfg(feature = "eng2-runtime")]
 impl CheckpointRestoreRead {
     pub(crate) fn network(&self) -> Hash {
         self.archive.network
@@ -881,6 +885,7 @@ impl Store {
             self, anchor, read, limits, budget,
         )
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn capture_checkpoint_restore(
         &self,
         budget: &crate::p2p::Budget,
@@ -931,6 +936,7 @@ impl Store {
             _context_memory: memory,
         })
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn checkpoint_revision(&self) -> Result<CheckpointRevision, String> {
         self.ensure_exportable()?;
         Ok(CheckpointRevision {

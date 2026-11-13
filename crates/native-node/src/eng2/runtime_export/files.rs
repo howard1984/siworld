@@ -1,9 +1,11 @@
 //! Descriptor-confined public artifacts and write-once public signature journals.
 use super::*;
 use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, renameat, unlinkat};
+#[cfg(any(test, feature = "eng2-runtime"))]
+use std::io::{Seek, SeekFrom};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
@@ -132,6 +134,7 @@ impl PublicExport {
         self.write_once(&name, &encode_candidate(&prepared, limits)?)?;
         Ok(Some(prepared))
     }
+    #[cfg(any(test, feature = "eng2-runtime"))]
     pub(super) fn retained_reader(
         &self,
         budget: &crate::p2p::Budget,
@@ -747,9 +750,11 @@ impl PublicExport {
         }
         Ok(())
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn forget_publication(&mut self) {
         self.latest = None;
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn retire_checked_cursor(
         &mut self,
         height: u64,
@@ -865,12 +870,14 @@ impl PublicExport {
 }
 /// Read-only operations exposed to the one owned validation worker. No writer,
 /// signer, Store or mutable cursor API is available through this wrapper.
+#[cfg(any(test, feature = "eng2-runtime"))]
 pub(super) struct RetainedReader {
     export: PublicExport,
     budget: crate::p2p::Budget,
     memory: std::cell::RefCell<Vec<crate::p2p::Reservation>>,
     material: std::cell::RefCell<blake3::Hasher>,
 }
+#[cfg(any(test, feature = "eng2-runtime"))]
 impl RetainedReader {
     fn observe(&self, name: &str, bytes: Option<&[u8]>) {
         let mut hash = self.material.borrow_mut();
@@ -988,6 +995,7 @@ impl RetainedReader {
         self.memory.borrow_mut().push(reservation);
         Ok(Some(bytes))
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn read_publication(
         &self,
         bytes: &[u8],
@@ -999,10 +1007,12 @@ impl RetainedReader {
                     .ok_or_else(|| "checkpoint retained dependency missing".into())
             })
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn votes(&self, statement: &Statement) -> Result<Vec<Vote>, String> {
         self.export
             .retained_votes_using(statement, |name, bound| self.read_optional(name, bound))
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn candidate(
         &self,
         epoch: u64,
@@ -1013,6 +1023,7 @@ impl RetainedReader {
             .map(|bytes| decode_candidate_parts(&bytes, self.export.network, limits))
             .transpose()
     }
+    #[cfg(feature = "eng2-runtime")]
     pub(super) fn withdrawn(&self, height: u64) -> Result<Option<Vec<u8>>, String> {
         self.read_optional(&publication_name(height), 8192)
     }

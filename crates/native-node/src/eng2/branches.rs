@@ -161,10 +161,12 @@ pub struct BranchStore {
     selection_revision: u64,
 }
 /// A pinned immutable header view for bounded retained-checkpoint inspection.
+#[cfg(feature = "eng2-runtime")]
 pub(crate) struct CheckpointHeaders {
     transaction: redb::ReadTransaction,
     network: Hash,
 }
+#[cfg(feature = "eng2-runtime")]
 impl CheckpointHeaders {
     pub(crate) fn header(&self, height: u64, id: Hash) -> Result<Option<Header>, String> {
         let table = self
@@ -186,6 +188,7 @@ impl CheckpointHeaders {
     }
 }
 impl BranchStore {
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn capture_checkpoint_headers(&self) -> Result<CheckpointHeaders, String> {
         Ok(CheckpointHeaders {
             transaction: self

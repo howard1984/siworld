@@ -39,7 +39,7 @@ pub use files::{PublicExport, WalletPolicy, WalletProgress, WalletPublisher};
 pub mod host;
 #[cfg(unix)]
 mod retained;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "eng2-runtime"))]
 mod retained_work;
 
 /// The newest eligible actual archive height; no height is synthesized.
@@ -76,6 +76,7 @@ pub struct PreparedCheckpoint {
     witness: AuthorizationWitness,
     snapshot: Vec<u8>,
     _snapshot_reservation: Option<crate::p2p::Reservation>,
+    #[cfg(feature = "eng2-runtime")]
     _native_identity: Option<archive_work::NativeArchiveIdentity>,
 }
 pub struct CertifiedCheckpoint {
@@ -139,6 +140,7 @@ impl PreparedCheckpoint {
             witness,
             snapshot,
             _snapshot_reservation: None,
+            #[cfg(feature = "eng2-runtime")]
             _native_identity: None,
         };
         value.check_prefix(store)?;
@@ -256,6 +258,7 @@ impl PreparedCheckpoint {
             witness,
             snapshot,
             _snapshot_reservation: None,
+            #[cfg(feature = "eng2-runtime")]
             _native_identity: None,
         };
         prepared.check_current(store)?;

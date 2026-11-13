@@ -303,6 +303,7 @@ pub struct Host {
     preparation: Option<ResidentPreparation>,
     restore_required: bool,
     retained_ready: bool,
+    #[cfg(feature = "eng2-runtime")]
     last_retained_material: Option<Hash>,
 }
 struct ResidentPreparation {
@@ -313,6 +314,7 @@ struct ResidentPreparation {
     certificate_only: bool,
     generation: u64,
     request_generation: u64,
+    #[cfg(feature = "eng2-runtime")]
     retained_request: bool,
 }
 impl ResidentPreparation {
@@ -387,6 +389,7 @@ impl Host {
             preparation: None,
             restore_required: false,
             retained_ready: true,
+            #[cfg(feature = "eng2-runtime")]
             last_retained_material: None,
         })
     }
@@ -424,6 +427,7 @@ impl Host {
             preparation: None,
             restore_required: false,
             retained_ready: true,
+            #[cfg(feature = "eng2-runtime")]
             last_retained_material: None,
         };
         value.reconcile_retained(store, retained)?;
@@ -610,6 +614,7 @@ impl Host {
             certificate_only: false,
             generation: 0,
             request_generation: 0,
+            #[cfg(feature = "eng2-runtime")]
             retained_request: false,
         });
         Ok(())
@@ -1305,4 +1310,5 @@ mod tests;
 
 mod codec;
 
+#[cfg(feature = "eng2-runtime")]
 mod restoration;

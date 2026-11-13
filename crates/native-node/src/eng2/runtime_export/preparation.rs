@@ -82,6 +82,7 @@ impl PreparedCheckpoint {
         let retained_metadata = std::mem::size_of::<CertifiedCheckpoint>()
             .checked_add(witness.governance.capacity())
             .ok_or("checkpoint retained metadata byte bound overflow")?;
+        #[cfg(feature = "eng2-runtime")]
         let native_identity = archive.identity();
         let (snapshot, reservation) = archive.into_snapshot(retained_metadata)?;
         let value = Self {
@@ -95,6 +96,7 @@ impl PreparedCheckpoint {
             witness,
             snapshot,
             _snapshot_reservation: Some(reservation),
+            #[cfg(feature = "eng2-runtime")]
             _native_identity: Some(native_identity),
         };
         value.check_current(store)?;

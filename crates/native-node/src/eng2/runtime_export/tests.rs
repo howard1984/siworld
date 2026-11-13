@@ -284,6 +284,7 @@ pub(super) fn synthetic_candidate() -> PreparedCheckpoint {
         },
         snapshot: super::super::snapshot::encode_components(&raw, limits()).unwrap(),
         _snapshot_reservation: None,
+        #[cfg(feature = "eng2-runtime")]
         _native_identity: None,
     }
 }

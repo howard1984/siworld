@@ -190,6 +190,7 @@ impl Driver {
             .retain_body(header, body, policy)
     }
 
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn capture_checkpoint_headers(
         &self,
     ) -> Result<Option<crate::eng2::branches::CheckpointHeaders>, String> {
