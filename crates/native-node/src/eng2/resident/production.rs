@@ -44,12 +44,28 @@ fn below_rehearsal_ceiling(
     }
 }
 
+// The caller supplies the current production/readiness gates before any
+// expensive proving keys or preprocessing are constructed.
+fn ready_prover<T>(
+    slot: &mut Option<Result<T, String>>,
+    ready: bool,
+    initialize: impl FnOnce() -> Result<T, String>,
+) -> Result<Option<&T>, String> {
+    if !ready {
+        return Ok(None);
+    }
+    slot.get_or_insert_with(initialize)
+        .as_ref()
+        .map(Some)
+        .map_err(Clone::clone)
+}
+
 fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> Result<(), String> {
     let _charge = shared
         .budget
         .reserve(256 * 1024 * 1024)
         .map_err(|_| "resident production budget unavailable")?;
-    let prover = NativeProver::new()?;
+    let mut prover = None;
     #[cfg(feature = "eng2-rehearsal")]
     let ceiling_required = {
         let owner = shared
@@ -62,16 +78,20 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
     #[cfg(not(feature = "eng2-rehearsal"))]
     let ceiling_required = false;
     while !shared.cancel.is_cancelled() {
-        if !below_rehearsal_ceiling(directory, shared, ceiling_required)? {
-            shared.phase("rehearsal_paused")?;
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        if !shared.mining_ready()? {
-            shared.phase("networking")?;
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
+        let below_ceiling = below_rehearsal_ceiling(directory, shared, ceiling_required)?;
+        let ready = below_ceiling && shared.mining_ready()?;
+        let prover = match ready_prover(&mut prover, ready, NativeProver::new)? {
+            Some(prover) => prover,
+            None => {
+                shared.phase(if below_ceiling {
+                    "networking"
+                } else {
+                    "rehearsal_paused"
+                })?;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         shared.phase("refilling")?;
         let (generation, task) = {
             let mut owner = shared
@@ -89,7 +109,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             (owner.template_generation(), task)
         };
         if let Some(task) = task {
-            let padding = task.prove(&prover)?;
+            let padding = task.prove(prover)?;
             if shared.cancel.is_cancelled() {
                 break;
             }
@@ -154,7 +174,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             };
             (owner.template_generation(), prepared, submission)
         };
-        let proved = match prepared.prove(&prover) {
+        let proved = match prepared.prove(prover) {
             Ok(proved) => proved,
             Err(error) => {
                 if submission.is_some() {
@@ -329,4 +349,67 @@ pub(super) fn run(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod deferred_prover_tests {
+    use super::ready_prover;
+    use std::cell::Cell;
+
+    #[test]
+    fn paused_start_and_pause_after_resume_never_initialize_a_prover() {
+        let calls = Cell::new(0);
+        let mut slot = None;
+        let initialize = || {
+            calls.set(calls.get() + 1);
+            Ok(41u8)
+        };
+        assert!(
+            ready_prover(&mut slot, false, initialize)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            *ready_prover(&mut slot, true, initialize).unwrap().unwrap(),
+            41
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(
+            ready_prover(&mut slot, false, initialize)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            *ready_prover(&mut slot, true, initialize).unwrap().unwrap(),
+            41
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn initialization_failure_propagates_without_a_second_initialization() {
+        let calls = Cell::new(0);
+        let mut slot: Option<Result<u8, String>> = None;
+        let initialize = || {
+            calls.set(calls.get() + 1);
+            Err("initialization failed".into())
+        };
+        assert!(
+            ready_prover(&mut slot, false, initialize)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            ready_prover(&mut slot, true, initialize).unwrap_err(),
+            "initialization failed"
+        );
+        assert_eq!(
+            ready_prover(&mut slot, true, initialize).unwrap_err(),
+            "initialization failed"
+        );
+        assert_eq!(calls.get(), 1);
+    }
 }
