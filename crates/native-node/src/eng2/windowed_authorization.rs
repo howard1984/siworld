@@ -52,7 +52,7 @@ impl CandidateAuthorizationState {
 }
 
 impl WindowedAuthorizationBody {
-    fn check(&self, body: &Body) -> Result<(), String> {
+    pub(super) fn check(&self, body: &Body) -> Result<(), String> {
         if self.network == [0; 32]
             || self.genesis == [0; 32]
             || self.rules_commitment == [0; 32]

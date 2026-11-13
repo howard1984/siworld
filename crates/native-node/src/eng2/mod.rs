@@ -7,6 +7,7 @@ pub mod archive;
 pub mod body;
 pub mod bootstrap;
 pub mod branches;
+pub mod candidate_registry;
 pub mod certificate;
 pub mod checkpoint_exchange;
 #[cfg(feature = "eng2-runtime")]
@@ -18,6 +19,8 @@ pub mod connector;
 pub mod driver;
 pub mod execution;
 pub mod fee_candidate;
+pub mod fee_child;
+pub mod fee_windowed_body;
 pub mod fund_claim;
 pub mod genesis;
 pub mod genesis_tool;

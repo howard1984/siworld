@@ -17,6 +17,7 @@ const SIGNED_BYTES: usize = ENCODED_BYTES - crate::fund_spend::SIGNATURE_BYTES;
 const MAGIC: &[u8; 4] = b"SW2F";
 
 mod windowed;
+pub(crate) use windowed::MIN_VALIDITY_BLOCKS as WINDOWED_MIN_VALIDITY_BLOCKS;
 pub use windowed::WindowedFundClaim;
 
 /// All fields, including the single payment's encapsulation coins, are public.

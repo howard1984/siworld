@@ -201,6 +201,104 @@ fn expected_run_stop_requires_an_active_export() {
 }
 
 #[test]
+fn expected_run_stop_rehearsal_pause_is_feature_gated_and_run_bound() {
+    let directory = Directory::new();
+    let lease = Lease::acquire(&directory.0).unwrap();
+    let run_id = "a".repeat(64);
+    let replacement = "b".repeat(64);
+    atomic_json(
+        &directory.0.join(STATUS_FILE),
+        &json!({"run_id": run_id, "phase": "rehearsal_paused"}),
+    )
+    .unwrap();
+    let before = fs::read(directory.0.join(STATUS_FILE)).unwrap();
+    for invalid in [replacement.clone(), "../invalid".into(), "A".repeat(64)] {
+        assert!(request_stop_expected(&directory.0, &invalid).is_err());
+        assert_eq!(fs::read(directory.0.join(STATUS_FILE)).unwrap(), before);
+        assert!(!stop_requested(&directory.0, &run_id).unwrap());
+        assert!(!stop_requested(&directory.0, &replacement).unwrap());
+    }
+    let result = request_stop_expected(&directory.0, &run_id);
+    assert_eq!(result.is_ok(), cfg!(feature = "eng2-rehearsal"));
+    assert_eq!(
+        stop_requested(&directory.0, &run_id).unwrap(),
+        cfg!(feature = "eng2-rehearsal")
+    );
+    assert_eq!(
+        request_stop(&directory.0).is_ok(),
+        cfg!(feature = "eng2-rehearsal")
+    );
+    assert_eq!(fs::read(directory.0.join(STATUS_FILE)).unwrap(), before);
+    assert!(Lease::acquire(&directory.0).is_err());
+    active_status(&directory.0, &replacement);
+    assert!(request_stop_expected(&directory.0, &run_id).is_err());
+    assert!(!stop_requested(&directory.0, &replacement).unwrap());
+    drop(lease);
+    assert!(Lease::acquire(&directory.0).is_ok());
+}
+
+#[test]
+fn expected_run_stop_rejects_unknown_or_nonstring_phases_without_mutation() {
+    let directory = Directory::new();
+    let run_id = "a".repeat(64);
+    for phase in [
+        Value::Null,
+        json!(true),
+        json!(1),
+        json!("paused"),
+        json!("Rehearsal_paused"),
+        json!("rehearsal_paused "),
+        json!("rehearsal_paused_extra"),
+        json!("stopped"),
+        json!("error"),
+    ] {
+        atomic_json(
+            &directory.0.join(STATUS_FILE),
+            &json!({"run_id": run_id, "phase": phase}),
+        )
+        .unwrap();
+        let before = fs::read(directory.0.join(STATUS_FILE)).unwrap();
+        assert!(request_stop_expected(&directory.0, &run_id).is_err());
+        assert!(request_stop(&directory.0).is_err());
+        assert!(!stop_requested(&directory.0, &run_id).unwrap());
+        assert_eq!(fs::read(directory.0.join(STATUS_FILE)).unwrap(), before);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn expected_run_stop_rehearsal_pause_retains_private_regular_status_checks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let directory = Directory::new();
+    let target = Directory::new();
+    let run_id = "a".repeat(64);
+    let status = json!({"run_id": run_id, "phase": "rehearsal_paused"});
+    let source = target.0.join("status.json");
+    atomic_json(&source, &status).unwrap();
+    let before = fs::read(&source).unwrap();
+    let exported = directory.0.join(STATUS_FILE);
+    symlink(&source, &exported).unwrap();
+    assert!(request_stop_expected(&directory.0, &run_id).is_err());
+    assert!(request_stop(&directory.0).is_err());
+    assert!(!stop_requested(&directory.0, &run_id).unwrap());
+    assert_eq!(fs::read(&source).unwrap(), before);
+    fs::remove_file(&exported).unwrap();
+    atomic_json(&exported, &status).unwrap();
+    fs::set_permissions(&exported, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(request_stop_expected(&directory.0, &run_id).is_err());
+    assert!(request_stop(&directory.0).is_err());
+    assert!(!stop_requested(&directory.0, &run_id).unwrap());
+    assert_eq!(fs::read(&exported).unwrap(), before);
+    fs::set_permissions(&exported, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(request_stop_expected(&directory.0, &run_id).is_err());
+    assert!(request_stop(&directory.0).is_err());
+    assert!(!stop_requested(&directory.0, &run_id).unwrap());
+    fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
 fn offline_check_reports_only_replayed_state_and_integer_receipt_count() {
     let parent = Directory::new();
     let directory = parent.0.join("network");

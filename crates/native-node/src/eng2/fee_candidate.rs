@@ -108,20 +108,28 @@ impl<'a> NativeCheckedFeeInputs<'a> {
     /// Derive all public inputs from the held native-checked block context.
     /// No verifier setup, STARK verification or state transition occurs here.
     pub fn statement(&self) -> Result<Statement, complete_fee::Error> {
-        Statement::from_authenticated(
-            StatementInputs {
-                policy: &self.policy,
-                network: self.checked.header().network,
-                transaction_list_digest: self.checked.body().list_digest(),
-                address: self.checked.fee_destination(),
-                fee_commitments: &self.fees,
-                reward_commitments: self.checked.rewards(),
-                fee_commitment: self.checked.fee_commitment(),
-                ciphertext: &self.payment,
-            },
-            self.suite.bind(&self.checked),
-        )
+        Statement::from_authenticated(self.statement_inputs(), self.protocol_binding())
     }
+    /// Canonical public data for a fixed local child, not an admission token.
+    pub fn canonical_child_statement(&self) -> Result<Vec<u8>, super::fee_child::Error> {
+        super::fee_child::encode_statement(self.statement_inputs())
+    }
+    pub(crate) fn protocol_binding(&self) -> ProtocolBinding {
+        self.suite.bind(&self.checked)
+    }
+    fn statement_inputs(&self) -> StatementInputs<'_> {
+        StatementInputs {
+            policy: &self.policy,
+            network: self.checked.header().network,
+            transaction_list_digest: self.checked.body().list_digest(),
+            address: self.checked.fee_destination(),
+            fee_commitments: &self.fees,
+            reward_commitments: self.checked.rewards(),
+            fee_commitment: self.checked.fee_commitment(),
+            ciphertext: &self.payment,
+        }
+    }
+
     pub fn suite(&self) -> &LocalFeeSuite {
         &self.suite
     }

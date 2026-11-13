@@ -23,6 +23,7 @@ pub type PublicKey = [u8; PUBLIC_KEY_BYTES];
 pub type AddressBytes = [u8; ADDRESS_BYTES];
 mod codec;
 mod windowed;
+pub(crate) use windowed::MIN_VALIDITY_BLOCKS as WINDOWED_MIN_VALIDITY_BLOCKS;
 pub use windowed::WindowedSignedAction;
 
 fn require(value: bool, message: &str) -> Result<(), String> {

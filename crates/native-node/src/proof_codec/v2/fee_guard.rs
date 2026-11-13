@@ -488,6 +488,27 @@ pub fn read_child_input(
     path: &Path,
     max_statement_bytes: usize,
 ) -> Result<ChildInput, &'static str> {
+    read_child_input_inner(path, max_statement_bytes, None)
+}
+
+/// A fixed verifier adapter also checks the complete-frame header before body
+/// allocation. The expected identity comes from local configuration, not input.
+pub fn read_child_input_preflight(
+    path: &Path,
+    max_statement_bytes: usize,
+    expected: super::Identity,
+) -> Result<ChildInput, &'static str> {
+    if expected.relation != Relation::CompleteFee {
+        return Err("guard input fee identity");
+    }
+    read_child_input_inner(path, max_statement_bytes, Some(expected))
+}
+
+fn read_child_input_inner(
+    path: &Path,
+    max_statement_bytes: usize,
+    expected: Option<super::Identity>,
+) -> Result<ChildInput, &'static str> {
     let mut file = File::open(path).map_err(|_| "guard input unavailable")?;
     let mut header = [0; INPUT_HEADER_BYTES];
     file.read_exact(&mut header)
@@ -504,17 +525,41 @@ pub fn read_child_input(
     if statement_len == 0 || statement_len > max_statement_bytes as u64 {
         return Err("guard input statement length");
     }
-    let expected = (INPUT_HEADER_BYTES as u64)
+    let expected_file_bytes = (INPUT_HEADER_BYTES as u64)
         .checked_add(declared.bytes() as u64)
         .and_then(|n| n.checked_add(statement_len))
         .ok_or("guard input length overflow")?;
-    if file.metadata().map_err(|_| "guard input metadata")?.len() != expected {
+    if file.metadata().map_err(|_| "guard input metadata")?.len() != expected_file_bytes {
         return Err("guard input length");
     }
     let binding = RequestBinding::decode(&header[28..]);
-    let mut proof = vec![0; declared.bytes()];
-    let mut statement = vec![0; statement_len as usize];
-    file.read_exact(&mut proof)
+    let mut frame_header = [0; FRAME_BYTES];
+    let prefix = if let Some(expected) = expected {
+        file.read_exact(&mut frame_header)
+            .map_err(|_| "guard input fee header")?;
+        super::preflight_header(
+            &frame_header,
+            expected,
+            declared.bytes(),
+            MAX_FEE_PROOF_BYTES,
+        )
+        .map_err(|_| "guard input fee header")?;
+        &frame_header[..]
+    } else {
+        &[]
+    };
+    let mut proof = Vec::new();
+    proof
+        .try_reserve_exact(declared.bytes())
+        .map_err(|_| "guard input allocation")?;
+    proof.extend_from_slice(prefix);
+    proof.resize(declared.bytes(), 0);
+    let mut statement = Vec::new();
+    statement
+        .try_reserve_exact(statement_len as usize)
+        .map_err(|_| "guard input allocation")?;
+    statement.resize(statement_len as usize, 0);
+    file.read_exact(&mut proof[prefix.len()..])
         .and_then(|_| file.read_exact(&mut statement))
         .map_err(|_| "guard input body")?;
     if binding.proof != proof_digest(&proof) || binding.statement != statement_digest(&statement) {
@@ -667,6 +712,43 @@ mod tests {
             ..GuardPolicy::default()
         })
         .unwrap()
+    }
+
+    #[test]
+    fn fixed_child_reader_rechecks_frame_identity_and_statement_cap() {
+        let fixture = Fixture::new();
+        let path = fixture.0.join("request.bin");
+        let expected = super::super::Identity {
+            relation: Relation::CompleteFee,
+            profile: [5; 32],
+        };
+        let proof = super::super::encode(expected, &[1, 2, 3], MAX_FEE_PROOF_BYTES).unwrap();
+        let base = input(70);
+        let request = VerificationInput {
+            declared: preflight_declared_length(proof.len() as u64).unwrap(),
+            proof: &proof,
+            statement: base.statement,
+            binding: RequestBinding {
+                proof: proof_digest(&proof),
+                ..base.binding
+            },
+        };
+        write_input(&path, &request).unwrap();
+        let received = read_child_input_preflight(&path, 1024, expected).unwrap();
+        assert_eq!(received.proof, proof);
+        assert_eq!(received.statement, request.statement);
+        let wrong = super::super::Identity {
+            profile: [7; 32],
+            ..expected
+        };
+        assert!(matches!(
+            read_child_input_preflight(&path, 1024, wrong),
+            Err("guard input fee header")
+        ));
+        assert!(matches!(
+            read_child_input_preflight(&path, 1, expected),
+            Err("guard input statement length")
+        ));
     }
 
     #[test]
