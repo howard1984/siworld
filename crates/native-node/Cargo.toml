@@ -31,12 +31,19 @@ checkpoint-rejection-acceptance = []
 checkpoint-stale-acceptance = []
 # Owner-operated native block/wallet rehearsal. CI must not select this feature.
 eng2-rehearsal = []
+# Explicit isolated proof-verifier executable; does not enable block admission.
+complete-fee-verifier = []
 # Explicit owner-operated resident entry point; excluded from CI build features.
 eng2-runtime = ["native-p2p"]
 
 [[bin]]
 name = "siworld-eng2-genesis"
 path = "src/bin/siworld-eng2-genesis.rs"
+
+[[bin]]
+name = "siworld-fee-verifier"
+path = "src/bin/siworld-fee-verifier.rs"
+required-features = ["complete-fee-verifier"]
 
 [[bin]]
 name = "siworld-eng2-node"
@@ -73,6 +80,13 @@ siworld-miner-platform = { path = "../miner-platform" }
 native = { package = "siworld-multi-asset-experiment", path = "../bench-multi-asset", default-features = false }
 siworld-core = { path = "../core" }
 p3-air = "=0.9.0-rc.2"
+p3-challenger = "=0.9.0-rc.2"
+p3-dft = "=0.9.0-rc.2"
+p3-koala-bear = "=0.9.0-rc.2"
+rand = { version = "0.10.3", default-features = false, features = ["std_rng", "sys_rng"] }
+p3-batch-stark = "=0.9.0-rc.2"
+p3-lookup = "=0.9.0-rc.2"
+p3-keccak-air = "=0.9.0-rc.2"
 p3-field = "=0.9.0-rc.2"
 p3-uni-stark = "=0.9.0-rc.2"
 p3-commit = "=0.9.0-rc.2"
@@ -83,10 +97,13 @@ p3-merkle-tree = "=0.9.0-rc.2"
 p3-symmetric = "=0.9.0-rc.2"
 p3-recursion = { git = "https://github.com/howard1984/siworld", rev = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f", default-features = false }
 postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
+serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 blake3 = { version = "1.8.3", features = ["zeroize"] }
 libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["mldsa65"] }
 libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+libcrux-sha3 = "=0.0.11"
+num-bigint = "=0.4.8"
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 sha2 = "=0.10.9"
 getrandom = "0.4"

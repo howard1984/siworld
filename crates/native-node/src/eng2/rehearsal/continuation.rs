@@ -135,7 +135,7 @@ pub fn continue_run(source: &Path, destination: &Path) -> Result<Value, String> 
         max_nullifiers: 1_000_000,
         max_component_bytes: 64 * 1024 * 1024,
     };
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(&Genesis::decode(&encoded)?)?;
     let store = Store::audit_existing(
         &destination.join("chain.redb"),
         Genesis::decode(&encoded)?,

@@ -204,15 +204,17 @@ and fees, matures at `height + 24`; Holder notes 1–4 use the selected
 52,560/105,120/157,680/210,240-block offsets. The mode-dependent reward count
 and exact subsidy allocations must be checked independently of secret fees.
 
-`T`, individual fees and note openings remain private. The public transcript
-binds the network, block height
+`T`, individual fees and note openings are private witness inputs. Their
+hiding requires analysis of the complete transcript, not only the statement
+field list. The public transcript binds the network, block height
 and ordered transaction-list digest. The block transition reconstructs these
 values, the ordered fee commitments, all mode-dependent reward allocations
 and unlock heights from trusted candidate data.
 The reward ciphertext belongs to the authenticated block/output codec and its
 wallet self-check, rather than a claim of in-AIR encryption correctness.
-The public block therefore
-does not expose a fee total, a paid-slot count, or a per-transaction fee.
+This statement encoding has no explicit fee-total, paid-slot-count or
+per-transaction-fee field. This does not establish that commitments or proof
+disclosures prevent inference of those values.
 The phrase "sum of commitments" means that the proof opens each `F_i` to its
 private fee witness and proves the integer sum of those openings; the digest
 values themselves are not arithmetically added.
@@ -223,8 +225,10 @@ zero-fee commitments derived from network, height, declared block-position
 count and row index. The block verifier reconstructs those commitments and the prover
 uses their known zero openings. These rows are not additional transactions in
 the block. Within its `M` positions, ordinary padding transactions use the same
-format and fee-opening relation as every other transaction. Neither statement
-nor proof reveals which of the `M` positions is padding.
+format and fee-opening relation as every other transaction. The statement
+has no explicit real/padding flag for those positions. Indistinguishability
+of real and padding transactions remains a joint disclosure requirement;
+uniform encoding and the absence of a flag do not establish it.
 
 This proof is intentionally described as a block-level relation rather than a
 recursive aggregation of the transaction proofs. It may reuse their public
@@ -236,6 +240,29 @@ fees under each private anchor's schedule. Settlement only opens canonical
 u64 fees and proves their sum; imposing one current block fee schedule here
 would incorrectly reject transactions using valid older anchors. A block must
 never accept an unverified transaction on the strength of settlement alone.
+
+### Inactive V2 public data boundary
+
+The [isolated CompleteFee adapter](complete-fee-child.md) serializes public
+network and transaction-list identifiers, inclusion height, reward mode,
+standard and priority fee schedules, the fee destination owner and complete
+encapsulation key, 576 ordered fee commitments, reward allocations and
+commitments, the fee-note commitment, and the complete payment ciphertext.
+Reward amounts in this encoding are the subsidy allocations; the fee-note
+value has no explicit amount field. The reward mode selects one or five
+reward entries and therefore affects the encoded statement length. These
+fields and length differences are public protocol data, not hidden witness
+values.
+
+The adapter contains no explicit individual fee, fee total, private opening,
+transaction tier or real/padding flag. That field inventory is an encoding
+property. It does not establish hiding of the complete proof, encrypted
+payment or combined block. The review must also account for public AIR
+values, lookup and permutation openings, PCS and FRI disclosures, repeated
+attempts and endpoint outputs under the
+[native hiding assumptions](native-hiding-proof-v2.md#review-assumptions-and-remaining-evidence).
+The adapter remains inactive; these interfaces do not register a transaction
+suite or enable the confidential-destination Engine transition.
 
 ### Required settlement evaluation
 

@@ -1,6 +1,30 @@
 use super::*;
 use std::io::Write;
 
+#[test]
+fn diagnostic_size_fallback_preserves_original_status() {
+    let original = json!({"ready":true,"native_accept_observation":{"enabled":true},"payload":"x".repeat(65_400)});
+    let mut value = original.clone();
+    value["peer_round_observation"] = json!({"rounds":["x".repeat(40_000)]});
+    value["native_accept_observation"]["recent"] = json!(["x".repeat(10_000)]);
+    bound_status_observations(&mut value, &original["native_accept_observation"]);
+    assert_eq!(value, original);
+    let mut detail = json!({"rounds":["x".repeat(20_000),"y".repeat(20_000)]});
+    bound_observation(&mut detail, "rounds", 24 * 1024);
+    assert!(status_bytes(&detail) <= 24 * 1024);
+    assert_eq!(detail["omitted_by_byte_limit"], 1);
+    assert!(
+        peers::diagnostic_storage_bytes()
+            + super::super::accept_observation::diagnostic_storage_bytes()
+            <= 32 * 1024
+    );
+    eprintln!(
+        "diagnostic_layout_bytes peers={} admission_and_transport={}",
+        peers::diagnostic_storage_bytes(),
+        super::super::accept_observation::diagnostic_storage_bytes()
+    );
+}
+
 fn directory() -> PathBuf {
     let mut entropy = [0u8; 16];
     getrandom::fill(&mut entropy).unwrap();
@@ -141,8 +165,7 @@ fn miner_configuration_is_outbound_only_with_explicit_existing_signer_selection(
 }
 #[cfg(unix)]
 #[test]
-fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_digest() {
-    use crate::identity::PeerPin;
+fn legacy_checkpoint_routing_only_selects_advertisements_without_peer_admission() {
     let directory = directory();
     let remote_directory = super::tests::directory();
     let genesis = genesis();
@@ -157,32 +180,39 @@ fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_diges
     assert!(current.legacy_checkpoint_peers.is_empty());
     value["legacy_checkpoint_peers"] = json!([fingerprint]);
     service::atomic_json(&path, &value).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    let pin = PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding()).unwrap();
     let pin_path = directory.join(format!("peer-{fingerprint}.pin"));
-    let mut wrong_binding = pin.encode();
-    wrong_binding[6] ^= 1;
-    fs::write(&pin_path, wrong_binding).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    fs::remove_file(&pin_path).unwrap();
-    pin.persist(&directory).unwrap();
+    assert!(!pin_path.exists());
     let legacy = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
     assert!(
         legacy
             .legacy_checkpoint_peers
             .contains(&descriptor.fingerprint())
     );
+    assert!(!pin_path.exists());
     // Ingress routing must not add readiness references or outbound destinations.
     assert_eq!(legacy.peers.len(), current.peers.len());
     assert!(legacy.peers.is_empty());
     assert_ne!(legacy.digest, current.digest);
+    value["peers"] = json!([{
+        "endpoint":"127.0.0.1:9000", "dial":false, "fingerprint":fingerprint,
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]);
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    value["peers"] = json!([]);
     for invalid in [
         Value::Null,
         json!(true),
         json!(["bad"]),
         json!([fingerprint, fingerprint]),
-        json!([crate::local::hex(&[0; 32])]),
-        json!([crate::local::hex(&[9; 32])]),
+        json!([crate::local::hex(
+            &identity.descriptor().unwrap().fingerprint()
+        )]),
+        Value::Array(
+            (0u8..17)
+                .map(|index| json!(crate::local::hex(&[index; 32])))
+                .collect(),
+        ),
     ] {
         value["legacy_checkpoint_peers"] = invalid;
         service::atomic_json(&path, &value).unwrap();
@@ -402,9 +432,8 @@ fn private_submission_reaches_native_driver_and_rejects_synthetic_proofs() {
     drop(NativeIdentity::initialize(&path, genesis.peer_binding()).unwrap());
     initialize_store(&path, &expected).unwrap();
     let store = Store::resume_existing(&path.join("chain.redb"), genesis, limits().chain).unwrap();
-    let owner = Arc::new(Mutex::new(
-        Driver::new(store, NativeVerifier::new().unwrap(), limits()).unwrap(),
-    ));
+    let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+    let owner = Arc::new(Mutex::new(Driver::new(store, verifier, limits()).unwrap()));
     let (head, packet) = {
         let driver = owner.lock().unwrap();
         let head = driver.head().unwrap();
@@ -550,12 +579,9 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
             limits,
         )
         .unwrap();
-        let mut driver = super::super::driver::Driver::new(
-            store,
-            NativeVerifier::new().unwrap(),
-            super::limits(),
-        )
-        .unwrap();
+        let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+        let mut driver =
+            super::super::driver::Driver::new(store, verifier, super::limits()).unwrap();
         let committed = driver.accept(&header, &body).unwrap();
         assert_eq!(committed.id(), header.id().unwrap());
     }
@@ -678,4 +704,79 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
         .block_size(1)
         .unwrap()
     }
+}
+
+#[test]
+fn unavailable_status_replaces_stale_ready_without_claiming_a_head() {
+    let directory = directory();
+    service::atomic_json(
+        &directory.join(service::STATUS_FILE),
+        &json!({"ready":true,"height":123}),
+    )
+    .unwrap();
+    export_unavailable_status(&directory, "test-run", Instant::now(), 2).unwrap();
+    let value: Value =
+        serde_json::from_slice(&fs::read(directory.join(service::STATUS_FILE)).unwrap()).unwrap();
+    assert_eq!(value["ready"], false);
+    assert_eq!(value["state_available"], false);
+    assert_eq!(value["height"], Value::Null);
+    assert_eq!(value["reorganization_alarm"], "canonical_state_unavailable");
+    assert_eq!(value["ready_reason_code"], "canonical_state_unavailable");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn readiness_reason_preserves_owner_and_observer_gates_ahead_of_peer_diagnostics() {
+    use super::super::checkpoint_observer::{
+        Observer,
+        tests::{synthetic_current_conflict, synthetic_pending_authorization},
+    };
+    use super::peers::PeerReadiness;
+    let healthy = Observer::default();
+    assert_eq!(
+        resident_readiness(true, "ready", &healthy, PeerReadiness::Ready),
+        (true, "ready")
+    );
+    assert_eq!(
+        resident_readiness(true, "ready", &healthy, PeerReadiness::NoConnectedPeers),
+        (false, "no_connected_peers")
+    );
+    let hard = synthetic_current_conflict();
+    assert_eq!(
+        resident_readiness(true, "ready", &hard, PeerReadiness::Ready),
+        (false, "checkpoint_current_quorum_conflict")
+    );
+    let pending = synthetic_pending_authorization();
+    assert_eq!(
+        resident_readiness(true, "ready", &pending, PeerReadiness::Ready),
+        (false, "checkpoint_authorization_pending")
+    );
+    for reason in [
+        "manual_recovery_required",
+        "applying_validated_branch",
+        "waiting_for_shared_byte_budget",
+        "resuming_best_branch",
+    ] {
+        assert_eq!(
+            resident_readiness(false, reason, &hard, PeerReadiness::NoConnectedPeers),
+            (false, reason)
+        );
+    }
+    assert_eq!(
+        resident_readiness(false, "ready", &healthy, PeerReadiness::Ready),
+        (false, "canonical_state_unavailable")
+    );
+}
+
+#[test]
+fn production_failure_retains_the_first_stable_alarm() {
+    let mut status = ProductionStatus::default();
+    assert!(status.failure.is_none());
+    assert!(status.error.is_none());
+    status.fail(production::Failure::ProductionControl);
+    status.fail(production::Failure::ProverInit);
+    assert_eq!(status.failure, Some(production::Failure::ProductionControl));
+    assert_eq!(status.error, Some("native_production_failed"));
+    assert_eq!(status.phase, "networking");
 }

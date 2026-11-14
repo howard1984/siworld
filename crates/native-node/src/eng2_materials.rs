@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
 use zeroize::{Zeroize, Zeroizing};
+#[cfg(feature = "eng2-rehearsal")]
+pub mod issuer;
 mod signing;
 mod storage;
 pub use signing::{SigningPins, sign_operation};
@@ -28,6 +30,8 @@ pub enum Purpose {
     FeeWallet = 4,
     FundWallet = 5,
     MinerWallet = 6,
+    #[cfg(feature = "eng2-rehearsal")]
+    Issuer = 7,
 }
 impl Purpose {
     pub fn parse(name: &str) -> Result<Self> {
@@ -39,6 +43,8 @@ impl Purpose {
             "fee-wallet" => Ok(Self::FeeWallet),
             "fund-wallet" => Ok(Self::FundWallet),
             "miner-wallet" => Ok(Self::MinerWallet),
+            #[cfg(feature = "eng2-rehearsal")]
+            "issuer" => Ok(Self::Issuer),
             _ => Err("unknown engineering material purpose".into()),
         }
     }
@@ -51,6 +57,8 @@ impl Purpose {
             Self::FeeWallet => "fee-wallet",
             Self::FundWallet => "fund-wallet",
             Self::MinerWallet => "miner-wallet",
+            #[cfg(feature = "eng2-rehearsal")]
+            Self::Issuer => "issuer",
         }
     }
     fn check(self, index: u8) -> Result<()> {
@@ -117,6 +125,10 @@ fn receipt(
 /// be outside every Git checkout. Only public hashes are returned.
 pub fn prepare(directory: &Path, network: [u8; 32], purpose: Purpose, index: u8) -> Result<Value> {
     purpose.check(index)?;
+    #[cfg(feature = "eng2-rehearsal")]
+    if purpose == Purpose::Issuer {
+        return Err("isolated issuer requires pinned initialization parameters".into());
+    }
     if network == [0; 32] {
         return Err("nonzero engineering network is required".into());
     }

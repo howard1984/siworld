@@ -2,7 +2,7 @@
 //! This module neither initializes keys nor creates a listener or service loop.
 use super::{
     certificate::{AuthorizationWitness, Certificate, Statement, Vote},
-    commitment::{self, Component, ComponentId, Descriptor},
+    commitment::{self, Component, ComponentId},
     header::Header,
     snapshot::{ImportLimits, SnapshotState},
     state_components::Binding,
@@ -18,6 +18,12 @@ use libcrux_ml_dsa::ml_dsa_65::MLDSA65SigningKey;
 use libcrux_ml_dsa::ml_dsa_65::{self, MLDSA65Signature, MLDSA65VerificationKey};
 use serde_json::{Value, json};
 
+pub mod archive_work;
+#[cfg(unix)]
+mod preparation;
+#[cfg(test)]
+use super::commitment::Descriptor;
+
 pub const CHECKPOINT_INTERVAL: u64 = 12;
 pub const LEGACY_CHECKPOINT_INTERVAL: u64 = 72;
 pub const CHECKPOINT_CONFIRMATIONS: u64 = 24;
@@ -31,6 +37,10 @@ mod files;
 pub use files::{PublicExport, WalletPolicy, WalletProgress, WalletPublisher};
 #[cfg(unix)]
 pub mod host;
+#[cfg(unix)]
+mod retained;
+#[cfg(all(unix, feature = "eng2-runtime"))]
+mod retained_work;
 
 /// The newest eligible actual archive height; no height is synthesized.
 pub fn eligible_checkpoint(head: u64) -> Option<u64> {
@@ -65,6 +75,9 @@ pub struct PreparedCheckpoint {
     statement: Statement,
     witness: AuthorizationWitness,
     snapshot: Vec<u8>,
+    _snapshot_reservation: Option<crate::p2p::Reservation>,
+    #[cfg(feature = "eng2-runtime")]
+    _native_identity: Option<archive_work::NativeArchiveIdentity>,
 }
 pub struct CertifiedCheckpoint {
     prepared: PreparedCheckpoint,
@@ -104,95 +117,31 @@ impl PreparedCheckpoint {
         snapshot: Vec<u8>,
         limits: ImportLimits,
     ) -> Result<Self, String> {
-        store.ensure_exportable()?;
-        let engine = store.engine();
-        let state = engine.state();
-        if statement.network != state.network()
-            || !confirmed_checkpoint(statement.checkpoint_height, statement.authorization_height)
-            || statement.authorization_height > state.height()
-            || snapshot.len() > limits.max_snapshot_bytes
-        {
-            return Err(
-                "saved checkpoint candidate has an invalid network, height or byte bound".into(),
-            );
+        if statement.authorization_height > store.engine().state().height() {
+            return Err("saved checkpoint authorization is above the canonical prefix".into());
         }
-        statement
-            .encode()
-            .map_err(|_| "invalid saved checkpoint statement")?;
-        let anchor = store.header(statement.checkpoint_height)?;
+        let anchor = saved_anchor(store, &statement, &snapshot, limits)?;
         let authorization = store.header(statement.authorization_height)?;
-        if anchor
-            .id()
-            .map_err(|_| "invalid checkpoint anchor identity")?
-            != statement.checkpoint_block
-            || authorization
-                .id()
-                .map_err(|_| "invalid checkpoint authorization identity")?
-                != statement.authorization_block
-        {
-            return Err(
-                "saved checkpoint candidate is outside the executed canonical prefix".into(),
-            );
-        }
-        let genesis = engine.genesis().id();
-        let rules = engine.genesis().rules_commitment();
-        let archived = store.checkpoint_anchor(statement.checkpoint_height, limits)?;
-        let components = archived.canonical_components(
-            Binding {
-                genesis,
-                rules_commitment: rules,
-                parent: anchor.parent,
-            },
-            limits.chain,
+        exact_saved_header(
+            &authorization,
+            statement.network,
+            statement.authorization_height,
+            statement.authorization_block,
         )?;
-        if super::snapshot::encode_components(&components, limits)? != snapshot {
-            return Err(
-                "saved checkpoint snapshot differs from the durable historical state".into(),
-            );
-        }
-        witness
-            .encode(limits.chain.max_component_bytes)
-            .map_err(|_| "invalid saved authorization witness")?;
-        let governance_descriptor = Component::from_local_encoding(
-            ComponentId::Governance,
-            &witness.governance,
-            limits.chain.max_component_bytes,
-        )
-        .map_err(|_| "checkpoint governance witness exceeds bounds")?
-        .descriptor();
-        if witness.descriptors[7] != governance_descriptor
-            || commitment::aggregate_descriptors(
-                state.network(),
-                authorization.height,
-                authorization.parent,
-                &witness.descriptors,
-            )
-            .map_err(|_| "invalid checkpoint authorization descriptors")?
-                != authorization.execution_commitment
-        {
-            return Err(
-                "saved checkpoint witness differs from its executed authorization header".into(),
-            );
-        }
-        let governance = GovernanceState::decode_component(&witness.governance, state.network())?;
-        let roster = governance.active_roster().clone();
-        if governance.height() != authorization.height
-            || roster.activated_height > authorization.height
-            || roster.epoch_sequence != statement.roster_sequence
-            || roster.digest(state.network()) != statement.roster_digest
-        {
-            return Err("saved checkpoint witness does not authorize its signer epoch".into());
-        }
+        let roster = saved_roster(&statement, &witness, &authorization, limits)?;
         let value = Self {
-            network: state.network(),
-            genesis,
-            rules,
+            network: statement.network,
+            genesis: store.engine().genesis().id(),
+            rules: store.engine().genesis().rules_commitment(),
             anchor,
             authorization,
             roster,
             statement,
             witness,
             snapshot,
+            _snapshot_reservation: None,
+            #[cfg(feature = "eng2-runtime")]
+            _native_identity: None,
         };
         value.check_prefix(store)?;
         Ok(value)
@@ -270,13 +219,12 @@ impl PreparedCheckpoint {
             rules_commitment: rules,
             parent: authorization.parent,
         };
-        let current = state.canonical_components(current_binding, limits.chain)?;
-        let descriptors = execution_descriptors(state, &current, limits)?;
+        let witness = state.checkpoint_witness(current_binding, limits.chain)?;
         if commitment::aggregate_descriptors(
             state.network(),
             state.height(),
             authorization.parent,
-            &descriptors,
+            &witness.descriptors,
         )
         .map_err(|_| "invalid checkpoint authorization descriptors")?
             != authorization.execution_commitment
@@ -296,10 +244,6 @@ impl PreparedCheckpoint {
         statement
             .encode()
             .map_err(|_| "invalid prepared checkpoint statement")?;
-        let witness = AuthorizationWitness {
-            descriptors,
-            governance: current[7].clone(),
-        };
         witness
             .encode(limits.chain.max_component_bytes)
             .map_err(|_| "invalid prepared checkpoint witness")?;
@@ -313,6 +257,9 @@ impl PreparedCheckpoint {
             statement,
             witness,
             snapshot,
+            _snapshot_reservation: None,
+            #[cfg(feature = "eng2-runtime")]
+            _native_identity: None,
         };
         prepared.check_current(store)?;
         Ok(Some(prepared))
@@ -358,21 +305,7 @@ impl PreparedCheckpoint {
         Ok(())
     }
     pub fn verify_vote(&self, vote: &Vote) -> Result<(), String> {
-        let key = self
-            .roster
-            .keys()
-            .get(usize::from(vote.slot))
-            .ok_or("checkpoint vote slot is outside the fixed roster")?;
-        ml_dsa_65::verify(
-            &MLDSA65VerificationKey::new(*key),
-            &self
-                .statement
-                .encode()
-                .map_err(|_| "invalid checkpoint statement")?,
-            Statement::signing_context(),
-            &MLDSA65Signature::new(vote.signature),
-        )
-        .map_err(|_| "checkpoint vote does not authenticate the local candidate".into())
+        verify_saved_vote(&self.roster, &self.statement, vote)
     }
     /// The durable PublicExport journal must be used before transmitting a vote.
     #[cfg(unix)]
@@ -439,6 +372,123 @@ impl CertifiedCheckpoint {
         self.prepared.check_current(store)
     }
 }
+/// Shared checks for durable current and retained obsolete records. This
+/// returns an anchor header, never a signing or publication capability.
+fn saved_anchor(
+    store: &Store,
+    statement: &Statement,
+    snapshot: &[u8],
+    limits: ImportLimits,
+) -> Result<Header, String> {
+    store.ensure_exportable()?;
+    let state = store.engine().state();
+    if statement.network != state.network()
+        || !confirmed_checkpoint(statement.checkpoint_height, statement.authorization_height)
+        || statement.checkpoint_height > state.height()
+        || snapshot.len() > limits.max_snapshot_bytes
+    {
+        return Err("saved checkpoint has an invalid network, anchor or byte bound".into());
+    }
+    statement
+        .encode()
+        .map_err(|_| "invalid saved checkpoint statement")?;
+    let anchor = store.header(statement.checkpoint_height)?;
+    exact_saved_header(
+        &anchor,
+        statement.network,
+        statement.checkpoint_height,
+        statement.checkpoint_block,
+    )?;
+    let archived = store.checkpoint_anchor(statement.checkpoint_height, limits)?;
+    let components = archived.canonical_components(
+        Binding {
+            genesis: store.engine().genesis().id(),
+            rules_commitment: store.engine().genesis().rules_commitment(),
+            parent: anchor.parent,
+        },
+        limits.chain,
+    )?;
+    if super::snapshot::encode_components(&components, limits)? != snapshot {
+        return Err("saved checkpoint snapshot differs from durable historical state".into());
+    }
+    Ok(anchor)
+}
+fn exact_saved_header(header: &Header, network: Hash, height: u64, id: Hash) -> Result<(), String> {
+    let bytes = header
+        .encode()
+        .map_err(|_| "saved checkpoint header framing invalid")?;
+    let decoded = Header::decode(&bytes, &network)
+        .map_err(|_| "saved checkpoint header network or framing invalid")?;
+    if decoded != *header
+        || header.height != height
+        || header
+            .id()
+            .map_err(|_| "saved checkpoint header identity invalid")?
+            != id
+    {
+        return Err("saved checkpoint header differs from its exact identity".into());
+    }
+    Ok(())
+}
+fn verify_saved_vote(
+    roster: &ActiveRoster,
+    statement: &Statement,
+    vote: &Vote,
+) -> Result<(), String> {
+    let key = roster
+        .keys()
+        .get(usize::from(vote.slot))
+        .ok_or("checkpoint vote slot is outside the fixed roster")?;
+    ml_dsa_65::verify(
+        &MLDSA65VerificationKey::new(*key),
+        &statement
+            .encode()
+            .map_err(|_| "invalid checkpoint statement")?,
+        Statement::signing_context(),
+        &MLDSA65Signature::new(vote.signature),
+    )
+    .map_err(|_| "checkpoint vote does not authenticate the local candidate".into())
+}
+fn saved_roster(
+    statement: &Statement,
+    witness: &AuthorizationWitness,
+    authorization: &Header,
+    limits: ImportLimits,
+) -> Result<ActiveRoster, String> {
+    witness
+        .encode(limits.chain.max_component_bytes)
+        .map_err(|_| "invalid saved authorization witness")?;
+    let governance_descriptor = Component::from_local_encoding(
+        ComponentId::Governance,
+        &witness.governance,
+        limits.chain.max_component_bytes,
+    )
+    .map_err(|_| "checkpoint governance witness exceeds bounds")?
+    .descriptor();
+    if witness.descriptors[7] != governance_descriptor
+        || commitment::aggregate_descriptors(
+            statement.network,
+            authorization.height,
+            authorization.parent,
+            &witness.descriptors,
+        )
+        .map_err(|_| "invalid checkpoint authorization descriptors")?
+            != authorization.execution_commitment
+    {
+        return Err("saved checkpoint witness differs from its authorization header".into());
+    }
+    let governance = GovernanceState::decode_component(&witness.governance, statement.network)?;
+    let roster = governance.active_roster().clone();
+    if governance.height() != authorization.height
+        || roster.activated_height > authorization.height
+        || roster.epoch_sequence != statement.roster_sequence
+        || roster.digest(statement.network) != statement.roster_digest
+    {
+        return Err("saved checkpoint witness does not authorize its signer epoch".into());
+    }
+    Ok(roster)
+}
+#[cfg(test)]
 fn execution_descriptors(
     state: &SnapshotState,
     raw: &[Vec<u8>; 11],
@@ -467,7 +517,7 @@ fn execution_descriptors(
 }
 
 /// One explicit read of the actual durable head. There is no fee aggregation,
-/// slot classification, address lookup or additional historical proof loop.
+/// slot classification, address lookup or historical native-proof execution.
 pub fn public_projection(
     store: &Store,
     published: u64,
@@ -485,13 +535,41 @@ pub fn public_projection(
     projection_with_blocks(store, published, checkpoint, blocks)
 }
 fn public_block(store: &Store, height: u64) -> Result<Value, String> {
-    let (header, body) = store.block(height)?;
+    let header = store.header(height)?;
+    let (slots, reward_mode) = if let Some(bytes) = store.permanent_receipt(height)? {
+        public_receipt_fields(
+            store.engine().genesis(),
+            &header,
+            store.block_size(height)?,
+            &bytes,
+        )?
+    } else {
+        let (_, body) = store.block(height)?;
+        (body.transactions.len(), body.reward_mode)
+    };
     Ok(
         json!({"height":height,"hash":crate::local::hex(&header.id().map_err(|_| "invalid public header")?),
         "parent_hash":crate::local::hex(&header.parent),"timestamp":header.timestamp,"target":crate::local::hex(&header.target),
-        "slots_including_padding":body.transactions.len(),"reward_mode":body.reward_mode.name(),
+        "slots_including_padding":slots,"reward_mode":reward_mode.name(),
         "work":siworld_core::pow::block_work(&header.target).to_string()}),
     )
+}
+fn public_receipt_fields(
+    genesis: &super::genesis::Genesis,
+    header: &Header,
+    body_bytes: usize,
+    bytes: &[u8],
+) -> Result<(usize, crate::wire::RewardMode), String> {
+    use super::wallet_history::codec::{Context, ReceiptBlock};
+    let context = Context::from_genesis(&genesis.encode()?, genesis.id())?;
+    let encoded = header
+        .encode()
+        .map_err(|_| "invalid public receipt header")?;
+    let receipt = ReceiptBlock::decode(&context, &encoded, bytes)?;
+    if receipt.body_bytes() != body_bytes {
+        return Err("public receipt body length differs from accepted index".into());
+    }
+    Ok((receipt.transactions().len(), receipt.reward_mode()))
 }
 fn projection_with_blocks(
     store: &Store,

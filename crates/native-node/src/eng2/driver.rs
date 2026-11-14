@@ -17,6 +17,23 @@ use crate::{
     wire::Hash,
 };
 
+mod reorganization;
+pub use reorganization::SwitchEvent;
+
+fn pending_pool(network: Hash) -> Result<Mempool, String> {
+    Mempool::with_limits(
+        network,
+        crate::admission::Limits {
+            bytes: crate::pool::MAX_BYTES,
+            entries: 128,
+            peer_bytes: 8 * 1024 * 1024,
+            peer_entries: 16,
+            peers: 128,
+        },
+    )
+    .map_err(|_| "pending admission limits rejected".into())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Head {
     pub network: Hash,
@@ -86,6 +103,10 @@ pub struct Driver {
     last_archive_error: Option<String>,
     bootstrap: super::bootstrap::leases::Registry,
     bootstrap_receipt_height: u64,
+    reorganization: Option<reorganization::Reorganization>,
+    template_generation: u64,
+    #[cfg(feature = "eng2-runtime")]
+    accept_observation: super::accept_observation::Observation,
 }
 impl Driver {
     /// The caller explicitly creates or resumes the store and loads only the
@@ -96,29 +117,40 @@ impl Driver {
         imports: ImportLimits,
     ) -> Result<Self, String> {
         store.ensure_exportable()?;
+        if !verifier.authenticates(store.engine().genesis()) {
+            return Err("driver verifier differs from sealed salted genesis".into());
+        }
         Ok(Self {
             padding: Pool::new(store.engine().state().network()),
-            pending: Mempool::with_limits(
-                store.engine().state().network(),
-                crate::admission::Limits {
-                    bytes: crate::pool::MAX_BYTES,
-                    entries: 128,
-                    peer_bytes: 8 * 1024 * 1024,
-                    peer_entries: 16,
-                    peers: 128,
-                },
-            )
-            .map_err(|_| "pending admission limits rejected")?,
+            pending: pending_pool(store.engine().state().network())?,
             store,
             verifier,
             imports,
             last_archive_error: None,
             bootstrap: super::bootstrap::leases::Registry::default(),
             bootstrap_receipt_height: 0,
+            reorganization: None,
+            template_generation: 0,
+            #[cfg(feature = "eng2-runtime")]
+            accept_observation: super::accept_observation::Observation::default(),
         })
+    }
+    fn ensure_activities_allowed(&self) -> Result<(), String> {
+        if self.activities_allowed() {
+            Ok(())
+        } else {
+            Err("canonical switching pauses owner activities".into())
+        }
     }
     pub fn store(&self) -> &Store {
         &self.store
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn observe_commits(
+        &mut self,
+        observer: std::sync::Arc<dyn super::store::CommitObserver>,
+    ) {
+        self.store.observe_commits(observer);
     }
     /// Explicit service-role maintenance. At most one missing permanent receipt
     /// is materialized per tick; this preserves bodies and all accepted state.
@@ -127,6 +159,7 @@ impl Driver {
         certified: Option<&super::runtime_export::CertifiedCheckpoint>,
         budget: &crate::p2p::Budget,
     ) -> Result<(), String> {
+        self.ensure_activities_allowed()?;
         let now = std::time::Instant::now();
         self.bootstrap
             .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
@@ -168,9 +201,11 @@ impl Driver {
         Ok(())
     }
     pub fn bootstrap_available(&self) -> bool {
-        self.bootstrap
-            .current()
-            .is_some_and(|provider| provider.check_current(&self.store).is_ok())
+        self.activities_allowed()
+            && self
+                .bootstrap
+                .current()
+                .is_some_and(|provider| provider.check_current(&self.store).is_ok())
     }
     /// Derive conservative proof-body retention from this owner's registry.
     /// No public constructor accepts remote ranges; deletion is not enabled.
@@ -194,6 +229,18 @@ impl Driver {
             work: engine.state().chain().cumulative_work,
         })
     }
+    /// Exact retained header resolution for retiring obsolete checkpoint
+    /// advertisements. This does not grant canonical or signing authority.
+    pub fn retained_header(&self, height: u64, id: Hash) -> Result<Option<Header>, String> {
+        let header = Driver::branch_header(self, id)?;
+        if header
+            .as_ref()
+            .is_some_and(|header| header.height != height)
+        {
+            return Err("retained authorization header height differs".into());
+        }
+        Ok(header)
+    }
     pub fn header(&self, height: u64) -> Result<Header, String> {
         self.store.header(height)
     }
@@ -207,7 +254,119 @@ impl Driver {
     /// Return only after the exact native block is durably committed. Archive
     /// failures are independently observable and do not undo accepted history.
     pub fn accept(&mut self, header: &Header, body: &Body) -> Result<CommittedBlock, String> {
-        let committed = self.store.append(header, body, &self.verifier)?;
+        #[cfg(feature = "eng2-runtime")]
+        {
+            self.accept_observed(header, body, None)
+        }
+        #[cfg(not(feature = "eng2-runtime"))]
+        {
+            self.check_forward_admission()?;
+            let committed = match self.store.append(header, body, &self.verifier) {
+                Ok(committed) => committed,
+                Err(original) => return Err(self.after_append_error(original)),
+            };
+            self.finish_accepted(header, body, committed)
+        }
+    }
+    fn check_forward_admission(&self) -> Result<(), String> {
+        // A preferred header without its body still permits ordinary forward sync.
+        if self
+            .reorganization
+            .as_ref()
+            .is_some_and(|state| state.paused())
+        {
+            return Err("canonical switching pauses forward admission".into());
+        }
+        self.store.ensure_exportable()
+    }
+    fn after_append_error(&mut self, original: String) -> String {
+        if self.store.ensure_exportable().is_err()
+            && let Some(state) = &mut self.reorganization
+        {
+            state.stopped = Some("reorganization_canonical_store_unavailable");
+        }
+        original
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn accept_observed(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        frame: Option<super::accept_observation::FrameIdentity>,
+    ) -> Result<CommittedBlock, String> {
+        self.check_forward_admission()?;
+        let attempt = frame.and_then(|frame| self.accept_observation.begin(header, Some(frame)));
+        let mut timing = super::accept_observation::ValidationTiming::default();
+        let committed = match self
+            .store
+            .append_diagnosed(header, body, &self.verifier, &mut timing)
+        {
+            Ok(committed) => committed,
+            Err(failure) => {
+                // Observe this actual typed rejection before returning the same
+                // original error and retaining the original availability handling.
+                self.accept_observation.rejected(attempt.as_ref(), &failure);
+                let outcome =
+                    if failure.commit() == super::accept_observation::CommitKnowledge::NotReached {
+                        2
+                    } else {
+                        3
+                    };
+                self.accept_observation
+                    .completed(attempt.as_ref(), timing, outcome);
+                return Err(self.after_append_error(failure.into_original()));
+            }
+        };
+        let result = self.finish_accepted(header, body, committed);
+        self.accept_observation.completed(
+            attempt.as_ref(),
+            timing,
+            if result.is_ok() { 1 } else { 4 },
+        );
+        result
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn accept_timing_json(&self, origin: std::time::Instant) -> serde_json::Value {
+        self.accept_observation.timing_json(origin)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn attach_accept_observer(
+        &mut self,
+        run: super::accept_observation::RunIdentity,
+        observer: std::sync::Arc<dyn super::accept_observation::Observer>,
+    ) -> bool {
+        self.accept_observation.attach(run, observer)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn accept_observation_diagnostic(
+        &self,
+    ) -> (
+        bool,
+        u64,
+        Option<super::accept_observation::DiagnosticError>,
+    ) {
+        let (dropped, error) = self.accept_observation.diagnostic();
+        (self.accept_observation.enabled(), dropped, error)
+    }
+    fn finish_accepted(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        committed: CommittedBlock,
+    ) -> Result<CommittedBlock, String> {
+        if let Some(state) = &mut self.reorganization
+            && let Err(error) = state.branches.retain_committed(
+                header,
+                body,
+                self.store.engine().body_policy(),
+                &committed,
+            )
+        {
+            // Canonical commit already succeeded. Preserve that fact and
+            // stop production instead of reporting the block uncommitted.
+            state.stopped = Some("reorganization_committed_archive_failed");
+            self.last_archive_error = Some(error);
+        }
         // The pool is created for this immutable network, so pruning cannot
         // fail its context check after a successful append.
         self.pending
@@ -274,6 +433,7 @@ impl Driver {
         packet: &[u8],
         deadline: &crate::p2p::Deadline,
     ) -> Result<Hash, String> {
+        self.ensure_activities_allowed()?;
         deadline
             .check()
             .map_err(|_| "pending transaction deadline elapsed")?;
@@ -338,6 +498,7 @@ impl Driver {
     /// A single bounded producer worker calls this, proves outside its owner
     /// lock, then returns the completed padding for independent admission.
     pub fn prepare_padding(&mut self) -> Result<Option<PreparedPadding>, String> {
+        self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
         self.padding.prune(self.store.engine().state().chain())?;
         if !self.padding.can_grow() {
@@ -346,6 +507,7 @@ impl Driver {
         prepare_padding_witness(self.store.engine().state().chain()).map(Some)
     }
     pub fn insert_padding(&mut self, padding: Padding) -> Result<(), String> {
+        self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
         self.padding
             .insert(self.store.engine().state().chain(), padding, &self.verifier)
@@ -366,6 +528,7 @@ impl Driver {
         operations: Option<crate::eng2_operations::PendingOperations>,
         issuances: Vec<crate::issuance::IssuanceRecord>,
     ) -> Result<PreparedBlock, String> {
+        self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
         if !(crate::wire::MIN_SLOTS..=crate::wire::MAX_SLOTS).contains(&count)
             || !count.is_multiple_of(crate::wire::GROUP)
@@ -389,17 +552,87 @@ impl Driver {
         )
     }
     pub fn prepare_work(&self, proved: ProvedBlock) -> Result<Work, String> {
+        self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
         proved.prepare_work(self.store.engine(), &self.verifier)
     }
 }
 
 impl super::network::Owner for Driver {
+    fn exact_exchange_enabled(&self) -> bool {
+        self.reorganization.is_some()
+    }
+    fn branch_discovery_next(
+        &mut self,
+        remote: (u64, Hash),
+        peer: Hash,
+        now_ms: u64,
+    ) -> Result<super::network::DiscoveryAction, String> {
+        let state = self
+            .reorganization
+            .as_mut()
+            .ok_or("independent branch archive unavailable")?;
+        if state.paused() {
+            return Ok(super::network::DiscoveryAction::Deferred);
+        }
+        state
+            .discovery
+            .next(&mut state.branches, &self.store, remote, peer, now_ms)
+    }
+    fn branch_discovery_received(
+        &mut self,
+        request: super::branches::discovery::HeaderRequest,
+        header: Option<Header>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let state = self
+            .reorganization
+            .as_mut()
+            .ok_or("independent branch archive unavailable")?;
+        state.discovery.received(request, header, now_ms)
+    }
+    fn branch_discovery_deferred(
+        &mut self,
+        request: super::branches::discovery::HeaderRequest,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let state = self
+            .reorganization
+            .as_mut()
+            .ok_or("independent branch archive unavailable")?;
+        state.discovery.deferred(request, now_ms)
+    }
+    fn branch_discovery_body(
+        &mut self,
+        request: super::branches::discovery::HeaderRequest,
+        header: &Header,
+        body: &Body,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let policy = self.store.engine().body_policy();
+        let state = self
+            .reorganization
+            .as_mut()
+            .ok_or("independent branch archive unavailable")?;
+        state
+            .discovery
+            .body(&mut state.branches, request, header, body, policy, now_ms)
+    }
+    fn branch_header(&self, id: Hash) -> Result<Option<Header>, String> {
+        Driver::branch_header(self, id)
+    }
+    fn branch_block_size(&self, id: Hash) -> Result<Option<usize>, String> {
+        Driver::branch_block_size(self, id)
+    }
+    fn branch_block(&self, id: Hash) -> Result<(Header, Body), String> {
+        Driver::branch_block(self, id)
+    }
     fn bootstrap_manifest(
         &mut self,
         authenticated_peer: Hash,
         requested_bundle: Option<Hash>,
     ) -> Result<Option<Vec<u8>>, String> {
+        self.ensure_activities_allowed()?;
         let now = std::time::Instant::now();
         self.bootstrap
             .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
@@ -413,6 +646,7 @@ impl super::network::Owner for Driver {
         authenticated_peer: Hash,
         query: super::transport::ChunkRequest,
     ) -> Result<Option<super::bootstrap::Chunk>, String> {
+        self.ensure_activities_allowed()?;
         let now = std::time::Instant::now();
         self.bootstrap
             .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
@@ -466,6 +700,15 @@ impl super::network::Owner for Driver {
     }
     fn accept(&mut self, header: &Header, body: &Body) -> Result<(), String> {
         Driver::accept(self, header, body).map(|_| ())
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn accept_received(
+        &mut self,
+        header: &Header,
+        received: &super::transport::ReceivedBody,
+    ) -> Result<(), String> {
+        self.accept_observed(header, &received.body, received.observation)
+            .map(|_| ())
     }
 }
 
@@ -593,7 +836,8 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("chain.redb");
         let store = Store::create(&path, genesis, imports.chain).unwrap();
-        let mut owner = Driver::new(store, NativeVerifier::new().unwrap(), imports).unwrap();
+        let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+        let mut owner = Driver::new(store, verifier, imports).unwrap();
         let head = owner.head().unwrap();
         assert_eq!(head.height, 0);
         assert!(

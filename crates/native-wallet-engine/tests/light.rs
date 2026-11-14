@@ -179,7 +179,7 @@ fn light_scans_owned_rewards_and_rejects_a_failed_append_atomically() {
     assert!(l.append(&d).is_err());
     assert_eq!(l.balance_json().unwrap(), old);
     let mut w = Wallet::from_seed(config.network, Zeroizing::new([42; 32]), 0).unwrap();
-    w.scan_light_data(&l.state, &[b.clone()], &[c.id], false)
+    w.scan_light_data(&l.state, std::slice::from_ref(&b), &[c.id], false)
         .unwrap();
     let mut invalid = b;
     invalid.rewards[0].commitment = [255; 48];

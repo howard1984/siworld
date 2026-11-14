@@ -200,3 +200,18 @@ fn checkpoint_replacement_authority_changes_only_at_the_executed_activation_boun
     assert_eq!(governance.active_roster().activated_height, 25);
     assert_eq!(ActiveRoster::THRESHOLD, 2);
 }
+
+#[test]
+fn pending_authorization_blocks_proposal_and_vote_even_with_current_peer_round() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let network = Arc::new(NetworkStatus::new([[1; 32]]));
+    let _connection = network.connected([1; 32]).unwrap();
+    network
+        .round([1; 32], 0, Some((0, store.engine().state().tip())))
+        .unwrap();
+    let observer = crate::eng2::checkpoint_observer::tests::synthetic_pending_authorization();
+    let gate = readiness(&store, &network, &observer);
+    assert_eq!(gate.alarm(&store), Some(Alarm::CurrentQuorumConflict));
+    guarded_actions(&store, &gate, false);
+}

@@ -58,6 +58,35 @@ fn history_config(rules_hex: &str, genesis: &str) -> Result<engine::state::Confi
     Ok(config)
 }
 
+fn eng2_payment_anchor(
+    context: &str,
+) -> Result<(engine::wire::Hash, engine::wire::Snapshot), String> {
+    if context.len() > 256 {
+        return Err("Engineering-v2 payment anchor byte bound.".into());
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(context).map_err(|_| "Invalid eng2 payment anchor.")?;
+    let fields = value.as_object().ok_or("Invalid eng2 payment anchor.")?;
+    if fields.len() != 3 {
+        return Err("Invalid eng2 payment anchor fields.".into());
+    }
+    let field = |name| {
+        fields
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or("Invalid eng2 payment anchor field.")
+    };
+    Ok((
+        wallet_core::hex_array::<32>(field("network")?)?,
+        engine::wire::Snapshot {
+            height: field("height")?
+                .parse()
+                .map_err(|_| "Invalid eng2 anchor height.")?,
+            block_id: wallet_core::hex_array::<32>(field("tip")?)?,
+        },
+    ))
+}
+
 /// Public tree context only. Adjacent authentication bytes are dropped after append.
 #[wasm_bindgen]
 pub struct BrowserCommitmentTree {
@@ -656,6 +685,76 @@ impl BrowserWallet {
         );
         Ok(())
     }
+    /// Open a same-wallet authenticated prefix without replacing accepted
+    /// balances. Errors leave both the accepted state and candidate unchanged.
+    pub fn begin_eng2_cached_candidate(
+        &mut self,
+        genesis: &[u8],
+        expected: &str,
+        bytes: &[u8],
+        height: &str,
+        tip: &str,
+    ) -> Result<String, JsValue> {
+        if self.challenge.is_some()
+            || self.light.is_some()
+            || self.candidate.is_some()
+            || self.eng2_candidate.is_some()
+        {
+            return Err(js(
+                "Finish the current operation before restoring a cached candidate.".into(),
+            ));
+        }
+        let state = self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        let plain = self.open_private(
+            bytes,
+            b"SWE2SC01",
+            "siworld eng2 browser local scan cache key v1",
+            64 * 1024 * 1024,
+        )?;
+        let candidate = state
+            .fork_local_cache(
+                genesis,
+                wallet_core::hex_array::<32>(expected).map_err(js)?,
+                Zeroizing::new(*self.material.entropy),
+                self.material.account,
+                &plain,
+                engine::wire::Snapshot {
+                    height: height
+                        .parse()
+                        .map_err(|_| js("Invalid eng2 cached height.".into()))?,
+                    block_id: wallet_core::hex_array::<32>(tip).map_err(js)?,
+                },
+            )
+            .map_err(js)?;
+        let result =
+            json!({"height":candidate.height(),"tip":hex(&candidate.tip()),"committed":false})
+                .to_string();
+        self.eng2_candidate = Some(candidate);
+        Ok(result)
+    }
+    /// Locally verified identities for initializing a bounded private window.
+    /// This exposes no notes, paths, encrypted cache or candidate balance.
+    pub fn eng2_recent_headers(&self) -> Result<String, JsValue> {
+        let state = self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        let mut rows = Vec::new();
+        for height in state.height().saturating_sub(31)..=state.height() {
+            if height == 0 {
+                rows.push(json!({"height":0,"id":hex(&state.context().genesis()),"parent":null}));
+            } else {
+                let header = state
+                    .header(height)
+                    .ok_or_else(|| js("Engineering-v2 local header absent.".into()))?;
+                rows.push(json!({"height":height,"id":hex(&header.id().map_err(|_| js("Invalid eng2 local header.".into()))?),"parent":hex(&header.parent)}));
+            }
+        }
+        Ok(serde_json::Value::Array(rows).to_string())
+    }
     /// Decode bounded public header pages. Each header still requires complete
     /// work verification when its body-authenticated receipt is applied.
     pub fn eng2_header_page(
@@ -712,6 +811,9 @@ impl BrowserWallet {
     }
     pub fn commit_eng2_candidate(&mut self, height: &str, tip: &str) -> Result<String, JsValue> {
         self.check_eng2_candidate(height, tip)?;
+        if let (Some(candidate), Some(previous)) = (&mut self.eng2_candidate, &mut self.eng2) {
+            candidate.retain_eng2_prover(previous);
+        }
         self.eng2 = self.eng2_candidate.take();
         self.eng2_balance()
     }
@@ -792,6 +894,117 @@ impl BrowserWallet {
         }
         self.eng2 = Some(restored);
         self.eng2_balance()
+    }
+    /// Offline engineering-v2 transfer preparation. The website mutation gate
+    /// remains closed independently of these worker-only proof interfaces.
+    pub fn prepare_eng2_sip(
+        &mut self,
+        anchor_json: &str,
+        recipient: &str,
+        resolved: &str,
+        amount: &str,
+        priority: bool,
+        reserved_json: &str,
+    ) -> Result<String, JsValue> {
+        if self.eng2_candidate.is_some() {
+            return Err(js(
+                "Finish engineering-v2 synchronization before preparing a payment.".into(),
+            ));
+        }
+        let (expected, anchor) = eng2_payment_anchor(anchor_json).map_err(js)?;
+        if expected != self.material.network {
+            return Err(js("Engineering-v2 payment network differs.".into()));
+        }
+        let bytes = address::resolve(
+            recipient,
+            expected,
+            (!resolved.is_empty()).then_some(resolved),
+        )
+        .map_err(js)?;
+        let owner = native::codec::decode_digest(bytes[..48].try_into().unwrap())
+            .map_err(|_| js("Invalid eng2 recipient owner.".into()))?;
+        let recipient =
+            native::encryption::PaymentAddress::new(owner, bytes[48..].try_into().unwrap())
+                .map_err(|_| js("Invalid eng2 recipient key.".into()))?;
+        if reserved_json.len() > 20000 {
+            return Err(js("Engineering-v2 reservation byte bound.".into()));
+        }
+        let reserved: Vec<String> = serde_json::from_str(reserved_json)
+            .map_err(|_| js("Invalid eng2 reservation journal.".into()))?;
+        if reserved.len() > 128 {
+            return Err(js("Engineering-v2 reservation count bound.".into()));
+        }
+        let reserved = reserved
+            .iter()
+            .map(|value| wallet_core::hex_array::<48>(value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(js)?;
+        self.eng2
+            .as_mut()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .prepare_sip(
+                expected,
+                anchor,
+                &recipient,
+                amount
+                    .parse()
+                    .map_err(|_| js("Use an integer atom amount.".into()))?,
+                priority,
+                &reserved,
+            )
+            .map_err(js)
+    }
+    pub fn prove_eng2_sip(&mut self) -> Result<Vec<u8>, JsValue> {
+        if self.eng2_candidate.is_some() {
+            return Err(js("Engineering-v2 synchronization is in progress.".into()));
+        }
+        self.eng2
+            .as_mut()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .prove_sip()
+            .map_err(js)
+    }
+    pub fn check_eng2_payment(&self, network: &str, packet: &[u8]) -> Result<String, JsValue> {
+        self.eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .check_payment_packet(wallet_core::hex_array::<32>(network).map_err(js)?, packet)
+            .map_err(js)
+    }
+    pub fn cancel_eng2_prepared(&mut self) {
+        if let Some(state) = &mut self.eng2 {
+            state.clear_eng2_prepared();
+        }
+    }
+    pub fn eng2_payment_receipt(
+        &self,
+        height: &str,
+        receipt: &[u8],
+        statement: &str,
+    ) -> Result<String, JsValue> {
+        self.eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .payment_receipt(
+                height
+                    .parse()
+                    .map_err(|_| js("Invalid eng2 receipt height.".into()))?,
+                receipt,
+                wallet_core::hex_array::<32>(statement).map_err(js)?,
+            )
+            .map_err(js)
+    }
+    pub fn eng2_payment_inclusion_valid(&self, height: &str, block: &str) -> Result<bool, JsValue> {
+        Ok(self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
+            .payment_inclusion_valid(
+                height
+                    .parse()
+                    .map_err(|_| js("Invalid eng2 inclusion height.".into()))?,
+                wallet_core::hex_array::<32>(block).map_err(js)?,
+            ))
     }
     pub fn protect_eng2_local(&self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
         if self.eng2.is_none() {
@@ -1090,5 +1303,55 @@ impl BrowserVault {
             &wallet_core::cloud_vault::digest(body),
             &wallet_core::hex_array(previous).map_err(js)?,
         )))
+    }
+}
+
+#[cfg(test)]
+mod payment_anchor_tests {
+    use super::eng2_payment_anchor;
+    use serde_json::json;
+
+    fn context() -> serde_json::Value {
+        json!({"network": "1".repeat(64), "height": "18446744073709551615", "tip": "2".repeat(64)})
+    }
+
+    #[test]
+    fn payment_anchor_preserves_full_width_height_and_hashes() {
+        let (network, anchor) = eng2_payment_anchor(&context().to_string()).unwrap();
+        assert_eq!(network, [0x11; 32]);
+        assert_eq!(anchor.height, u64::MAX);
+        assert_eq!(anchor.block_id, [0x22; 32]);
+    }
+
+    #[test]
+    fn payment_anchor_rejects_wrong_types_fields_and_out_of_range_values() {
+        let valid = context();
+        for field in ["network", "height", "tip"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(eng2_payment_anchor(&missing.to_string()).is_err());
+            let mut wrong_type = valid.clone();
+            wrong_type[field] = json!(1);
+            assert!(eng2_payment_anchor(&wrong_type.to_string()).is_err());
+        }
+        for height in ["-1", "18446744073709551616", "1.0", ""] {
+            let mut invalid = valid.clone();
+            invalid["height"] = json!(height);
+            assert!(eng2_payment_anchor(&invalid.to_string()).is_err());
+        }
+        let mut extra = valid.clone();
+        extra["extra"] = json!(true);
+        assert!(eng2_payment_anchor(&extra.to_string()).is_err());
+        let mut invalid_hash = valid;
+        invalid_hash["tip"] = json!("0".repeat(63));
+        assert!(eng2_payment_anchor(&invalid_hash.to_string()).is_err());
+    }
+
+    #[test]
+    fn payment_anchor_rejects_unbounded_or_nonobject_input() {
+        assert!(eng2_payment_anchor(&" ".repeat(257)).is_err());
+        for context in ["[]", "null", "not json"] {
+            assert!(eng2_payment_anchor(context).is_err());
+        }
     }
 }

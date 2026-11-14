@@ -134,5 +134,6 @@ fn decode_note(
     Ok(note)
 }
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
+#[path = "wallet_crypto/tests.rs"]
 mod tests;

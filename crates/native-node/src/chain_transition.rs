@@ -11,6 +11,49 @@ use crate::{
 pub use shared::ChainPreview;
 pub(crate) use shared::{Actions, ChainDelta, CheckedActions, Context, PreparedActions};
 
+#[cfg(feature = "eng2-runtime")]
+impl crate::proofs::NativeVerifier {
+    /// Keep the original four-decoder bound and canonical error ordering.
+    pub(crate) fn transactions_diagnosed(
+        &self,
+        proofs: &[crate::state::TransactionProof<'_>],
+    ) -> Result<(), crate::eng2::accept_observation::Failure> {
+        use rayon::prelude::*;
+        for batch in proofs.chunks(4) {
+            let results: Vec<_> = batch
+                .par_iter()
+                .map(|proof| {
+                    self.verify_transaction_diagnosed(
+                        &proof.public,
+                        &proof.context,
+                        &proof.fee,
+                        &proof.root,
+                        proof.proof,
+                    )
+                })
+                .collect();
+            for result in results {
+                result?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+impl<'a> PreparedActions<'a> {
+    pub(crate) fn verify_native_diagnosed(
+        self,
+        verifier: &crate::proofs::NativeVerifier,
+    ) -> Result<CheckedActions<'a>, crate::eng2::accept_observation::Failure> {
+        verifier.transactions_diagnosed(&self.transaction_proofs)?;
+        for issuance in self.actions.issuances {
+            verifier.verify_issuance_diagnosed(issuance)?;
+        }
+        Ok(CheckedActions { prepared: self })
+    }
+}
+
 impl ChainPreview<'_> {
     pub fn versioned_execution(
         &self,

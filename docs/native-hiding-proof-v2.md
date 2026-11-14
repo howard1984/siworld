@@ -1,0 +1,294 @@
+# Native hiding proof format V2
+
+## Status and scope
+
+The retained transaction, capacity-576 settlement and three-note issuance
+relations have genesis-bound runtime adapters. The adapters select the salted
+V2 frame, reconstruct deterministic public preprocessing locally and bind the
+network, sealed genesis, rules, compiled AIR closure and key. The locally
+selected context also initializes the backend challenger before any proof
+challenge; changing only a public outer header cannot transfer a proof body to
+another genesis or rules domain. Engine, Driver
+and Store admission reject unbound verifiers before state transitions. A new
+profile requires a new engineering genesis and data directory; existing stores
+are not migrated in place.
+
+`NativeProofGenesis` selects the authenticated local domain type at the crate
+boundary. Native-node builds accept the sealed `eng2::genesis::Genesis`;
+portable wallet-engine builds accept `eng2_history::Context`, whose bootstrap
+bytes and compiled proof profile must match an independently pinned genesis
+identifier. Both adapters derive the same network, genesis and rules fields
+from their selected domain and retain the salted constructors. The portable
+adapter does not import the native execution engine or select a domain from a
+proof frame.
+
+This type boundary does not connect the portable payment path to salted V2.
+That path still uses the historical transaction prover and verifier. Header and
+receipt scanning does not verify native transaction, settlement or issuance
+proofs. Compile-only checks establish host/WASM type compatibility; they do not
+establish wallet generation, native proof admission, custody or end-to-end
+wallet acceptance for the salted profile.
+
+The implementation retains polynomial masking and adds independent Merkle
+leaf salts to both input and FRI commitments. It does not establish a complete
+zero-knowledge security claim. Full transcript hiding, actual runtime proof
+measurements, build provenance and deployment acceptance remain qualification
+requirements. The complete confidential fee relation remains inactive; it is
+not selected by this runtime profile. Browser generation is also unqualified.
+Signed-issuance proof verification does not replace declaration authorization,
+fee-payment policy or ledger-transition checks.
+
+## Private and public information
+
+The intended private transaction witness includes input note amounts, note
+contents, spending material, commitment blindings and the selected recent-root
+membership path. Canonical nullifiers, output commitments, ciphertexts, fee
+commitments and authenticated chain context remain public. Salted Merkle trees
+do not hide public inputs or eliminate information already implied by them.
+
+Retained settlement proves openings of fee commitments and reward-note
+commitments; its authenticated public statement includes the reward allocation
+plan and chain context. Asset issuance intentionally publishes the declaration,
+issuer verification key, asset metadata, supply and issuance fee. Its individual
+note witness and encryption randomness are separate private inputs. The
+confidential fee relation requires a joint review of transaction, settlement,
+ciphertext and public block data; these native adapters alone do not establish
+that per-transaction or per-block fee totals are hidden.
+
+## Randomness and commitments
+
+The field is KoalaBear, with modulus `0x7f000001`; challenges use an extension
+of degree eight. The input and FRI MMCSs use the width-24 Poseidon2 permutation,
+a rate-12 sponge, twelve-field digests and nine independent field elements of
+salt per committed matrix row. FRI extension elements are flattened into base
+fields before the salted MMCS. Input and FRI cap heights are one and two.
+
+Each private proof attempt obtains 96 bytes from the operating system. Three
+disjoint 32-byte portions are derived under separate BLAKE3 domains for
+polynomial masks, input salts and FRI salts. No deterministic private fallback
+exists. Configuration aliases share one ownership fence; successful final
+opening, callback completion or unwinding retires private authority. An
+additional dependency-level fence prevents reopening private masked data.
+
+Nine uniform field salts contain approximately 278.9 ideal bits per row. Each
+private stream has a 256-bit seed. These counts are not a claim of 278.9-bit
+computational security, post-quantum security or protocol zero knowledge.
+
+Public preprocessing is deterministic and reusable, with an explicit public
+route that cannot activate private commits. Its randomness is public and is
+not a witness-hiding mechanism. Independent private attempts reuse public
+preprocessing without reusing private mask or leaf-salt streams.
+
+## Openings and hiding obligations
+
+A queried leaf is transmitted with both its values and salt. Thus salts protect
+unopened leaf commitments; they do not themselves conceal a queried value.
+Queried values must be evaluations of adequately masked polynomials. OOD
+evaluations, random-codeword openings, FRI sibling values and the final
+polynomial also form part of the public transcript.
+
+The configured PCS retains eight random codewords, interleaved random trace
+rows, randomized quotient chunks and the STARK randomization polynomial. Its
+conservative mask budget is `N >= 2 * (q + D * p)`, where `N` is the private mask
+height, `q` the query count, `D = 8`, and `p` the number of supplied opening
+points. Opening and verification check the actual disclosure count. Repeated
+private openings cannot multiply this budget. Both MMCS layers must be hiding;
+polynomial masking alone does not satisfy that documented requirement.
+
+A complete review must still analyze the joint distribution conditioned on all
+disclosed random openings, adaptive Fiat-Shamir challenges, exceptional
+challenge events and correlations across quotient, lookup, FRI and transaction
+proofs. The query/grinding score is not a replacement for an instance-specific
+soundness analysis. Salt tampering rejection and distinct proof outputs are
+functional evidence, not a simulator or a proof of zero knowledge.
+
+## Format and admission
+
+The complete frame has a 48-byte header: eight-byte `SIWZKP2` magic including
+its zero terminator, little-endian version two, relation byte, zero flags,
+32-byte profile identity and little-endian body length. The canonical postcard
+body follows. Unknown versions, flags, identities, truncation and trailing
+bytes are rejected; parsing never falls back to V1.
+
+The expected identity binds the codec, backend parameters, relation, complete
+AIR identifier, preprocessing key including its commitment, structural limits,
+genesis and rules digest. These are authenticated local inputs. A header digest
+is not a signature and does not authenticate peer-selected keys or programs.
+Dimensions alone cannot identify an AIR. Production admission requires a
+genesis registry for the exact constraint program and independently rebuilt
+public statement.
+
+Before typed decoding, a bounded parser checks all vector lengths, canonical
+fields, opening counts, salt dimensions and authentication frontiers. Successful
+decoding establishes structure only; independent cryptographic verification
+against the canonical statement remains mandatory.
+
+| Relation | Complete frame upper bound | Salt encoding increase | New header |
+| --- | ---: | ---: | ---: |
+| Transaction | 631383 bytes | 30886 bytes | 48 bytes |
+| Retained settlement, capacity 576 | 563791 bytes | 29859 bytes | 48 bytes |
+| Asset issuance, three notes | 319354 bytes | 25752 bytes | 48 bytes |
+
+These are structural maxima checked against actual typed postcard containers,
+including maximum authentication frontiers. The containers are deliberately
+not valid cryptographic proofs. The increment compares identical geometry with
+the corresponding unsalted body; it is not a measured difference between two
+random proof samples. The transaction frame cap is 655360 bytes. Exactly one
+complete-fee proof is permitted per block, with a separate complete-frame cap
+of 5242880 bytes (5 MiB); issuance retains its pre-existing 524288-byte cap from the native issuance codec. These limits and
+the fee-proof count are encoded in a canonical consensus-parameter record and
+included in the V2 profile identity. Actual proof sizes, setup and generation time,
+independent verification time and peak memory require separate measurements.
+
+The existing complete-fee candidate has 7668 main columns and 80 queries. Main
+query values alone require `7668 * 80 * 4 = 2453760` bytes, before any salts,
+paths or other sections. Existing complete frames of 3982061 through 3992477
+bytes fit the separate fee cap. Those measurements are from an earlier
+confidential candidate and do not qualify the V2 profile. The uni-STARK codec
+still explicitly rejects the complete-fee relation. A separate inactive
+single-AIR batch adapter includes the permutation and lookup openings, validates
+all lengths before typed decoding and calls the stock batch verifier. Its fixed
+profile uses logarithmic blowup five (factor 32), eighty queries and zero
+proof-of-work difficulty,
+with the same dual salted commitments and polynomial masks. The verifier owns
+its AIR and rebuilds preprocessing locally; the caller supplies authenticated
+genesis, rules, complete AIR digest and the independently reconstructed statement.
+It rejects empty bindings, periodic columns, boundary I/O, absent lookups and
+unsupported geometry. Closed single-instance lookup terminals must be zero.
+The complete frame remains capped at 5 MiB and the batch parser separately caps
+declared decoded vectors at 32 MiB. Other native decoders retain their existing
+4 MiB allocation budget.
+
+A synthetic 256-row lookup AIR exercises an actual full-profile batch proof,
+newly rebuilt verification, changed public statements and malformed fields.
+This is codec and backend evidence. A separate inactive fixed-capacity adapter
+composes the fee sum, subsidy-only reward outputs, ML-KEM encapsulation,
+payment-key derivation and ChaCha20-Poly1305 delivery constraints into one AIR.
+It retains the historical fee commitment tag 136 and eight-field blinding layout.
+Individual transaction validation must authenticate fee-tier validity; untrusted
+sidecar priority or padding labels grant no authority to the sum relation.
+
+The adapter reconstructs its statement from 576 ordered fee commitments, reward
+commitments, the complete destination address, payment ciphertext and authenticated
+block context. Its 7590 statement-dependent preprocessing values become 64
+additional constrained main columns. The producer checks the exact 1024-row,
+7604-column legacy trace geometry before extending it to 7668 columns, writes
+the derived values only on their declared support and zeros all remaining rows.
+The retained constraint and lookup bodies remain active through the mapping.
+The complete source closure, genesis, rules, codec and locally rebuilt key are
+bound in the expected profile. No proof selects an AIR, key or public vector.
+
+The verifier currently rebuilds the full deterministic preprocessing locally.
+A separately installed fixed-root verifier and cold setup resources remain
+unqualified. The manual complete-fee measurement example uses synthetic fee
+openings; its fresh verification mode reconstructs public data without creating
+private openings and requires externally pinned manifest and frame hashes.
+It exercises neither native transaction-proof admission nor real network fee
+blocks. Full-profile size and resource measurements, authenticated network
+registration, isolated engine admission, joint disclosure analysis and ordinary
+and priority wallet blocks remain qualification gates. No AIR compression or
+security-parameter reduction is required by the fee size limit.
+
+The V2 fee receiver checks the outer declared length before reading proof bytes
+or allocating a body. After reading the fixed header it checks the authenticated
+identity and exact inner length before allocating at most the admitted frame
+size. Truncation and excess declarations fail without invoking a verifier.
+Transport read deadlines and bounded aggregate concurrency remain mandatory.
+
+Fee verification requires a configurable operational deadline and a terminable
+isolated worker. Expiry must kill and reap the worker; discarding a future or
+thread result while computation continues is insufficient. A timeout, busy
+worker or process failure defers local admission and must not mark a block
+permanently consensus-invalid or penalize a peer for an invalid proof. Only a
+completed cryptographic check against the canonical statement may establish
+validity. A deadline is a resource policy, not a consensus parameter.
+
+The local supervisor uses one shared permit with no waiting queue. Its
+provisional default deadline is five seconds and can be configured by the
+operator. Hashing, input staging, startup, verification, child exit and receipt
+acceptance share that deadline. A fixed-size receipt binds the attempt, network,
+genesis, rules, profile, verification-key set, statement, proof and captured
+canonical context. Late output cannot complete admission. The permit is released
+only after confirmed child reaping; an uncertain process-control result keeps
+it occupied. Native process isolation is excluded from WASM builds.
+
+The supervisor is an integration component, not a verifier. A resident must own
+one shared supervisor, select a trusted child executable that spawns no children,
+rebuild its statement and keys independently, enforce transport read deadlines,
+and recheck canonical context before adopting state. The new complete-fee batch
+adapter and genesis registry must connect these boundaries before activation.
+
+## Review assumptions and remaining evidence
+
+The intended hiding argument assumes unpredictable operating-system entropy,
+secure stream generation and domain separation, the required hiding properties
+of salted Poseidon2 commitments, appropriate Fiat-Shamir/hash assumptions,
+adequate masks for the complete transcript, correct one-time ownership and no
+side-channel or secret export outside the proof. This implementation does not
+make constant-time or forensic memory-erasure claims. Endpoint compromise and
+network traffic correlation are outside the proof-hiding claim.
+
+Required remaining evidence includes real proofs and independently rebuilt
+statements for each relation, independent public preprocessing reproduction,
+complete-fee size qualification, whole-block disclosure analysis and the web
+wallet's new-format generation path. An external cryptographic review must
+assess the combined protocol and its assumptions. The presence of both salted
+MMCSs completes a specific missing configuration obligation; it does not by
+itself close these remaining obligations.
+
+
+## Paired offline observations
+
+The manual `native_hiding_v2_measure` example accepts `measure-pair FAMILY
+NEW_DIRECTORY` for `transaction`, `settlement576` and `issuance3`. It generates
+one synthetic witness, including one set of issuance ciphertexts, then performs
+two fresh private attempts sequentially. Public context, preprocessing key,
+profile and source bindings must match exactly; complete-frame hashes must
+differ. A partial pair does not emit a successful pair report.
+
+Run `verify-pair DIRECTORY FIRST_MANIFEST_SHA256 SECOND_MANIFEST_SHA256` in a
+new process, using the two externally recorded manifest hashes. This mode does
+not construct a witness. Each verifier independently rebuilds deterministic
+public preprocessing from its locally selected relation and profile, checks its
+key against the pinned manifest, reconstructs the public statement and verifies
+the frame. It also requires rejection of a changed public statement, an input
+leaf salt and a FRI leaf salt. Setup, decoding, verification and rejection timings
+are reported separately. The ordinary `verify` mode applies the same checks.
+
+These observations establish reproducibility and functional rejection behavior.
+Distinct proof bytes do not establish zero knowledge, and these manual adapters
+do not activate V2 generation or verification in a resident, wallet or network.
+Qualification must bind each measured relation and profile to the exact intended
+runtime path and analyze all public disclosures together. The synthetic retained
+settlement allocation is not an economics acceptance fixture. Full-profile proof
+generation and its proof-of-work grinding run only in bounded manual sessions
+on owner-controlled machines, outside CI.
+
+## Sealed-genesis facade measurements
+
+The manual example has separate modes for the actual runtime facade:
+
+```text
+native_hiding_v2_measure runtime-measure-pair FAMILY NEW_DIRECTORY
+native_hiding_v2_measure runtime-verify-pair DIRECTORY FIRST_MANIFEST_SHA256 SECOND_MANIFEST_SHA256
+```
+
+`FAMILY` is `transaction`, `settlement576` or `issuance3`. Generation constructs
+one synthetic witness and public context, then makes two independent private
+proof attempts through `NativeProver::for_genesis`. It writes only complete
+proof frames, encoded public genesis, public context and measurement records.
+Transaction ciphertext bytes are synthetic public fixture data; this mode does
+not qualify encryption correctness or ledger admission. Issuance payment fields
+are structural fixtures and do not qualify a fee payment.
+
+Run verification in a fresh process using the externally pinned pair manifest
+hashes. It rebuilds the selected genesis and public preprocessing through
+`NativeVerifier::for_genesis`, reconstructs statements without private witness
+generation and checks both frames. Negative checks cover changed public data,
+wrong genesis/rules, wrong network, wrong frame identity, truncation and trailing
+bytes. A separate reframing negative case writes the target genesis's correct
+outer identity around the old body, confirms that outer framing parses and
+requires rejection by the cryptographic verifier. Passing these checks establishes functional binding and verification;
+it does not establish whole-transcript zero knowledge. No mode connects to a
+network or starts mining. The earlier `measure-pair` and `verify-pair` modes use
+backend-specific synthetic bindings and are separate from runtime qualification.

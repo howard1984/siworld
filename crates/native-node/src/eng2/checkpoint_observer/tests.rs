@@ -212,6 +212,196 @@ fn unknown_history_and_invalid_signatures_are_not_quorum_conflicts() {
 fn lawful_roster_rotation_keeps_old_certificates_historical_without_refreshing_observation() {
     let mut fixture = fixture();
     let old = certified(&fixture, fixture.statement.clone());
+    rotate_roster(&mut fixture);
+    assert_eq!(fixture.governance.active_roster().epoch_sequence, 1);
+    let mut observer = Observer::default();
+    assert_eq!(observer.check(&fixture, 1, &old), Ok(Outcome::Historical));
+    let proposal = Incoming::Proposal(Proposal {
+        statement: fixture.statement.clone(),
+        witness: fixture.witness.clone(),
+    });
+    assert_eq!(
+        observer.check(&fixture, 2, &proposal),
+        Ok(Outcome::Historical)
+    );
+    assert_eq!(observer.observed_height(), None);
+    assert!(!observer.conflicted());
+}
+
+#[cfg(unix)]
+#[test]
+fn current_quorum_for_competing_authorization_waits_without_trusting_its_witness() {
+    let fixture = fixture();
+    let mut statement = fixture.statement.clone();
+    statement.authorization_block[0] ^= 1;
+    let mut packet = certified(&fixture, statement);
+    if let Incoming::Certified { witness, .. } = &mut packet {
+        // This witness cannot bind to the competing header, which is absent.
+        // Conflict authority comes only from independently current quorum keys.
+        witness.governance[0] ^= 1;
+    }
+    let mut bad_signatures = packet.clone();
+    if let Incoming::Certified { certificate, .. } = &mut bad_signatures {
+        certificate.votes[1].signature[0] ^= 1;
+    }
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &bad_signatures),
+        Err(Error::Rejected)
+    );
+    assert!(!observer.conflicted());
+    assert_eq!(
+        observer.check(&fixture, 2, &packet),
+        Ok(Outcome::PendingAuthorization)
+    );
+    assert!(observer.conflicted());
+    assert_eq!(observer.error(), Some(Error::PendingAuthorization));
+    assert_eq!(observer.observed_height(), None);
+}
+
+// Construct the latched state through actual synthetic quorum verification.
+// This helper is compiled only with the unit-test module.
+pub(crate) fn synthetic_current_conflict() -> Observer {
+    let fixture = fixture();
+    let mut statement = fixture.statement.clone();
+    statement.checkpoint_block[0] ^= 1;
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &certified(&fixture, statement)),
+        Err(Error::Conflict)
+    );
+    observer
+}
+
+#[test]
+fn current_quorum_verification_does_not_depend_on_publisher_cadence() {
+    for checkpoint in [1, 11, 13, 71, 73] {
+        let fixture = fixture_at(checkpoint);
+        let packet = certified(&fixture, fixture.statement.clone());
+        assert_eq!(
+            Observer::default().check(&fixture, 1, &packet),
+            Ok(Outcome::CurrentCertificate(checkpoint))
+        );
+        let mut insufficient = fixture.statement.clone();
+        insufficient.checkpoint_height += 1;
+        let packet = certified(&fixture, insufficient);
+        assert_eq!(
+            Observer::default().check(&fixture, 1, &packet),
+            Err(Error::Rejected)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_adoption_requires_fresh_full_witness_before_same_observer_recovers() {
+    let mut fixture = fixture_at(12);
+    let original = fixture.headers[&36].clone();
+    let packet = certified(&fixture, fixture.statement.clone());
+    fixture.headers.get_mut(&36).unwrap().nonce ^= 1;
+    let mut broken = packet.clone();
+    if let Incoming::Certified { witness, .. } = &mut broken {
+        witness.governance[0] ^= 1;
+    }
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &broken),
+        Ok(Outcome::PendingAuthorization)
+    );
+    assert!(observer.conflicted());
+    assert_eq!(observer.pending.len(), 1);
+    // Repeated pending evidence must not allocate another retained certificate.
+    assert_eq!(
+        observer.check(&fixture, 2, &broken),
+        Ok(Outcome::PendingAuthorization)
+    );
+    assert_eq!(observer.pending.len(), 1);
+    fixture.headers.insert(36, original);
+    observer.reconcile_view(&fixture);
+    assert!(observer.conflicted());
+    assert_eq!(observer.observed_height(), None);
+    assert_eq!(observer.check(&fixture, 3, &broken), Err(Error::Rejected));
+    assert!(observer.conflicted());
+    assert_eq!(
+        observer.check(&fixture, 4, &packet),
+        Ok(Outcome::CurrentCertificate(12))
+    );
+    assert!(!observer.conflicted());
+    assert_eq!(observer.error(), None);
+    assert_eq!(observer.observed_height(), Some(12));
+    assert!(observer.pending.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_valid_statement_for_an_accepted_anchor_is_permanent_conflict() {
+    let mut fixture = fixture_at(12);
+    let first = certified(&fixture, fixture.statement.clone());
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &first),
+        Ok(Outcome::CurrentCertificate(12))
+    );
+    fixture.headers.get_mut(&36).unwrap().nonce ^= 1;
+    let mut other = fixture.statement.clone();
+    other.authorization_block = fixture.headers[&36].id().unwrap();
+    let second = certified(&fixture, other);
+    assert_eq!(observer.check(&fixture, 2, &second), Err(Error::Conflict));
+    assert!(observer.conflicted());
+    assert_eq!(observer.pending.len(), 0);
+    assert_eq!(observer.check(&fixture, 3, &first), Err(Error::Conflict));
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_authorization_and_anchor_changes_cannot_clear_pending() {
+    let mut fixture = fixture_at(12);
+    let packet = certified(&fixture, fixture.statement.clone());
+    fixture.headers.get_mut(&36).unwrap().nonce ^= 1;
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::PendingAuthorization)
+    );
+    let auth = fixture.headers.remove(&36).unwrap();
+    observer.reconcile_view(&fixture);
+    assert!(observer.conflicted());
+    assert_eq!(
+        observer.check(&fixture, 2, &packet),
+        Err(Error::Unavailable)
+    );
+    fixture.headers.insert(36, auth);
+    fixture.headers.get_mut(&12).unwrap().nonce ^= 1;
+    observer.reconcile_view(&fixture);
+    assert_eq!(observer.check(&fixture, 3, &packet), Err(Error::Conflict));
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_capacity_is_fail_closed_and_evidence_budget_is_reserved() {
+    let bytes = MAX_PENDING_AUTHORIZATIONS * std::mem::size_of::<Certificate>();
+    assert!(Observer::new(&crate::p2p::Budget::new(bytes - 1)).is_err());
+    let budget = crate::p2p::Budget::new(bytes);
+    let mut observer = Observer::new(&budget).unwrap();
+    assert!(budget.reserve(1).is_err());
+    for checkpoint in 1..=MAX_PENDING_AUTHORIZATIONS as u64 + 1 {
+        let mut fixture = fixture_at(checkpoint);
+        let packet = certified(&fixture, fixture.statement.clone());
+        fixture.headers.get_mut(&(checkpoint + 24)).unwrap().nonce ^= 1;
+        let result = observer.check(&fixture, checkpoint, &packet);
+        if checkpoint <= MAX_PENDING_AUTHORIZATIONS as u64 {
+            assert_eq!(result, Ok(Outcome::PendingAuthorization));
+        } else {
+            assert_eq!(result, Err(Error::EvidenceUnavailable));
+        }
+    }
+    assert_eq!(observer.pending.len(), MAX_PENDING_AUTHORIZATIONS);
+    assert!(observer.conflicted());
+    drop(observer);
+    assert!(budget.reserve(bytes).is_ok());
+}
+
+fn rotate_roster(fixture: &mut Synthetic) {
     let action = Action {
         network: fixture.governance.network(),
         sequence: 1,
@@ -256,69 +446,49 @@ fn lawful_roster_rotation_keeps_old_certificates_historical_without_refreshing_o
             )
             .unwrap();
     }
-    assert_eq!(fixture.governance.active_roster().epoch_sequence, 1);
-    let mut observer = Observer::default();
-    assert_eq!(observer.check(&fixture, 1, &old), Ok(Outcome::Historical));
-    assert_eq!(observer.observed_height(), None);
-    assert!(!observer.conflicted());
 }
 
+#[cfg(unix)]
 #[test]
-fn current_quorum_for_competing_authorization_latches_without_trusting_its_witness() {
-    let fixture = fixture();
-    let mut statement = fixture.statement.clone();
-    statement.authorization_block[0] ^= 1;
-    let mut packet = certified(&fixture, statement);
-    if let Incoming::Certified { witness, .. } = &mut packet {
-        // This witness cannot bind to the competing header, which is absent.
-        // Conflict authority comes only from independently current quorum keys.
+fn roster_rotation_alone_never_clears_pending_but_verified_history_can() {
+    let mut fixture = fixture();
+    let selected = fixture.headers[&96].clone();
+    let packet = certified(&fixture, fixture.statement.clone());
+    fixture.headers.get_mut(&96).unwrap().nonce ^= 1;
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::PendingAuthorization)
+    );
+    rotate_roster(&mut fixture);
+    observer.reconcile_view(&fixture);
+    assert!(observer.conflicted());
+    fixture.headers.insert(96, selected);
+    observer.reconcile_view(&fixture);
+    assert!(observer.conflicted());
+    let mut broken = packet.clone();
+    if let Incoming::Certified { witness, .. } = &mut broken {
         witness.governance[0] ^= 1;
     }
-    let mut bad_signatures = packet.clone();
-    if let Incoming::Certified { certificate, .. } = &mut bad_signatures {
-        certificate.votes[1].signature[0] ^= 1;
-    }
-    let mut observer = Observer::default();
+    assert_eq!(observer.check(&fixture, 2, &broken), Err(Error::Rejected));
+    assert!(observer.conflicted());
     assert_eq!(
-        observer.check(&fixture, 1, &bad_signatures),
-        Err(Error::Rejected)
+        observer.check(&fixture, 3, &packet),
+        Ok(Outcome::Historical)
     );
     assert!(!observer.conflicted());
-    assert_eq!(observer.check(&fixture, 2, &packet), Err(Error::Conflict));
-    assert!(observer.conflicted());
-    assert_eq!(observer.error(), Some(Error::Conflict));
     assert_eq!(observer.observed_height(), None);
 }
 
-// Construct the latched state through actual synthetic quorum verification.
-// This helper is compiled only with the unit-test module.
-pub(crate) fn synthetic_current_conflict() -> Observer {
-    let fixture = fixture();
-    let mut statement = fixture.statement.clone();
-    statement.checkpoint_block[0] ^= 1;
+#[cfg(unix)]
+pub(crate) fn synthetic_pending_authorization() -> Observer {
+    let mut fixture = fixture_at(12);
+    let packet = certified(&fixture, fixture.statement.clone());
+    fixture.headers.get_mut(&36).unwrap().nonce ^= 1;
     let mut observer = Observer::default();
     assert_eq!(
-        observer.check(&fixture, 1, &certified(&fixture, statement)),
-        Err(Error::Conflict)
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::PendingAuthorization)
     );
     observer
-}
-
-#[test]
-fn current_quorum_verification_does_not_depend_on_publisher_cadence() {
-    for checkpoint in [1, 11, 13, 71, 73] {
-        let fixture = fixture_at(checkpoint);
-        let packet = certified(&fixture, fixture.statement.clone());
-        assert_eq!(
-            Observer::default().check(&fixture, 1, &packet),
-            Ok(Outcome::CurrentCertificate(checkpoint))
-        );
-        let mut insufficient = fixture.statement.clone();
-        insufficient.checkpoint_height += 1;
-        let packet = certified(&fixture, insufficient);
-        assert_eq!(
-            Observer::default().check(&fixture, 1, &packet),
-            Err(Error::Rejected)
-        );
-    }
 }

@@ -261,3 +261,476 @@ fn concurrent_immutable_publications_install_one_complete_record_without_clobber
             .is_some_and(|extension| extension == "tmp")
     }));
 }
+
+#[test]
+fn withdrawal_preserves_original_publication_time_and_immutable_dependencies() {
+    // Synthetic signed export records test file behavior, not native execution.
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("withdrawal");
+    let mut export = PublicExport::open(&root, &store, limits()).unwrap();
+    let prepared = synthetic_candidate();
+    let message = prepared.statement.encode().unwrap();
+    let vote = |slot: u8, seed: u8| Vote {
+        slot,
+        signature: *ml_dsa_65::sign(
+            &ml_dsa_65::generate_key_pair([seed; 32]).signing_key,
+            &message,
+            Statement::signing_context(),
+            [42; 32],
+        )
+        .unwrap()
+        .as_ref(),
+    };
+    let certificate = Certificate {
+        statement: prepared.statement.clone(),
+        votes: [vote(0, 3), vote(1, 4)],
+    };
+    certificate
+        .check_signatures(prepared.roster.keys())
+        .unwrap();
+    let mut checkpoint = CertifiedCheckpoint {
+        prepared,
+        certificate,
+        published: 100_000,
+    };
+    let cursor = export.publication_cursor(&checkpoint).unwrap();
+    let value: Value = serde_json::from_slice(&cursor).unwrap();
+    let certificate = checkpoint.certificate.encode().unwrap();
+    let witness = checkpoint
+        .witness()
+        .encode(limits().chain.max_component_bytes)
+        .unwrap();
+    for (key, bytes) in [
+        ("certificate_file", certificate.as_slice()),
+        ("witness_file", witness.as_slice()),
+        ("snapshot_file", checkpoint.snapshot_bytes()),
+    ] {
+        export
+            .write_once(value[key].as_str().unwrap(), bytes)
+            .unwrap();
+    }
+    let journal_name = format!(
+        "vote-{:020}-{:020}-0.eng2.bin",
+        checkpoint.certificate.statement.roster_sequence,
+        checkpoint.certificate.statement.checkpoint_height
+    );
+    let journal = [
+        message.as_slice(),
+        &[0],
+        checkpoint.certificate.votes[0].signature.as_slice(),
+    ]
+    .concat();
+    export.write_once(&journal_name, &journal).unwrap();
+    export.replace("checkpoint-eng2.json", &cursor).unwrap();
+    export.remember_publication(&checkpoint).unwrap();
+    export.withdraw_checkpoint(&checkpoint).unwrap();
+    assert!(!root.join("checkpoint-eng2.json").exists());
+    assert_eq!(export.latest_height(), None);
+    let record = publication_name(checkpoint.certificate.statement.checkpoint_height);
+    assert_eq!(export.read(&record, 8192).unwrap(), cursor);
+    assert_eq!(export.read(&journal_name, journal.len()).unwrap(), journal);
+    assert_eq!(
+        export
+            .retained_votes(&checkpoint.certificate.statement)
+            .unwrap()
+            .len(),
+        1
+    );
+    for key in ["certificate_file", "witness_file", "snapshot_file"] {
+        assert!(root.join(value[key].as_str().unwrap()).is_file());
+    }
+    // Repeating a barrier keeps the exact original record. A later attempt to
+    // relabel the same anchor with a newer publication time is rejected.
+    export.withdraw_checkpoint(&checkpoint).unwrap();
+    checkpoint.published += 100;
+    assert!(export.withdraw_checkpoint(&checkpoint).is_err());
+    assert_eq!(export.read(&record, 8192).unwrap(), cursor);
+    let mut corrupted = journal.clone();
+    corrupted[0] ^= 1;
+    fs::write(root.join(&journal_name), &corrupted).unwrap();
+    assert!(
+        export
+            .retained_votes(&checkpoint.certificate.statement)
+            .is_err()
+    );
+}
+
+#[test]
+fn retained_reader_inspects_all_actual_material_with_unchanged_length_and_mtime() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-material");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let candidate = synthetic_candidate();
+    let witness = candidate
+        .witness
+        .encode(limits().chain.max_component_bytes)
+        .unwrap();
+    let encoded = encode_candidate(&candidate, limits()).unwrap();
+    let rows = [
+        ("checkpoint-eng2.json", b"cursor-record".to_vec()),
+        (
+            "candidate-00000000000000000000-00000000000000000012.eng2.bin",
+            encoded,
+        ),
+        (
+            "checkpoint-publication-00000000000000000012.json",
+            b"withdrawn-record".to_vec(),
+        ),
+        ("material.certificate-eng2.bin", vec![8; 64]),
+        ("material.witness-eng2.bin", witness),
+        ("material.snapshot-eng2.bin", vec![7; 4096]),
+        (
+            "vote-00000000000000000000-00000000000000000012-0.eng2.bin",
+            vec![0; 64],
+        ),
+        (
+            "vote-00000000000000000000-00000000000000000012-1.eng2.bin",
+            vec![1; 64],
+        ),
+        (
+            "vote-00000000000000000000-00000000000000000012-2.eng2.bin",
+            vec![2; 64],
+        ),
+    ];
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    for (name, bytes) in rows {
+        export.write_once(name, &bytes).unwrap();
+        let path = root.join(name);
+        let metadata = fs::metadata(&path).unwrap();
+        let reader = export.retained_reader(&budget).unwrap();
+        assert_eq!(
+            reader.read_optional(name, bytes.len()).unwrap(),
+            Some(bytes.clone())
+        );
+        let original = reader.material_identity();
+        drop(reader);
+        let mut changed = bytes;
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&path, &changed).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(metadata.accessed().unwrap())
+                    .set_modified(metadata.modified().unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            metadata.modified().unwrap()
+        );
+        let reader = export.retained_reader(&budget).unwrap();
+        assert_eq!(
+            reader.read_optional(name, changed.len()).unwrap(),
+            Some(changed)
+        );
+        assert_ne!(reader.material_identity(), original);
+        drop(reader);
+        assert_eq!(budget.available().unwrap(), 64 * 1024 * 1024);
+    }
+    let reader = export.retained_reader(&budget).unwrap();
+    reader.read_optional("absent-vote", 64).unwrap();
+    let absent = reader.material_identity();
+    drop(reader);
+    export.write_once("absent-vote", &[0; 64]).unwrap();
+    let reader = export.retained_reader(&budget).unwrap();
+    reader.read_optional("absent-vote", 64).unwrap();
+    assert_ne!(reader.material_identity(), absent);
+}
+
+#[test]
+fn retained_reader_reserves_before_large_read_and_releases_every_guard() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-budget");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    export
+        .write_once("bounded.snapshot-eng2.bin", &[4; 8192])
+        .unwrap();
+    let budget = crate::p2p::Budget::new(64 * 1024 + 8192);
+    let reader = export.retained_reader(&budget).unwrap();
+    assert_eq!(budget.available().unwrap(), 8192);
+    assert!(
+        reader
+            .read_optional("bounded.snapshot-eng2.bin", 8192)
+            .is_err()
+    );
+    assert_eq!(budget.available().unwrap(), 8192);
+    drop(reader);
+    assert_eq!(budget.available().unwrap(), 64 * 1024 + 8192);
+    let budget = crate::p2p::Budget::new(64 * 1024 + 16384);
+    let reader = export.retained_reader(&budget).unwrap();
+    let bytes = reader
+        .read_optional("bounded.snapshot-eng2.bin", 8192)
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.available().unwrap(), 0);
+    drop(bytes);
+    drop(reader);
+    assert_eq!(budget.available().unwrap(), 64 * 1024 + 16384);
+}
+
+#[test]
+fn material_generation_rejects_same_head_own_writes_and_exhaustion() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("material-generation");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let original = export.material_generation();
+    export.write_once("vote-0.eng2.bin", &[7; 64]).unwrap();
+    assert!(export.material_generation() > original);
+    let unchanged = export.material_generation();
+    export.write_once("vote-0.eng2.bin", &[7; 64]).unwrap();
+    export.write_status(b"{}").unwrap();
+    assert_eq!(export.material_generation(), unchanged);
+    export.material_generation.set(u64::MAX);
+    assert!(export.write_once("vote-1.eng2.bin", &[8; 64]).is_err());
+    assert!(!root.join("vote-1.eng2.bin").exists());
+}
+
+#[test]
+fn segmented_candidate_preserves_the_existing_format_and_snapshot_bound() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("segmented-candidate");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let mut candidate = synthetic_candidate();
+    candidate.snapshot = (0..(2 * IMMUTABLE_COMPARE_BYTES + 17))
+        .map(|n| (n % 251) as u8)
+        .collect();
+    let expected = encode_candidate(&candidate, limits()).unwrap();
+    let name = candidate_name(candidate.statement.roster_sequence, 72);
+    export.write_candidate(&name, &candidate, limits()).unwrap();
+    assert_eq!(fs::read(root.join(&name)).unwrap(), expected);
+    export.write_candidate(&name, &candidate, limits()).unwrap();
+    let mut tiny = limits();
+    tiny.max_snapshot_bytes = candidate.snapshot.len() - 1;
+    assert!(
+        export
+            .write_candidate("refused.eng2.bin", &candidate, tiny)
+            .is_err()
+    );
+    assert!(!root.join("refused.eng2.bin").exists());
+}
+
+#[test]
+fn immutable_segment_comparison_reads_tail_bytes_and_preserves_conflicting_files() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("segmented-comparison");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let bytes = (0..(2 * IMMUTABLE_COMPARE_BYTES + 37))
+        .map(|n| (n % 251) as u8)
+        .collect::<Vec<_>>();
+    let parts = [&bytes[..1], &[][..], &bytes[1..65539], &bytes[65539..]];
+    export.write_once_parts("segmented.bin", &parts).unwrap();
+    export.write_once("segmented.bin", &bytes).unwrap();
+    export.write_once_parts("segmented.bin", &parts).unwrap();
+    let path = root.join("segmented.bin");
+    let metadata = fs::metadata(&path).unwrap();
+    let mut changed = bytes.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(&path, &changed).unwrap();
+    fs::File::open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+        .unwrap();
+    assert!(export.write_once_parts("segmented.bin", &parts).is_err());
+    assert_eq!(fs::read(&path).unwrap(), changed);
+    assert!(
+        export
+            .write_once_parts("segmented.bin", &[&bytes[..7]])
+            .is_err()
+    );
+    fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+    assert!(export.write_once_parts("segmented.bin", &parts).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes[..bytes.len() - 1]);
+    assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "tmp")
+    }));
+}
+
+#[test]
+fn immutable_install_collision_authenticates_existing_segments_without_replacing_them() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("segmented-install-collision");
+    let export = PublicExport::open_unrestored(&root, &store).unwrap();
+    let bytes = vec![19u8; IMMUTABLE_COMPARE_BYTES + 7];
+    let parts = [&bytes[..3], &bytes[3..]];
+    export.write_once_parts("occupied.bin", &parts).unwrap();
+    export.write_once_parts("incoming.tmp", &parts).unwrap();
+    export
+        .install_immutable_parts("incoming.tmp", "occupied.bin", &parts, bytes.len())
+        .unwrap();
+    let mut changed = bytes.clone();
+    *changed.last_mut().unwrap() ^= 1;
+    fs::write(root.join("occupied.bin"), &changed).unwrap();
+    assert!(
+        export
+            .install_immutable_parts("incoming.tmp", "occupied.bin", &parts, bytes.len())
+            .is_err()
+    );
+    assert_eq!(fs::read(root.join("occupied.bin")).unwrap(), changed);
+    assert_eq!(fs::read(root.join("incoming.tmp")).unwrap(), bytes);
+}
+
+fn observed_certificate(statement: &Statement, slots: [u8; 2]) -> Certificate {
+    use libcrux_ml_dsa::ml_dsa_65;
+    Certificate {
+        statement: statement.clone(),
+        votes: slots.map(|slot| Vote {
+            slot,
+            signature: *ml_dsa_65::sign(
+                &ml_dsa_65::generate_key_pair([slot + 3; 32]).signing_key,
+                &statement.encode().unwrap(),
+                Statement::signing_context(),
+                [42; 32],
+            )
+            .unwrap()
+            .as_ref(),
+        }),
+    }
+}
+
+#[test]
+fn observed_quorum_evidence_reopens_preserves_first_statement_and_records_both_quorums() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("observations");
+    let candidate = synthetic_candidate();
+    let keys = candidate.roster.keys();
+    let first = observed_certificate(&candidate.statement, [0, 1]);
+    first.check_signatures(keys).unwrap();
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    assert!(!export.record_observed_quorum(&first, keys).unwrap());
+    let name = "checkpoint-observed-00000000000000000000-00000000000000000072.certificate-eng2.bin";
+    let original = fs::read(root.join(name)).unwrap();
+    assert_eq!(original.len(), crate::eng2::certificate::CERTIFICATE_BYTES);
+    assert_eq!(fs::metadata(root.join(name)).unwrap().mode() & 0o777, 0o600);
+    drop(export);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    let equivalent = observed_certificate(&candidate.statement, [0, 2]);
+    equivalent.check_signatures(keys).unwrap();
+    assert!(!reopened.record_observed_quorum(&equivalent, keys).unwrap());
+    assert_eq!(fs::read(root.join(name)).unwrap(), original);
+    let before = fs::read_dir(&root).unwrap().count();
+    assert!(!reopened.record_observed_quorum(&first, keys).unwrap());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+    let mut second_statement = candidate.statement.clone();
+    second_statement.authorization_block[0] ^= 1;
+    let second = observed_certificate(&second_statement, [1, 2]);
+    second.check_signatures(keys).unwrap();
+    assert!(reopened.record_observed_quorum(&second, keys).unwrap());
+    assert_eq!(fs::read(root.join(name)).unwrap(), original);
+    let conflict_name = "checkpoint-observed-conflict-00000000000000000000-00000000000000000072.certificate-eng2.bin";
+    assert_eq!(
+        fs::read(root.join(conflict_name)).unwrap(),
+        second.encode().unwrap()
+    );
+    drop(reopened);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    assert!(reopened.record_observed_quorum(&first, keys).unwrap());
+    assert!(reopened.record_observed_quorum(&second, keys).unwrap());
+    assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|e| e == "tmp")
+    }));
+}
+
+#[test]
+fn observed_quorum_evidence_rejects_truncation_symlinks_and_directory_permission_failure() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("observations");
+    let candidate = synthetic_candidate();
+    let certificate = observed_certificate(&candidate.statement, [0, 1]);
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    let name = "checkpoint-observed-00000000000000000000-00000000000000000072.certificate-eng2.bin";
+    let path = root.join(name);
+    export.write_once(name, b"truncated").unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+    fs::remove_file(&path).unwrap();
+    let target = root.join("target.bin");
+    fs::write(&target, certificate.encode().unwrap()).unwrap();
+    symlink(&target, &path).unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+    fs::remove_file(&path).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+    assert!(!path.exists());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .unwrap()
+    );
+    let mut damaged = certificate.encode().unwrap();
+    damaged[200] ^= 1;
+    fs::write(&path, damaged).unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+}
+
+#[test]
+fn observed_quorum_forward_progress_has_no_cumulative_ram_capacity_limit() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("observations");
+    let candidate = synthetic_candidate();
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    for height in 1..=257 {
+        let mut statement = candidate.statement.clone();
+        statement.checkpoint_height = height * 12;
+        statement.authorization_height = statement.checkpoint_height + 24;
+        let certificate = observed_certificate(&statement, [0, 1]);
+        certificate
+            .check_signatures(candidate.roster.keys())
+            .unwrap();
+        assert!(
+            !export
+                .record_observed_quorum(&certificate, candidate.roster.keys())
+                .unwrap()
+        );
+    }
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 258);
+    drop(export);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    let first = observed_certificate(
+        &Statement {
+            checkpoint_height: 12,
+            authorization_height: 36,
+            ..candidate.statement.clone()
+        },
+        [0, 1],
+    );
+    assert!(
+        !reopened
+            .record_observed_quorum(&first, candidate.roster.keys())
+            .unwrap()
+    );
+}

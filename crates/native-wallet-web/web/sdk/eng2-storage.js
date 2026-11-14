@@ -23,13 +23,19 @@ export function eng2Storage(context) {
       }); } finally { db.close(); }
     },
     async pair(firstKey,first,secondKey,second) {
-      if (!(first instanceof Uint8Array) || !(second instanceof Uint8Array)) throw new Error('Only encrypted engineering-v2 state may be persisted.');
+      if(!(first instanceof Uint8Array)||!(second instanceof Uint8Array))throw new Error('Only encrypted engineering-v2 state may be persisted.');
+      return this.atomic(firstKey===secondKey?[[secondKey,second]]:[[firstKey,first],[secondKey,second]]);
+    },
+    async atomic(entries,removed=[]) {
+      if(!Array.isArray(entries)||!entries.length||entries.length>8||!Array.isArray(removed)||removed.length>4||entries.some(entry=>!Array.isArray(entry)||entry.length!==2||!(entry[1] instanceof Uint8Array)))throw new Error('Only encrypted engineering-v2 state may be persisted.');
+      const keys=[...entries.map(([key])=>key),...removed];
+      if(keys.some((key,i)=>typeof key!=='string'||!key||key.length>2048||keys.indexOf(key)!==i))throw new Error('Engineering-v2 atomic storage keys differ.');
       const db = await database();
       try { await new Promise((resolve,reject) => {
         const tx = db.transaction('private','readwrite'), store = tx.objectStore('private');
         tx.oncomplete = resolve;
         tx.onabort = tx.onerror = () => reject(new Error('Engineering-v2 state was not durably saved. Previous data was preserved.'));
-        try { store.put(first,firstKey); store.put(second,secondKey); } catch { tx.abort(); }
+        try { for(const [key,value] of entries)store.put(value,key);for(const key of removed)store.delete(key); } catch { tx.abort(); }
       }); } finally { db.close(); }
     }
   });

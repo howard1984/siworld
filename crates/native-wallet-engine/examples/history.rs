@@ -11,7 +11,11 @@ fn main() {
     for slots in [64, 576] {
         let folder = root.join(slots.to_string());
         std::fs::create_dir(&folder).unwrap();
-        let (config, mut block) = common::fixture_slots(slots);
+        let (config, mut block) = if slots == 64 {
+            common::fixture()
+        } else {
+            common::fixture_slots(slots)
+        };
         for tx in &mut block.transactions {
             tx.proof = vec![7; 588832];
         }

@@ -4,6 +4,227 @@ use crate::fixtures::candidate;
 use native::{codec::encode_digest, multi_asset::F};
 use p3_field::PrimeCharacteristicRing;
 
+fn candidate_engine() -> Engine {
+    let parent = bootstrap();
+    let genesis = Genesis::seal(
+        parent.chain.config.clone(),
+        parent.governance.clone(),
+        FeeMode::LegacyMiner,
+    )
+    .unwrap();
+    Engine::new(genesis, super::super::snapshot::tests::limits().chain).unwrap()
+}
+
+fn fee_candidate(
+    engine: &Engine,
+) -> (
+    Header,
+    super::super::candidate_registry::CandidateRegistry,
+    super::super::fee_windowed_body::FeeWindowedBody,
+) {
+    use crate::proof_codec::v2::{self, Identity, Relation};
+    let identity = |relation, seed| Identity {
+        relation,
+        profile: [seed; 32],
+    };
+    let registry = super::super::candidate_registry::CandidateRegistry::for_candidate_framing(
+        engine.state().network(),
+        engine.genesis().id(),
+        engine.genesis().rules_commitment(),
+        identity(Relation::Transaction, 31),
+        identity(Relation::Issuance, 37),
+        identity(Relation::CompleteFee, 41),
+    )
+    .unwrap();
+    // Synthetic records select the current parent snapshot. Their short proof
+    // frames are structural inputs without cryptographic proof validity.
+    let mut body = body::tests::body();
+    body.network = engine.state().network();
+    body.height = engine.state().height() + 1;
+    body.profile = registry.suite().id();
+    body.fund_claims.clear();
+    body.governance.clear();
+    let snapshot = engine.state().chain().tip_snapshot().selector;
+    for tx in &mut body.transactions {
+        tx.record.snapshot = snapshot;
+        tx.proof = v2::encode(
+            registry.transaction(),
+            &[1],
+            v2::MAX_TRANSACTION_PROOF_BYTES,
+        )
+        .unwrap();
+    }
+    let network = body.network;
+    body.transactions
+        .sort_by_key(|tx| tx.record.statement_id(&network));
+    body.settlement_proof = v2::encode(registry.fee(), &[2], v2::MAX_FEE_PROOF_BYTES).unwrap();
+    let authorizations = super::super::windowed_authorization::WindowedAuthorizationBody {
+        network: body.network,
+        genesis: registry.genesis(),
+        rules_commitment: registry.rules(),
+        height: body.height,
+        fund_claims: Vec::new(),
+        governance: Vec::new(),
+    };
+    let candidate = super::super::fee_windowed_body::FeeWindowedBody {
+        body,
+        authorizations,
+    };
+    let header = Header {
+        network,
+        height: candidate.body.height,
+        parent: engine.state().tip(),
+        timestamp: engine.state().chain().timestamp()
+            + engine.state().chain().config.target_interval,
+        target: engine.state().chain().next_target(),
+        execution_commitment: [41; 32],
+        body_commitment: candidate.commitment(&registry).unwrap(),
+        nonce: 0,
+    };
+    (header, registry, candidate)
+}
+
+#[test]
+fn fee_first_preparation_uses_one_transition_without_reinterpreting_legacy_fees() {
+    use super::super::fee_windowed_body::PreparedCandidateBody;
+    let engine = candidate_engine();
+    let (header, registry, candidate) = fee_candidate(&engine);
+    let body = PreparedCandidateBody::prepare(&candidate, &registry).unwrap();
+    let before = engine.state().chain().fingerprint();
+    let prepared = engine.prepare_fee_candidate(7, &header, &body).unwrap();
+    assert!(std::ptr::eq(prepared.parent(), engine.state()));
+    assert_eq!(prepared.header(), &header);
+    assert_eq!(prepared.ledgers().economics.height(), 1);
+    assert_eq!(prepared.ledgers().fund.height(), 1);
+    assert_eq!(prepared.ledgers().governance.height(), 1);
+    assert!(prepared.settlement_policy().is_err());
+    assert_eq!(prepared.parent().fee_mode(), FeeMode::LegacyMiner);
+    assert_eq!(engine.state().height(), 0);
+    assert_eq!(engine.state().chain().fingerprint(), before);
+    assert!(!registry.suite().activation_supported());
+
+    let mut legacy = candidate.body.clone();
+    legacy.profile = body::tests::policy().profile;
+    legacy.fee_output = legacy_fee_output();
+    let mut legacy_header = header.clone();
+    legacy_header.body_commitment = legacy.commitment(body::tests::policy()).unwrap();
+    let reference = PreparedBlock::prepare_inner(
+        engine.state(),
+        &legacy_header,
+        &legacy,
+        engine.binding(engine.state().tip()),
+        body::tests::policy(),
+        HeaderUse::Template,
+    )
+    .unwrap();
+    assert_eq!(
+        prepared.ledgers().economics.component_bytes().unwrap(),
+        reference.ledgers().economics.component_bytes().unwrap()
+    );
+    assert_eq!(prepared.ledgers().fund, reference.ledgers().fund);
+    assert_eq!(
+        prepared.ledgers().governance,
+        reference.ledgers().governance
+    );
+    assert!(
+        engine
+            .prepare_fee_candidate(7, &legacy_header, &body)
+            .is_err()
+    );
+    assert!(
+        PreparedBlock::prepare(
+            engine.state(),
+            &header,
+            &candidate.body,
+            engine.binding(engine.state().tip()),
+            body::tests::policy(),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn fee_candidate_preparation_rejects_unknown_parent_snapshot_without_mutation() {
+    use super::super::fee_windowed_body::PreparedCandidateBody;
+    let engine = candidate_engine();
+    let (mut header, registry, mut candidate) = fee_candidate(&engine);
+    candidate.body.transactions[0].record.snapshot.block_id[0] ^= 1;
+    let network = candidate.body.network;
+    candidate
+        .body
+        .transactions
+        .sort_by_key(|tx| tx.record.statement_id(&network));
+    let body = PreparedCandidateBody::prepare(&candidate, &registry).unwrap();
+    header.body_commitment = body.commitment();
+    let before = engine.state().chain().fingerprint();
+    assert!(matches!(
+        engine.prepare_fee_candidate(7, &header, &body),
+        Err(reason) if reason == "unknown or removed canonical snapshot"
+    ));
+    assert_eq!(engine.state().chain().fingerprint(), before);
+    assert_eq!(engine.state().height(), 0);
+}
+
+#[test]
+fn fee_candidate_preparation_authenticates_windowed_governance_once() {
+    use super::super::fee_windowed_body::PreparedCandidateBody;
+    use crate::eng2_governance::{
+        Action, ActionKind, Authorization, SignedAction, SignerRole, WindowedSignedAction,
+    };
+    use libcrux_ml_dsa::ml_dsa_65;
+    let engine = candidate_engine();
+    let (mut header, registry, mut candidate) = fee_candidate(&engine);
+    let mut action = WindowedSignedAction {
+        signed: SignedAction {
+            action: Action {
+                network: engine.state().network(),
+                sequence: 1,
+                kind: ActionKind::ProposeIssuanceFee {
+                    amount_atoms: 100_000_000,
+                },
+            },
+            signatures: vec![Authorization {
+                role: SignerRole::Founder,
+                signature: [0; 3309],
+            }],
+        },
+        valid_from: 1,
+        valid_until: 288,
+    };
+    action.signed.signatures[0].signature = *ml_dsa_65::sign(
+        &ml_dsa_65::generate_key_pair([1; 32]).signing_key,
+        &action.signing_bytes(SignerRole::Founder).unwrap(),
+        WindowedSignedAction::signature_context(),
+        [41; 32],
+    )
+    .unwrap()
+    .as_ref();
+    candidate.authorizations.governance.push(action);
+    let body = PreparedCandidateBody::prepare(&candidate, &registry).unwrap();
+    header.body_commitment = body.commitment();
+    let prepared = engine.prepare_fee_candidate(7, &header, &body).unwrap();
+    assert_eq!(prepared.prepared.ledgers.frozen.sequence(), 0);
+    assert_eq!(prepared.prepared.ledgers.governance.sequence(), 1);
+    assert_eq!(prepared.prepared.ledgers.inclusions.len(), 1);
+    assert_eq!(
+        prepared.prepared.ledgers.inclusions[0].effective_height,
+        4033
+    );
+    assert_eq!(prepared.ledgers().fund.height(), 1);
+    assert_eq!(prepared.ledgers().economics.height(), 1);
+    assert_eq!(engine.state().governance().sequence(), 0);
+    drop(prepared);
+    candidate.authorizations.governance[0].signed.signatures[0].signature[0] ^= 1;
+    let body = PreparedCandidateBody::prepare(&candidate, &registry).unwrap();
+    header.body_commitment = body.commitment();
+    assert!(matches!(
+        engine.prepare_fee_candidate(7, &header, &body),
+        Err(reason) if reason == "governance ML-DSA-65 signature invalid"
+    ));
+    assert_eq!(engine.state().governance().sequence(), 0);
+    assert_eq!(engine.state().height(), 0);
+}
+
 fn fixture(parent: &SnapshotState) -> (Header, body::Body) {
     let old = candidate(&parent.chain, 1_500_000);
     let body = body::Body {
