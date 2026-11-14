@@ -606,13 +606,13 @@ pub(crate) mod tests {
             &hasher,
             0,
             &state.chain.tree.root(),
-            crate::eng2_economics::fee_base(0).unwrap(),
+            bootstrap.fee_mode().base_fee(0).unwrap(),
         );
         roots.insert(
             &hasher,
             1,
             &state.chain.tree.root(),
-            crate::eng2_economics::fee_base(1).unwrap(),
+            bootstrap.fee_mode().base_fee(1).unwrap(),
         );
         state
             .chain
@@ -626,6 +626,27 @@ pub(crate) mod tests {
                 recent_root: encode_digest(&roots.tree(&hasher).root()),
             });
         state
+    }
+    #[test]
+    fn populated_fixture_uses_the_bootstrap_fee_mode() {
+        let original = bootstrap();
+        for mode in [
+            super::super::genesis::FeeMode::LegacyMiner,
+            super::super::genesis::FeeMode::ConfidentialDestination,
+        ] {
+            let initial = SnapshotState::genesis_for_fee_mode(
+                original.chain.config.clone(),
+                original.tip(),
+                original.governance().clone(),
+                mode,
+            )
+            .unwrap();
+            let state = populated(&initial);
+            assert_eq!(state.fee_mode(), mode);
+            state
+                .execution_commitment(binding(&initial, initial.tip()), limits().chain)
+                .unwrap();
+        }
     }
     #[test]
     fn reconstructs_all_eleven_actual_components_against_the_selected_anchor_header() {

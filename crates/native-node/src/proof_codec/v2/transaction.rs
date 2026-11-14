@@ -3,6 +3,10 @@
 //! The caller authenticates the local configuration and selects a canonical
 //! historical snapshot before constructing the prepared input. Proof validity
 //! grants no block, Engine, issuance, settlement or state-commit capability.
+#[cfg(all(test, unix))]
+#[path = "transaction/fixture_tests.rs"]
+mod fixture_tests;
+
 use super::backend::{Config, Profile, TransactionVerifier};
 use super::native::{DecodeError, NativeProofShape};
 use super::{FrameError, Identity, MAX_TRANSACTION_PROOF_BYTES, ProtocolBinding, Relation};

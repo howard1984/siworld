@@ -278,6 +278,98 @@ fn check_operation(
     Ok(())
 }
 
+/// One in-process assertion accumulator for an entire genesis-to-head audit.
+/// Segment boundaries never reset inclusion flags or exclusion checks.
+#[cfg(unix)]
+pub(super) struct SessionAssertions {
+    expected: Expectations,
+    found: Vec<bool>,
+}
+#[cfg(unix)]
+impl SessionAssertions {
+    pub(super) fn load(bytes: &[u8], height: u64) -> Result<Self, String> {
+        let expected = parse_expectations_inner(bytes, height)?;
+        if expected.state.height != height {
+            return Err("session expectations require the exact final height".into());
+        }
+        let found = vec![false; expected.included_operations.len()];
+        Ok(Self { expected, found })
+    }
+    pub(super) fn observe(&mut self, body: &crate::eng2::body::Body) -> Result<(), String> {
+        for claim in &body.fund_claims {
+            self.record(
+                body.height,
+                Kind::FundClaimSha256,
+                crate::local::hex(&Sha256::digest(claim.encode())),
+            )?;
+        }
+        for action in &body.governance {
+            self.record(
+                body.height,
+                Kind::GovernanceActionSha256,
+                crate::local::hex(&Sha256::digest(action.encode()?)),
+            )?;
+        }
+        for issuance in &body.issuances {
+            self.record(
+                body.height,
+                Kind::IssuanceDeclaration,
+                crate::local::hex(&issuance.signed.declaration.binding()),
+            )?;
+        }
+        for transaction in &body.transactions {
+            self.record(
+                body.height,
+                Kind::TransactionStatement,
+                crate::local::hex(&transaction.record.statement_id(&body.network)),
+            )?;
+        }
+        Ok(())
+    }
+    fn record(&mut self, height: u64, kind: Kind, identity: String) -> Result<(), String> {
+        check_operation(&self.expected, &mut self.found, height, kind, identity)
+    }
+    pub(super) fn progress(&self) -> Value {
+        json!({"included_operations_seen":self.found,
+            "excluded_operations_checked_on_every_replayed_block":true})
+    }
+    fn require_inclusions(&self) -> Result<(), String> {
+        if self.found.iter().any(|seen| !seen) {
+            return Err("session canonical operation assertion was not reached".into());
+        }
+        Ok(())
+    }
+    pub(super) fn finish(&self, actual: &Engine, reference: &Engine) -> Result<Value, String> {
+        self.require_inclusions()?;
+        let observed = public_state(actual)?;
+        if observed != self.expected.state || public_state(reference)? != observed {
+            return Err("session exact public business state differs".into());
+        }
+        let spent = &actual.state().chain().spent;
+        if self
+            .expected
+            .present_nullifiers
+            .iter()
+            .any(|key| !spent.contains(&nullifier_key(key)))
+            || self
+                .expected
+                .absent_nullifiers
+                .iter()
+                .any(|key| spent.contains(&nullifier_key(key)))
+        {
+            return Err("session final nullifier assertions differ".into());
+        }
+        Ok(json!({"public_business_state":observed,
+            "included_operations":self.expected.included_operations,
+            "absent_operations_checked_through_entire_prefix":self.expected.absent_operations,
+            "present_nullifiers":self.expected.present_nullifiers,
+            "absent_nullifiers":self.expected.absent_nullifiers,
+            "wallet_scan_performed":false,"wallet_balances_verified":false,
+            "transaction_payment_classification_verified":false,
+            "full_business_acceptance_passed":false}))
+    }
+}
+
 /// Observe the existing database with its identity and accepted-state seal.
 /// Both opens use a strictly read-only backend without rollback maintenance.
 /// Independently verify unchanged public frames; never import, repair, append,
@@ -572,6 +664,88 @@ mod tests {
                 r#"{"kind":"transaction_statement","kind":"issuance_declaration","identity":"00"}"#
             )
             .is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn session_assertions_persist_across_boundaries_and_exclude_the_entire_prefix() {
+        let key = |byte| OperationKey {
+            kind: Kind::TransactionStatement,
+            identity: format!("{byte:02x}").repeat(32),
+        };
+        // Only the operation accumulator is exercised; this projection is never
+        // parsed as a qualified ledger, executed or passed as state evidence.
+        let expected = Expectations {
+            version: 1,
+            state: PublicState {
+                height: 97,
+                tip: "01".repeat(32),
+                economics: Economics {
+                    issued: "0".into(),
+                    burned: "0".into(),
+                    miner_credited: "0".into(),
+                    fund_credited: "0".into(),
+                    holder_pool: "0".into(),
+                    locked_total: "0".into(),
+                    locked_schedule: Vec::new(),
+                },
+                fund_total_entitlement: "0".into(),
+                funds: Vec::new(),
+                governance_sequence: 0,
+                issuance_fee_atoms: 0,
+                pending_issuance_fee: None,
+                fee_destination: String::new(),
+                assets: Vec::new(),
+                leaf_count: 0,
+                nullifier_count: 0,
+            },
+            included_operations: vec![
+                Included {
+                    height: 1,
+                    operation: key(1),
+                },
+                Included {
+                    height: 97,
+                    operation: key(2),
+                },
+            ],
+            absent_operations: vec![key(3)],
+            present_nullifiers: Vec::new(),
+            absent_nullifiers: Vec::new(),
+        };
+        let mut assertions = SessionAssertions {
+            expected,
+            found: vec![false; 2],
+        };
+        assertions
+            .record(1, Kind::TransactionStatement, key(1).identity)
+            .unwrap();
+        let first_boundary = assertions.progress();
+        assert_eq!(
+            first_boundary["included_operations_seen"],
+            json!([true, false])
+        );
+        assert!(assertions.require_inclusions().is_err());
+        assertions
+            .record(96, Kind::TransactionStatement, key(2).identity)
+            .unwrap();
+        assert!(assertions.require_inclusions().is_err());
+        assertions
+            .record(97, Kind::TransactionStatement, key(2).identity)
+            .unwrap();
+        assertions.require_inclusions().unwrap();
+        assert_eq!(
+            assertions.progress()["included_operations_seen"],
+            json!([true, true])
+        );
+        assert!(
+            assertions
+                .record(98, Kind::TransactionStatement, key(3).identity)
+                .is_err()
+        );
+        assert_eq!(
+            first_boundary["included_operations_seen"],
+            json!([true, false])
         );
     }
 }

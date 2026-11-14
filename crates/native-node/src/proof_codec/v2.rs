@@ -16,6 +16,8 @@ pub mod complete_fee;
 #[cfg(not(target_family = "wasm"))]
 #[path = "v2/fee_guard.rs"]
 pub mod fee_guard;
+#[path = "v2/issuance.rs"]
+pub mod issuance;
 #[path = "v2/native.rs"]
 pub mod native;
 #[path = "v2/receive.rs"]
