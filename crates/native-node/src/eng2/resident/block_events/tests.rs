@@ -78,7 +78,7 @@ fn event_types_keep_fixed_process_bindings_and_distinct_sequences() {
         assert_eq!(event["run_id"], "4".repeat(64));
         assert_eq!(event["binary_sha256"], "5".repeat(64));
         assert_eq!(event["source_commit_externally_verified"], false);
-        assert!(serde_json::to_vec(event).unwrap().len() + 1 <= RECORD_BYTES);
+        assert!(serde_json::to_vec(event).unwrap().len() < RECORD_BYTES);
         let keys = event.as_object().unwrap();
         assert!(keys.keys().all(|key| {
             [

@@ -44,6 +44,7 @@ DOCUMENTS = {
     "g2-miner-bootstrap-acceptance.md", "isolated-production-controls.md",
     "reorganization-shared-memory.md",
     "live-reorganization-control.md",
+    "eng2-checkpoint-observation.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",

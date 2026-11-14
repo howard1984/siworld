@@ -298,10 +298,7 @@ fn checkpoint_phase(
     initiator: bool,
     shared: &Shared,
 ) -> Result<(), String> {
-    use super::super::{
-        checkpoint_exchange,
-        checkpoint_observer::{Error, Outcome},
-    };
+    use super::super::checkpoint_exchange;
     let deadline = p2p::Deadline::new(checkpoint_exchange::PHASE_TIMEOUT);
     let maximum = super::super::checkpoint_wire::MAX_CHECKPOINT_PACKET_BYTES;
     let _phase = shared
@@ -339,15 +336,18 @@ fn checkpoint_phase(
                 .checkpoint_observer
                 .lock()
                 .map_err(|_| "checkpoint observer lock poisoned")?;
-            observer.observe(owner.store(), unix_ms()? / 1000, &item.message)
-        };
-        match outcome {
-            Ok(Outcome::Historical) | Err(Error::Unavailable) => {}
-            Ok(_) => {
-                #[cfg(unix)]
-                shared.mailbox.enqueue(item.message, item.reservation)?;
+            let was_conflicted = observer.conflicted();
+            let outcome = observer.observe(owner.store(), unix_ms()? / 1000, &item.message);
+            if was_conflicted && !observer.conflicted() {
+                // Recovery must await an actual newly completed block →
+                // checkpoint → transaction round at this exact canonical head.
+                shared.network.invalidate_head_evidence()?;
             }
-            Err(error) => return Err(error.code().into()),
+            outcome
+        };
+        if checkpoint_mailbox_admission(outcome)? {
+            #[cfg(unix)]
+            shared.mailbox.enqueue(item.message, item.reservation)?;
         }
         deadline
             .check()
@@ -356,6 +356,23 @@ fn checkpoint_phase(
     deadline
         .check()
         .map_err(|_| "checkpoint control phase deadline elapsed".into())
+}
+/// Pending authority keeps normal bounded synchronization alive, without
+/// supplying publication material or swallowing rejected packets/hard faults.
+fn checkpoint_mailbox_admission(
+    outcome: Result<
+        super::super::checkpoint_observer::Outcome,
+        super::super::checkpoint_observer::Error,
+    >,
+) -> Result<bool, String> {
+    use super::super::checkpoint_observer::{Error, Outcome};
+    match outcome {
+        Ok(Outcome::Historical | Outcome::PendingAuthorization) | Err(Error::Unavailable) => {
+            Ok(false)
+        }
+        Ok(_) => Ok(true),
+        Err(error) => Err(error.code().into()),
+    }
 }
 #[derive(Debug)]
 enum WorkerAdmission<T> {
@@ -566,6 +583,31 @@ pub(super) fn run(
 mod tests {
     use super::*;
     #[test]
+    fn pending_checkpoint_allows_round_completion_but_recovery_requires_new_head_evidence() {
+        use super::super::super::checkpoint_observer::{Error, Outcome};
+        let status = Arc::new(NetworkStatus::new([[1; 32]]));
+        let _connection = status.connected([1; 32]).unwrap();
+        let head = (50, [2; 32]);
+        status.round([1; 32], 0, Some(head)).unwrap();
+        assert!(status.ready_at(head).unwrap());
+        assert!(!checkpoint_mailbox_admission(Ok(Outcome::PendingAuthorization)).unwrap());
+        // Actual rounds can still finish while the observer independently gates
+        // mining/signing. A pending certificate creates no round by itself.
+        status.round([1; 32], 0, Some(head)).unwrap();
+        assert!(checkpoint_mailbox_admission(Ok(Outcome::CurrentCertificate(12))).unwrap());
+        status.invalidate_head_evidence().unwrap();
+        assert!(!status.ready_at(head).unwrap());
+        assert!(status.checkpoint_ready(head).is_err());
+        status.round([1; 32], 0, None).unwrap();
+        assert!(!status.ready_at(head).unwrap());
+        status.round([1; 32], 0, Some(head)).unwrap();
+        assert!(status.ready_at(head).unwrap());
+        assert!(status.checkpoint_ready(head).is_ok());
+        for error in [Error::Rejected, Error::Conflict, Error::EvidenceUnavailable] {
+            assert!(checkpoint_mailbox_admission(Err(error)).is_err());
+        }
+    }
+    #[test]
     fn worker_admission_defers_capacity_without_starting_or_releasing_other_owners() {
         let budget = p2p::Budget::new(WORKER_BYTES + 9);
         let existing = budget.reserve(10).unwrap();
@@ -607,18 +649,18 @@ mod tests {
         let budget = p2p::Budget::new(WORKER_BYTES);
         let pressure = budget.reserve(1).unwrap();
         let accepts = std::cell::Cell::new(0);
-        let mut accept_empty = |_charge| {
+        let accept_empty = |_charge| {
             accepts.set(accepts.get() + 1);
             Ok::<Option<()>, String>(None)
         };
         assert!(matches!(
-            admit_worker(budget.reserve_observed(WORKER_BYTES), &mut accept_empty).unwrap(),
+            admit_worker(budget.reserve_observed(WORKER_BYTES), accept_empty).unwrap(),
             WorkerAdmission::Deferred
         ));
         assert_eq!(accepts.get(), 0);
         drop(pressure);
         assert!(matches!(
-            admit_worker(budget.reserve_observed(WORKER_BYTES), &mut accept_empty).unwrap(),
+            admit_worker(budget.reserve_observed(WORKER_BYTES), accept_empty).unwrap(),
             WorkerAdmission::Ready(None)
         ));
         assert_eq!(accepts.get(), 1);

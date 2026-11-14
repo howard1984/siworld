@@ -35,6 +35,76 @@ pub struct PublicExport {
     material_generation: std::cell::Cell<u64>,
 }
 impl PublicExport {
+    /// Reuse the export's descriptor confinement and network/genesis binding.
+    pub(crate) fn open_observation_evidence(root: &Path, store: &Store) -> Result<Self, String> {
+        Self::open_unrestored(root, store)
+    }
+
+    /// Preserve the first independently verified quorum for an epoch and anchor.
+    /// The caller has already checked the incoming current-roster signatures.
+    /// A different statement is retained separately before reporting conflict.
+    pub(crate) fn record_observed_quorum(
+        &self,
+        certificate: &Certificate,
+        keys: &[[u8; super::super::certificate::VERIFYING_KEY_BYTES]; 3],
+    ) -> Result<bool, String> {
+        self.check_root()?;
+        let statement = &certificate.statement;
+        if statement.network != self.network {
+            return Err("checkpoint observation evidence network differs".into());
+        }
+        let name = format!(
+            "checkpoint-observed-{:020}-{:020}.certificate-eng2.bin",
+            statement.roster_sequence, statement.checkpoint_height
+        );
+        let conflict_name = format!(
+            "checkpoint-observed-conflict-{:020}-{:020}.certificate-eng2.bin",
+            statement.roster_sequence, statement.checkpoint_height
+        );
+        let read = |name: &str| -> Result<Option<Certificate>, String> {
+            let Some(mut file) =
+                self.open_read(name, super::super::certificate::CERTIFICATE_BYTES)?
+            else {
+                return Ok(None);
+            };
+            let mut bytes = [0; super::super::certificate::CERTIFICATE_BYTES];
+            file.read_exact(&mut bytes)
+                .map_err(|_| "checkpoint observation evidence truncated")?;
+            let saved = Certificate::decode(&bytes, self.network)
+                .map_err(|_| "checkpoint observation evidence malformed")?;
+            if saved.statement.roster_sequence != statement.roster_sequence
+                || saved.statement.checkpoint_height != statement.checkpoint_height
+            {
+                return Err("checkpoint observation evidence index differs".into());
+            }
+            saved
+                .check_signatures(keys)
+                .map_err(|_| "checkpoint observation evidence signatures invalid")?;
+            Ok(Some(saved))
+        };
+        let saved = read(&name)?;
+        let conflict = read(&conflict_name)?;
+        if let Some(conflict) = conflict {
+            let saved = saved.ok_or("checkpoint observation conflict lacks first evidence")?;
+            if saved.statement == conflict.statement {
+                return Err("checkpoint observation conflict evidence is identical".into());
+            }
+            return Ok(true);
+        }
+        let encoded = certificate
+            .encode()
+            .map_err(|_| "checkpoint observation certificate malformed")?;
+        if let Some(saved) = saved {
+            if saved.statement == *statement {
+                return Ok(false);
+            }
+            self.write_once(&conflict_name, &encoded)?;
+            return Ok(true);
+        }
+        self.write_once(&name, &encoded)?;
+        Ok(false)
+    }
+
     /// The host creates its dedicated directory. All subsequent filesystem
     /// operations remain relative to this opened directory descriptor.
     pub fn open(root: &Path, store: &Store, limits: ImportLimits) -> Result<Self, String> {

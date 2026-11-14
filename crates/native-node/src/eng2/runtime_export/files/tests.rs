@@ -580,3 +580,157 @@ fn immutable_install_collision_authenticates_existing_segments_without_replacing
     assert_eq!(fs::read(root.join("occupied.bin")).unwrap(), changed);
     assert_eq!(fs::read(root.join("incoming.tmp")).unwrap(), bytes);
 }
+
+fn observed_certificate(statement: &Statement, slots: [u8; 2]) -> Certificate {
+    use libcrux_ml_dsa::ml_dsa_65;
+    Certificate {
+        statement: statement.clone(),
+        votes: slots.map(|slot| Vote {
+            slot,
+            signature: *ml_dsa_65::sign(
+                &ml_dsa_65::generate_key_pair([slot + 3; 32]).signing_key,
+                &statement.encode().unwrap(),
+                Statement::signing_context(),
+                [42; 32],
+            )
+            .unwrap()
+            .as_ref(),
+        }),
+    }
+}
+
+#[test]
+fn observed_quorum_evidence_reopens_preserves_first_statement_and_records_both_quorums() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("observations");
+    let candidate = synthetic_candidate();
+    let keys = candidate.roster.keys();
+    let first = observed_certificate(&candidate.statement, [0, 1]);
+    first.check_signatures(keys).unwrap();
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    assert!(!export.record_observed_quorum(&first, keys).unwrap());
+    let name = "checkpoint-observed-00000000000000000000-00000000000000000072.certificate-eng2.bin";
+    let original = fs::read(root.join(name)).unwrap();
+    assert_eq!(original.len(), crate::eng2::certificate::CERTIFICATE_BYTES);
+    assert_eq!(fs::metadata(root.join(name)).unwrap().mode() & 0o777, 0o600);
+    drop(export);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    let equivalent = observed_certificate(&candidate.statement, [0, 2]);
+    equivalent.check_signatures(keys).unwrap();
+    assert!(!reopened.record_observed_quorum(&equivalent, keys).unwrap());
+    assert_eq!(fs::read(root.join(name)).unwrap(), original);
+    let before = fs::read_dir(&root).unwrap().count();
+    assert!(!reopened.record_observed_quorum(&first, keys).unwrap());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), before);
+    let mut second_statement = candidate.statement.clone();
+    second_statement.authorization_block[0] ^= 1;
+    let second = observed_certificate(&second_statement, [1, 2]);
+    second.check_signatures(keys).unwrap();
+    assert!(reopened.record_observed_quorum(&second, keys).unwrap());
+    assert_eq!(fs::read(root.join(name)).unwrap(), original);
+    let conflict_name = "checkpoint-observed-conflict-00000000000000000000-00000000000000000072.certificate-eng2.bin";
+    assert_eq!(
+        fs::read(root.join(conflict_name)).unwrap(),
+        second.encode().unwrap()
+    );
+    drop(reopened);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    assert!(reopened.record_observed_quorum(&first, keys).unwrap());
+    assert!(reopened.record_observed_quorum(&second, keys).unwrap());
+    assert!(!fs::read_dir(&root).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|e| e == "tmp")
+    }));
+}
+
+#[test]
+fn observed_quorum_evidence_rejects_truncation_symlinks_and_directory_permission_failure() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("observations");
+    let candidate = synthetic_candidate();
+    let certificate = observed_certificate(&candidate.statement, [0, 1]);
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    let name = "checkpoint-observed-00000000000000000000-00000000000000000072.certificate-eng2.bin";
+    let path = root.join(name);
+    export.write_once(name, b"truncated").unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+    fs::remove_file(&path).unwrap();
+    let target = root.join("target.bin");
+    fs::write(&target, certificate.encode().unwrap()).unwrap();
+    symlink(&target, &path).unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+    fs::remove_file(&path).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+    assert!(!path.exists());
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .unwrap()
+    );
+    let mut damaged = certificate.encode().unwrap();
+    damaged[200] ^= 1;
+    fs::write(&path, damaged).unwrap();
+    assert!(
+        export
+            .record_observed_quorum(&certificate, candidate.roster.keys())
+            .is_err()
+    );
+}
+
+#[test]
+fn observed_quorum_forward_progress_has_no_cumulative_ram_capacity_limit() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("observations");
+    let candidate = synthetic_candidate();
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    for height in 1..=257 {
+        let mut statement = candidate.statement.clone();
+        statement.checkpoint_height = height * 12;
+        statement.authorization_height = statement.checkpoint_height + 24;
+        let certificate = observed_certificate(&statement, [0, 1]);
+        certificate
+            .check_signatures(candidate.roster.keys())
+            .unwrap();
+        assert!(
+            !export
+                .record_observed_quorum(&certificate, candidate.roster.keys())
+                .unwrap()
+        );
+    }
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 258);
+    drop(export);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    let first = observed_certificate(
+        &Statement {
+            checkpoint_height: 12,
+            authorization_height: 36,
+            ..candidate.statement.clone()
+        },
+        [0, 1],
+    );
+    assert!(
+        !reopened
+            .record_observed_quorum(&first, candidate.roster.keys())
+            .unwrap()
+    );
+}

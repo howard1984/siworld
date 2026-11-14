@@ -295,7 +295,7 @@ fn export_status(
         "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
         "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
         "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
-        "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {"checkpoint_current_quorum_conflict"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+        "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {observer.gate_reason().map(super::checkpoint_observer::Error::code).unwrap_or("checkpoint_current_quorum_conflict")} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
         "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
@@ -578,7 +578,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             phase: "starting",
             ..Default::default()
         }),
-        checkpoint_observer: Mutex::new(super::checkpoint_observer::Observer::default()),
+        checkpoint_observer: Mutex::new(super::checkpoint_observer::Observer::new(&budget)?),
         legacy_checkpoint_peers: config.legacy_checkpoint_peers.clone(),
         budget: budget.clone(),
         _pool_charge: budget
@@ -606,6 +606,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             .owner
             .lock()
             .map_err(|_| "resident owner lock poisoned")?;
+        shared
+            .checkpoint_observer
+            .lock()
+            .map_err(|_| "checkpoint observer lock poisoned")?
+            .open_evidence(&root, owner.store())?;
         let mut host = super::runtime_export::host::Host::open_resident(
             &root,
             owner.store(),
@@ -709,6 +714,13 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     let _ = ancestor_height;
                     Ok(())
                 });
+                if owner.activities_allowed() {
+                    shared
+                        .checkpoint_observer
+                        .lock()
+                        .map_err(|_| "checkpoint observer lock poisoned")?
+                        .reconcile(owner.store());
+                }
                 if !owner.activities_allowed() {
                     #[cfg(unix)]
                     {
