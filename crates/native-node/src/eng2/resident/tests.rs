@@ -748,3 +748,15 @@ fn readiness_reason_preserves_owner_and_observer_gates_ahead_of_peer_diagnostics
         (false, "canonical_state_unavailable")
     );
 }
+
+#[test]
+fn production_failure_retains_the_first_stable_alarm() {
+    let mut status = ProductionStatus::default();
+    assert!(status.failure.is_none());
+    assert!(status.error.is_none());
+    status.fail(production::Failure::ProductionControl);
+    status.fail(production::Failure::ProverInit);
+    assert_eq!(status.failure, Some(production::Failure::ProductionControl));
+    assert_eq!(status.error, Some("native_production_failed"));
+    assert_eq!(status.phase, "networking");
+}

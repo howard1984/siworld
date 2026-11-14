@@ -88,13 +88,11 @@ fn pause_resume_revisions_and_exact_height_do_not_reuse_old_permission() {
     assert_eq!(receipt["revision"], 2);
 }
 #[test]
-fn stale_run_build_tip_height_revision_and_manifest_are_rejected_without_enabling() {
+fn invalid_run_build_revision_manifest_and_bounds_are_rejected_without_enabling() {
     for field in [
         "run_id",
         "source_commit",
         "binary_sha256",
-        "expected_tip",
-        "expected_height",
         "revision",
         "manifest_sha256",
         "stop_height",
@@ -232,4 +230,119 @@ fn acknowledgement_write_failure_latches_failed_without_advancing_revision() {
     assert_eq!(control.status(25)["production_allowed"], false);
     assert_eq!(control.files.required(&result_name).unwrap(), b"{}");
     assert!(control.permission(25, &tip, Some(0)).is_err());
+}
+
+#[test]
+fn authenticated_head_compare_failure_consumes_once_pauses_and_requires_a_new_revision() {
+    for (height, tip, paused) in [
+        (26, [9; 32], false),
+        (25, [8; 32], false),
+        (26, [9; 32], true),
+    ] {
+        let temp = Temporary::new();
+        let mut control = controller(&temp.0);
+        install(&control, &command(&control, 25, &[9; 32], 50, false));
+        assert_eq!(control.permission(25, &[9; 32], None).unwrap(), (true, 1));
+        let old_stop = control.stop_height;
+        install(&control, &command(&control, 25, &[9; 32], 60, paused));
+        assert_eq!(
+            control.permission(height, &tip, Some(1)).unwrap(),
+            (false, 2)
+        );
+        assert!(!control.failed);
+        assert!(control.paused);
+        assert!(control.stop_height <= old_stop);
+        let status = control.status(height);
+        assert_eq!(status["production_allowed"], false);
+        let result = name("result", &control.run, 2);
+        let receipt = control.files.required(&result).unwrap();
+        let rejected: Value = serde_json::from_slice(&receipt).unwrap();
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["reason"], "head_compare_failed");
+        assert_eq!(rejected["paused"], true);
+        assert_eq!(rejected["stop_height"], control.stop_height);
+        for _ in 0..3 {
+            assert_eq!(
+                control.permission(height, &tip, Some(2)).unwrap(),
+                (false, 2)
+            );
+            assert_eq!(control.files.required(&result).unwrap(), receipt);
+        }
+        install(&control, &command(&control, height, &tip, 70, false));
+        assert_eq!(
+            control.permission(height, &tip, Some(1)).unwrap(),
+            (false, 3)
+        );
+        assert_eq!(
+            control.permission(height, &tip, Some(2)).unwrap(),
+            (false, 3)
+        );
+        assert_eq!(
+            control.permission(height, &tip, Some(3)).unwrap(),
+            (true, 3)
+        );
+    }
+}
+
+#[test]
+fn head_mismatch_does_not_hide_invalid_context_or_bounds() {
+    for (field, value) in [
+        ("source_commit", json!("04".repeat(20))),
+        ("manifest_sha256", json!("04".repeat(32))),
+        ("run_id", json!("04".repeat(32))),
+        ("binary_sha256", json!("04".repeat(32))),
+        ("revision", json!(2)),
+        ("stop_height", json!(100_001)),
+        ("expected_height", json!(100_001)),
+    ] {
+        let temp = Temporary::new();
+        let mut control = controller(&temp.0);
+        let mut selected = command(&control, 24, &[8; 32], 50, true);
+        selected[field] = value;
+        control
+            .files
+            .create(
+                &name("request", &control.run, 1),
+                &serde_json::to_vec(&selected).unwrap(),
+            )
+            .unwrap();
+        assert!(control.permission(25, &[9; 32], None).is_err(), "{field}");
+        assert!(control.failed);
+        assert_eq!(control.revision, 0);
+        assert_eq!(control.status(25)["production_allowed"], false);
+    }
+}
+
+#[test]
+fn rejected_head_request_and_manifest_are_still_immutable() {
+    for target in ["request", "manifest"] {
+        let temp = Temporary::new();
+        let mut control = controller(&temp.0);
+        install(&control, &command(&control, 24, &[8; 32], 50, false));
+        assert_eq!(control.permission(25, &[9; 32], None).unwrap(), (false, 1));
+        let path = if target == "request" {
+            name("request", &control.run, 1)
+        } else {
+            "manifest.json".into()
+        };
+        fs::write(temp.0.join(DIRECTORY).join(path), b"[]").unwrap();
+        assert!(control.permission(25, &[9; 32], None).is_err());
+        assert!(control.failed);
+    }
+}
+
+#[test]
+fn rejected_head_receipt_io_failure_is_fatal_without_consuming_revision() {
+    let temp = Temporary::new();
+    let mut control = controller(&temp.0);
+    install(&control, &command(&control, 24, &[8; 32], 50, false));
+    control
+        .files
+        .create(&name("result", &control.run, 1), b"{}")
+        .unwrap();
+    assert!(control.permission(25, &[9; 32], None).is_err());
+    assert!(control.failed);
+    assert_eq!(control.revision, 0);
+    assert!(control.request_sha256.is_none());
+    assert!(control.paused);
 }

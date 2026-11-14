@@ -223,7 +223,7 @@ The producer uses four proving workers. Native proving and bounded nonce-search
 slices run outside the consensus owner's mutex. A changed parent invalidates a
 prepared block. Every produced block returns through the same native verifier,
 execution-commitment comparison and durable admission path as a peer block.
-A production error is exported while validation and serving remain active.
+A production error is exported while validation and serving remain active. Returned production failures keep `error_code: native_production_failed` and add bounded `production_failure_stage` and `production_failure_code` fields. These fields identify the actual budget, initialization, control, padding, preparation, proof, work, commit, reward or status failure site using fixed labels; underlying error strings, paths and credentials are not exported. Both fields are null before a returned failure, and an unannotated returned error is explicitly `unknown` / `unknown_production_failure`. The first failure stays latched until cancellation; production is not retried, including worker-pool or prover initialization failures. Panics are not caught or classified by this returned-error interface.
 
 Status uses `connections`, `ready`, `sync_status`, the current committed head,
 a run identifier and freshness fields. A disconnected or stale session cannot

@@ -209,6 +209,17 @@ struct ProductionStatus {
     blocks: u64,
     last_pow: Option<Instant>,
     error: Option<&'static str>,
+    failure: Option<production::Failure>,
+}
+impl ProductionStatus {
+    fn fail(&mut self, failure: production::Failure) {
+        // Preserve the first returned failure until this resident is stopped.
+        if self.failure.is_none() {
+            self.failure = Some(failure);
+        }
+        self.error = Some("native_production_failed");
+        self.phase = "networking";
+    }
 }
 struct Shared {
     owner: Arc<Mutex<Driver>>,
@@ -308,6 +319,8 @@ fn export_status(
         "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
         "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
         "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
+        "production_failure_stage":production.failure.map(production::Failure::stage),
+        "production_failure_code":production.failure.map(production::Failure::code),
         "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
         "historical_proof_replay":false
     });
@@ -390,6 +403,7 @@ fn export_unavailable_status(
             "ready_reason_code":"canonical_state_unavailable",
             "reorganization_status":"manual_recovery_required", "reorganization_alarm":"canonical_state_unavailable",
             "wallet_export_paused":true, "signed_bootstrap_available":false,
+            "production_failure_stage":null,"production_failure_code":null,
             "error_code":"canonical_state_unavailable", "updated_unix_ms":unix_ms()?,
             "elapsed_monotonic_ms":started.elapsed().as_millis().to_string(), "historical_proof_replay":false,
         }),

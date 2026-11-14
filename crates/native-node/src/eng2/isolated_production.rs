@@ -233,7 +233,7 @@ impl Controller {
         }))
     }
 
-    fn validate(&self, selected: &Request, height: u64, tip: &Hash) -> Result<(), String> {
+    fn validate_context(&self, selected: &Request) -> Result<(), String> {
         if selected.manifest_sha256 != self.manifest
             || selected.run_id != self.run
             || selected.source_commit != self.source
@@ -243,8 +243,7 @@ impl Controller {
                     .revision
                     .checked_add(1)
                     .ok_or("isolated revision exhausted")?
-            || selected.expected_height != height
-            || selected.expected_tip != crate::local::hex(tip)
+            || selected.expected_height > self.maximum
             || selected.stop_height > self.maximum
         {
             return Err("isolated production request context is stale or different".into());
@@ -271,7 +270,7 @@ impl Controller {
             if let Some(bytes) = self.files.read(&name("request", &self.run, next))? {
                 let hash = digest(&bytes);
                 let selected = request(&bytes).and_then(|selected| {
-                    self.validate(&selected, height, tip)?;
+                    self.validate_context(&selected)?;
                     Ok(selected)
                 });
                 let selected = match selected {
@@ -289,6 +288,28 @@ impl Controller {
                         return Err(error);
                     }
                 };
+                if selected.expected_height != height
+                    || selected.expected_tip != crate::local::hex(tip)
+                {
+                    // A fully authenticated next revision lost its head CAS.
+                    // Consume it once, invalidate old work and only reduce the
+                    // policy. Neither a receipt nor a stale request grants work.
+                    let stop_height = self.stop_height.min(height);
+                    self.files.create(
+                        &name("result", &self.run, next),
+                        &serde_json::to_vec(&json!({"version":1,"run_id":self.run,
+                            "manifest_sha256":self.manifest,"source_commit":self.source,
+                            "binary_sha256":self.binary,"revision":next,"request_sha256":hash,
+                            "height":height,"tip":crate::local::hex(tip),"status":"rejected",
+                            "reason":"head_compare_failed","paused":true,"stop_height":stop_height}))
+                        .map_err(|_| "isolated production result encoding failed")?,
+                    )?;
+                    self.revision = next;
+                    self.paused = true;
+                    self.stop_height = stop_height;
+                    self.request_sha256 = Some(hash);
+                    return Ok((false, next));
+                }
                 // Durable acknowledgement is installed before updating memory.
                 // Any I/O error terminates this producer; there is no fallback.
                 self.files.create(
