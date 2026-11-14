@@ -73,12 +73,14 @@ struct BudgetInner {
     maximum: usize,
     usage: Mutex<Usage>,
 }
+#[cfg(any(feature = "eng2-runtime", test))]
 /// Atomic logical byte counters observed during one admission attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ByteUsage {
     pub maximum: usize,
     pub used: usize,
 }
+#[cfg(any(feature = "eng2-runtime", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReserveFailure {
     Exhausted(ByteUsage),
@@ -114,6 +116,7 @@ impl Budget {
             bytes,
         })
     }
+    #[cfg(any(feature = "eng2-runtime", test))]
     /// Preserve the failure category and counters under the same budget lock.
     /// This acquires exactly the requested bytes or changes no ownership.
     pub(crate) fn reserve_observed(
