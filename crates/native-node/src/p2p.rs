@@ -73,6 +73,18 @@ struct BudgetInner {
     maximum: usize,
     usage: Mutex<Usage>,
 }
+/// Atomic logical byte counters observed during one admission attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ByteUsage {
+    pub maximum: usize,
+    pub used: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReserveFailure {
+    Exhausted(ByteUsage),
+    Overflow,
+    Unavailable,
+}
 /// Shared logical ownership budget. Every listener, outbound connection and
 /// retained packet for one node must receive clones of the same instance.
 /// Handshake reservations consume this same maximum, in addition to their
@@ -101,6 +113,40 @@ impl Budget {
             budget: self.0.clone(),
             bytes,
         })
+    }
+    /// Preserve the failure category and counters under the same budget lock.
+    /// This acquires exactly the requested bytes or changes no ownership.
+    pub(crate) fn reserve_observed(
+        &self,
+        bytes: usize,
+    ) -> Result<(Reservation, ByteUsage), ReserveFailure> {
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .map_err(|_| ReserveFailure::Unavailable)?;
+        let observed = ByteUsage {
+            maximum: self.0.maximum,
+            used: usage.bytes,
+        };
+        let next = usage
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ReserveFailure::Overflow)?;
+        if next > self.0.maximum {
+            return Err(ReserveFailure::Exhausted(observed));
+        }
+        usage.bytes = next;
+        Ok((
+            Reservation {
+                budget: self.0.clone(),
+                bytes,
+            },
+            ByteUsage {
+                maximum: self.0.maximum,
+                used: next,
+            },
+        ))
     }
     pub(crate) fn available(&self) -> Result<usize, Error> {
         let usage = self.0.usage.lock().map_err(|_| Error::Unavailable)?;
@@ -1015,3 +1061,50 @@ mod admission_tests;
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod observed_budget_tests {
+    use super::*;
+    #[test]
+    fn observed_reservation_distinguishes_contention_overflow_and_poison() {
+        let budget = Budget::new(100);
+        let held = budget.reserve(80).unwrap();
+        assert!(matches!(
+            budget.reserve_observed(21),
+            Err(ReserveFailure::Exhausted(ByteUsage {
+                maximum: 100,
+                used: 80
+            }))
+        ));
+        assert_eq!(budget.available().unwrap(), 20);
+        assert!(matches!(
+            budget.reserve_observed(usize::MAX),
+            Err(ReserveFailure::Overflow)
+        ));
+        assert_eq!(budget.available().unwrap(), 20);
+        drop(held);
+        let (owned, observed) = budget.reserve_observed(21).unwrap();
+        assert_eq!(
+            observed,
+            ByteUsage {
+                maximum: 100,
+                used: 21
+            }
+        );
+        drop(owned);
+        assert_eq!(budget.available().unwrap(), 100);
+        let poisoned = budget.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _lock = poisoned.0.usage.lock().unwrap();
+                panic!("bounded budget poison fixture");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(matches!(
+            budget.reserve_observed(1),
+            Err(ReserveFailure::Unavailable)
+        ));
+    }
+}
