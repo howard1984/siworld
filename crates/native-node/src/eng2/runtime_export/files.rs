@@ -36,6 +36,7 @@ pub struct PublicExport {
 }
 impl PublicExport {
     /// Reuse the export's descriptor confinement and network/genesis binding.
+    #[cfg(any(test, feature = "eng2-runtime"))]
     pub(crate) fn open_observation_evidence(root: &Path, store: &Store) -> Result<Self, String> {
         Self::open_unrestored(root, store)
     }
@@ -43,6 +44,7 @@ impl PublicExport {
     /// Preserve the first independently verified quorum for an epoch and anchor.
     /// The caller has already checked the incoming current-roster signatures.
     /// A different statement is retained separately before reporting conflict.
+    #[cfg(any(test, feature = "eng2-runtime"))]
     pub(crate) fn record_observed_quorum(
         &self,
         certificate: &Certificate,
