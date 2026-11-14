@@ -817,7 +817,7 @@ def sample_owned_group_rss(children):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["topology", "partition", "heal", "run-node"])
+    parser.add_argument("command", choices=["topology", "partition", "heal", "run-node", "live-contract"])
     parser.add_argument("plan", type=Path)
     parser.add_argument("--topology", type=Path)
     parser.add_argument("--node")
@@ -826,7 +826,25 @@ def main():
     parser.add_argument("--control-mode", choices=["status", "ipc"], default="status")
     parser.add_argument("--kill-boundary", choices=sorted(BOUNDARIES))
     parser.add_argument("--height", type=int)
+    parser.add_argument("--input-sha256")
+    parser.add_argument("--inert-trace", type=Path)
+    parser.add_argument("--trace-sha256")
+    parser.add_argument("--native-control-snapshot", type=Path)
+    parser.add_argument("--control-sha256")
     arguments = parser.parse_args()
+    if arguments.command == "live-contract":
+        import reorg_live_control
+        NETWORK.owner_local()
+        proposal = reorg_live_control.load_bound(arguments.plan, arguments.input_sha256)
+        result = reorg_live_control.requirements(proposal)
+        if arguments.inert_trace is not None:
+            trace = reorg_live_control.load_bound(arguments.inert_trace, arguments.trace_sha256)
+            result["inert_model"] = reorg_live_control.check_inert_trace(proposal, trace)
+        if arguments.native_control_snapshot is not None:
+            snapshot = reorg_live_control.load_bound(arguments.native_control_snapshot, arguments.control_sha256)
+            result["native_record_snapshot"] = reorg_live_control.check_native_control_snapshot(proposal, snapshot)
+        print(json.dumps(result, sort_keys=True))
+        return
     plan = checked_plan(arguments.plan)
     if arguments.command == "run-node":
         require(arguments.arguments is not None, "explicit_frozen_arguments_required")

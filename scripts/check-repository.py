@@ -42,6 +42,7 @@ DOCUMENTS = {
     "eng2-wallet-history.md", "engineering-signed-state-import.md",
     "g2-miner-bootstrap-acceptance.md", "isolated-production-controls.md",
     "reorganization-shared-memory.md",
+    "live-reorganization-control.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
