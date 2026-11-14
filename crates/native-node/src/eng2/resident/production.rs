@@ -92,6 +92,15 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         .budget
         .reserve(256 * 1024 * 1024)
         .map_err(|_| Failure::Budget)?;
+    let proof_genesis = {
+        let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
+        let encoded = owner
+            .engine()
+            .genesis()
+            .encode()
+            .map_err(|_| Failure::ProverInit)?;
+        crate::eng2::genesis::Genesis::decode(&encoded).map_err(|_| Failure::ProverInit)?
+    };
     let mut prover = None;
     #[cfg(feature = "eng2-rehearsal")]
     let ceiling_required = {
@@ -112,7 +121,9 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         let ready = below_ceiling
             && isolated_ready
             && shared.mining_ready().map_err(|_| Failure::Readiness)?;
-        let prover = match ready_prover(&mut prover, ready, NativeProver::new)? {
+        let prover = match ready_prover(&mut prover, ready, || {
+            NativeProver::for_genesis(&proof_genesis)
+        })? {
             Some(prover) => prover,
             None => {
                 shared

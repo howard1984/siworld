@@ -94,7 +94,7 @@ pub(super) fn audit_inner(
     }
     create_private(output)?;
     private_write(&output.join("genesis.bin"), &encoded)?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(&Genesis::decode(&encoded)?)?;
     let mut records = Vec::new();
     let started = Instant::now();
     let mut commitment = [0u8; 32];

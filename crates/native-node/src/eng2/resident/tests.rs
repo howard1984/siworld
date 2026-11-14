@@ -408,9 +408,8 @@ fn private_submission_reaches_native_driver_and_rejects_synthetic_proofs() {
     drop(NativeIdentity::initialize(&path, genesis.peer_binding()).unwrap());
     initialize_store(&path, &expected).unwrap();
     let store = Store::resume_existing(&path.join("chain.redb"), genesis, limits().chain).unwrap();
-    let owner = Arc::new(Mutex::new(
-        Driver::new(store, NativeVerifier::new().unwrap(), limits()).unwrap(),
-    ));
+    let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+    let owner = Arc::new(Mutex::new(Driver::new(store, verifier, limits()).unwrap()));
     let (head, packet) = {
         let driver = owner.lock().unwrap();
         let head = driver.head().unwrap();
@@ -556,12 +555,9 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
             limits,
         )
         .unwrap();
-        let mut driver = super::super::driver::Driver::new(
-            store,
-            NativeVerifier::new().unwrap(),
-            super::limits(),
-        )
-        .unwrap();
+        let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+        let mut driver =
+            super::super::driver::Driver::new(store, verifier, super::limits()).unwrap();
         let committed = driver.accept(&header, &body).unwrap();
         assert_eq!(committed.id(), header.id().unwrap());
     }

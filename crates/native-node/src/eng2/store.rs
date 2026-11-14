@@ -400,6 +400,9 @@ impl Store {
         limits: Limits,
         verifier: &NativeVerifier,
     ) -> Result<Self, String> {
+        if !verifier.authenticates(&genesis) {
+            return Err("audit verifier differs from sealed salted genesis".into());
+        }
         let metadata = std::fs::symlink_metadata(path)
             .map_err(|_| "existing versioned database unavailable")?;
         if !metadata.file_type().is_file() || metadata.len() == 0 {
@@ -1009,7 +1012,7 @@ impl Store {
             base,
             self.engine.limits(),
         )?;
-        let verifier = NativeVerifier::new()?;
+        let verifier = NativeVerifier::for_genesis(self.engine.genesis())?;
         for current in base_height + 1..=height {
             let (header, body) = self.block(current)?;
             reconstructed.apply(&header, &body, &verifier)?;
@@ -2343,8 +2346,8 @@ mod tests {
         let store = Store::create(&path, make_genesis(), limits).unwrap();
         assert!(Store::create(&path, make_genesis(), limits).is_err());
         drop(store);
-        let verifier = NativeVerifier::new().unwrap();
         let original = make_genesis();
+        let verifier = NativeVerifier::for_genesis(&original).unwrap();
         let other = Genesis::seal(
             crate::state::Config::development(original.config().network, 1).unwrap(),
             original.initial_governance().clone(),

@@ -2,18 +2,25 @@
 
 ## Status and scope
 
-This inactive implementation adds independently randomized Merkle leaves to
-the input and FRI commitments of the native D8/W24 proof family. It retains
-polynomial masking. It does not select a network, change an existing genesis,
-or establish a complete zero-knowledge security claim. Transaction, retained
-settlement and asset-issuance adapters exist. The complete confidential fee
-relation, network admission and browser generation remain integration gates.
+The retained transaction, capacity-576 settlement and three-note issuance
+relations have genesis-bound runtime adapters. The adapters select the salted
+V2 frame, reconstruct deterministic public preprocessing locally and bind the
+network, sealed genesis, rules, compiled AIR closure and key. The locally
+selected context also initializes the backend challenger before any proof
+challenge; changing only a public outer header cannot transfer a proof body to
+another genesis or rules domain. Engine, Driver
+and Store admission reject unbound verifiers before state transitions. A new
+profile requires a new engineering genesis and data directory; existing stores
+are not migrated in place.
 
-The inactive backend and relation adapters live under the native node V2 codec.
-The previously measured benchmark sources and frozen artifacts remain unchanged.
-Trace adapters construct witnesses for the retained issuance and settlement AIRs;
-they do not modify those constraint programs. Signed-issuance verification in this
-inactive adapter returns a proof-validation result, not a ledger transition token.
+The implementation retains polynomial masking and adds independent Merkle
+leaf salts to both input and FRI commitments. It does not establish a complete
+zero-knowledge security claim. Full transcript hiding, actual runtime proof
+measurements, build provenance and deployment acceptance remain qualification
+requirements. The complete confidential fee relation remains inactive; it is
+not selected by this runtime profile. Browser generation is also unqualified.
+Signed-issuance proof verification does not replace declaration authorization,
+fee-payment policy or ledger-transition checks.
 
 ## Private and public information
 
@@ -112,7 +119,7 @@ not valid cryptographic proofs. The increment compares identical geometry with
 the corresponding unsalted body; it is not a measured difference between two
 random proof samples. The transaction frame cap is 655360 bytes. Exactly one
 complete-fee proof is permitted per block, with a separate complete-frame cap
-of 5242880 bytes (5 MiB); issuance retains its 524288-byte cap. These limits and
+of 5242880 bytes (5 MiB); issuance retains its pre-existing 524288-byte cap from the native issuance codec. These limits and
 the fee-proof count are encoded in a canonical consensus-parameter record and
 included in the V2 profile identity. Actual proof sizes, setup and generation time,
 independent verification time and peak memory require separate measurements.
@@ -212,3 +219,60 @@ wallet's new-format generation path. An external cryptographic review must
 assess the combined protocol and its assumptions. The presence of both salted
 MMCSs completes a specific missing configuration obligation; it does not by
 itself close these remaining obligations.
+
+
+## Paired offline observations
+
+The manual `native_hiding_v2_measure` example accepts `measure-pair FAMILY
+NEW_DIRECTORY` for `transaction`, `settlement576` and `issuance3`. It generates
+one synthetic witness, including one set of issuance ciphertexts, then performs
+two fresh private attempts sequentially. Public context, preprocessing key,
+profile and source bindings must match exactly; complete-frame hashes must
+differ. A partial pair does not emit a successful pair report.
+
+Run `verify-pair DIRECTORY FIRST_MANIFEST_SHA256 SECOND_MANIFEST_SHA256` in a
+new process, using the two externally recorded manifest hashes. This mode does
+not construct a witness. Each verifier independently rebuilds deterministic
+public preprocessing from its locally selected relation and profile, checks its
+key against the pinned manifest, reconstructs the public statement and verifies
+the frame. It also requires rejection of a changed public statement, an input
+leaf salt and a FRI leaf salt. Setup, decoding, verification and rejection timings
+are reported separately. The ordinary `verify` mode applies the same checks.
+
+These observations establish reproducibility and functional rejection behavior.
+Distinct proof bytes do not establish zero knowledge, and these manual adapters
+do not activate V2 generation or verification in a resident, wallet or network.
+Qualification must bind each measured relation and profile to the exact intended
+runtime path and analyze all public disclosures together. The synthetic retained
+settlement allocation is not an economics acceptance fixture. Full-profile proof
+generation and its proof-of-work grinding run only in bounded manual sessions
+on owner-controlled machines, outside CI.
+
+## Sealed-genesis facade measurements
+
+The manual example has separate modes for the actual runtime facade:
+
+```text
+native_hiding_v2_measure runtime-measure-pair FAMILY NEW_DIRECTORY
+native_hiding_v2_measure runtime-verify-pair DIRECTORY FIRST_MANIFEST_SHA256 SECOND_MANIFEST_SHA256
+```
+
+`FAMILY` is `transaction`, `settlement576` or `issuance3`. Generation constructs
+one synthetic witness and public context, then makes two independent private
+proof attempts through `NativeProver::for_genesis`. It writes only complete
+proof frames, encoded public genesis, public context and measurement records.
+Transaction ciphertext bytes are synthetic public fixture data; this mode does
+not qualify encryption correctness or ledger admission. Issuance payment fields
+are structural fixtures and do not qualify a fee payment.
+
+Run verification in a fresh process using the externally pinned pair manifest
+hashes. It rebuilds the selected genesis and public preprocessing through
+`NativeVerifier::for_genesis`, reconstructs statements without private witness
+generation and checks both frames. Negative checks cover changed public data,
+wrong genesis/rules, wrong network, wrong frame identity, truncation and trailing
+bytes. A separate reframing negative case writes the target genesis's correct
+outer identity around the old body, confirms that outer framing parses and
+requires rejection by the cryptographic verifier. Passing these checks establishes functional binding and verification;
+it does not establish whole-transcript zero knowledge. No mode connects to a
+network or starts mining. The earlier `measure-pair` and `verify-pair` modes use
+backend-specific synthetic bindings and are separate from runtime qualification.

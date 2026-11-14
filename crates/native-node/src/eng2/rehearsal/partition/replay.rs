@@ -176,7 +176,7 @@ pub(super) fn replay_prefix_inner(
         return Err("replay destination must have an authenticated empty store".into());
     }
     let started = Instant::now();
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(store.engine().genesis())?;
     let mut preflight = Engine::new(Genesis::decode(&encoded)?, limits)?;
     for record in records {
         if started.elapsed().as_secs() >= REPLAY_DEADLINE_SECONDS {

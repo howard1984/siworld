@@ -169,6 +169,9 @@ impl Engine {
         timestamp: u64,
         verifier: &NativeVerifier,
     ) -> Result<Header, String> {
+        if !verifier.authenticates(&self.genesis) {
+            return Err("native verifier differs from sealed salted genesis".into());
+        }
         let mut header = Header {
             network: self.state.network(),
             height: self
@@ -213,6 +216,9 @@ impl Engine {
         body: &body::Body,
         verifier: &NativeVerifier,
     ) -> Result<StagedBlock, String> {
+        if !verifier.authenticates(&self.genesis) {
+            return Err("native verifier differs from sealed salted genesis".into());
+        }
         if self.state.fee_mode() != self.genesis.fee_mode()
             || self.genesis.fee_mode() != FeeMode::LegacyMiner
         {
@@ -235,6 +241,11 @@ impl Engine {
         body: &body::Body,
         verifier: &NativeVerifier,
     ) -> Result<StagedBlock, super::accept_observation::Failure> {
+        if !verifier.authenticates(&self.genesis) {
+            return Err(precommit_failure(
+                "native verifier differs from sealed salted genesis".into(),
+            ));
+        }
         if self.state.fee_mode() != self.genesis.fee_mode()
             || self.genesis.fee_mode() != FeeMode::LegacyMiner
         {

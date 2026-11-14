@@ -264,7 +264,7 @@ impl ArchiveWork {
                 state,
                 self.limits.chain,
             )?;
-            let verifier = crate::proofs::NativeVerifier::new()?;
+            let verifier = crate::proofs::NativeVerifier::for_genesis(engine.genesis())?;
             for (header, body) in self.suffix {
                 if cancelled.load(Ordering::Acquire) {
                     return Err("checkpoint archive preparation cancelled".into());

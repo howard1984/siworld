@@ -344,7 +344,7 @@ pub fn export(
     }
     create_private(output)?;
     super::super::super::private_write(&output.join("genesis.bin"), &encoded)?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(&selected)?;
     let mut reference = Engine::new(selected, limits())?;
     let mut records = Vec::with_capacity(PAGE_RECORDS as usize);
     let mut pages = Vec::new();

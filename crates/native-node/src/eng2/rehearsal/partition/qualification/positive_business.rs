@@ -881,7 +881,7 @@ pub fn generate(
     output.write("genesis.bin", &store.engine().genesis().encode()?)?;
     output.json("intent.json", &json!({"version":1,"scope":"private-owner-positive-native-business","qualification":context.receipt(),"plan_sha256":plan_pin,"campaign_id":plan.campaign_id,"external_resource_manifest_sha256":plan.external_resource_manifest_sha256,"external_resource_guard_independently_verified":false,"new_blocks":MAX_STEPS,"canonical_append_authorized_by_caller":true,"completed":false,"g1_passed":false,"g2_passed":false}))?;
     gate(started, &plan, custody, "before_native_verifier_setup")?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(store.engine().genesis())?;
     let mut reference = Engine::new(
         crate::eng2::genesis::Genesis::decode(&store.engine().genesis().encode()?)?,
         store.engine().limits(),
@@ -923,11 +923,7 @@ pub fn generate(
     output.json("wallet-before.json", &json!({"height":plan.start_height,"tip":plan.start_tip,"expected":plan.expected_before,"observed":before,"local_wallet_scan_performed":true,"independent_s4_scan_performed":false}))?;
     frozen_policy(store, actors)?;
     gate(started, &plan, custody, "before_native_prover_setup")?;
-    let prover = NativeProver::new()?;
-    let issuance_prover = native::issuance_air::IssuanceProver::new(
-        crate::issuance::INITIAL_NOTES,
-        crate::issuance::params(),
-    );
+    let prover = NativeProver::for_genesis(store.engine().genesis())?;
     let mut records = Vec::new();
     for (index, (step, (pending, fund_members))) in plan.steps.iter().zip(operations).enumerate() {
         gate(started, &plan, custody, "before_positive_business_proof")?;
@@ -1039,7 +1035,7 @@ pub fn generate(
                     tier,
                     now,
                     |message| custody_cell.borrow_mut().sign_issuance(message),
-                    &issuance_prover,
+                    store.engine().genesis(),
                     &prover,
                     |prepared| {
                         check_prepared_payment(prepared, step, state, &expected_recipient, tier)?;

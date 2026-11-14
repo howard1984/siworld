@@ -23,6 +23,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod branch;
+
 const MAX_PLAN: usize = 16 * 1024;
 const MAX_REQUESTS: usize = 4;
 const PHASE: Duration = Duration::from_secs(180);

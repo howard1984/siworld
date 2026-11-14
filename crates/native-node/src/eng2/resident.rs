@@ -105,11 +105,12 @@ pub fn qualify_restart(directory: &Path, expected: &str) -> Result<Value, String
     let genesis = load_genesis(directory, expected)?;
     let identity = NativeIdentity::load(directory, &genesis.peer_binding())
         .map_err(|_| "existing versioned identity required")?;
+    let verifier = NativeVerifier::for_genesis(&genesis)?;
     let mut store = Store::audit_existing(
         &directory.join("chain.redb"),
         genesis,
         limits().chain,
-        &NativeVerifier::new()?,
+        &verifier,
     )?;
     store.enable_authenticated_restart(identity)?;
     Ok(
@@ -518,7 +519,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     )?;
     check_windows_admission(cfg!(windows), store.imported_checkpoint_height())?;
     let budget = p2p::Budget::new(MEMORY_BYTES);
-    let mut driver = Driver::new(store, NativeVerifier::new()?, limits())?;
+    let mut driver = Driver::new(store, NativeVerifier::for_genesis(&genesis)?, limits())?;
     let header_rules = super::selection::HeaderRules {
         network: genesis.config().network,
         genesis: genesis.id(),

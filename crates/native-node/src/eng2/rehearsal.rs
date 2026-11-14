@@ -267,16 +267,9 @@ pub fn run(directory: &Path, blocks: u64, mode: FeeMode) -> Result<Value, String
         max_component_bytes: 64 * 1024 * 1024,
     };
     let path = directory.join("chain.redb");
+    let verifier = NativeVerifier::for_genesis(&genesis)?;
     let store = Store::create(&path, genesis, limits)?;
-    execute(
-        directory,
-        blocks,
-        seed,
-        genesis_bytes,
-        store,
-        NativeVerifier::new()?,
-        0,
-    )
+    execute(directory, blocks, seed, genesis_bytes, store, verifier, 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,7 +378,7 @@ fn execute(
             return Err("continuation governance differs from cancelled actual proposal".into());
         }
     }
-    let prover = NativeProver::new()?;
+    let prover = NativeProver::for_genesis(store.engine().genesis())?;
     for height in prefix + 1..=blocks {
         let block_started = Instant::now();
         let state = store.engine().state().chain();
@@ -503,11 +496,8 @@ fn execute(
                 .map_err(|_| "rehearsal issuer signing failed")?;
                 issuer.signing_key.as_mut_slice().zeroize();
                 let signed = prepared.attach_signature(*signature.as_ref())?;
-                let issuance_prover = native::issuance_air::IssuanceProver::new(
-                    crate::issuance::INITIAL_NOTES,
-                    crate::issuance::params(),
-                );
-                let issued = signed.prove(&issuance_prover, &receipt, &state.config)?;
+                let issued =
+                    signed.prove_for_genesis(&prover, &receipt, store.engine().genesis())?;
                 issued_asset = Some(issued.record.signed.declaration.asset_id);
                 issuances.push(issued.record);
                 fee.into_transfer().prove(&prover)?

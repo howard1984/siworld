@@ -1,5 +1,8 @@
 //! Fixed-profile native proof adapters for the separate engineering network.
 
+#[path = "proofs/hiding.rs"]
+mod hiding;
+
 use crate::proof_codec::{
     MAX_SETTLEMENT_PROOF_BODY_LEN, MAX_TRANSACTION_PROOF_BODY_LEN, ProofShape,
 };
@@ -136,7 +139,7 @@ fn trusted_air_shapes() -> [TrustedAirShape; 2] {
 /// semantic revision and actual AIR shapes also bind the admission decoder.
 /// Measurement reports and their source hashes are deliberately excluded.
 /// Only trusted local constructors and fixed constants enter this identity.
-pub(crate) fn protocol_profile_fingerprint() -> [u8; 32] {
+pub(crate) fn legacy_profile_fingerprint() -> [u8; 32] {
     static FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
     *FINGERPRINT.get_or_init(|| {
         let transaction = decode_hex(Relation::Transaction.key_hex())
@@ -152,6 +155,13 @@ pub(crate) fn protocol_profile_fingerprint() -> [u8; 32] {
             &trusted_air_shapes(),
         )
     })
+}
+
+/// The active engineering profile binds the retained AIRs and the complete
+/// deterministic V2 preprocessing recipe. Network genesis and rules are bound
+/// separately in every V2 frame identity.
+pub(crate) fn protocol_profile_fingerprint() -> [u8; 32] {
+    hiding::profile_fingerprint()
 }
 
 fn profile_fingerprint_from_keys(
@@ -297,6 +307,7 @@ fn settlement_statement(
 /// Verification-only resident data, authenticated against local fixed keys.
 /// This constructor never invokes preprocessing setup or a prover.
 pub struct NativeVerifier {
+    hiding: Option<hiding::Verifier>,
     transaction_cfg: Cfg,
     transaction_air: TransactionAir,
     transaction_vk: PreprocessedVerifierKey<Cfg>,
@@ -361,6 +372,28 @@ impl NativeVerificationFailure {
 }
 
 impl NativeVerifier {
+    /// Select the mandatory salted profile from an already sealed genesis.
+    /// This constructor never accepts a frame-selected AIR, key or binding.
+    pub fn for_genesis(genesis: &crate::eng2::genesis::Genesis) -> Result<Self, String> {
+        let mut verifier = Self::new()?;
+        verifier.hiding = Some(hiding::Verifier::new(genesis)?);
+        Ok(verifier)
+    }
+    /// Read-only public metadata for the locally selected retained proof domain.
+    pub fn proof_identity(
+        &self,
+        relation: crate::proof_codec::v2::Relation,
+    ) -> Result<crate::proof_codec::v2::Identity, String> {
+        self.hiding
+            .as_ref()
+            .ok_or("proof identity requires a sealed salted genesis")?
+            .identity(relation)
+    }
+    pub(crate) fn authenticates(&self, genesis: &crate::eng2::genesis::Genesis) -> bool {
+        self.hiding
+            .as_ref()
+            .is_some_and(|v| v.authenticates(genesis))
+    }
     pub fn new() -> Result<Self, String> {
         let tp = Relation::Transaction.params();
         let sp = Relation::Settlement.params();
@@ -397,6 +430,7 @@ impl NativeVerifier {
         )
         .map_err(|e| e.to_string())?;
         Ok(Self {
+            hiding: None,
             transaction_cfg,
             transaction_air,
             transaction_vk,
@@ -418,6 +452,9 @@ impl NativeVerifier {
         &self,
         record: &crate::issuance::IssuanceRecord,
     ) -> Result<(), NativeVerificationFailure> {
+        if let Some(verifier) = &self.hiding {
+            return verifier.issuance(record);
+        }
         use crate::issuance::IssuanceVerificationFailure;
         self.issuance
             .verify_typed(record)
@@ -453,6 +490,9 @@ impl NativeVerifier {
         root: &Digest,
         proof: &[u8],
     ) -> Result<(), NativeVerificationFailure> {
+        if let Some(verifier) = &self.hiding {
+            return verifier.transaction(public, context, fee, root, proof);
+        }
         check_context(context).map_err(|original| {
             NativeVerificationFailure::Preparation(original, NativePreparation::Context)
         })?;
@@ -504,6 +544,9 @@ impl NativeVerifier {
         rewards: &[Digest],
         proof: &[u8],
     ) -> Result<(), NativeVerificationFailure> {
+        if let Some(verifier) = &self.hiding {
+            return verifier.settlement(fees, plan, network, list_hash, rewards, proof);
+        }
         let public =
             settlement_statement(fees, plan, network, list_hash, rewards).map_err(|original| {
                 NativeVerificationFailure::Preparation(original, NativePreparation::Context)
@@ -529,8 +572,9 @@ impl NativeVerifier {
 /// Fixed-profile resident prover for a disposable single-node engineering
 /// network. Preprocessing occurs once at service startup and remains resident.
 pub struct NativeProver {
-    transaction: TransactionProver,
-    settlement: SettlementProver,
+    hiding: Option<hiding::Prover>,
+    transaction: Option<TransactionProver>,
+    settlement: Option<SettlementProver>,
     verifier: NativeVerifier,
 }
 
@@ -541,6 +585,23 @@ fn same_key(left: &PreprocessedVerifierKey<Cfg>, right: &PreprocessedVerifierKey
 }
 
 impl NativeProver {
+    pub fn for_genesis(genesis: &crate::eng2::genesis::Genesis) -> Result<Self, String> {
+        Ok(Self {
+            hiding: Some(hiding::Prover::new(genesis)?),
+            transaction: None,
+            settlement: None,
+            // The historical verifier is retained only for the separate V1 API.
+            verifier: NativeVerifier::new()?,
+        })
+    }
+    /// Generates the fixed three-note V2 issuance proof; record policy and
+    /// declaration signatures remain independently checked by admission.
+    pub fn issuance(&self, witness: &native::issuance::IssuanceWitness) -> Result<Vec<u8>, String> {
+        self.hiding
+            .as_ref()
+            .ok_or("issuance requires sealed V2 genesis")?
+            .issuance(witness)
+    }
     pub fn new() -> Result<Self, String> {
         let verifier = NativeVerifier::new()?;
         let transaction = TransactionProver::new(Relation::Transaction.params());
@@ -553,8 +614,9 @@ impl NativeProver {
             );
         }
         Ok(Self {
-            transaction,
-            settlement,
+            hiding: None,
+            transaction: Some(transaction),
+            settlement: Some(settlement),
             verifier,
         })
     }
@@ -565,6 +627,9 @@ impl NativeProver {
         public: &PublicTransaction,
         context: &ProofContext,
     ) -> Result<Vec<u8>, String> {
+        if let Some(prover) = &self.hiding {
+            return prover.transaction(witness, public, context);
+        }
         check_context(context)?;
         let bound = public
             .bind_witness(witness, context)
@@ -576,8 +641,11 @@ impl NativeProver {
             .check_at_snapshot(&hasher, &root, snapshot_height)
             .map_err(str::to_owned)?;
         let fee = hasher.fee_commit(bound.slot.fee, &bound.slot.fee_blind);
-        let (proof, generated_statement) =
-            self.transaction.prove_at_snapshot(&bound, snapshot_height);
+        let (proof, generated_statement) = self
+            .transaction
+            .as_ref()
+            .ok_or("legacy transaction prover unavailable")?
+            .prove_at_snapshot(&bound, snapshot_height);
         if generated_statement != public.statement(context, &fee, &root) {
             return Err("native prover statement reconstruction mismatch".into());
         }
@@ -588,13 +656,20 @@ impl NativeProver {
     }
 
     pub fn settlement(&self, witness: &FixedSettlementWitness) -> Result<Vec<u8>, String> {
+        if let Some(prover) = &self.hiding {
+            return prover.settlement(witness);
+        }
         if witness.capacity() != SETTLEMENT_CAPACITY {
             return Err("native settlement witness capacity must be 576".into());
         }
         witness
             .check(&Hasher::new())
             .map_err(|_| "invalid local settlement witness".to_owned())?;
-        let (proof, public) = self.settlement.prove(witness);
+        let (proof, public) = self
+            .settlement
+            .as_ref()
+            .ok_or("legacy settlement prover unavailable")?
+            .prove(witness);
         validate_settlement_public(SETTLEMENT_CAPACITY, &public)?;
         let bytes = postcard::to_allocvec(&proof).map_err(|e| e.to_string())?;
         let fees: Vec<_> = witness.slots.iter().map(|slot| slot.commitment).collect();

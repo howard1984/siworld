@@ -3,18 +3,18 @@ use super::entropy::{EntropyError, Streams};
 use super::owner::{AccessError, Alias, Owner, OwnerError};
 use super::{FRI_CAP_HEIGHT, INPUT_CAP_HEIGHT, Profile, RANDOM_CODEWORDS, SALT_ELEMENTS};
 use ::native::common::F;
-use p3_challenger::DuplexChallenger;
+use p3_challenger::{CanObserve, DuplexChallenger};
 use p3_commit::{
     CommitmentOpening, ExtensionMmcs, OpenedValues, OpeningRequest, Pcs, UnivariateStarkPcs,
 };
 use p3_dft::Radix2DitParallel;
-use p3_field::{Field, extension::BinomialExtensionField};
+use p3_field::{Field, PrimeCharacteristicRing, extension::BinomialExtensionField};
 use p3_fri::{FriParameters, HidingFriPcs};
 use p3_koala_bear::{Poseidon2KoalaBear, default_koalabear_poseidon2_24};
 use p3_matrix::dense::RowMajorMatrix;
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-use p3_uni_stark::StarkConfig;
+use p3_uni_stark::{StarkConfig, StarkGenericConfig};
 use rand::{SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 
@@ -124,9 +124,54 @@ impl Clone for PrivatePcs {
         }
     }
 }
+/// Locally selected proof domain; outer frame bytes never supply authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptContext([u8; 32]);
+impl TranscriptContext {
+    pub fn new(
+        network: [u8; 32],
+        binding: crate::proof_codec::v2::ProtocolBinding,
+        identity: crate::proof_codec::v2::Identity,
+    ) -> Result<Self, String> {
+        if identity.relation == crate::proof_codec::v2::Relation::CompleteFee
+            || [
+                network,
+                binding.genesis,
+                binding.rules,
+                binding.air,
+                identity.profile,
+            ]
+            .contains(&[0; 32])
+        {
+            return Err("invalid retained proof transcript context".into());
+        }
+        let mut hash =
+            blake3::Hasher::new_derive_key("siworld retained salted proof transcript context v2");
+        hash.update(&[identity.relation as u8]);
+        hash.update(&network);
+        hash.update(&binding.genesis);
+        hash.update(&binding.rules);
+        hash.update(&binding.air);
+        // The trusted composite identity includes backend profile, key and shape.
+        hash.update(&identity.profile);
+        Ok(Self(*hash.finalize().as_bytes()))
+    }
+    fn observe(self, challenger: &mut Challenger) {
+        const LABEL: &[u8] = b"siworld retained native proof domain v2";
+        challenger.observe(F::from_usize(LABEL.len()));
+        for byte in LABEL.iter().chain(self.0.iter()) {
+            challenger.observe(F::from_u8(*byte));
+        }
+    }
+}
 pub type Config = StarkConfig<PrivatePcs, E, Challenger>;
 fn config(pcs: PrivatePcs) -> Config {
     StarkConfig::new(pcs, DuplexChallenger::new(default_koalabear_poseidon2_24()))
+}
+fn config_with_context(pcs: PrivatePcs, context: TranscriptContext) -> Config {
+    let mut challenger = DuplexChallenger::new(default_koalabear_poseidon2_24());
+    context.observe(&mut challenger);
+    StarkConfig::new(pcs, challenger)
 }
 /// Reusable trusted public setup and verification route. It has no owner that
 /// can activate private operations; deterministic seeds cannot create a proof.
@@ -150,6 +195,10 @@ impl PublicPreprocessing {
     pub fn config(&self) -> &Config {
         &self.config
     }
+    /// Reuses only public preprocessing; every proof transcript starts here.
+    pub fn config_with_context(&self, context: TranscriptContext) -> Config {
+        config_with_context(self.config.pcs().clone(), context)
+    }
     pub const fn profile(&self) -> Profile {
         self.profile
     }
@@ -162,10 +211,23 @@ pub struct PrivateAttempt {
 }
 impl PrivateAttempt {
     pub fn from_os(profile: Profile) -> Result<Self, EntropyError> {
+        Self::from_os_with(profile, config)
+    }
+    /// Mandatory context route for genesis-bound retained proofs.
+    pub fn from_os_with_context(
+        profile: Profile,
+        context: TranscriptContext,
+    ) -> Result<Self, EntropyError> {
+        Self::from_os_with(profile, |pcs| config_with_context(pcs, context))
+    }
+    fn from_os_with(
+        profile: Profile,
+        initialize: impl FnOnce(PrivatePcs) -> Config,
+    ) -> Result<Self, EntropyError> {
         let streams = Streams::from_os()?;
         let (owner, fence) = Owner::new();
         Ok(Self {
-            config: config(PrivatePcs {
+            config: initialize(PrivatePcs {
                 inner: Arc::new(raw(
                     profile,
                     streams.input_salts,

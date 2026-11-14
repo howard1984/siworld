@@ -355,7 +355,7 @@ pub fn verify(
         &anchor.state().governance().canonical_component_bytes()?,
     )?;
     let mut engine = Engine::from_imported_anchor(genesis, anchor, policy.state.chain)?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(engine.genesis())?;
     let mut bodies = Vec::new();
     for height in pin.anchor_height + 1..=pin.tip_height {
         check_cancel(&canceled)?;

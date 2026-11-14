@@ -378,7 +378,7 @@ pub fn audit(
     let source_root = output.json("frozen-metadata.json", &json!({"version":1,"qualification":context.receipt(),
         "height":budget.height,"tip":crate::local::hex(&expected_tip),"budget_sha256":budget_input.1,
         "total_frame_bytes":total,"pages":metadata_pages,"segments":segments,"native_execution_performed":false}), MAX_MANIFEST_BYTES)?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(&selected)?;
     let mut reference = Engine::new(selected, limits())?;
     let genesis_parts = reference.state().canonical_components(
         Binding {

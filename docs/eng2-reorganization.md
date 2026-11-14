@@ -367,6 +367,69 @@ connection has an unknown cause. Receiver admission diagnostics and authenticate
 state comparisons must establish those conclusions independently. New malformed
 input copies must remain separate from valid fork corpora and accepted history.
 
+## Authenticated competing-branch submission
+
+```text
+siworld-eng2-rehearsal --qualification-send-branch IDENTITY_NODE PLAN PLAN_SHA256 BINDING BINDING_SHA256 --json
+```
+
+This sender uses the same existing stopped identity, installed receiver pin,
+qualification binding and canonical native header framing as single-frame
+submission. It reads supplied branch artifacts and never creates or edits them.
+The receiver retains ordinary discovery, body decoding and native admission.
+
+The strict plan is limited to 64 KiB and contains these fields:
+
+| Fields | Meaning |
+| --- | --- |
+| `version` | 1, independently versioned for this command |
+| `endpoint`, `receiver_descriptor`, `receiver_fingerprint`, `receiver_role`, `local_fingerprint` | Explicit authenticated destination and existing sender identity; roles are `bootstrap` or `validator` |
+| `receiver_height`, `receiver_tip` | Exact receiver baseline before submission |
+| `source_fingerprint`, `source_manifest`, `source_manifest_sha256` | Declared original branch source and an independently pinned public provenance artifact, limited to 1 MiB |
+| `ancestor_height`, `ancestor_id`, `rollback_depth` | Common ancestor and exact receiver distance, from 1 through 25 blocks |
+| `candidate_height`, `candidate_tip` | Exact advertised competing tip, higher than the pinned receiver baseline |
+| `frames` | 1 through 64 ascending contiguous `{path, sha256, bytes}` complete raw frames, starting immediately after the ancestor and ending at the candidate tip |
+| `total_frame_bytes` | Exact sum of declared frame lengths, at most 16 GiB |
+| `maximum_transmitted_body_bytes` | Cumulative body transmission allowance, including repeated requests, at most 16 GiB |
+| `maximum_rounds` | From 1 through 16 ordinary rounds |
+| `input_kind` | Declared `valid_control` or `negative_input` |
+
+All identity and SHA-256 fields use canonical 32-byte hexadecimal values. Input
+paths are limited to 2048 bytes and duplicate frame paths are refused. Every
+frame must fit the selected native body policy. The sender reserves memory before
+reading each frame, verifies its exact length and SHA-256, then checks all header
+heights, parent links and the exact candidate tip. It retains only the bounded
+header inventory between reads; every requested body is read and pinned again.
+
+Before advertising, the sender checks the receiver's live tip, queries its
+canonical common-ancestor header (or checks the bound genesis at height zero),
+and checks that the next canonical header differs from the candidate's first
+header. A second live-tip query must match the original baseline. These checks
+bind the stated rollback depth to the observed divergence before submission;
+they do not lock the remote node or establish its eventual head.
+
+The sender answers ordinary height queries, exact-identity header queries and
+exact body queries only from the supplied inventory. It answers the normal exact
+exchange capability probe. Each completed block round is followed by the normal
+checkpoint exchange with an empty outgoing batch and a bounded transaction
+inventory exchange requesting no transactions. This permits discovery to retain
+its normal cursor across rounds. At most 1024 block-phase messages are received;
+all application operations share the remaining 180-second deadline, including
+input preflight. The owner must supervise process resources independently.
+
+A receipt inventories frame identities and hashes, actual completed header and
+body transmissions, completed rounds and successful body-chunk writes. An error
+after advertising is retained as an exchange outcome with the preceding events.
+The source manifest's bytes are SHA-256 verified, but the source fingerprint and
+creation provenance remain declarations requiring independent inspection.
+Checkpoint messages are decoded and discarded locally; no certificate or
+transaction is issued or admitted by the sender. Transmission does not prove
+input invalidity, receiver rejection, unchanged receiver state or gate acceptance.
+The owner must retain the real partition history and independent receiver state
+and diagnostics for those conclusions. A negative artifact must be newly created
+branch material, separate from accepted history; this sender cannot establish its
+creation history from bytes alone.
+
 ## Authenticated persisted-state comparison
 
 ```text

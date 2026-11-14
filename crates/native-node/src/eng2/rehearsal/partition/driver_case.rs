@@ -148,7 +148,7 @@ pub(super) fn driver_case_inner(
     store.enable_authenticated_restart(identity)?;
     let mut driver = Driver::new(
         store,
-        NativeVerifier::new()?,
+        NativeVerifier::for_genesis(reference.genesis())?,
         ImportLimits {
             chain: limits,
             max_snapshot_bytes: 256 * 1024 * 1024,
@@ -162,7 +162,7 @@ pub(super) fn driver_case_inner(
             maximum_body_bytes: 2 * 1024 * 1024 * 1024,
         },
     )?)?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(reference.genesis())?;
     // A is admitted through the ordinary canonical path, never a restored DB copy.
     for h in 1..=old_height {
         check_time(started)?;

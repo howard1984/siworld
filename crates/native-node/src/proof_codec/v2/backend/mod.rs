@@ -19,7 +19,7 @@ pub use relations::{
 use ::native::FriParams;
 pub use entropy::EntropyError;
 pub use owner::{AccessError, OwnerError};
-pub use pcs::{Challenger, Config, E, PrivateAttempt, PublicPreprocessing};
+pub use pcs::{Challenger, Config, E, PrivateAttempt, PublicPreprocessing, TranscriptContext};
 
 pub const SALT_ELEMENTS: usize = 9;
 pub const RANDOM_CODEWORDS: usize = 8;

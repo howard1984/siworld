@@ -270,7 +270,7 @@ fn resume_case() -> Result<(), String> {
     let started = Instant::now();
     let path = input.directory.join("chain.redb");
     let store = Store::resume_existing(&path, Genesis::decode(&a.genesis)?, limits)?;
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(reference_b.genesis())?;
     let (old_branch, expected_height) = input.expected_prefix()?;
     if old_branch {
         let mut reference_a = Engine::new(Genesis::decode(&a.genesis)?, limits)?;
@@ -299,7 +299,7 @@ fn resume_case() -> Result<(), String> {
     // Observe the exact committed crash prefix before rebuilding any owner/archive.
     let mut driver = Driver::new(
         store,
-        NativeVerifier::new()?,
+        NativeVerifier::for_genesis(reference_b.genesis())?,
         ImportLimits {
             chain: limits,
             max_snapshot_bytes: 256 * 1024 * 1024,

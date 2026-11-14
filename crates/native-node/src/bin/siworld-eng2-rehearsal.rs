@@ -118,6 +118,20 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
+    #[cfg(feature = "native-p2p")]
+    if args.len() == 7 && args[0] == "--qualification-send-branch" && args[6] == "--json" {
+        println!(
+            "{}",
+            siworld_native_node::eng2::rehearsal::partition::qualification::invalid_peer::branch::send(
+                std::path::Path::new(&args[1]),
+                std::path::Path::new(&args[2]),
+                args[3].to_str().ok_or("invalid sender plan SHA-256")?,
+                std::path::Path::new(&args[4]),
+                args[5].to_str().ok_or("invalid sender binding SHA-256")?
+            )?
+        );
+        return Ok(());
+    }
     if args.len() == 6 && args[0] == "--qualification-audit" && args[5] == "--json" {
         println!(
             "{}",

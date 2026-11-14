@@ -117,6 +117,9 @@ impl Driver {
         imports: ImportLimits,
     ) -> Result<Self, String> {
         store.ensure_exportable()?;
+        if !verifier.authenticates(store.engine().genesis()) {
+            return Err("driver verifier differs from sealed salted genesis".into());
+        }
         Ok(Self {
             padding: Pool::new(store.engine().state().network()),
             pending: pending_pool(store.engine().state().network())?,
@@ -811,7 +814,8 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let path = directory.join("chain.redb");
         let store = Store::create(&path, genesis, imports.chain).unwrap();
-        let mut owner = Driver::new(store, NativeVerifier::new().unwrap(), imports).unwrap();
+        let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+        let mut owner = Driver::new(store, verifier, imports).unwrap();
         let head = owner.head().unwrap();
         assert_eq!(head.height, 0);
         assert!(

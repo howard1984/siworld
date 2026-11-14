@@ -6,13 +6,13 @@
 use native::{
     issuance::{
         AssetMetadata, ISSUER_KEY_BYTES, ISSUER_SIGNATURE_BYTES, IssuanceDeclaration,
-        IssuancePolicy, SignedIssuance, sample_issuance,
+        IssuancePolicy, IssuanceWitness, SignedIssuance, sample_issuance,
     },
-    multi_asset::{AssetId, DCT_BYTES, Digest, F, Hasher, sample_witness},
+    multi_asset::{AccWitness, AssetId, DCT_BYTES, Digest, F, Hasher, sample_witness},
     multi_asset_transaction::statement_for,
     settlement::{
-        RewardAllocation, RewardMode, RewardPlan, sample_fixed_settlement_witness,
-        settlement_public,
+        FixedSettlementWitness, RewardAllocation, RewardMode, RewardPlan,
+        sample_fixed_settlement_witness, settlement_public,
     },
 };
 use p3_field::{PrimeCharacteristicRing, PrimeField32};
@@ -31,6 +31,9 @@ use std::{
     path::Path,
     time::Instant,
 };
+
+#[path = "native_hiding_v2_measure/runtime.rs"]
+mod runtime;
 
 type Result<T> = std::result::Result<T, String>;
 const MANIFEST_LIMIT: usize = 1_048_576;
@@ -408,15 +411,34 @@ fn finish(
     println!("{report}");
     Ok(())
 }
-fn measure(family: Family, output: &Path) -> Result<()> {
+enum Fixture {
+    Transaction(Box<AccWitness>),
+    Settlement(FixedSettlementWitness),
+    Issuance(Box<SignedIssuance>, Box<IssuanceWitness>, IssuancePolicy),
+}
+impl Fixture {
+    fn new(family: Family) -> Self {
+        match family {
+            Family::Transaction => Self::Transaction(Box::new(transaction_context().0)),
+            Family::Settlement => Self::Settlement(sample_fixed_settlement_witness(
+                SETTLEMENT_CAPACITY,
+                RewardMode::Holder,
+            )),
+            Family::Issuance => {
+                let (signed, witness, policy) = sample_issuance(ISSUANCE_NOTES);
+                Self::Issuance(Box::new(signed), Box::new(witness), policy)
+            }
+        }
+    }
+}
+fn measure(family: Family, output: &Path, fixture: &Fixture) -> Result<()> {
     fs::create_dir(output).map_err(|_| "use a new dedicated measurement directory")?;
     let profile = family.profile();
     let binding = family.binding();
     let mut times = BTreeMap::new();
-    match family {
-        Family::Transaction => {
-            let (witness, context) =
-                phase(family, "fixture", &mut times, || Ok(transaction_context()))?;
+    match (family, fixture) {
+        (Family::Transaction, Fixture::Transaction(witness)) => {
+            let context = transaction_context().1;
             let public = transaction_public(&context)?;
             let prover = phase(family, "public_setup", &mut times, || {
                 TransactionProver::new(profile)
@@ -437,7 +459,7 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                 .maximum_frame_bytes()
                 .map_err(|_| "frame accounting failed")?;
             let (proof, returned) = phase(family, "prove", &mut times, || {
-                prover.prove_at_snapshot(&witness, SNAPSHOT_HEIGHT)
+                prover.prove_at_snapshot(witness, SNAPSHOT_HEIGHT)
             })?;
             if returned != public {
                 return Err("transaction statement reconstruction mismatch".into());
@@ -448,7 +470,6 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                     .map_err(|_| "frame encoding failed".into())
             })?;
             drop(proof);
-            drop(witness);
             drop(prover);
             let decoded = phase(family, "decode", &mut times, || {
                 shape
@@ -468,14 +489,8 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                 times,
             )
         }
-        Family::Settlement => {
-            let witness = phase(family, "fixture", &mut times, || {
-                Ok(sample_fixed_settlement_witness(
-                    SETTLEMENT_CAPACITY,
-                    RewardMode::Holder,
-                ))
-            })?;
-            let context = settlement_context(&witness);
+        (Family::Settlement, Fixture::Settlement(witness)) => {
+            let context = settlement_context(witness);
             let public = settlement_statement(&context)?;
             let prover = phase(family, "public_setup", &mut times, || {
                 SettlementProver::new(SETTLEMENT_CAPACITY, profile)
@@ -498,7 +513,7 @@ fn measure(family: Family, output: &Path) -> Result<()> {
             let maximum = shape
                 .maximum_frame_bytes()
                 .map_err(|_| "frame accounting failed")?;
-            let (proof, returned) = phase(family, "prove", &mut times, || prover.prove(&witness))?;
+            let (proof, returned) = phase(family, "prove", &mut times, || prover.prove(witness))?;
             if returned != public {
                 return Err("settlement statement reconstruction mismatch".into());
             }
@@ -508,7 +523,6 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                     .map_err(|_| "frame encoding failed".into())
             })?;
             drop(proof);
-            drop(witness);
             drop(prover);
             let decoded = phase(family, "decode", &mut times, || {
                 shape
@@ -528,11 +542,8 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                 times,
             )
         }
-        Family::Issuance => {
-            let (signed, witness, policy) = phase(family, "fixture", &mut times, || {
-                Ok(sample_issuance(ISSUANCE_NOTES))
-            })?;
-            let context = issuance_context(&signed, &witness.ciphertexts, policy)?;
+        (Family::Issuance, Fixture::Issuance(signed, witness, policy)) => {
+            let context = issuance_context(signed, &witness.ciphertexts, *policy)?;
             let (rebuilt, ciphertexts, policy) = issuance_statement(&context)?;
             let public = rebuilt.declaration.public_inputs();
             let prover = phase(family, "public_setup", &mut times, || {
@@ -558,7 +569,7 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                 .map_err(|_| "frame accounting failed")?;
             let (proof, returned) = phase(family, "prove", &mut times, || {
                 prover
-                    .prove(&witness)
+                    .prove(witness)
                     .map_err(|_| "issuance proving failed".into())
             })?;
             if returned != public {
@@ -570,7 +581,6 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                     .map_err(|_| "frame encoding failed".into())
             })?;
             drop(proof);
-            drop(witness);
             drop(prover);
             let decoded = phase(family, "decode", &mut times, || {
                 shape
@@ -607,7 +617,81 @@ fn measure(family: Family, output: &Path) -> Result<()> {
                 times,
             )
         }
+        _ => Err("fixture relation mismatch".into()),
     }
+}
+
+/// Compare all shared public inputs and bindings, permitting only the randomized
+/// proof bytes and their lengths to differ. This is functional evidence only.
+fn compare_pair(first: &Value, second: &Value) -> Result<()> {
+    let normalize = |manifest: &Value| -> Result<Value> {
+        let mut object = manifest.as_object().ok_or("invalid pair manifest")?.clone();
+        for name in ["proof_sha256", "proof_bytes"] {
+            object.remove(name).ok_or("missing pair proof binding")?;
+        }
+        Ok(Value::Object(object))
+    };
+    if normalize(first)? != normalize(second)? {
+        return Err("pair public context, key or profile differs".into());
+    }
+    let first_hash = bytes::<32>(&first["proof_sha256"])?;
+    let second_hash = bytes::<32>(&second["proof_sha256"])?;
+    if first_hash == second_hash {
+        return Err("independent private attempts produced identical frames".into());
+    }
+    Ok(())
+}
+fn pair_manifests(directory: &Path) -> Result<([Value; 2], [String; 2])> {
+    let read = |name: &str| -> Result<(Value, String)> {
+        let raw = read_bounded(
+            &directory.join(name).join("public-manifest.json"),
+            MANIFEST_LIMIT,
+        )?;
+        Ok((
+            serde_json::from_slice(&raw).map_err(|_| "invalid pair manifest JSON")?,
+            hex(&sha(&raw)),
+        ))
+    };
+    let (first, first_hash) = read("first")?;
+    let (second, second_hash) = read("second")?;
+    compare_pair(&first, &second)?;
+    Ok(([first, second], [first_hash, second_hash]))
+}
+fn measure_pair(family: Family, output: &Path) -> Result<()> {
+    fs::create_dir(output).map_err(|_| "use a new dedicated pair directory")?;
+    // In particular, issuance ciphertexts are generated once, so the second
+    // private attempt proves the exact same witness and public statement.
+    let fixture = Fixture::new(family);
+    measure(family, &output.join("first"), &fixture)?;
+    measure(family, &output.join("second"), &fixture)?;
+    drop(fixture);
+    let (_, manifest_hashes) = pair_manifests(output)?;
+    let report = json!({"status":"dual_attempt_observation_passed", "relation":family.name(),
+        "public_manifest_sha256":manifest_hashes, "same_public_context_and_key":true,
+        "distinct_complete_frames":true, "fresh_process_verification":false,
+        "runtime_activation":false, "zero_knowledge_qualified":false});
+    write_new(
+        &output.join("pair.json"),
+        &serde_json::to_vec_pretty(&report).map_err(|_| "pair report encoding failed")?,
+    )?;
+    println!("{report}");
+    Ok(())
+}
+fn verify_pair(input: &Path, first_hash: &str, second_hash: &str) -> Result<()> {
+    let (_, hashes) = pair_manifests(input)?;
+    if hashes != [first_hash, second_hash] {
+        return Err("trusted pair manifest hashes mismatch".into());
+    }
+    verify(&input.join("first"), first_hash, 1)?;
+    verify(&input.join("second"), second_hash, 1)?;
+    println!(
+        "{}",
+        json!({"status":"public_pair_verification_passed",
+        "public_manifest_sha256":hashes, "public_preprocessing_rebuilt":true,
+        "negative_checks_per_frame":["changed_public", "input_salt", "fri_salt"],
+        "witness_generation":false,"runtime_activation":false,"zero_knowledge_qualified":false})
+    );
+    Ok(())
 }
 fn verify(input: &Path, trusted_hash: &str, iterations: usize) -> Result<()> {
     if !(1..=100).contains(&iterations) {
@@ -641,12 +725,15 @@ fn verify(input: &Path, trusted_hash: &str, iterations: usize) -> Result<()> {
     {
         return Err("public proof binding mismatch".into());
     }
-    let key = read_key(&manifest["key"])?;
+    read_key(&manifest["key"])?;
     let context = &manifest["public_context"];
     let mut times = BTreeMap::new();
     macro_rules! verify_body {
         ($verifier:expr,$public:expr) => {{
-            let verifier = $verifier;
+            let verifier = phase(family, "public_setup_rebuilt", &mut times, || $verifier)?;
+            if key_json(verifier.verification_key())? != manifest["key"] {
+                return Err("rebuilt public preprocessing key mismatch".into());
+            }
             let public = $public;
             let shape = NativeProofShape::from_trusted(
                 &verifier.air,
@@ -670,21 +757,67 @@ fn verify(input: &Path, trusted_hash: &str, iterations: usize) -> Result<()> {
                         .map_err(|_| "independent verification failed".into())
                 })?;
             }
+            phase(family, "reject_changed_public", &mut times, || {
+                let mut changed = public.clone();
+                *changed.first_mut().ok_or("empty public statement")? += F::ONE;
+                if verifier.verify(&proof, &changed).is_ok() {
+                    return Err("changed public statement accepted".into());
+                }
+                Ok(())
+            })?;
+            phase(family, "reject_input_salt", &mut times, || {
+                let mut changed = shape
+                    .decode(&frame)
+                    .map_err(|_| "input salt fixture decoding failed")?;
+                let salt = changed
+                    .opening_proof
+                    .1
+                    .input_openings
+                    .first_mut()
+                    .and_then(|o| o.opening_proof.0.first_mut())
+                    .and_then(|m| m.first_mut())
+                    .and_then(|row| row.first_mut())
+                    .ok_or("input salt missing")?;
+                *salt += F::ONE;
+                if verifier.verify(&changed, &public).is_ok() {
+                    return Err("changed input salt accepted".into());
+                }
+                Ok(())
+            })?;
+            phase(family, "reject_fri_salt", &mut times, || {
+                let mut changed = shape
+                    .decode(&frame)
+                    .map_err(|_| "FRI salt fixture decoding failed")?;
+                let salt = changed
+                    .opening_proof
+                    .1
+                    .commit_phase_openings
+                    .first_mut()
+                    .and_then(|o| o.opening_proof.0.first_mut())
+                    .and_then(|m| m.first_mut())
+                    .and_then(|row| row.first_mut())
+                    .ok_or("FRI salt missing")?;
+                *salt += F::ONE;
+                if verifier.verify(&changed, &public).is_ok() {
+                    return Err("changed FRI salt accepted".into());
+                }
+                Ok(())
+            })?;
         }};
     }
     match family {
         Family::Transaction => verify_body!(
-            TransactionVerifier::from_trusted_key(profile, key),
+            TransactionVerifier::from_public_parameters(profile),
             transaction_public(context)?
         ),
         Family::Settlement => verify_body!(
-            SettlementVerifier::from_trusted_key(SETTLEMENT_CAPACITY, profile, key),
+            SettlementVerifier::from_public_parameters(SETTLEMENT_CAPACITY, profile),
             settlement_statement(context)?
         ),
         Family::Issuance => {
             let (signed, _, _) = issuance_statement(context)?;
             verify_body!(
-                IssuanceVerifier::from_trusted_key(ISSUANCE_NOTES, profile, key),
+                IssuanceVerifier::from_public_parameters(ISSUANCE_NOTES, profile),
                 signed.declaration.public_inputs()
             );
         }
@@ -703,9 +836,16 @@ fn run() -> Result<()> {
         .build()
         .map_err(|_| "cannot create bounded proving pool")?;
     match arguments.as_slice() {
-        [command,family,output] if command=="measure"=>pool.install(||measure(Family::parse(family)?,Path::new(output))),
+        [command,family,output] if command=="runtime-measure-pair"=>pool.install(||runtime::measure_pair(Family::parse(family)?,Path::new(output))),
+        [command,input,first_hash,second_hash] if command=="runtime-verify-pair"=>pool.install(||runtime::verify_pair(Path::new(input),first_hash,second_hash)),
+        [command,family,output] if command=="measure"=>pool.install(|| {
+            let family=Family::parse(family)?;
+            measure(family,Path::new(output),&Fixture::new(family))
+        }),
+        [command,family,output] if command=="measure-pair"=>pool.install(||measure_pair(Family::parse(family)?,Path::new(output))),
+        [command,input,first_hash,second_hash] if command=="verify-pair"=>pool.install(||verify_pair(Path::new(input),first_hash,second_hash)),
         [command,input,hash,count] if command=="verify"=>pool.install(||verify(Path::new(input),hash,count.parse().map_err(|_|"invalid iteration count")?)),
-        _=>Err("usage: native_hiding_v2_measure measure FAMILY NEW_DIRECTORY | verify DIRECTORY TRUSTED_MANIFEST_SHA256 ITERATIONS".into()),
+        _=>Err("usage: native_hiding_v2_measure runtime-measure-pair FAMILY NEW_DIRECTORY | runtime-verify-pair DIRECTORY FIRST_MANIFEST_SHA256 SECOND_MANIFEST_SHA256 | measure FAMILY NEW_DIRECTORY | measure-pair FAMILY NEW_DIRECTORY | verify DIRECTORY TRUSTED_MANIFEST_SHA256 ITERATIONS | verify-pair DIRECTORY FIRST_MANIFEST_SHA256 SECOND_MANIFEST_SHA256".into()),
     }
 }
 fn main() {
@@ -715,5 +855,44 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("{}", json!({"status":"measurement_failed","error":error}));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn manifests() -> (Value, Value) {
+        let first = json!({"schema":1,"relation":"issuance3","public_context":{"ciphertext":"01"},
+            "key":{"commitment":"02"},"profile":"03","binding":{"rules":"04"},
+            "proof_bytes":101,"proof_sha256":hex(&[1;32])});
+        let mut second = first.clone();
+        second["proof_bytes"] = json!(102);
+        second["proof_sha256"] = json!(hex(&[2; 32]));
+        (first, second)
+    }
+    #[test]
+    fn pair_accepts_randomized_proof_lengths_with_equal_public_context() {
+        let (first, second) = manifests();
+        assert!(compare_pair(&first, &second).is_ok());
+    }
+    #[test]
+    fn pair_rejects_ciphertext_key_profile_and_binding_substitution() {
+        let (first, second) = manifests();
+        for field in ["public_context", "key", "profile", "binding"] {
+            let mut changed = second.clone();
+            changed[field] = json!("substituted");
+            assert!(compare_pair(&first, &changed).is_err());
+        }
+    }
+    #[test]
+    fn pair_rejects_replayed_proof_missing_bindings_and_unknown_fields() {
+        let (first, second) = manifests();
+        assert!(compare_pair(&first, &first).is_err());
+        let mut changed = second.clone();
+        changed.as_object_mut().unwrap().remove("proof_sha256");
+        assert!(compare_pair(&first, &changed).is_err());
+        let mut changed = second;
+        changed["unrecognized_context"] = json!(1);
+        assert!(compare_pair(&first, &changed).is_err());
     }
 }

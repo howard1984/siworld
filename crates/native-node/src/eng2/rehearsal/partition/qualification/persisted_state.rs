@@ -502,7 +502,7 @@ fn compare_inner(
     if store.engine().state().height() != expected.state.height {
         return Err("authenticated actual height differs from independent expectations".into());
     }
-    let verifier = NativeVerifier::new()?;
+    let verifier = NativeVerifier::for_genesis(&Genesis::decode(&encoded)?)?;
     let mut reference = Engine::new(Genesis::decode(&encoded)?, limits)?;
     let mut found = vec![false; expected.included_operations.len()];
     let mut final_header = None;
