@@ -5,6 +5,7 @@
 //! Setup and verification run only inside the guarded child, outside owner locks.
 
 mod canonical;
+pub mod owner;
 pub use canonical::MAX_STATEMENT_BYTES;
 
 use super::fee_candidate::NativeCheckedFeeInputs;

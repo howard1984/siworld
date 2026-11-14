@@ -129,6 +129,31 @@ impl Engine {
             max_settlement_proof_bytes: crate::wire::MAX_SETTLEMENT_PROOF,
         }
     }
+    /// Prepare an isolated fee-first transition against the actual local parent.
+    /// This candidate has no native-verifier, work-verification or publication
+    /// method. It neither activates a fee mode nor replaces historical roots.
+    /// The returned inputs still borrow this Engine; detached runtime ownership
+    /// and registered V2 proof qualification remain separate requirements.
+    pub fn prepare_fee_candidate<'a>(
+        &'a self,
+        generation: u64,
+        header: &'a Header,
+        candidate: &'a super::fee_windowed_body::PreparedCandidateBody<'_>,
+    ) -> Result<PreparedFeeCandidate<'a>, String> {
+        let captured = self.capture_fee_candidate_context(generation, header, candidate)?;
+        let prepared = PreparedBlock::prepare_layout(
+            &self.state,
+            header,
+            &candidate.body().body,
+            self.binding(self.state.tip()),
+            HeaderUse::Template,
+            PreparationLayout::Windowed {
+                commitment: candidate.commitment(),
+                authorizations: &candidate.body().authorizations,
+            },
+        )?;
+        Ok(PreparedFeeCandidate { prepared, captured })
+    }
     fn binding(&self, parent: Hash) -> Binding {
         Binding {
             genesis: self.genesis.id(),
@@ -294,6 +319,22 @@ enum HeaderUse {
     Mined,
     Template,
 }
+#[derive(Clone, Copy)]
+enum PreparationLayout<'a> {
+    Legacy(body::Policy),
+    Windowed {
+        commitment: Hash,
+        authorizations: &'a super::windowed_authorization::WindowedAuthorizationBody,
+    },
+}
+impl PreparationLayout<'_> {
+    fn commitment(self, body: &body::Body) -> Result<Hash, String> {
+        match self {
+            Self::Legacy(policy) => body.commitment(policy),
+            Self::Windowed { commitment, .. } => Ok(commitment),
+        }
+    }
+}
 use crate::eng2_settlement::{FeeSchedule, SettlementPolicy};
 use native::{codec::decode_digest, encryption::PaymentAddress, multi_asset::Digest};
 
@@ -326,6 +367,35 @@ pub struct PreparedBlock<'a> {
     ledgers: CandidateLedgers,
     header_use: HeaderUse,
 }
+/// One isolated chain/ledger preparation using the complete fee-first body.
+/// Fields are private and there is no conversion to NativeTransactions or a
+/// staged block. The current parent fee mode and snapshot roots are preserved.
+pub struct PreparedFeeCandidate<'a> {
+    prepared: PreparedBlock<'a>,
+    captured: super::fee_child::owner::CapturedContext,
+}
+impl PreparedFeeCandidate<'_> {
+    pub fn parent(&self) -> &SnapshotState {
+        self.prepared.parent
+    }
+    pub fn header(&self) -> &Header {
+        self.prepared.header
+    }
+    pub fn ledgers(&self) -> VersionedLedgers<'_> {
+        self.prepared.ledgers.view()
+    }
+    /// A legacy parent cannot supply a confidential fee policy. Structural
+    /// preparation alone must not reinterpret its historical fee commitments.
+    pub fn settlement_policy(&self) -> Result<&SettlementPolicy, String> {
+        if self.prepared.parent.fee_mode() != FeeMode::ConfidentialDestination {
+            return Err("fee candidate parent does not select confidential fees".into());
+        }
+        Ok(&self.prepared.ledgers.settlement)
+    }
+    pub fn captured_context(&self) -> &super::fee_child::owner::CapturedContext {
+        &self.captured
+    }
+}
 /// Actual native transaction and issuance proofs passed for these exact inputs.
 /// This is not settlement verification, an executable delta or live admission.
 pub struct NativeTransactions<'a> {
@@ -355,8 +425,28 @@ impl<'a> PreparedBlock<'a> {
         policy: body::Policy,
         header_use: HeaderUse,
     ) -> Result<Self, String> {
+        Self::prepare_layout(
+            parent,
+            header,
+            body,
+            binding,
+            header_use,
+            PreparationLayout::Legacy(policy),
+        )
+    }
+    fn prepare_layout(
+        parent: &'a SnapshotState,
+        header: &'a Header,
+        body: &'a body::Body,
+        binding: Binding,
+        header_use: HeaderUse,
+        layout: PreparationLayout<'_>,
+    ) -> Result<Self, String> {
         parent.check_context()?;
-        if parent.fee_mode() == FeeMode::LegacyMiner && body.fee_output != legacy_fee_output() {
+        if matches!(layout, PreparationLayout::Legacy(_))
+            && parent.fee_mode() == FeeMode::LegacyMiner
+            && body.fee_output != legacy_fee_output()
+        {
             return Err("legacy fee output must be the unused all-zero sentinel".into());
         }
         if binding.genesis == [0; 32]
@@ -365,7 +455,7 @@ impl<'a> PreparedBlock<'a> {
             || header.network != parent.network()
             || body.network != header.network
             || body.height != header.height
-            || body.commitment(policy)? != header.body_commitment
+            || layout.commitment(body)? != header.body_commitment
         {
             return Err("isolated block binding or complete body commitment differs".into());
         }
@@ -410,7 +500,14 @@ impl<'a> PreparedBlock<'a> {
         // only previously included operations; new actions cannot change this
         // block's settlement destination or fund recipients.
         let mut governance = parent.governance.clone();
-        let inclusions = governance.apply_block(header.height, &body.governance)?;
+        let inclusions = match layout {
+            PreparationLayout::Legacy(_) => {
+                governance.apply_block(header.height, &body.governance)?
+            }
+            PreparationLayout::Windowed { authorizations, .. } => {
+                governance.apply_windowed_block(header.height, &authorizations.governance)?
+            }
+        };
         let allocation = parent
             .chain
             .config
@@ -427,12 +524,36 @@ impl<'a> PreparedBlock<'a> {
             siworld_core::v1_economics::subsidy(header.height)
                 .map_err(|error| error.to_string())?,
         )?;
-        let mut outputs = Vec::with_capacity(body.fund_claims.len());
-        for claim in &body.fund_claims {
-            outputs.push(
-                AuthorizedFundClaim::verify(claim, &parent.chain.config, &frozen, header.height)?
-                    .debit(&mut fund)?,
-            );
+        let mut outputs = Vec::new();
+        match layout {
+            PreparationLayout::Legacy(_) => {
+                outputs.reserve(body.fund_claims.len());
+                for claim in &body.fund_claims {
+                    outputs.push(
+                        AuthorizedFundClaim::verify(
+                            claim,
+                            &parent.chain.config,
+                            &frozen,
+                            header.height,
+                        )?
+                        .debit(&mut fund)?,
+                    );
+                }
+            }
+            PreparationLayout::Windowed { authorizations, .. } => {
+                outputs.reserve(authorizations.fund_claims.len());
+                for claim in &authorizations.fund_claims {
+                    outputs.push(
+                        AuthorizedFundClaim::verify_windowed(
+                            claim,
+                            &parent.chain.config,
+                            &frozen,
+                            header.height,
+                        )?
+                        .debit(&mut fund)?,
+                    );
+                }
+            }
         }
         economics.verify_fund_entitlement(fund.total_entitlement())?;
         let previous_standard = siworld_core::v1_economics::fee_base(header.height)
