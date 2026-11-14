@@ -284,12 +284,12 @@ impl SignedPreparedIssuance {
             |record| IssuanceVerifier::new()?.verify(record),
         )
     }
-    /// Generate and independently verify V2 under the exact sealed genesis.
+    /// Generate and independently verify V2 under the authenticated genesis domain.
     pub fn prove_for_genesis(
         self,
         prover: &crate::proofs::NativeProver,
         fee: &IssuanceFeeReceipt,
-        genesis: &crate::eng2::genesis::Genesis,
+        genesis: &crate::proofs::NativeProofGenesis,
     ) -> Result<WalletIssuance, String> {
         let verifier = crate::proofs::NativeVerifier::for_genesis(genesis)?;
         self.prove_with(

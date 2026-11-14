@@ -1,9 +1,9 @@
 //! Genesis-bound salted adapters for the retained native proof relations.
+use super::NativeProofGenesis as Genesis;
 use super::{
     NativePreparation, NativeRejectionEvidence, NativeVerificationFailure, RejectedNativeRelation,
     SETTLEMENT_CAPACITY, check_context, settlement_statement,
 };
-use crate::eng2::genesis::Genesis;
 use crate::proof_codec::v2::{
     Identity, MAX_ISSUANCE_PROOF_BYTES, MAX_TRANSACTION_PROOF_BYTES, ProtocolBinding, Relation,
     backend::{
@@ -105,11 +105,15 @@ struct Context {
 }
 impl Context {
     fn from_genesis(genesis: &Genesis) -> Result<Self, String> {
+        #[cfg(siworld_native_node)]
+        let (id, rules) = (genesis.id(), genesis.rules_commitment());
+        #[cfg(not(siworld_native_node))]
+        let (id, rules) = (genesis.genesis(), genesis.rules());
         let result = Self {
             network: genesis.config().network,
             binding: ProtocolBinding {
-                genesis: genesis.id(),
-                rules: genesis.rules_commitment(),
+                genesis: id,
+                rules,
                 air: air_identity(),
             },
         };
@@ -270,6 +274,7 @@ impl Verifier {
             Relation::CompleteFee => Err("complete fee is not a retained runtime relation".into()),
         }
     }
+    #[cfg(siworld_native_node)]
     pub(super) fn authenticates(&self, genesis: &Genesis) -> bool {
         Context::from_genesis(genesis).is_ok_and(|context| context == self.context)
     }
@@ -471,7 +476,7 @@ impl Prover {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 mod tests {
     use super::*;
     use crate::eng2::{body::Body, execution::Engine, genesis::FeeMode, state_components::Limits};

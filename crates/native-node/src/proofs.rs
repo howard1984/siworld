@@ -3,6 +3,14 @@
 #[path = "proofs/hiding.rs"]
 mod hiding;
 
+/// Caller-authenticated genesis domain for the retained salted proof profile.
+/// Native admission uses a sealed genesis. The portable adapter uses bootstrap
+/// bytes verified against an independently pinned genesis identifier.
+#[cfg(siworld_native_node)]
+pub use crate::eng2::genesis::Genesis as NativeProofGenesis;
+#[cfg(not(siworld_native_node))]
+pub use crate::eng2_history::Context as NativeProofGenesis;
+
 use crate::proof_codec::{
     MAX_SETTLEMENT_PROOF_BODY_LEN, MAX_TRANSACTION_PROOF_BODY_LEN, ProofShape,
 };
@@ -372,9 +380,9 @@ impl NativeVerificationFailure {
 }
 
 impl NativeVerifier {
-    /// Select the mandatory salted profile from an already sealed genesis.
+    /// Select the mandatory salted profile from an authenticated genesis domain.
     /// This constructor never accepts a frame-selected AIR, key or binding.
-    pub fn for_genesis(genesis: &crate::eng2::genesis::Genesis) -> Result<Self, String> {
+    pub fn for_genesis(genesis: &NativeProofGenesis) -> Result<Self, String> {
         let mut verifier = Self::new()?;
         verifier.hiding = Some(hiding::Verifier::new(genesis)?);
         Ok(verifier)
@@ -389,7 +397,8 @@ impl NativeVerifier {
             .ok_or("proof identity requires a sealed salted genesis")?
             .identity(relation)
     }
-    pub(crate) fn authenticates(&self, genesis: &crate::eng2::genesis::Genesis) -> bool {
+    #[cfg(siworld_native_node)]
+    pub(crate) fn authenticates(&self, genesis: &NativeProofGenesis) -> bool {
         self.hiding
             .as_ref()
             .is_some_and(|v| v.authenticates(genesis))
@@ -585,7 +594,7 @@ fn same_key(left: &PreprocessedVerifierKey<Cfg>, right: &PreprocessedVerifierKey
 }
 
 impl NativeProver {
-    pub fn for_genesis(genesis: &crate::eng2::genesis::Genesis) -> Result<Self, String> {
+    pub fn for_genesis(genesis: &NativeProofGenesis) -> Result<Self, String> {
         Ok(Self {
             hiding: Some(hiding::Prover::new(genesis)?),
             transaction: None,
@@ -711,8 +720,8 @@ mod tests {
             &transaction,
             &settlement,
         );
-        assert_eq!(fingerprint, protocol_profile_fingerprint());
-        assert_eq!(fingerprint, protocol_profile_fingerprint());
+        assert_eq!(fingerprint, legacy_profile_fingerprint());
+        assert_ne!(fingerprint, protocol_profile_fingerprint());
         assert_ne!(
             fingerprint,
             fingerprint_for_keys(
@@ -821,9 +830,14 @@ mod tests {
         };
         let original = profile(RELATION_REVISION, &shapes);
         let config = crate::state::Config::development([95; 32], 0).unwrap();
-        let genesis = config.genesis_id();
-        assert_eq!(original, protocol_profile_fingerprint());
-        assert_eq!(genesis, config.genesis_id_for_profile(&original));
+        assert_eq!(original, legacy_profile_fingerprint());
+        assert_ne!(original, protocol_profile_fingerprint());
+        let genesis = config.genesis_id_for_profile(&original);
+        assert_ne!(genesis, config.genesis_id());
+        assert_eq!(
+            config.genesis_id(),
+            config.genesis_id_for_profile(&protocol_profile_fingerprint())
+        );
         let changed_revision = profile(b"different-relation-revision", &shapes);
         assert_ne!(original, changed_revision);
         assert_ne!(genesis, config.genesis_id_for_profile(&changed_revision));

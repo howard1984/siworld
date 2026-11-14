@@ -38,8 +38,8 @@ use zeroize::Zeroize;
 
 pub mod custody_caller;
 mod native_business;
+mod prefix;
 const MAX_PLAN: usize = 128 * 1024;
-const MAX_PREFIX: u64 = 96;
 const MAX_STEPS: usize = 4;
 const ROLES: [&str; 5] = [
     "payer",
@@ -252,6 +252,7 @@ struct Plan {
     max_nonce_attempts: u64,
     max_output_bytes: u64,
     external_resource_manifest_sha256: String,
+    history_budget: PublicInput,
     expected_before: Vec<WalletExpectation>,
     steps: Vec<Step>,
 }
@@ -721,7 +722,7 @@ pub fn generate(
     ];
     let mut original_commitments = BTreeSet::new();
     let mut original_nullifiers = BTreeSet::new();
-    if plan.version != 2
+    if plan.version != 3
         || !hex(&plan.campaign_id, 32)
         || !hex(&plan.start_tip, 32)
         || !hex(&plan.external_resource_manifest_sha256, 32)
@@ -729,8 +730,9 @@ pub fn generate(
             != isolated_directory
                 .to_str()
                 .ok_or("business path encoding rejected")?
-        || !(1..=MAX_PREFIX - MAX_STEPS as u64).contains(&plan.start_height)
-        || !(1..=900).contains(&plan.deadline_seconds)
+        || !(1..=super::full_history::MAX_HISTORY_HEIGHT - MAX_STEPS as u64)
+            .contains(&plan.start_height)
+        || !(1..=3600).contains(&plan.deadline_seconds)
         || !(1..=1_000_000).contains(&plan.max_nonce_attempts)
         || !(1_048_576..=17_179_869_184).contains(&plan.max_output_bytes)
         || !expected_shape(&plan.expected_before)
@@ -800,6 +802,14 @@ pub fn generate(
         return Err("business output and isolated node must be separate".into());
     }
     let started = Instant::now();
+    gate(
+        started,
+        &plan,
+        custody,
+        "before_complete_original_prefix_preflight",
+    )?;
+    let prefix =
+        prefix::FrozenPrefix::prepare(&context, store, &plan, output_directory, started, custody)?;
     gate(started, &plan, custody, "before_public_input_preflight")?;
     let mut operations = Vec::with_capacity(MAX_STEPS);
     let mut signed_fund = false;
@@ -878,6 +888,7 @@ pub fn generate(
     }
     let mut output = Output::create(output_directory, owner, plan.max_output_bytes)?;
     output.write("plan.json", &encoded_plan)?;
+    output.write("history-budget.json", prefix.budget_bytes())?;
     output.write("genesis.bin", &store.engine().genesis().encode()?)?;
     output.json("intent.json", &json!({"version":1,"scope":"private-owner-positive-native-business","qualification":context.receipt(),"plan_sha256":plan_pin,"campaign_id":plan.campaign_id,"external_resource_manifest_sha256":plan.external_resource_manifest_sha256,"external_resource_guard_independently_verified":false,"new_blocks":MAX_STEPS,"canonical_append_authorized_by_caller":true,"completed":false,"g1_passed":false,"g2_passed":false}))?;
     gate(started, &plan, custody, "before_native_verifier_setup")?;
@@ -888,10 +899,17 @@ pub fn generate(
     )?;
     for height in 1..=plan.start_height {
         gate(started, &plan, custody, "before_original_prefix_verify")?;
+        let _frame_charge = prefix.before_frame(store, height)?;
         let (header, body) = store.block(height)?;
+        let mut encoded = header
+            .encode()
+            .map_err(|_| "business original header encoding failed")?
+            .to_vec();
+        encoded.extend_from_slice(&body.encode(store.engine().body_policy())?);
+        prefix.check_frame(&header, encoded.len())?;
         reference.apply(&header, &body, &verifier)?;
         actors.scan(reference.state().chain(), &header, &body, height != 1)?;
-        output.write(&format!("block-{height:04}.frame"), &frame(store, height)?)?;
+        output.write(&format!("block-{height:04}.frame"), &encoded)?;
     }
     let (parent_header, _) = store.block(plan.start_height)?;
     let parent_binding = Binding {
@@ -910,6 +928,9 @@ pub fn generate(
     {
         return Err("business original prefix and all11 actual state components differ".into());
     }
+    prefix.check_head(store)?;
+    prefix.check_input_unchanged()?;
+    output.json("original-prefix.json", &prefix.receipt())?;
     actors.require_head(store.engine().state().chain())?;
     for step in &plan.steps {
         selected(step, actors.payer, store.engine().state().chain())?;
@@ -1197,11 +1218,12 @@ pub fn generate(
             "business final actual components differ from independent native replay".into(),
         );
     }
+    prefix.check_input_unchanged()?;
     if read(plan_path, MAX_PLAN)? != encoded_plan {
         return Err("business pinned plan changed during generation".into());
     }
     gate(started, &plan, custody, "before_positive_business_closeout")?;
-    let result = json!({"version":1,"scope":"private-owner-positive-native-business","qualification":context.receipt(),"campaign_id":plan.campaign_id,"plan_sha256":plan_pin,"new_blocks":MAX_STEPS,"final_height":final_height,"final_tip":crate::local::hex(&store.engine().state().tip()),"native_verified_and_explicitly_appended":true,"all11_actual_component_bytes_equal_independent_native_replay":true,"business":records,"wallet_material_private":true,"dedicated_wallet_scanner_memory_mutated":true,"custody_implementation_independently_verified":false,"expectation_author_independently_verified":false,"independent_s4_scan_performed":false,"independent_p5_audit_manifest_produced":false,"complete_fee_activated":false,"full_business_acceptance_passed":false,"g1_passed":false,"g2_passed":false,"elapsed_ms":started.elapsed().as_millis().to_string()});
+    let result = json!({"version":1,"scope":"private-owner-positive-native-business","qualification":context.receipt(),"campaign_id":plan.campaign_id,"plan_sha256":plan_pin,"new_blocks":MAX_STEPS,"final_height":final_height,"final_tip":crate::local::hex(&store.engine().state().tip()),"native_verified_and_explicitly_appended":true,"all11_actual_component_bytes_equal_independent_native_replay":true,"business":records,"original_history":prefix.receipt(),"wallet_material_private":true,"dedicated_wallet_scanner_memory_mutated":true,"custody_implementation_independently_verified":false,"expectation_author_independently_verified":false,"independent_s4_scan_performed":false,"independent_p5_audit_manifest_produced":false,"complete_fee_activated":false,"full_business_acceptance_passed":false,"g1_passed":false,"g2_passed":false,"elapsed_ms":started.elapsed().as_millis().to_string()});
     output.json("completed.json", &result)?;
     Ok(
         json!({"version":1,"scope":"private-owner-positive-native-business","campaign_id":plan.campaign_id,"plan_sha256":plan_pin,"new_blocks":MAX_STEPS,"final_height":final_height,"private_result_written":true,"dedicated_wallet_scanner_memory_mutated":true,"custody_implementation_independently_verified":false,"expectation_author_independently_verified":false,"native_verified_and_explicitly_appended":true,"all11_actual_component_bytes_equal_independent_native_replay":true,"independent_s4_scan_performed":false,"independent_p5_audit_manifest_produced":false,"complete_fee_activated":false,"full_business_acceptance_passed":false,"g1_passed":false,"g2_passed":false}),

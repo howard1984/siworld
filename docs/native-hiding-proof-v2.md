@@ -13,6 +13,22 @@ and Store admission reject unbound verifiers before state transitions. A new
 profile requires a new engineering genesis and data directory; existing stores
 are not migrated in place.
 
+`NativeProofGenesis` selects the authenticated local domain type at the crate
+boundary. Native-node builds accept the sealed `eng2::genesis::Genesis`;
+portable wallet-engine builds accept `eng2_history::Context`, whose bootstrap
+bytes and compiled proof profile must match an independently pinned genesis
+identifier. Both adapters derive the same network, genesis and rules fields
+from their selected domain and retain the salted constructors. The portable
+adapter does not import the native execution engine or select a domain from a
+proof frame.
+
+This type boundary does not connect the portable payment path to salted V2.
+That path still uses the historical transaction prover and verifier. Header and
+receipt scanning does not verify native transaction, settlement or issuance
+proofs. Compile-only checks establish host/WASM type compatibility; they do not
+establish wallet generation, native proof admission, custody or end-to-end
+wallet acceptance for the salted profile.
+
 The implementation retains polynomial masking and adds independent Merkle
 leaf salts to both input and FRI commitments. It does not establish a complete
 zero-knowledge security claim. Full transcript hiding, actual runtime proof
