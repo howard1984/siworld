@@ -701,5 +701,50 @@ fn unavailable_status_replaces_stale_ready_without_claiming_a_head() {
     assert_eq!(value["state_available"], false);
     assert_eq!(value["height"], Value::Null);
     assert_eq!(value["reorganization_alarm"], "canonical_state_unavailable");
+    assert_eq!(value["ready_reason_code"], "canonical_state_unavailable");
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn readiness_reason_preserves_owner_and_observer_gates_ahead_of_peer_diagnostics() {
+    use super::super::checkpoint_observer::{
+        Observer,
+        tests::{synthetic_current_conflict, synthetic_pending_authorization},
+    };
+    use super::peers::PeerReadiness;
+    let healthy = Observer::default();
+    assert_eq!(
+        resident_readiness(true, "ready", &healthy, PeerReadiness::Ready),
+        (true, "ready")
+    );
+    assert_eq!(
+        resident_readiness(true, "ready", &healthy, PeerReadiness::NoConnectedPeers),
+        (false, "no_connected_peers")
+    );
+    let hard = synthetic_current_conflict();
+    assert_eq!(
+        resident_readiness(true, "ready", &hard, PeerReadiness::Ready),
+        (false, "checkpoint_current_quorum_conflict")
+    );
+    let pending = synthetic_pending_authorization();
+    assert_eq!(
+        resident_readiness(true, "ready", &pending, PeerReadiness::Ready),
+        (false, "checkpoint_authorization_pending")
+    );
+    for reason in [
+        "manual_recovery_required",
+        "applying_validated_branch",
+        "waiting_for_shared_byte_budget",
+        "resuming_best_branch",
+    ] {
+        assert_eq!(
+            resident_readiness(false, reason, &hard, PeerReadiness::NoConnectedPeers),
+            (false, reason)
+        );
+    }
+    assert_eq!(
+        resident_readiness(false, "ready", &healthy, PeerReadiness::Ready),
+        (false, "canonical_state_unavailable")
+    );
 }

@@ -22,6 +22,83 @@ struct StatusInner {
     connections: BTreeMap<Hash, Connection>,
     rounds: u64,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PeerReadiness {
+    Ready,
+    NoConnectedPeers,
+    NoCompletedPeerRound,
+    PeerRoundStale,
+    PeerRoundHeadMismatch,
+    PeerRoundHeadUnavailable,
+    PeerCatchupInProgress,
+}
+impl PeerReadiness {
+    pub(super) fn is_ready(self) -> bool {
+        self == Self::Ready
+    }
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::NoConnectedPeers => "no_connected_peers",
+            Self::NoCompletedPeerRound => "no_completed_peer_round",
+            Self::PeerRoundStale => "peer_round_stale",
+            Self::PeerRoundHeadMismatch => "peer_round_head_mismatch",
+            Self::PeerRoundHeadUnavailable => "peer_round_head_unavailable",
+            Self::PeerCatchupInProgress => "peer_catchup_in_progress",
+        }
+    }
+    fn classify(status: &StatusInner, head: (u64, Hash), now: Instant) -> Self {
+        if status.connections.is_empty() {
+            return Self::NoConnectedPeers;
+        }
+        if status
+            .connections
+            .values()
+            .all(|connection| connection.last_round.is_none())
+        {
+            return Self::NoCompletedPeerRound;
+        }
+        let fresh = |connection: &&Connection| {
+            connection
+                .last_round
+                .is_some_and(|last| now.saturating_duration_since(last) <= READY_FRESHNESS)
+        };
+        if status
+            .connections
+            .values()
+            .filter(fresh)
+            .any(|connection| connection.caught_up && connection.completed_head == Some(head))
+        {
+            return Self::Ready;
+        }
+        if !status
+            .connections
+            .values()
+            .any(|connection| fresh(&connection))
+        {
+            return Self::PeerRoundStale;
+        }
+        // Report the most complete fresh evidence. A new wrong-head round
+        // cannot refresh a stale matching-head round from a different peer.
+        if status
+            .connections
+            .values()
+            .filter(fresh)
+            .any(|connection| connection.caught_up && connection.completed_head.is_some())
+        {
+            return Self::PeerRoundHeadMismatch;
+        }
+        if status
+            .connections
+            .values()
+            .filter(fresh)
+            .any(|connection| connection.caught_up)
+        {
+            return Self::PeerRoundHeadUnavailable;
+        }
+        Self::PeerCatchupInProgress
+    }
+}
 #[derive(Default)]
 pub(crate) struct NetworkStatus {
     inner: Mutex<StatusInner>,
@@ -159,17 +236,16 @@ impl NetworkStatus {
     }
     /// A completed round for another tip cannot authorize work on this one.
     pub(super) fn ready_at(&self, head: (u64, Hash)) -> Result<bool, String> {
+        Ok(self.readiness_at(head)?.is_ready())
+    }
+    /// Classification and the original readiness predicate use the same lock
+    /// and monotonic instant. Codes confer no synchronization authority.
+    pub(super) fn readiness_at(&self, head: (u64, Hash)) -> Result<PeerReadiness, String> {
         let status = self
             .inner
             .lock()
             .map_err(|_| "connection registry lock poisoned")?;
-        Ok(status.connections.values().any(|connection| {
-            connection.completed_head == Some(head)
-                && connection.caught_up
-                && connection
-                    .last_round
-                    .is_some_and(|time| time.elapsed() <= READY_FRESHNESS)
-        }))
+        Ok(PeerReadiness::classify(&status, head, Instant::now()))
     }
     pub(super) fn invalidate_head_evidence(&self) -> Result<(), String> {
         let mut status = self
@@ -582,6 +658,91 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readiness_reasons_follow_live_connections_not_the_lifetime_round_counter() {
+        let status = Arc::new(NetworkStatus::default());
+        let head = (50, [2; 32]);
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::NoConnectedPeers
+        );
+        let connection = status.connected([1; 32]).unwrap();
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::NoCompletedPeerRound
+        );
+        status.round([1; 32], ROUND_BLOCKS, Some(head)).unwrap();
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::PeerCatchupInProgress
+        );
+        status.round([1; 32], 0, None).unwrap();
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::PeerRoundHeadUnavailable
+        );
+        status.round([1; 32], 0, Some((49, [3; 32]))).unwrap();
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::PeerRoundHeadMismatch
+        );
+        status.round([1; 32], 0, Some(head)).unwrap();
+        assert_eq!(status.readiness_at(head).unwrap(), PeerReadiness::Ready);
+        assert!(status.ready_at(head).unwrap());
+        status.invalidate_head_evidence().unwrap();
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::PeerCatchupInProgress
+        );
+        assert!(!status.ready_at(head).unwrap());
+        drop(connection);
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::NoConnectedPeers
+        );
+        let _reconnected = status.connected([1; 32]).unwrap();
+        assert!(status.snapshot().unwrap().rounds > 0);
+        assert_eq!(
+            status.readiness_at(head).unwrap(),
+            PeerReadiness::NoCompletedPeerRound
+        );
+    }
+
+    #[test]
+    fn a_fresh_wrong_head_cannot_refresh_a_stale_matching_round_and_boundary_is_inclusive() {
+        let status = Arc::new(NetworkStatus::default());
+        let _first = status.connected([1; 32]).unwrap();
+        let _second = status.connected([2; 32]).unwrap();
+        let head = (50, [3; 32]);
+        status.round([1; 32], 0, Some(head)).unwrap();
+        status.round([2; 32], 0, Some((50, [4; 32]))).unwrap();
+        let now = Instant::now();
+        let mut inner = status.inner.lock().unwrap();
+        inner.connections.get_mut(&[1; 32]).unwrap().last_round = Some(now - READY_FRESHNESS);
+        inner.connections.get_mut(&[2; 32]).unwrap().last_round = Some(now);
+        assert_eq!(
+            PeerReadiness::classify(&inner, head, now),
+            PeerReadiness::Ready
+        );
+        inner.connections.get_mut(&[1; 32]).unwrap().last_round =
+            Some(now - READY_FRESHNESS - Duration::from_nanos(1));
+        assert_eq!(
+            PeerReadiness::classify(&inner, head, now),
+            PeerReadiness::PeerRoundHeadMismatch
+        );
+        inner.connections.get_mut(&[2; 32]).unwrap().last_round =
+            Some(now - READY_FRESHNESS - Duration::from_nanos(1));
+        assert_eq!(
+            PeerReadiness::classify(&inner, head, now),
+            PeerReadiness::PeerRoundStale
+        );
+        inner.connections.get_mut(&[1; 32]).unwrap().last_round = Some(now);
+        assert_eq!(
+            PeerReadiness::classify(&inner, head, now),
+            PeerReadiness::Ready
+        );
+    }
+
     #[test]
     fn pending_checkpoint_allows_round_completion_but_recovery_requires_new_head_evidence() {
         use super::super::super::checkpoint_observer::{Error, Outcome};

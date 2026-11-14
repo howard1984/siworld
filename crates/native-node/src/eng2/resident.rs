@@ -288,8 +288,14 @@ fn export_status(
         .lock()
         .map_err(|_| "checkpoint observer lock poisoned")?;
     let conflict = observer.conflicted();
-    let ready =
-        owner.activities_allowed() && shared.network.ready_at((head.height, head.id))? && !conflict;
+    let activities_allowed = owner.activities_allowed();
+    let peer_readiness = shared.network.readiness_at((head.height, head.id))?;
+    let (ready, ready_reason_code) = resident_readiness(
+        activities_allowed,
+        owner.reorganization_status(),
+        &observer,
+        peer_readiness,
+    );
     let event = owner.last_reorganization();
     let mut status = json!({
         "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
@@ -297,6 +303,7 @@ fn export_status(
         "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
         "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {observer.gate_reason().map(super::checkpoint_observer::Error::code).unwrap_or("checkpoint_current_quorum_conflict")} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
+        "ready_reason_code":ready_reason_code,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
         "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
         "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
@@ -343,6 +350,30 @@ fn export_status(
     });
     service::atomic_json(&directory.join(service::STATUS_FILE), &status)
 }
+fn resident_readiness(
+    activities_allowed: bool,
+    reorganization_status: &'static str,
+    observer: &super::checkpoint_observer::Observer,
+    peer: peers::PeerReadiness,
+) -> (bool, &'static str) {
+    let ready = activities_allowed && peer.is_ready() && !observer.conflicted();
+    let reason = if !activities_allowed {
+        match reorganization_status {
+            // With no reorganization pause, only the exportability check can
+            // prevent activities. Never label ready=false with reason ready.
+            "ready" | "unconfigured" => "canonical_state_unavailable",
+            other => other,
+        }
+    } else if observer.conflicted() {
+        observer
+            .gate_reason()
+            .map(super::checkpoint_observer::Error::code)
+            .unwrap_or("checkpoint_current_quorum_conflict")
+    } else {
+        peer.code()
+    };
+    (ready, reason)
+}
 
 fn export_unavailable_status(
     directory: &Path,
@@ -356,6 +387,7 @@ fn export_unavailable_status(
             "schema_version":2, "run_id":run_id, "process_id":std::process::id(), "sequence":sequence,
             "phase":"manual_recovery_required", "state_available":false, "ready":false,
             "sync_status":"canonical_state_unavailable", "height":null, "tip":null,
+            "ready_reason_code":"canonical_state_unavailable",
             "reorganization_status":"manual_recovery_required", "reorganization_alarm":"canonical_state_unavailable",
             "wallet_export_paused":true, "signed_bootstrap_available":false,
             "error_code":"canonical_state_unavailable", "updated_unix_ms":unix_ms()?,
