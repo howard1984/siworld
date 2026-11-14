@@ -156,6 +156,42 @@ impl Alarm {
         }
     }
 }
+/// Fixed diagnostic origins for a failed tick. No error text or input is exposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TickFailureReason {
+    Context,
+    InputBounds,
+    Preparation,
+    Proposal,
+    Vote,
+    VoteWithoutCandidate,
+    Certificate,
+    CertificatePreparationPending,
+    CandidatePreparation,
+    VoteSigning,
+    CertificatePublication,
+    StatusPublication,
+    CurrentProjection,
+}
+impl TickFailureReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::InputBounds => "input_bounds",
+            Self::Preparation => "preparation",
+            Self::Proposal => "proposal",
+            Self::Vote => "vote",
+            Self::VoteWithoutCandidate => "vote_without_candidate",
+            Self::Certificate => "certificate",
+            Self::CertificatePreparationPending => "certificate_preparation_pending",
+            Self::CandidatePreparation => "candidate_preparation",
+            Self::VoteSigning => "vote_signing",
+            Self::CertificatePublication => "certificate_publication",
+            Self::StatusPublication => "status_publication",
+            Self::CurrentProjection => "current_projection",
+        }
+    }
+}
 // Only the resident entry point can construct the production readiness gate.
 // Public observation never accepts an asserted boolean or a caller-made permit.
 struct SigningGuard<'a> {
@@ -256,11 +292,24 @@ pub struct Host {
     last_now: Option<u64>,
     last_exported: Option<(u64, Hash, Option<u64>)>,
     last_status: Option<Status>,
+    tick_failure: Option<TickFailureReason>,
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
+    preparation: Option<ResidentPreparation>,
+}
+struct ResidentPreparation {
+    budget: crate::p2p::Budget,
+    worker: archive_work::ArchiveWorker,
+    request: Option<Proposal>,
+    completed: Option<PreparedCheckpoint>,
+    certificate_only: bool,
 }
 impl Host {
+    /// The failed operation's bounded origin; the original Result is unchanged.
+    pub fn tick_failure_reason(&self) -> Option<TickFailureReason> {
+        self.tick_failure
+    }
     /// The accepted, durably published capability only; pending proposals and
     /// votes cannot be exposed as signed bootstrap state.
     pub fn latest_checkpoint(&self) -> Option<&CertifiedCheckpoint> {
@@ -296,9 +345,11 @@ impl Host {
             last_now: None,
             last_exported: None,
             last_status: None,
+            tick_failure: None,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
+            preparation: None,
         })
     }
     /// Explicit wallet opt-in, independent of checkpoint signing and admission.
@@ -320,6 +371,197 @@ impl Host {
     }
     pub fn wallet_export_state(&self) -> Option<bool> {
         self.wallet_requested.then_some(self.wallet_paused)
+    }
+    /// Enable one keyless archive-preparation worker using the resident's
+    /// existing shared budget. The canonical Store is never moved to it.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn enable_async_preparation(
+        &mut self,
+        budget: &crate::p2p::Budget,
+    ) -> Result<(), String> {
+        if self.preparation.is_some() {
+            return Err("checkpoint preparation was already enabled".into());
+        }
+        self.preparation = Some(ResidentPreparation {
+            budget: budget.clone(),
+            worker: archive_work::ArchiveWorker::default(),
+            request: None,
+            completed: None,
+            certificate_only: false,
+        });
+        Ok(())
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn stop_preparation(&mut self) -> Result<(), String> {
+        if let Some(mut preparation) = self.preparation.take() {
+            preparation.completed = None;
+            preparation.request = None;
+            preparation.worker.stop()?;
+        }
+        Ok(())
+    }
+    fn advance_preparation(
+        &mut self,
+        store: &Store,
+        readiness: Option<&dyn SigningReadiness>,
+    ) -> Result<(), String> {
+        let Some(preparation) = &mut self.preparation else {
+            return Ok(());
+        };
+        if let Some(archive) = preparation.worker.try_complete()? {
+            let request = preparation
+                .request
+                .take()
+                .ok_or("checkpoint preparation request missing")?;
+            // Canonical extension is allowed. Replaced anchor/authorization
+            // headers, epoch or immutable context invalidate the result.
+            if archive.check_current(store).is_ok() {
+                preparation.completed = Some(PreparedCheckpoint::from_validated_archive(
+                    store,
+                    archive,
+                    request.statement,
+                    request.witness,
+                    self.limits,
+                )?);
+            }
+        }
+        if let Some(completed) = &preparation.completed {
+            if completed.check_current(store).is_err()
+                || pending_obsolete(
+                    completed.statement.checkpoint_height,
+                    self.export.latest_height(),
+                    store.engine().state().height(),
+                )
+            {
+                preparation.completed = None;
+                return Ok(());
+            }
+            if preparation.certificate_only {
+                return Ok(());
+            }
+            if let Some(pending) = &self.pending {
+                if pending.statement != completed.statement || pending.witness != completed.witness
+                {
+                    // A durable pending candidate retains priority over an
+                    // unsigned completed task. Do not block incoming quorum
+                    // certificates behind work that is no longer needed.
+                    preparation.completed = None;
+                    return Ok(());
+                }
+                preparation.completed = None;
+                return Ok(());
+            }
+            if with_signing_readiness(store, readiness, || {
+                self.export.retain_prepared(store, completed, self.limits)
+            })?
+            .is_some()
+            {
+                self.pending = preparation.completed.take();
+            }
+        }
+        Ok(())
+    }
+    fn start_local_preparation(
+        &mut self,
+        store: &Store,
+        readiness: Option<&dyn SigningReadiness>,
+    ) -> Result<(), String> {
+        let preparation = self
+            .preparation
+            .as_mut()
+            .ok_or("checkpoint preparation unavailable")?;
+        if preparation.worker.is_busy() || preparation.completed.is_some() {
+            return Ok(());
+        }
+        if let Some((request, work)) = with_signing_readiness(store, readiness, || {
+            let (statement, witness) = PreparedCheckpoint::current_proposal(store, self.limits)?
+                .ok_or("eligible checkpoint disappeared")?;
+            let work = store.capture_checkpoint_archive(
+                statement.checkpoint_height,
+                self.limits,
+                &preparation.budget,
+            )?;
+            Ok((Proposal { statement, witness }, work))
+        })? {
+            preparation.worker.start(work)?;
+            preparation.request = Some(request);
+            preparation.certificate_only = false;
+        }
+        Ok(())
+    }
+    fn schedule_peer_preparation(
+        &mut self,
+        store: &Store,
+        proposal: &Proposal,
+        certificate_only: bool,
+    ) -> Result<(), String> {
+        let preparation = self
+            .preparation
+            .as_mut()
+            .ok_or("checkpoint preparation unavailable")?;
+        PreparedCheckpoint::proposal_context(
+            store,
+            &proposal.statement,
+            &proposal.witness,
+            self.limits,
+        )?;
+        if let Some(completed) = &preparation.completed {
+            if completed.statement != proposal.statement || completed.witness != proposal.witness {
+                if !certificate_only {
+                    return Err("checkpoint preparation conflicts with completed candidate".into());
+                }
+                preparation.completed = None;
+            } else {
+                return Ok(());
+            }
+        }
+        if preparation.worker.is_busy() {
+            if preparation.request.as_ref() != Some(proposal) {
+                if certificate_only {
+                    preparation.worker.cancel();
+                }
+                return Err("checkpoint preparation already owns another candidate".into());
+            }
+            return Ok(());
+        }
+        let work = store.capture_checkpoint_archive(
+            proposal.statement.checkpoint_height,
+            self.limits,
+            &preparation.budget,
+        )?;
+        preparation.worker.start(work)?;
+        preparation.request = Some(proposal.clone());
+        preparation.certificate_only = certificate_only;
+        Ok(())
+    }
+    fn completed_certificate_preparation(
+        &mut self,
+        store: &Store,
+        proposal: &Proposal,
+        certificate: &Certificate,
+    ) -> Result<Option<PreparedCheckpoint>, String> {
+        if let Some(pending) = &self.pending
+            && pending.statement == proposal.statement
+            && pending.witness == proposal.witness
+        {
+            pending.check_current(store)?;
+            certificate
+                .check_signatures(pending.roster.keys())
+                .map_err(|_| "checkpoint certificate signatures invalid")?;
+            return Ok(self.pending.take());
+        }
+        if let Some(preparation) = &mut self.preparation
+            && let Some(completed) = &preparation.completed
+            && completed.statement == proposal.statement
+            && completed.witness == proposal.witness
+        {
+            completed.check_current(store)?;
+            certificate
+                .check_signatures(completed.roster.keys())
+                .map_err(|_| "checkpoint certificate signatures invalid")?;
+            return Ok(preparation.completed.take());
+        }
+        Ok(None)
     }
     /// The existing resident owner calls one step with its shared budget.
     /// Failure cannot stop checkpoint coordination or canonical validation.
@@ -357,6 +599,7 @@ impl Host {
         network: &crate::eng2::resident::peers::NetworkStatus,
         observer: &crate::eng2::checkpoint_observer::Observer,
     ) -> Result<Tick, String> {
+        self.tick_failure = Some(TickFailureReason::Context);
         let readiness = ResidentSigningReadiness {
             head: ResidentSigningReadiness::head(store)?,
             network,
@@ -375,7 +618,22 @@ impl Host {
         incoming: &[Incoming],
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<Tick, String> {
+        self.tick_failure = Some(TickFailureReason::Context);
+        let result = self.tick_step(store, now, incoming, readiness);
+        if result.is_ok() {
+            self.tick_failure = None;
+        }
+        result
+    }
+    fn tick_step(
+        &mut self,
+        store: &Store,
+        now: u64,
+        incoming: &[Incoming],
+        readiness: Option<&dyn SigningReadiness>,
+    ) -> Result<Tick, String> {
         store.ensure_exportable()?;
+        self.tick_failure = Some(TickFailureReason::InputBounds);
         if incoming.len() > MAX_MESSAGES_PER_TICK
             || now >= (1u64 << 53)
             || self.last_now.is_some_and(|last| now < last)
@@ -431,9 +689,12 @@ impl Host {
             self.votes = std::array::from_fn(|_| None);
         }
         let mut newly_published = false;
+        self.tick_failure = Some(TickFailureReason::Preparation);
+        self.advance_preparation(store, readiness)?;
         for item in incoming {
             match item {
                 Incoming::Proposal(proposal) => {
+                    self.tick_failure = Some(TickFailureReason::Proposal);
                     if super::pending_obsolete(
                         proposal.statement.checkpoint_height,
                         self.export.latest_height(),
@@ -444,12 +705,16 @@ impl Host {
                     self.accept_proposal(store, proposal)?;
                 }
                 Incoming::Vote { statement, vote } => {
+                    self.tick_failure = Some(TickFailureReason::Vote);
                     if super::pending_obsolete(
                         statement.checkpoint_height,
                         self.export.latest_height(),
                         state.height(),
                     ) {
                         continue;
+                    }
+                    if self.pending.is_none() {
+                        self.tick_failure = Some(TickFailureReason::VoteWithoutCandidate);
                     }
                     let pending = self
                         .pending
@@ -476,6 +741,7 @@ impl Host {
                     certificate,
                     witness,
                 } => {
+                    self.tick_failure = Some(TickFailureReason::Certificate);
                     if let Some(latest) = &self.latest
                         && latest.certificate.statement == certificate.statement
                     {
@@ -507,14 +773,46 @@ impl Host {
                                 .into(),
                         );
                     }
-                    let prepared = PreparedCheckpoint::from_proposal(
-                        store,
-                        certificate.statement.clone(),
-                        witness.clone(),
-                        self.limits,
-                    )?;
+                    let prepared = if self.preparation.is_some() {
+                        let proposal = Proposal {
+                            statement: certificate.statement.clone(),
+                            witness: witness.clone(),
+                        };
+                        let (_, _, roster) = PreparedCheckpoint::proposal_context(
+                            store,
+                            &proposal.statement,
+                            &proposal.witness,
+                            self.limits,
+                        )?;
+                        certificate
+                            .check_signatures(roster.keys())
+                            .map_err(|_| "checkpoint certificate signatures invalid")?;
+                        match self.completed_certificate_preparation(
+                            store,
+                            &proposal,
+                            certificate,
+                        )? {
+                            Some(prepared) => prepared,
+                            None => {
+                                self.schedule_peer_preparation(store, &proposal, true)?;
+                                // Failed input remains eligible for peer replay
+                                // while the owned keyless worker runs.
+                                self.tick_failure =
+                                    Some(TickFailureReason::CertificatePreparationPending);
+                                return Err("checkpoint certificate preparation is pending".into());
+                            }
+                        }
+                    } else {
+                        PreparedCheckpoint::from_proposal(
+                            store,
+                            certificate.statement.clone(),
+                            witness.clone(),
+                            self.limits,
+                        )?
+                    };
                     // Publication time is a local observation, never authenticated
                     // by a peer's unsigned wall-clock metadata.
+                    self.tick_failure = Some(TickFailureReason::CertificatePublication);
                     let certified = prepared.certify(store, certificate.votes.clone(), now)?;
                     if self
                         .export
@@ -528,6 +826,7 @@ impl Host {
                 }
             }
         }
+        self.tick_failure = Some(TickFailureReason::CandidatePreparation);
         let current_signer = self
             .signer
             .as_ref()
@@ -540,11 +839,16 @@ impl Host {
             && current_signer
             && self.signer.as_ref().is_some_and(|s| s.slot == 0)
         {
-            self.pending = with_signing_readiness(store, readiness, || {
-                self.export.prepare_checkpoint(store, self.limits)
-            })?
-            .flatten();
+            if self.preparation.is_some() {
+                self.start_local_preparation(store, readiness)?;
+            } else {
+                self.pending = with_signing_readiness(store, readiness, || {
+                    self.export.prepare_checkpoint(store, self.limits)
+                })?
+                .flatten();
+            }
         }
+        self.tick_failure = Some(TickFailureReason::VoteSigning);
         if let Some(pending) = &self.pending
             && current_signer
             && self
@@ -580,6 +884,7 @@ impl Host {
             .take(2)
             .cloned()
             .collect::<Vec<_>>();
+        self.tick_failure = Some(TickFailureReason::CertificatePublication);
         if available.len() == 2 && self.pending.is_some() && due {
             let prepared = self
                 .pending
@@ -601,6 +906,7 @@ impl Host {
             }
             self.votes = std::array::from_fn(|_| None);
         }
+        self.tick_failure = Some(TickFailureReason::StatusPublication);
         let paused = self.export.pruning_paused(now)?;
         let signing_alarm = self.signer.as_ref().and_then(|_| {
             readiness.map_or(Some(Alarm::WaitingForPeerHead), |gate| gate.alarm(store))
@@ -633,6 +939,7 @@ impl Host {
             self.export.write_status(&bytes)?;
             self.last_status = Some(status.clone());
         }
+        self.tick_failure = Some(TickFailureReason::CurrentProjection);
         let export_head = (state.height(), state.tip(), self.export.latest_height());
         let exported_current = self.last_exported != Some(export_head);
         if exported_current {
@@ -682,16 +989,22 @@ impl Host {
             }
             return pending.check_current(store);
         }
-        self.pending = Some(self.export.accept_proposal(
-            store,
-            proposal.statement.clone(),
-            proposal.witness.clone(),
-            self.limits,
-        )?);
+        if self.preparation.is_some() {
+            self.schedule_peer_preparation(store, proposal, false)?;
+        } else {
+            self.pending = Some(self.export.accept_proposal(
+                store,
+                proposal.statement.clone(),
+                proposal.witness.clone(),
+                self.limits,
+            )?);
+        }
         self.votes = std::array::from_fn(|_| None);
         Ok(())
     }
 }
+#[cfg(all(test, feature = "eng2-runtime"))]
+mod preparation_tests;
 #[cfg(all(test, feature = "eng2-runtime"))]
 mod readiness_tests;
 #[cfg(test)]

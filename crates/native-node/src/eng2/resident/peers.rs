@@ -47,6 +47,16 @@ pub(crate) struct CheckpointReady<'a> {
     _guard: std::sync::MutexGuard<'a, StatusInner>,
 }
 impl NetworkStatus {
+    #[cfg(test)]
+    pub(crate) fn expire_checkpoint_round_for_test(&self, peer: Hash) {
+        self.inner
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut(&peer)
+            .unwrap()
+            .last_round = Some(Instant::now() - Duration::from_secs(31));
+    }
     /// Only independently pinned configuration identities can establish or block
     /// checkpoint readiness. Open miner ingress supplies no reference evidence.
     pub(crate) fn new(checkpoint_references: impl IntoIterator<Item = Hash>) -> Self {
@@ -306,6 +316,31 @@ fn checkpoint_phase(
         .check()
         .map_err(|_| "checkpoint control phase deadline elapsed".into())
 }
+#[derive(Debug)]
+enum WorkerAdmission<T> {
+    Deferred,
+    Ready(T),
+}
+
+// Capacity pressure postpones new work while current owners release their
+// reservations. Invariant failures still terminate the network owner.
+fn admit_worker<T>(
+    reservation: Result<(p2p::Reservation, p2p::ByteUsage), p2p::ReserveFailure>,
+    start: impl FnOnce(p2p::Reservation) -> Result<T, String>,
+) -> Result<WorkerAdmission<T>, String> {
+    let charge = match reservation {
+        Ok((charge, _)) => charge,
+        Err(p2p::ReserveFailure::Exhausted(_)) => return Ok(WorkerAdmission::Deferred),
+        Err(p2p::ReserveFailure::Overflow) => {
+            return Err("peer worker byte budget overflow".into());
+        }
+        Err(p2p::ReserveFailure::Unavailable) => {
+            return Err("peer worker byte budget unavailable".into());
+        }
+    };
+    start(charge).map(WorkerAdmission::Ready)
+}
+
 fn spawn(
     job: Job,
     connector: Arc<Connector>,
@@ -437,17 +472,18 @@ pub(super) fn run(
                 {
                     continue;
                 }
-                let charge = shared
-                    .budget
-                    .reserve(WORKER_BYTES)
-                    .map_err(|_| "peer worker byte budget exhausted")?;
-                workers.push(spawn(
-                    Job::Dial(destination.endpoint, peer),
-                    connector.clone(),
-                    config.role,
-                    shared.clone(),
-                    charge,
-                )?);
+                match admit_worker(shared.budget.reserve_observed(WORKER_BYTES), |charge| {
+                    spawn(
+                        Job::Dial(destination.endpoint, peer),
+                        connector.clone(),
+                        config.role,
+                        shared.clone(),
+                        charge,
+                    )
+                })? {
+                    WorkerAdmission::Ready(worker) => workers.push(worker),
+                    WorkerAdmission::Deferred => break,
+                }
             }
             for _ in 0..2 {
                 if workers.len() >= MAX_WORKERS {
@@ -456,20 +492,22 @@ pub(super) fn run(
                 let Some(listener) = &listener else {
                     break;
                 };
-                let charge = shared
-                    .budget
-                    .reserve(WORKER_BYTES)
-                    .map_err(|_| "peer worker byte budget exhausted")?;
-                match listener.accept() {
-                    Ok((socket, _)) => workers.push(spawn(
-                        Job::Accept(socket, Instant::now()),
-                        connector.clone(),
-                        config.role,
-                        shared.clone(),
-                        charge,
-                    )?),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => return Err("resident listener accept failed".into()),
+                match admit_worker(shared.budget.reserve_observed(WORKER_BYTES), |charge| {
+                    match listener.accept() {
+                        Ok((socket, _)) => spawn(
+                            Job::Accept(socket, Instant::now()),
+                            connector.clone(),
+                            config.role,
+                            shared.clone(),
+                            charge,
+                        )
+                        .map(Some),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                        Err(_) => Err("resident listener accept failed".into()),
+                    }
+                })? {
+                    WorkerAdmission::Ready(Some(worker)) => workers.push(worker),
+                    WorkerAdmission::Ready(None) | WorkerAdmission::Deferred => break,
                 }
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -486,6 +524,137 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_admission_defers_capacity_without_starting_or_releasing_other_owners() {
+        let budget = p2p::Budget::new(WORKER_BYTES + 9);
+        let existing = budget.reserve(10).unwrap();
+        let before = budget.available().unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = admit_worker(budget.reserve_observed(WORKER_BYTES), |_| {
+            called.set(true);
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(result, WorkerAdmission::Deferred));
+        assert!(!called.get());
+        assert_eq!(budget.available().unwrap(), before);
+        drop(existing);
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES + 9);
+    }
+
+    #[test]
+    fn worker_admission_retries_after_release_and_retains_the_exact_worker_charge() {
+        let budget = p2p::Budget::new(WORKER_BYTES);
+        let pressure = budget.reserve(1).unwrap();
+        assert!(matches!(
+            admit_worker(budget.reserve_observed(WORKER_BYTES), Ok).unwrap(),
+            WorkerAdmission::Deferred
+        ));
+        drop(pressure);
+        let WorkerAdmission::Ready(charge) =
+            admit_worker(budget.reserve_observed(WORKER_BYTES), Ok).unwrap()
+        else {
+            panic!("released capacity must admit a worker");
+        };
+        assert_eq!(budget.available().unwrap(), 0);
+        drop(charge);
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES);
+    }
+
+    #[test]
+    fn worker_admission_gates_accept_and_releases_an_empty_accept() {
+        let budget = p2p::Budget::new(WORKER_BYTES);
+        let pressure = budget.reserve(1).unwrap();
+        let accepts = std::cell::Cell::new(0);
+        let mut accept_empty = |_charge| {
+            accepts.set(accepts.get() + 1);
+            Ok::<Option<()>, String>(None)
+        };
+        assert!(matches!(
+            admit_worker(budget.reserve_observed(WORKER_BYTES), &mut accept_empty).unwrap(),
+            WorkerAdmission::Deferred
+        ));
+        assert_eq!(accepts.get(), 0);
+        drop(pressure);
+        assert!(matches!(
+            admit_worker(budget.reserve_observed(WORKER_BYTES), &mut accept_empty).unwrap(),
+            WorkerAdmission::Ready(None)
+        ));
+        assert_eq!(accepts.get(), 1);
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES);
+    }
+
+    #[test]
+    fn worker_admission_start_failure_releases_only_its_reservation() {
+        let budget = p2p::Budget::new(WORKER_BYTES + 17);
+        let existing = budget.reserve(17).unwrap();
+        let result = admit_worker(budget.reserve_observed(WORKER_BYTES), |_charge| {
+            Err::<(), String>("peer worker creation failed".into())
+        });
+        assert_eq!(result.unwrap_err(), "peer worker creation failed");
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES);
+        drop(existing);
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES + 17);
+    }
+
+    #[test]
+    fn worker_admission_start_unwind_releases_its_reservation() {
+        let budget = p2p::Budget::new(WORKER_BYTES);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = admit_worker(
+                budget.reserve_observed(WORKER_BYTES),
+                |_charge| -> Result<(), String> {
+                    panic!("worker start unwind");
+                },
+            );
+        }));
+        assert!(result.is_err());
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES);
+    }
+
+    #[test]
+    fn worker_admission_preserves_distinct_fatal_budget_failures() {
+        for (failure, expected) in [
+            (
+                p2p::ReserveFailure::Overflow,
+                "peer worker byte budget overflow",
+            ),
+            (
+                p2p::ReserveFailure::Unavailable,
+                "peer worker byte budget unavailable",
+            ),
+        ] {
+            let called = std::cell::Cell::new(false);
+            let result = admit_worker(Err(failure), |_| {
+                called.set(true);
+                Ok(())
+            });
+            assert_eq!(result.unwrap_err(), expected);
+            assert!(!called.get());
+        }
+    }
+
+    #[test]
+    fn worker_admission_repeated_deferrals_do_not_accumulate_charges() {
+        let budget = p2p::Budget::new(WORKER_BYTES);
+        let pressure = budget.reserve(1).unwrap();
+        let starts = std::cell::Cell::new(0);
+        for _ in 0..32 {
+            assert!(matches!(
+                admit_worker(budget.reserve_observed(WORKER_BYTES), |_| {
+                    starts.set(starts.get() + 1);
+                    Ok(())
+                })
+                .unwrap(),
+                WorkerAdmission::Deferred
+            ));
+            assert_eq!(budget.available().unwrap(), WORKER_BYTES - 1);
+        }
+        assert_eq!(starts.get(), 0);
+        drop(pressure);
+        assert_eq!(budget.available().unwrap(), WORKER_BYTES);
+    }
+
     #[test]
     fn checkpoint_ready_guard_pins_exact_head_and_expires_without_changing_mining_readiness() {
         let status = Arc::new(NetworkStatus::new([[1; 32]]));

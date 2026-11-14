@@ -704,6 +704,65 @@ impl Store {
         txn.commit()
             .map_err(|_| "checkpoint archive durable commit failed".into())
     }
+    /// Capture immutable archive and at most 71 accepted native suffix blocks.
+    /// Capture is read-only and reserves shared workspace before copying bytes;
+    /// native reconstruction and proof replay run outside the canonical owner.
+    pub fn capture_checkpoint_archive(
+        &self,
+        height: u64,
+        limits: super::snapshot::ImportLimits,
+        budget: &crate::p2p::Budget,
+    ) -> Result<super::runtime_export::archive_work::ArchiveWork, String> {
+        self.ensure_exportable()?;
+        if height == 0 || height > self.engine.state().height() {
+            return Err("invalid checkpoint preparation archive height".into());
+        }
+        let anchor = self.header(height)?;
+        let txn = self
+            .database
+            .begin_read()
+            .map_err(|_| "checkpoint preparation archive read unavailable")?;
+        let table = txn
+            .open_table(ANCHORS)
+            .map_err(|_| "checkpoint preparation archive table unavailable")?;
+        let lower = height
+            .saturating_sub(crate::eng2::runtime_export::LEGACY_CHECKPOINT_INTERVAL - 1)
+            .max(1);
+        let mut entries = table
+            .range(lower..=height)
+            .map_err(|_| "checkpoint preparation archive range unavailable")?;
+        let (key, bytes) = entries
+            .next_back()
+            .ok_or("checkpoint preparation archive missing within bounded migration window")?
+            .map_err(|_| "checkpoint preparation archive read failed")?;
+        let base_height = key.value();
+        if bytes.value().len() > limits.max_snapshot_bytes {
+            return Err("checkpoint preparation archive exceeds byte bound".into());
+        }
+        let base = self.header(base_height)?;
+        let suffix_bytes = (base_height + 1..=height).try_fold(0usize, |total, h| {
+            total
+                .checked_add(self.block_size(h)?)
+                .ok_or_else(|| "checkpoint suffix byte bound overflow".to_owned())
+        })?;
+        let reservation = super::runtime_export::archive_work::ArchiveWork::reserve(
+            bytes.value().len(),
+            suffix_bytes,
+            budget,
+        )?;
+        let suffix = (base_height + 1..=height)
+            .map(|h| self.block(h))
+            .collect::<Result<Vec<_>, _>>()?;
+        super::runtime_export::archive_work::ArchiveWork::capture(
+            self,
+            anchor,
+            base,
+            bytes.value(),
+            suffix,
+            reservation,
+            limits,
+        )
+    }
     /// Reconstruct and recheck a prior explicitly archived actual state. The
     /// checkpoint publisher separately requires 24 later confirmations.
     pub fn checkpoint_anchor(
@@ -1336,8 +1395,49 @@ mod tests {
             .insert(13, original.as_slice())
             .unwrap();
         txn.commit().unwrap();
+        let budget = crate::p2p::Budget::new(512 * 1024 * 1024);
+        let mut worker = crate::eng2::runtime_export::archive_work::ArchiveWorker::default();
+        worker
+            .start(
+                store
+                    .capture_checkpoint_archive(24, limits, &budget)
+                    .unwrap(),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let independently_validated = loop {
+            if let Some(value) = worker.try_complete().unwrap() {
+                break value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native suffix replay deadline exceeded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        independently_validated.check_current(&store).unwrap();
+        assert_eq!(independently_validated.state().height(), 24);
+        // Independent preparation does not add an archive or alter canonical
+        // history, even when it fully verifies a missing cadence boundary.
+        {
+            let txn = store.database.begin_read().unwrap();
+            assert!(txn.open_table(ANCHORS).unwrap().get(24).unwrap().is_none());
+        }
         let migrated = store.checkpoint_anchor(24, limits).unwrap();
         assert_eq!(migrated.height(), 24);
+        let binding = crate::eng2::state_components::Binding {
+            genesis: store.engine().genesis().id(),
+            rules_commitment: store.engine().genesis().rules_commitment(),
+            parent: store.header(24).unwrap().parent,
+        };
+        let canonical = crate::eng2::snapshot::encode_components(
+            &migrated
+                .canonical_components(binding, limits.chain)
+                .unwrap(),
+            limits,
+        )
+        .unwrap();
+        assert_eq!(independently_validated.snapshot_bytes(), canonical);
         assert_eq!(
             head(
                 store.engine(),

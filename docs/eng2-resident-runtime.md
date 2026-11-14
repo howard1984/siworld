@@ -56,8 +56,12 @@ Each configured peer specifies an endpoint, a `dial` boolean, a fingerprint and
 a descriptor matching an independently persisted service pin. Duplicate
 identities, endpoints, self-connections and unpinned targets are rejected.
 An optional top-level `legacy_checkpoint_peers` array defaults to empty. Each
-fingerprint must match an independently persisted pin for the current genesis.
-The selection creates no outbound destination or checkpoint-readiness reference.
+entry is an administrator-selected fingerprint; the array is limited to 16
+distinct, nonlocal identities. This advertisement selection does not require or
+create a peer pin, an outbound destination or a checkpoint-readiness reference.
+It grants no admission or signing authority. Before it can affect a connection,
+the peer must complete the existing hybrid handshake with a descriptor bound to
+the current genesis; selection then compares the authenticated peer fingerprint.
 It restricts checkpoint advertisements to each authenticated selected peer
 to statements accepted by the earlier 72-block publisher rule, including its
 24-block confirmation calculation. This filters proposals, votes and

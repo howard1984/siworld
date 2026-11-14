@@ -112,6 +112,24 @@ impl PublicExport {
     pub fn latest_height(&self) -> Option<u64> {
         self.latest.map(|row| row.0)
     }
+    /// Persist only an internally prepared, currently matched candidate. The
+    /// host invokes this under the original live signing-readiness guard.
+    pub(super) fn retain_prepared(
+        &self,
+        store: &Store,
+        prepared: &PreparedCheckpoint,
+        limits: ImportLimits,
+    ) -> Result<(), String> {
+        self.check_store(store)?;
+        prepared.check_current(store)?;
+        self.write_once(
+            &candidate_name(
+                prepared.statement.roster_sequence,
+                prepared.statement.checkpoint_height,
+            ),
+            &encode_candidate(prepared, limits)?,
+        )
+    }
     pub fn last_publication(&self) -> Option<u64> {
         self.latest.map(|row| row.2)
     }

@@ -196,6 +196,9 @@ fn exact_execution_witness_uses_compact_tree_and_nullifier_encodings() {
     let binding = crate::eng2::snapshot::tests::binding(&state, [0; 32]);
     let raw = state.canonical_components(binding, limits().chain).unwrap();
     let descriptors = execution_descriptors(&state, &raw, limits()).unwrap();
+    let compact = state.checkpoint_witness(binding, limits().chain).unwrap();
+    assert_eq!(compact.descriptors, descriptors);
+    assert_eq!(compact.governance, raw[7]);
     assert_eq!(
         commitment::aggregate_descriptors(
             state.network(),
@@ -217,6 +220,28 @@ fn exact_execution_witness_uses_compact_tree_and_nullifier_encodings() {
     let mut too_small = limits();
     too_small.chain.max_component_bytes = 1;
     assert!(execution_descriptors(&state, &raw, too_small).is_err());
+}
+#[test]
+fn compact_current_witness_matches_full_reconstruction_for_populated_state() {
+    let state = crate::eng2::snapshot::tests::populated(&bootstrap());
+    let binding = crate::eng2::snapshot::tests::binding(&state, state.chain.config.genesis_id());
+    let raw = state.canonical_components(binding, limits().chain).unwrap();
+    let compact = state.checkpoint_witness(binding, limits().chain).unwrap();
+    assert_eq!(
+        compact.descriptors,
+        execution_descriptors(&state, &raw, limits()).unwrap()
+    );
+    assert_eq!(compact.governance, raw[7]);
+    assert_eq!(
+        commitment::aggregate_descriptors(
+            state.network(),
+            state.height(),
+            binding.parent,
+            &compact.descriptors
+        )
+        .unwrap(),
+        state.execution_commitment(binding, limits().chain).unwrap()
+    );
 }
 // This fixture exercises signature and byte-format guards only. It is never
 // appended to Store, and is not evidence of a native checkpoint at height 72.
@@ -258,6 +283,7 @@ pub(super) fn synthetic_candidate() -> PreparedCheckpoint {
             governance: raw[7].clone(),
         },
         snapshot: super::super::snapshot::encode_components(&raw, limits()).unwrap(),
+        _snapshot_reservation: None,
     }
 }
 #[test]
