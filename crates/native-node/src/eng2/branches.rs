@@ -9,6 +9,7 @@ use super::{
     store::{BodyAvailability, Store},
 };
 pub mod discovery;
+mod refusal;
 
 use crate::wire::Hash;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};

@@ -212,6 +212,8 @@ struct ProductionStatus {
 }
 struct Shared {
     owner: Arc<Mutex<Driver>>,
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    isolated_production: Mutex<Option<super::isolated_production::Controller>>,
     block_events: Arc<block_events::Recorder>,
     cancel: p2p::Cancellation,
     network: Arc<peers::NetworkStatus>,
@@ -320,6 +322,16 @@ fn export_status(
     );
     status["checkpoint_observed_height"] = json!(observer.observed_height());
     status["checkpoint_conflict"] = json!(conflict);
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    {
+        status["isolated_production_control"] = shared
+            .isolated_production
+            .lock()
+            .map_err(|_| "isolated production control lock poisoned")?
+            .as_ref()
+            .map(|control| control.status(head.height))
+            .unwrap_or(Value::Null);
+    }
     status["operations_error"] = json!(operations_error(shared));
     status["native_block_events"] = shared.block_events.diagnostic();
     let (enabled, dropped, error) = owner.accept_observation_diagnostic();
@@ -497,6 +509,24 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         &genesis,
         &running_binary,
     )?);
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    let isolated_production = super::isolated_production::Controller::from_environment(
+        directory,
+        &run.run_id,
+        &genesis,
+        &running_binary,
+    )?;
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    if isolated_production.is_some() && !mining {
+        return Err("isolated production selection requires a miner role".into());
+    }
+    #[cfg(not(all(unix, feature = "eng2-rehearsal")))]
+    if std::env::var_os("SIWORLD_ENG2_ISOLATED_PRODUCTION").is_some()
+        || !matches!(std::fs::symlink_metadata(directory.join("isolated-production")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err("isolated production control requires a supported rehearsal build".into());
+    }
     let event_node = identity
         .descriptor()
         .ok()
@@ -536,6 +566,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     .ok();
     let shared = Arc::new(Shared {
         owner: Arc::new(Mutex::new(driver)),
+        #[cfg(all(unix, feature = "eng2-rehearsal"))]
+        isolated_production: Mutex::new(isolated_production),
         block_events,
         cancel: p2p::Cancellation::default(),
         network: Arc::new(peers::NetworkStatus::new(

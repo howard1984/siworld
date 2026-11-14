@@ -28,6 +28,8 @@ pub mod genesis;
 pub mod genesis_tool;
 pub mod header;
 pub mod import;
+#[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+pub mod isolated_production;
 pub mod network;
 pub mod nullifiers;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]

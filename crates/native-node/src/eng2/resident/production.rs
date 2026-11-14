@@ -44,6 +44,31 @@ fn below_rehearsal_ceiling(
     }
 }
 
+// Every control poll runs under the same canonical owner used for admission.
+// Revisions invalidate work prepared or proved under an earlier local policy.
+fn isolated_permission(
+    shared: &Shared,
+    owner: &Driver,
+    expected: Option<u64>,
+) -> Result<(bool, u64), String> {
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    {
+        let mut slot = shared
+            .isolated_production
+            .lock()
+            .map_err(|_| "isolated production control lock poisoned")?;
+        if let Some(control) = slot.as_mut() {
+            return control.permission(
+                owner.engine().state().height(),
+                &owner.engine().state().tip(),
+                expected,
+            );
+        }
+    }
+    let _ = (shared, owner, expected);
+    Ok((true, 0))
+}
+
 // The caller supplies the current production/readiness gates before any
 // expensive proving keys or preprocessing are constructed.
 fn ready_prover<T>(
@@ -79,11 +104,18 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
     let ceiling_required = false;
     while !shared.cancel.is_cancelled() {
         let below_ceiling = below_rehearsal_ceiling(directory, shared, ceiling_required)?;
-        let ready = below_ceiling && shared.mining_ready()?;
+        let (isolated_ready, policy_revision) = {
+            let owner = shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?;
+            isolated_permission(shared, &owner, None)?
+        };
+        let ready = below_ceiling && isolated_ready && shared.mining_ready()?;
         let prover = match ready_prover(&mut prover, ready, NativeProver::new)? {
             Some(prover) => prover,
             None => {
-                shared.phase(if below_ceiling {
+                shared.phase(if below_ceiling && isolated_ready {
                     "networking"
                 } else {
                     "rehearsal_paused"
@@ -98,7 +130,9 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .owner
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
-            if !owner.activities_allowed() {
+            if !owner.activities_allowed()
+                || !isolated_permission(shared, &owner, Some(policy_revision))?.0
+            {
                 continue;
             }
             let task = if owner.ready_positions() < crate::pool::MIN_READY {
@@ -109,6 +143,15 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             (owner.template_generation(), task)
         };
         if let Some(task) = task {
+            {
+                let owner = shared
+                    .owner
+                    .lock()
+                    .map_err(|_| "resident owner lock poisoned")?;
+                if !isolated_permission(shared, &owner, Some(policy_revision))?.0 {
+                    continue;
+                }
+            }
             let padding = task.prove(prover)?;
             if shared.cancel.is_cancelled() {
                 break;
@@ -120,6 +163,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             // A long catch-up can expire the witnessed snapshot while a proof
             // runs. Such work is discarded, with no fallback or queue reuse.
             if owner.activities_allowed()
+                && isolated_permission(shared, &owner, Some(policy_revision))?.0
                 && owner.template_generation() == generation
                 && owner
                     .engine()
@@ -141,7 +185,10 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .owner
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
-            if !owner.activities_allowed() || owner.ready_positions() < crate::pool::MIN_READY {
+            if !owner.activities_allowed()
+                || owner.ready_positions() < crate::pool::MIN_READY
+                || !isolated_permission(shared, &owner, Some(policy_revision))?.0
+            {
                 continue;
             }
             let timestamp = (unix_ms()? / 1000).max(
@@ -174,6 +221,18 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             };
             (owner.template_generation(), prepared, submission)
         };
+        {
+            let owner = shared
+                .owner
+                .lock()
+                .map_err(|_| "resident owner lock poisoned")?;
+            if !isolated_permission(shared, &owner, Some(policy_revision))?.0 {
+                if submission.is_some() {
+                    submission.fail("isolated_production_policy_changed");
+                }
+                continue;
+            }
+        }
         let proved = match prepared.prove(prover) {
             Ok(proved) => proved,
             Err(error) => {
@@ -193,6 +252,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 .lock()
                 .map_err(|_| "resident owner lock poisoned")?;
             if !owner.activities_allowed()
+                || !isolated_permission(shared, &owner, Some(policy_revision))?.0
                 || owner.template_generation() != generation
                 || owner.head()?.id != proved.parent()
             {
@@ -226,6 +286,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                     .lock()
                     .map_err(|_| "resident owner lock poisoned")?;
                 owner.activities_allowed()
+                    && isolated_permission(shared, &owner, Some(policy_revision))?.0
                     && owner.template_generation() == generation
                     && owner.head()?.id == work.parent()
             };
@@ -258,6 +319,12 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                             .owner
                             .lock()
                             .map_err(|_| "resident owner lock poisoned")?;
+                        if !isolated_permission(shared, &owner, Some(policy_revision))?.0 {
+                            if submission.is_some() {
+                                submission.fail("isolated_production_policy_changed");
+                            }
+                            break;
+                        }
                         #[cfg(feature = "eng2-rehearsal")]
                         {
                             let ceiling = crate::eng2::rehearsal::partition::production_ceiling(

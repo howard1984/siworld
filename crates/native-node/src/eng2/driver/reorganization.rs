@@ -8,6 +8,17 @@ use crate::eng2::{
 };
 use std::{collections::VecDeque, time::Instant};
 
+const DEEP_REFUSAL: &str = "reorganization_depth_exceeds_twenty_four";
+fn refuse_depth(
+    stopped: &mut Option<&'static str>,
+    persist: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    // Stop first: even an unavailable transaction must leave activities gated.
+    *stopped = Some(DEEP_REFUSAL);
+    persist()?;
+    Err("reorganization depth exceeds retained window".into())
+}
+
 struct Active {
     plan: SwitchReplay,
     replay: ReplacementReplay,
@@ -88,6 +99,7 @@ impl Driver {
             return Err("reorganization archive already configured".into());
         }
         let height = self.store.engine().state().height();
+        let refused = branches.has_deep_refusal(height, self.store.engine().state().tip())?;
         branches.archive_canonical_suffix(&self.store, height)?;
         self.archive_reorganization_boundary()?;
         let discovery = crate::eng2::branches::discovery::runtime::Discovery::new(
@@ -119,7 +131,7 @@ impl Driver {
             pending_restart,
             cached_candidate,
             cached_revision,
-            stopped: None,
+            stopped: refused.then_some(DEEP_REFUSAL),
             recent: VecDeque::new(),
             last: None,
         });
@@ -265,8 +277,14 @@ impl Driver {
         }
         let path = state.branches.candidate_path(current, candidate)?;
         if path.removed.len() > 24 {
-            state.stopped = Some("reorganization_depth_exceeds_twenty_four");
-            return Err("reorganization depth exceeds retained window".into());
+            return refuse_depth(&mut state.stopped, || {
+                state.branches.persist_deep_refusal(
+                    self.store.engine().state().height(),
+                    current,
+                    candidate,
+                    &path,
+                )
+            });
         }
         let policy = self.store.engine().body_policy();
         let budget = ReplacementBudget {
@@ -557,3 +575,18 @@ impl Driver {
 
 #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
 mod tests;
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    #[test]
+    fn persistent_write_failure_stops_before_propagating_and_never_relabels_success() {
+        for persist_result in [Ok(()), Err("write unavailable".into())] {
+            let mut stopped = None;
+            let result = refuse_depth(&mut stopped, || persist_result);
+            assert_eq!(stopped, Some(DEEP_REFUSAL));
+            assert!(result.is_err());
+            assert_ne!(result, Ok(true));
+        }
+    }
+}

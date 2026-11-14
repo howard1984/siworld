@@ -40,7 +40,7 @@ DOCUMENTS = {
     "eng2-isolated-sync-staging.md", "eng2-public-fund-claims.md",
     "eng2-snapshot-import.md", "eng2-operation-files.md", "eng2-resident-runtime.md",
     "eng2-wallet-history.md", "engineering-signed-state-import.md",
-    "g2-miner-bootstrap-acceptance.md",
+    "g2-miner-bootstrap-acceptance.md", "isolated-production-controls.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
