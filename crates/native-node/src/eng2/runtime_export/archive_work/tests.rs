@@ -270,3 +270,66 @@ fn retained_archive_failures_release_charges_without_borrowing_live_bytes() {
     drop((snapshot, metadata, reservation));
     assert_eq!(budget.available().unwrap(), maximum);
 }
+
+#[test]
+#[cfg(unix)]
+fn cancellation_discards_both_finished_handle_and_polled_archive_reservations() {
+    for polled in [false, true] {
+        let maximum = 64 * 1024 * 1024;
+        let budget = Budget::new(maximum);
+        let validated = fixture(&budget).validate(&AtomicBool::new(false)).unwrap();
+        let mut worker = ArchiveWorker::default();
+        worker
+            .spawn(move |_| Ok(WorkerResult::Archive(Box::new(validated))))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !worker.worker.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if polled {
+            worker.poll().unwrap();
+            assert!(worker.completed.is_some());
+        }
+        assert!(worker.is_busy());
+        assert!(budget.reserve(maximum).is_err());
+        worker.cancel_and_discard_finished().unwrap();
+        assert!(!worker.is_busy());
+        let replay = budget.reserve(maximum).unwrap();
+        drop(replay);
+        assert_eq!(budget.available().unwrap(), maximum);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn cancellation_never_joins_a_running_result_owner_and_later_poll_discards_it() {
+    let maximum = 64 * 1024 * 1024;
+    let budget = Budget::new(maximum);
+    let validated = fixture(&budget).validate(&AtomicBool::new(false)).unwrap();
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let mut worker = ArchiveWorker::default();
+    worker
+        .spawn(move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            Ok(WorkerResult::Archive(Box::new(validated)))
+        })
+        .unwrap();
+    started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    worker.cancel_and_discard_finished().unwrap();
+    assert!(worker.is_busy());
+    assert!(worker.cancelled.load(Ordering::Acquire));
+    assert!(budget.reserve(maximum).is_err());
+    // A join above could not return successfully before this rendezvous.
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !worker.worker.as_ref().unwrap().is_finished() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    worker.cancel_and_discard_finished().unwrap();
+    assert!(!worker.is_busy());
+    assert_eq!(budget.available().unwrap(), maximum);
+}

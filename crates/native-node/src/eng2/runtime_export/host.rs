@@ -318,19 +318,23 @@ struct ResidentPreparation {
     retained_request: bool,
 }
 impl ResidentPreparation {
-    /// Invalidate without joining: the caller may own the canonical Store.
+    /// Invalidate without waiting for running work; the caller may own the Store.
     /// Keep an in-flight request until its exact owned result is drained.
     fn invalidate(&mut self) -> Result<(), String> {
         self.generation = self
             .generation
             .checked_add(1)
             .ok_or("checkpoint preparation generation exhausted")?;
-        self.worker.cancel();
+        self.worker.cancel_and_discard_finished()?;
         self.completed = None;
         if !self.worker.is_busy() {
             self.request = None;
             self.request_generation = self.generation;
             self.certificate_only = false;
+            #[cfg(feature = "eng2-runtime")]
+            {
+                self.retained_request = false;
+            }
         }
         Ok(())
     }

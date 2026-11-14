@@ -804,3 +804,68 @@ fn retained_native_restore_reuses_live_budget_and_rejects_every_same_head_materi
     drop(host);
     assert_eq!(budget.available().unwrap(), 640 * 1024 * 1024);
 }
+
+#[test]
+fn resident_pause_drains_obsolete_completed_worker_without_an_activity_enabled_tick() {
+    for polled in [false, true] {
+        let dir = super::super::tests::Directory::new();
+        let owner = Mutex::new(dir.store());
+        let root = dir.private("pause-completed-worker");
+        let mut host = Host::open(
+            &root,
+            &owner.lock().unwrap(),
+            crate::eng2::snapshot::tests::limits(),
+            None,
+        )
+        .unwrap();
+        let maximum = 64 * 1024 * 1024;
+        let budget = crate::p2p::Budget::new(maximum);
+        host.enable_async_preparation(&budget).unwrap();
+        let work = archive_work::ArchiveWork::component_fixture_for_test(&budget);
+        host.preparation
+            .as_mut()
+            .unwrap()
+            .worker
+            .start(work)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !host
+            .preparation
+            .as_ref()
+            .unwrap()
+            .worker
+            .has_finished_result_for_test()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if polled {
+            // Archive results remain buffered when the retained-result accessor
+            // polls them. Pause must discard both result representations.
+            assert!(
+                host.preparation
+                    .as_mut()
+                    .unwrap()
+                    .worker
+                    .try_complete_retained()
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(budget.reserve(maximum).is_err());
+        let store = owner.lock().unwrap();
+        let tip = store.engine().state().tip();
+        host.pause_reorganization_exports().unwrap();
+        let preparation = host.preparation.as_ref().unwrap();
+        assert!(!preparation.worker.is_busy());
+        assert!(preparation.request.is_none() && preparation.completed.is_none());
+        assert!(!preparation.retained_request);
+        assert_eq!(store.engine().state().tip(), tip);
+        let replay = budget.reserve(maximum).unwrap();
+        drop(replay);
+        // No reconcile, signing tick, native execution or ownership bypass.
+        assert!(host.pending.is_none() && host.latest_checkpoint().is_none());
+        drop(store);
+        host.stop_preparation().unwrap();
+    }
+}

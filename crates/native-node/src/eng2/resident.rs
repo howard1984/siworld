@@ -309,6 +309,7 @@ fn export_status(
     status["checkpoint_archive_error"] = json!(owner.last_archive_error());
     status["reorganization_status"] = json!(owner.reorganization_status());
     status["reorganization_alarm"] = json!(owner.reorganization_alarm());
+    status["reorganization_shared_byte_budget"] = json!(owner.reorganization_memory_diagnostic());
     status["reorganization_depth"] = json!(event.map(|event| event.depth));
     status["reorganization_ancestor_height"] = json!(event.map(|event| event.ancestor_height));
     status["template_generation"] = json!(owner.template_generation());

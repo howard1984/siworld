@@ -317,18 +317,43 @@ fn real_native_driver_switch_pause_invalid_and_restart() {
     competitor(&mut exhausted, false);
     let old = exhausted.driver.head().unwrap();
     exhausted.driver.reorganization.as_mut().unwrap().memory = crate::p2p::Budget::new(1);
-    assert!(
-        exhausted
-            .driver
-            .reorganization_tick(|_| panic!("unreserved replay reached restore"))
-            .is_err()
-    );
+    exhausted
+        .driver
+        .reorganization_tick(|_| panic!("unreserved replay reached restore"))
+        .unwrap();
     assert_eq!(exhausted.driver.head().unwrap(), old);
     assert_eq!(
         exhausted.driver.reorganization_alarm(),
-        Some("reorganization_shared_byte_budget_deferred")
+        Some("reorganization_shared_byte_budget_waiting")
     );
     assert!(!exhausted.driver.activities_allowed());
+    assert_eq!(
+        exhausted.driver.reorganization_status(),
+        "waiting_for_shared_byte_budget"
+    );
+    assert_eq!(exhausted.driver.template_generation(), 0);
+    let mut contended = load(&destination.join("budget-released"), &source);
+    let candidate = competitor(&mut contended, false);
+    let shared = crate::p2p::Budget::new(256 * 1024 * 1024);
+    let held = shared.reserve(256 * 1024 * 1024).unwrap();
+    contended.driver.reorganization.as_mut().unwrap().memory = shared;
+    let before = contended.driver.head().unwrap();
+    contended
+        .driver
+        .reorganization_tick(|_| panic!("contended replay reached restore"))
+        .unwrap();
+    assert_eq!(contended.driver.head().unwrap(), before);
+    assert!(!contended.driver.activities_allowed());
+    assert_eq!(contended.driver.template_generation(), 0);
+    drop(held);
+    std::thread::sleep(shared_memory::RETRY_INTERVAL);
+    contended.driver.reorganization_tick(|_| Ok(())).unwrap();
+    contended
+        .driver
+        .reorganization_tick(|_| panic!("barrier repeated after reservation"))
+        .unwrap();
+    assert_eq!(contended.driver.head().unwrap().id, candidate);
+    assert!(contended.driver.activities_allowed());
     // A header-only retained descendant must not deadlock ordinary restart sync.
     let headers_only = load(&destination.join("headers-only"), &source);
     let Fixture {

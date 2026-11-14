@@ -7,6 +7,8 @@ use crate::eng2::{
     store::{ReplacementBudget, ReplacementFailure, ReplacementReplay},
 };
 use std::{collections::VecDeque, time::Instant};
+mod shared_memory;
+use shared_memory::MemoryAdmission;
 
 const DEEP_REFUSAL: &str = "reorganization_depth_exceeds_twenty_four";
 fn refuse_depth(
@@ -29,6 +31,7 @@ pub(super) struct Reorganization {
     pub(super) branches: BranchStore,
     pub(super) discovery: crate::eng2::branches::discovery::runtime::Discovery,
     memory: crate::p2p::Budget,
+    memory_admission: MemoryAdmission,
     active: Option<Active>,
     pending_restart: bool,
     cached_candidate: Option<Hash>,
@@ -57,7 +60,7 @@ impl Reorganization {
         Ok(self.cached_candidate)
     }
     pub(super) fn paused(&self) -> bool {
-        self.active.is_some() || self.stopped.is_some()
+        self.active.is_some() || self.stopped.is_some() || self.memory_admission.is_waiting()
     }
 }
 
@@ -127,6 +130,7 @@ impl Driver {
             branches,
             discovery,
             memory,
+            memory_admission: MemoryAdmission::default(),
             active: None,
             pending_restart,
             cached_candidate,
@@ -140,9 +144,10 @@ impl Driver {
 
     pub fn activities_allowed(&self) -> bool {
         self.store.ensure_exportable().is_ok()
-            && self.reorganization.as_ref().is_none_or(|state| {
-                state.active.is_none() && state.stopped.is_none() && !state.pending_restart
-            })
+            && self
+                .reorganization
+                .as_ref()
+                .is_none_or(|state| !state.paused() && !state.pending_restart)
     }
 
     pub fn template_generation(&self) -> u64 {
@@ -153,6 +158,7 @@ impl Driver {
         match &self.reorganization {
             Some(state) if state.stopped.is_some() => "manual_recovery_required",
             Some(state) if state.active.is_some() => "applying_validated_branch",
+            Some(state) if state.memory_admission.is_waiting() => "waiting_for_shared_byte_budget",
             Some(state) if state.pending_restart => "resuming_best_branch",
             Some(_) => "ready",
             None => "unconfigured",
@@ -162,6 +168,9 @@ impl Driver {
     pub fn reorganization_alarm(&self) -> Option<&'static str> {
         self.reorganization.as_ref().and_then(|state| {
             state.stopped.or_else(|| {
+                if state.memory_admission.is_waiting() {
+                    return Some("reorganization_shared_byte_budget_waiting");
+                }
                 state.last.and_then(|event| {
                     if event.depth > 6 {
                         Some("reorganization_depth_exceeds_six")
@@ -173,6 +182,13 @@ impl Driver {
                 })
             })
         })
+    }
+
+    /// One bounded numeric admission observation, independent of completed switches.
+    pub fn reorganization_memory_diagnostic(&self) -> Option<serde_json::Value> {
+        self.reorganization
+            .as_ref()
+            .and_then(|state| state.memory_admission.diagnostic())
     }
 
     pub fn last_reorganization(&self) -> Option<SwitchEvent> {
@@ -272,8 +288,17 @@ impl Driver {
         }
         let current = self.store.engine().state().tip();
         if candidate == current {
+            state.memory_admission.cancel_wait();
             state.pending_restart = false;
             return Ok(false);
+        }
+        match state.memory_admission.ready_for_retry(Instant::now()) {
+            Ok(true) => (),
+            Ok(false) => return Ok(false),
+            Err(failure) => {
+                state.stopped = Some(failure.alarm());
+                return Err(failure.alarm().into());
+            }
         }
         let path = state.branches.candidate_path(current, candidate)?;
         if path.removed.len() > 24 {
@@ -323,17 +348,21 @@ impl Driver {
         // Plans and append load one body at a time. Hold the shared reservation
         // through preflight, prevalidation and every replay transaction. This
         // accounts for encoded/decoded proof-byte scratch, not total process RSS.
-        let raw_bytes = largest_body
-            .checked_mul(4)
-            .and_then(|bytes| bytes.checked_add(65536))
-            .ok_or("replay working byte budget overflow")?;
-        let raw_memory = match state.memory.reserve(raw_bytes) {
-            Ok(reservation) => reservation,
-            Err(_) => {
-                state.stopped = Some("reorganization_shared_byte_budget_deferred");
-                return Err("replay shared byte budget unavailable".into());
-            }
-        };
+        let raw_memory =
+            match state
+                .memory_admission
+                .try_acquire(&state.memory, largest_body, Instant::now())
+            {
+                Ok(Some(reservation)) => reservation,
+                // No restore, body allocation, blocking wait or permanent refusal.
+                // The caller releases the owner lock before the next bounded tick;
+                // existing network guards can finish and release their own charge.
+                Ok(None) => return Ok(false),
+                Err(failure) => {
+                    state.stopped = Some(failure.alarm());
+                    return Err(failure.alarm().into());
+                }
+            };
         let prepared = (|| {
             state
                 .branches
@@ -588,5 +617,84 @@ mod refusal_tests {
             assert!(result.is_err());
             assert_ne!(result, Ok(true));
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_gate_tests {
+    use super::*;
+    #[test]
+    fn shared_memory_wait_uses_the_live_activity_gate_and_releases_after_admission() {
+        let fixture = crate::eng2::branches::tests::Fixture::new();
+        let rules = crate::eng2::selection::HeaderRules {
+            network: [17; 32],
+            genesis: [2; 32],
+            genesis_timestamp: 1,
+            genesis_target: [255; 32],
+            target_interval: 300,
+            pow_iterations: 0,
+            max_headers: 128,
+        };
+        let branches = BranchStore::create(
+            &fixture.path(),
+            rules,
+            crate::eng2::branches::Limits {
+                maximum_headers: 128,
+                maximum_body_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let discovery = crate::eng2::branches::discovery::runtime::Discovery::new(
+            [17; 32],
+            [2; 32],
+            crate::eng2::branches::discovery::Limits {
+                maximum_candidates: 8,
+                maximum_peers: 8,
+                maximum_requests: 1024,
+                maximum_headers: 2048,
+                maximum_headers_per_candidate: 256,
+                maximum_body_bytes: 4 * 1024 * 1024 * 1024,
+                maximum_attempts_per_header: 4,
+                candidate_lifetime_ms: 900_000,
+                window_ms: 3_600_000,
+            },
+            0,
+        )
+        .unwrap();
+        let mut state = Reorganization {
+            branches,
+            discovery,
+            memory: crate::p2p::Budget::new(65540),
+            memory_admission: MemoryAdmission::default(),
+            active: None,
+            pending_restart: false,
+            cached_candidate: None,
+            cached_revision: 0,
+            stopped: None,
+            recent: VecDeque::new(),
+            last: None,
+        };
+        let now = Instant::now();
+        assert!(!state.paused());
+        let held = state.memory.reserve(1).unwrap();
+        assert!(
+            state
+                .memory_admission
+                .try_acquire(&state.memory, 1, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.paused());
+        assert!(state.stopped.is_none() && state.active.is_none() && state.last.is_none());
+        drop(held);
+        let reservation = state
+            .memory_admission
+            .try_acquire(&state.memory, 1, now + shared_memory::RETRY_INTERVAL)
+            .unwrap()
+            .unwrap();
+        assert!(!state.paused());
+        assert!(state.stopped.is_none() && state.active.is_none() && state.last.is_none());
+        drop(reservation);
+        assert_eq!(state.memory.available().unwrap(), 65540);
     }
 }

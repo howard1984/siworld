@@ -502,6 +502,30 @@ impl ArchiveWorker {
     pub fn cancel(&mut self) {
         self.cancelled.store(true, Ordering::Release);
     }
+    /// Cancel under the owner lock without waiting for a running task.
+    /// Discard only this worker's obsolete result, including a finished handle
+    /// that has not been polled by the now-paused export tick.
+    #[cfg(unix)]
+    pub(super) fn cancel_and_discard_finished(&mut self) -> Result<(), String> {
+        self.cancel();
+        self.completed = None;
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            let obsolete = self
+                .worker
+                .take()
+                .ok_or("checkpoint worker disappeared")?
+                .join()
+                .map_err(|_| "checkpoint archive worker panicked")?;
+            // A cancelled task's validation error is obsolete too. Dropping
+            // either variant releases its own archive/retained reservation.
+            drop(obsolete);
+        }
+        Ok(())
+    }
+    #[cfg(all(test, unix, feature = "eng2-runtime"))]
+    pub(crate) fn has_finished_result_for_test(&self) -> bool {
+        self.completed.is_some() || self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+    }
     /// Called only after canonical-owner access has ended. Native work is
     /// drained rather than interrupted or detached.
     pub fn stop(&mut self) -> Result<(), String> {
