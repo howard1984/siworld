@@ -206,6 +206,32 @@ fn receives_scans_all_history_and_reopens_only_same_context_private_cache() {
     assert_eq!(missing.height(), 0);
 }
 #[test]
+fn existing_custody_wallet_scans_authenticated_receipt_and_refuses_reused_or_wrong_network_views() {
+    use siworld_native_wallet_engine::wallet::Wallet;
+    let (config, genesis, id, block) = fixture();
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let (header, receipt) =
+        qualified_block(&config, &context, block, 1, id, config.genesis_timestamp);
+    let existing = Wallet::from_seed(config.network, Zeroizing::new([42; 32]), 0).unwrap();
+    let address = existing.address();
+    let mut light = Eng2LightState::from_existing_wallet(&genesis, id, existing).unwrap();
+    assert_eq!(light.wallet().address(), address);
+    light.append(&header.encode().unwrap(), &receipt).unwrap();
+    light.check_head(1, header.id().unwrap(), None).unwrap();
+    assert!(light.check_head(2, header.id().unwrap(), None).is_err());
+    let balance: serde_json::Value = serde_json::from_str(&light.balance_json().unwrap()).unwrap();
+    assert_eq!(balance["rows"][0]["available_atoms"], "100000000000");
+    assert_eq!(light.wallet().receipts().len(), 1);
+    assert_eq!(light.asset_registry().len(), 0);
+    // A populated independent view cannot be silently relabeled as a fresh scan.
+    let mut reused = Wallet::from_seed(config.network, Zeroizing::new([42; 32]), 0).unwrap();
+    let state = siworld_native_wallet_engine::state::State::new(config.clone()).unwrap();
+    reused.scan_light_data(&state, &[], &[], false).unwrap();
+    assert!(Eng2LightState::from_existing_wallet(&genesis, id, reused).is_err());
+    let wrong = Wallet::from_seed([99; 32], Zeroizing::new([42; 32]), 0).unwrap();
+    assert!(Eng2LightState::from_existing_wallet(&genesis, id, wrong).is_err());
+}
+#[test]
 fn malformed_headers_receipts_and_stale_candidate_do_not_change_accepted_state() {
     let (config, genesis, id, block) = fixture();
     let context = Context::from_genesis(&genesis, id).unwrap();

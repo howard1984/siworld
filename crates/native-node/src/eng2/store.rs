@@ -1057,6 +1057,7 @@ impl Store {
         header: &Header,
         body: &Body,
         verifier: &NativeVerifier,
+        timing: &mut super::accept_observation::ValidationTiming,
     ) -> Result<CommittedBlock, super::accept_observation::Failure> {
         use super::accept_observation::{CommitKnowledge, Failure, OtherClass, Phase};
         if !self.usable {
@@ -1068,7 +1069,10 @@ impl Store {
             ));
         }
         // Every actual native verifier rejection precedes the write transaction.
-        let staged = self.engine.stage_diagnosed(header, body, verifier)?;
+        timing.start = Some(std::time::Instant::now());
+        let staged = self.engine.stage_diagnosed(header, body, verifier);
+        timing.end = Some(std::time::Instant::now());
+        let staged = staged?;
         // This unchanged writer may fail before or after the durable commit.
         // Such an error has no native token and no unchanged-chain assertion.
         self.append_staged(header, body, staged)

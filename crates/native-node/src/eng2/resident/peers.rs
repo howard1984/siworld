@@ -11,7 +11,120 @@ use std::{
 const MAX_WORKERS: usize = 8;
 const WORKER_BYTES: usize = 2 * 1024 * 1024 + 65536;
 const ROUND_BLOCKS: u16 = 8;
+const ROUND_RECORDS: usize = 8;
+#[derive(Clone, Copy, Default)]
+struct PhaseSpan {
+    start: Option<Instant>,
+    end: Option<Instant>,
+    // 0 not entered, 1 in progress, 2 returned Ok, 3 returned Err.
+    outcome: u8,
+}
+#[derive(Clone, Copy, Default)]
+struct RoundRecord {
+    sequence: u64,
+    checked_head: Option<(u64, Hash)>,
+    accepted: u16,
+    phases: [PhaseSpan; 3],
+}
+impl RoundRecord {
+    fn json(self, connection: u64, origin: Instant) -> Value {
+        use super::super::accept_observation::monotonic_ns;
+        json!({"connection":connection,"sequence":self.sequence,
+            "checked_head":head_json(self.checked_head),"accepted":self.accepted,
+            "phases":self.phases.map(|phase|json!([
+                monotonic_ns(phase.start,origin),monotonic_ns(phase.end,origin),phase.outcome]))})
+    }
+}
+#[derive(Clone, Copy, Default)]
+struct ConnectionDiagnostic {
+    ordinal: u64,
+    initiator: bool,
+    sequence: u64,
+    cursor: usize,
+    overwritten: u64,
+    unavailable: bool,
+    rounds: [Option<RoundRecord>; ROUND_RECORDS],
+    latest_fetch: Option<super::super::accept_observation::FetchTiming>,
+    overwritten_fetches: u64,
+}
+impl ConnectionDiagnostic {
+    fn begin(&mut self) {
+        let Some(sequence) = self.sequence.checked_add(1) else {
+            self.unavailable = true;
+            return;
+        };
+        self.sequence = sequence;
+        if self.rounds[self.cursor].is_some() {
+            self.overwritten = self.overwritten.saturating_add(1);
+        }
+        let mut round = RoundRecord {
+            sequence,
+            ..Default::default()
+        };
+        round.phases[0].start = Some(Instant::now());
+        round.phases[0].outcome = 1;
+        self.rounds[self.cursor] = Some(round);
+        self.cursor = (self.cursor + 1) % ROUND_RECORDS;
+    }
+    fn current(&mut self) -> Option<&mut RoundRecord> {
+        if self.unavailable {
+            return None;
+        }
+        self.rounds[(self.cursor + ROUND_RECORDS - 1) % ROUND_RECORDS].as_mut()
+    }
+}
+#[derive(Clone, Copy)]
+struct ConnectionObservation {
+    diagnostic: ConnectionDiagnostic,
+    last_round: Option<Instant>,
+    caught_up: bool,
+    completed_head: Option<(u64, Hash)>,
+    checkpoint_head: Option<(u64, Hash)>,
+}
+pub(super) struct NetworkObservation {
+    at: Instant,
+    invalidations: u64,
+    disconnections: u64,
+    last_disconnect: Option<ConnectionDiagnostic>,
+    connections: [Option<ConnectionObservation>; MAX_WORKERS],
+}
+fn head_json(head: Option<(u64, Hash)>) -> Value {
+    head.map(|(height, id)| json!({"height":height,"id":crate::local::hex(&id)}))
+        .unwrap_or(Value::Null)
+}
+impl NetworkObservation {
+    pub(super) fn json(self, origin: Instant) -> Value {
+        use super::super::accept_observation::monotonic_ns;
+        let mut rounds = Vec::with_capacity(MAX_WORKERS * ROUND_RECORDS);
+        let connections: Vec<_> = self.connections.into_iter().flatten().map(|item| {
+            let d = item.diagnostic;
+            rounds.extend((0..ROUND_RECORDS).filter_map(|i|d.rounds[(d.cursor+i)%ROUND_RECORDS])
+                .map(|round|round.json(d.ordinal,origin)));
+            json!({"ordinal":d.ordinal,"initiator":d.initiator,"overwritten_rounds":d.overwritten,
+                "unavailable":d.unavailable,"caught_up":item.caught_up,
+                "completed_head":head_json(item.completed_head),"checkpoint_head":head_json(item.checkpoint_head),
+                "last_complete":monotonic_ns(item.last_round,origin),
+                "latest_fetch":d.latest_fetch.map(|fetch|fetch.json(origin)),
+                "overwritten_fetches":d.overwritten_fetches})
+        }).collect();
+        json!({"scope":"sampled_snapshot","exact_readiness_transitions":false,
+            "observed_monotonic_ns":monotonic_ns(Some(self.at),origin),"freshness_ns":"30000000000",
+            "invalidations":self.invalidations,"disconnections":self.disconnections,
+            "closed_history_complete":false,"connections":connections,"rounds":rounds,
+            "last_disconnect":self.last_disconnect.map(|d|json!({"ordinal":d.ordinal,
+                "last_round":d.rounds[(d.cursor+ROUND_RECORDS-1)%ROUND_RECORDS].map(|r|r.json(d.ordinal,origin)),
+                "latest_fetch":d.latest_fetch.map(|fetch|fetch.json(origin))}))})
+    }
+}
+const _: () = assert!(std::mem::size_of::<RoundRecord>() <= 256);
+pub(super) const fn diagnostic_storage_bytes() -> usize {
+    MAX_WORKERS * (std::mem::size_of::<ConnectionDiagnostic>() + std::mem::size_of::<u64>())
+        + std::mem::size_of::<Option<ConnectionDiagnostic>>()
+        + 3 * std::mem::size_of::<u64>()
+}
+
 struct Connection {
+    diagnostic: ConnectionDiagnostic,
     last_round: Option<Instant>,
     caught_up: bool,
     checkpoint_head: Option<(u64, Hash)>,
@@ -21,6 +134,10 @@ struct Connection {
 struct StatusInner {
     connections: BTreeMap<Hash, Connection>,
     rounds: u64,
+    next_connection: u64,
+    invalidations: u64,
+    disconnections: u64,
+    last_disconnect: Option<ConnectionDiagnostic>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PeerReadiness {
@@ -114,11 +231,15 @@ pub(super) struct Snapshot {
 pub(crate) struct Connected {
     status: Arc<NetworkStatus>,
     peer: Hash,
+    ordinal: u64,
 }
 impl Drop for Connected {
     fn drop(&mut self) {
-        if let Ok(mut status) = self.status.inner.lock() {
-            status.connections.remove(&self.peer);
+        if let Ok(mut status) = self.status.inner.lock()
+            && let Some(connection) = status.connections.remove(&self.peer)
+        {
+            status.last_disconnect = Some(connection.diagnostic);
+            status.disconnections = status.disconnections.saturating_add(1);
         }
     }
 }
@@ -152,9 +273,16 @@ impl NetworkStatus {
         if status.connections.len() >= MAX_WORKERS || status.connections.contains_key(&peer) {
             return Err("duplicate or excessive established session".into());
         }
+        let ordinal = status.next_connection.checked_add(1).unwrap_or(0);
+        status.next_connection = status.next_connection.saturating_add(1);
         status.connections.insert(
             peer,
             Connection {
+                diagnostic: ConnectionDiagnostic {
+                    ordinal,
+                    unavailable: ordinal == 0,
+                    ..Default::default()
+                },
                 last_round: None,
                 caught_up: false,
                 checkpoint_head: None,
@@ -164,17 +292,87 @@ impl NetworkStatus {
         Ok(Connected {
             status: self.clone(),
             peer,
+            ordinal,
         })
     }
     pub(crate) fn begin_round(&self, peer: Hash) -> Result<(), String> {
-        self.inner
+        let mut status = self
+            .inner
             .lock()
-            .map_err(|_| "connection registry lock poisoned")?
+            .map_err(|_| "connection registry lock poisoned")?;
+        let entry = status
             .connections
             .get_mut(&peer)
-            .ok_or("established session disappeared")?
-            .checkpoint_head = None;
+            .ok_or("established session disappeared")?;
+        entry.checkpoint_head = None;
+        entry.diagnostic.begin();
         Ok(())
+    }
+    fn observe_phase(
+        &self,
+        peer: Hash,
+        phase: usize,
+        ok: bool,
+        checked: Option<(u16, Option<(u64, Hash)>)>,
+        fetch: Option<(Option<super::super::accept_observation::FetchTiming>, u64)>,
+    ) {
+        let Ok(mut status) = self.inner.lock() else {
+            return;
+        };
+        let Some(entry) = status.connections.get_mut(&peer) else {
+            return;
+        };
+        if let Some((fetch, overwritten)) = fetch {
+            entry.diagnostic.latest_fetch = fetch.or(entry.diagnostic.latest_fetch);
+            entry.diagnostic.overwritten_fetches = overwritten;
+        }
+        let Some(round) = entry.diagnostic.current() else {
+            return;
+        };
+        let Some(span) = round.phases.get_mut(phase) else {
+            return;
+        };
+        let now = Instant::now();
+        span.end = Some(now);
+        span.outcome = if ok { 2 } else { 3 };
+        if let Some((accepted, head)) = checked {
+            round.accepted = accepted;
+            round.checked_head = head;
+        }
+        if ok && phase < 2 {
+            round.phases[phase + 1].start = Some(now);
+            round.phases[phase + 1].outcome = 1;
+        }
+    }
+    pub(super) fn observed_readiness_at(
+        &self,
+        head: (u64, Hash),
+    ) -> Result<(PeerReadiness, NetworkObservation), String> {
+        let status = self
+            .inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?;
+        let at = Instant::now();
+        let mut entries = status.connections.values();
+        let connections = std::array::from_fn(|_| {
+            entries.next().map(|entry| ConnectionObservation {
+                diagnostic: entry.diagnostic,
+                last_round: entry.last_round,
+                caught_up: entry.caught_up,
+                completed_head: entry.completed_head,
+                checkpoint_head: entry.checkpoint_head,
+            })
+        });
+        Ok((
+            PeerReadiness::classify(&status, head, at),
+            NetworkObservation {
+                at,
+                invalidations: status.invalidations,
+                disconnections: status.disconnections,
+                last_disconnect: status.last_disconnect,
+                connections,
+            },
+        ))
     }
     /// Evidence comes from the block pull's owner critical section, carried
     /// unchanged through completion of the checkpoint and transaction phases.
@@ -252,6 +450,7 @@ impl NetworkStatus {
             .inner
             .lock()
             .map_err(|_| "connection registry lock poisoned")?;
+        status.invalidations = status.invalidations.saturating_add(1);
         for connection in status.connections.values_mut() {
             connection.completed_head = None;
             connection.checkpoint_head = None;
@@ -299,7 +498,13 @@ fn session(
     shared: &Shared,
 ) -> Result<(), String> {
     let fingerprint = peer.peer();
-    let _connected = shared.network.connected(fingerprint)?;
+    let connected = shared.network.connected(fingerprint)?;
+    peer.observe_connection(connected.ordinal);
+    if let Ok(mut status) = shared.network.inner.lock()
+        && let Some(entry) = status.connections.get_mut(&fingerprint)
+    {
+        entry.diagnostic.initiator = initiator;
+    }
     let mut sequence = network::Sequence::default();
     while !shared.cancel.is_cancelled() {
         let round = if initiator {
@@ -322,15 +527,32 @@ fn session(
                 },
                 || shared.network.begin_round(fingerprint),
             )
-        }
-        .map_err(|_| "peer round failed")?;
-        checkpoint_phase(&mut peer, initiator, shared)?;
-        if initiator {
+        };
+        shared.network.observe_phase(
+            fingerprint,
+            0,
+            round.is_ok(),
+            round
+                .as_ref()
+                .ok()
+                .map(|round| (round.accepted, round.checked_head)),
+            Some(peer.take_fetch_observation()),
+        );
+        let round = round.map_err(|_| "peer round failed")?;
+        let checkpoint = checkpoint_phase(&mut peer, initiator, shared);
+        shared
+            .network
+            .observe_phase(fingerprint, 1, checkpoint.is_ok(), None, None);
+        checkpoint?;
+        let transactions = if initiator {
             super::super::transaction_exchange::initiate(&mut peer, &shared.owner)
         } else {
             super::super::transaction_exchange::respond(&mut peer, &shared.owner)
-        }
-        .map_err(|_| "transaction peer phase failed")?;
+        };
+        shared
+            .network
+            .observe_phase(fingerprint, 2, transactions.is_ok(), None, None);
+        transactions.map_err(|_| "transaction peer phase failed")?;
         // Only a complete block → checkpoint → transaction round refreshes
         // networking. A certificate alone can never manufacture readiness.
         shared
@@ -658,6 +880,88 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn diagnostic_round_retention_does_not_refresh_readiness() {
+        let status = Arc::new(NetworkStatus::default());
+        let head = (9, [7; 32]);
+        let connection = status.connected([1; 32]).unwrap();
+        for _ in 0..12 {
+            status.begin_round([1; 32]).unwrap();
+            status.observe_phase([1; 32], 0, true, Some((0, Some(head))), None);
+            status.observe_phase([1; 32], 1, false, None, None);
+        }
+        let (reason, observed) = status.observed_readiness_at(head).unwrap();
+        assert_eq!(reason, PeerReadiness::NoCompletedPeerRound);
+        let value = observed.json(Instant::now());
+        assert_eq!(value["rounds"].as_array().unwrap().len(), 8);
+        assert_eq!(value["connections"][0]["overwritten_rounds"], 4);
+        assert_eq!(value["rounds"][7]["phases"][1][2], 3);
+        drop(connection);
+        let (reason, observed) = status.observed_readiness_at(head).unwrap();
+        assert_eq!(reason, PeerReadiness::NoConnectedPeers);
+        assert_eq!(observed.json(Instant::now())["disconnections"], 1);
+    }
+
+    #[test]
+    fn diagnostic_snapshot_preserves_completed_head_and_counter_overflow() {
+        let status = Arc::new(NetworkStatus::default());
+        let _connection = status.connected([1; 32]).unwrap();
+        let head = (9, [7; 32]);
+        status.round([1; 32], 0, Some(head)).unwrap();
+        status.begin_round([1; 32]).unwrap();
+        assert_eq!(
+            status.observed_readiness_at(head).unwrap().0,
+            PeerReadiness::Ready
+        );
+        status
+            .inner
+            .lock()
+            .unwrap()
+            .connections
+            .get_mut(&[1; 32])
+            .unwrap()
+            .diagnostic
+            .sequence = u64::MAX;
+        status.begin_round([1; 32]).unwrap();
+        assert!(status.ready_at(head).unwrap());
+        assert!(
+            status
+                .observed_readiness_at(head)
+                .unwrap()
+                .1
+                .json(Instant::now())["connections"][0]["unavailable"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(diagnostic_storage_bytes() <= 24 * 1024);
+    }
+
+    #[test]
+    fn diagnostic_full_snapshot_keeps_eight_rounds_per_connection() {
+        let status = Arc::new(NetworkStatus::default());
+        let origin = Instant::now();
+        let mut connections = Vec::new();
+        for ordinal in 1..=8u8 {
+            let peer = [ordinal; 32];
+            connections.push(status.connected(peer).unwrap());
+            for _ in 0..12 {
+                status.begin_round(peer).unwrap();
+                status.observe_phase(peer, 0, true, Some((0, Some((u64::MAX, [255; 32])))), None);
+                status.observe_phase(peer, 1, true, None, None);
+                status.observe_phase(peer, 2, true, None, None);
+            }
+        }
+        let (_, observed) = status.observed_readiness_at((u64::MAX, [255; 32])).unwrap();
+        let mut value = observed.json(origin);
+        assert_eq!(value["connections"].as_array().unwrap().len(), 8);
+        assert_eq!(value["rounds"].as_array().unwrap().len(), 64);
+        super::super::bound_observation(&mut value, "rounds", 24 * 1024);
+        assert!(super::super::status_bytes(&value) <= 24 * 1024);
+        assert_eq!(
+            status.readiness_at((u64::MAX, [255; 32])).unwrap(),
+            PeerReadiness::NoCompletedPeerRound
+        );
+    }
     #[test]
     fn readiness_reasons_follow_live_connections_not_the_lifetime_round_counter() {
         let status = Arc::new(NetworkStatus::default());

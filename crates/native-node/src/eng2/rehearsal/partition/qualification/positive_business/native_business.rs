@@ -174,7 +174,9 @@ pub(crate) fn prove_paid_issuance(
     request: IssuanceRequest,
     tier: FeeTier,
     now: u64,
-    sign: impl FnOnce(&[u8]) -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String>,
+    sign: impl FnOnce(
+        &native::issuance::IssuanceDeclaration,
+    ) -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String>,
     genesis: &crate::eng2::genesis::Genesis,
     transaction_prover: &NativeProver,
     mut before_proof: impl FnMut(&PreparedTransfer) -> Result<(), String>,
@@ -194,7 +196,7 @@ pub(crate) fn prove_paid_issuance(
     )?;
     before_proof(fee.transfer())?;
     let receipt = fee.receipt().clone();
-    let signature = sign(&prepared.signature_message())?;
+    let signature = sign(prepared.declaration())?;
     let signed = prepared.attach_signature(signature)?;
     before_phase("before_native_issuance_proof")?;
     let issuance = signed.prove_for_genesis(transaction_prover, &receipt, genesis)?;

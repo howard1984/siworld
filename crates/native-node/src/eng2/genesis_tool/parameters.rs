@@ -164,6 +164,15 @@ fn parameters(value: &Value) -> Result<(Config, GovernanceState, Expected)> {
     Ok((config, governance, expected))
 }
 
+#[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
+pub(crate) fn reconstruct(value: &Value) -> Result<Genesis> {
+    let (config, governance, expected) = parameters(value)?;
+    let genesis =
+        Genesis::seal(config, governance, FeeMode::LegacyMiner).map_err(|_| "invalid_genesis")?;
+    guard(&genesis, expected)?;
+    Ok(genesis)
+}
+
 /// Encode public parameters in an absent directory after all checks complete.
 /// This does not generate keys, write a genesis, or initialize a node.
 pub fn encode_public(input: &Path, output: &Path, expected_input: Hash) -> Result<Value> {

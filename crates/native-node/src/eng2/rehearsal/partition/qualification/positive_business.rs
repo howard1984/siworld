@@ -146,11 +146,11 @@ pub trait Custody {
         &mut self,
         block: &crate::eng2::producer::ProducedBlock,
     ) -> Result<(), String>;
-    /// Sign these exact bytes with the independently held issuer key and
+    /// Sign this typed declaration using the independently held issuer key and
     /// wallet::issuance::ISSUER_SIGNATURE_CONTEXT.
     fn sign_issuance(
         &mut self,
-        message: &[u8],
+        declaration: &native::issuance::IssuanceDeclaration,
     ) -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String>;
 }
 
@@ -1055,7 +1055,7 @@ pub fn generate(
                     request,
                     tier,
                     now,
-                    |message| custody_cell.borrow_mut().sign_issuance(message),
+                    |declaration| custody_cell.borrow_mut().sign_issuance(declaration),
                     store.engine().genesis(),
                     &prover,
                     |prepared| {

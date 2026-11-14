@@ -5,6 +5,8 @@ use sha2::{Digest as _, Sha256};
 
 pub(super) const AUDIT_SCOPE: &str = "read-only-owner-nonfixture-native-audit";
 const MAX_BINDING_BYTES: usize = 8192;
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub mod custody_session;
 pub mod full_history;
 #[cfg(unix)]
 pub mod history_session;

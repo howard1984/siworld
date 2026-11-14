@@ -16,6 +16,8 @@ use std::{
 
 mod parameters;
 pub use parameters::encode_public;
+#[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
+pub(crate) use parameters::reconstruct;
 
 pub const MAX_GOVERNANCE_BYTES: usize = 131_072;
 const MAX_GENESIS_BYTES: usize = 41 + crate::state::CONFIG_RULE_BYTES + 4 + MAX_GOVERNANCE_BYTES;

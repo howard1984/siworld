@@ -1,5 +1,66 @@
 //! Synthetic interface tests only; none establishes an actual native rejection.
 use super::*;
+
+#[test]
+fn fetch_timing_never_changes_authenticated_frame_identity() {
+    let body = b"bounded timing fixture";
+    let header = header(body);
+    let frame = FrameIdentity::after_authenticated_decode([9; 32], &header, body, 128).unwrap();
+    let timed = frame.with_fetch_timing(FetchTiming {
+        connection: 4,
+        attempt: 7,
+        ..FetchTiming::default()
+    });
+    assert_eq!(frame.frame_id(), timed.frame_id());
+    assert!(timed.matches(&header));
+    assert_eq!(timed.fetch.unwrap().attempt, 7);
+}
+
+#[test]
+fn admission_timing_retention_and_commit_knowledge_are_bounded() {
+    let mut observation = setup(Arc::new(Sink::default()));
+    let body = b"bounded timing fixture";
+    let header = header(body);
+    let frame = FrameIdentity::after_authenticated_decode([9; 32], &header, body, 128).unwrap();
+    for index in 0..12 {
+        let attempt = observation.begin(&header, Some(frame));
+        observation.completed(
+            attempt.as_ref(),
+            ValidationTiming::default(),
+            if index == 11 { 3 } else { 1 },
+        );
+    }
+    let value = observation.timing_json(Instant::now());
+    assert_eq!(value["recent"].as_array().unwrap().len(), 8);
+    assert_eq!(value["overwritten"], 4);
+    assert_eq!(value["recent"][7]["outcome"], 3);
+    assert!(diagnostic_storage_bytes() <= 8 * 1024);
+}
+
+#[test]
+fn timing_completion_does_not_relabel_or_publish_product_failures() {
+    let sink = Arc::new(Sink::default());
+    let mut observation = setup(sink.clone());
+    let body = b"bounded timing fixture";
+    let header = header(body);
+    let frame = FrameIdentity::after_authenticated_decode([9; 32], &header, body, 128).unwrap();
+    let attempt = observation.begin(&header, Some(frame));
+    let failure = Failure::other(
+        "original writer failure".into(),
+        OtherClass::Storage,
+        Phase::Storage,
+        CommitKnowledge::Unknown,
+    );
+    observation.completed(attempt.as_ref(), ValidationTiming::default(), 3);
+    observation.rejected(attempt.as_ref(), &failure);
+    assert_eq!(failure.into_original(), "original writer failure");
+    assert!(sink.events.lock().unwrap().is_empty());
+    observation.completed(attempt.as_ref(), ValidationTiming::default(), 4);
+    assert_eq!(
+        observation.timing_json(Instant::now())["recent"][1]["outcome"],
+        4
+    );
+}
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},

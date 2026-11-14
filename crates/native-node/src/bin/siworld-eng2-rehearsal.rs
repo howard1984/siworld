@@ -12,6 +12,26 @@ fn run() -> Result<(), String> {
     }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     #[cfg(all(unix, feature = "eng2-runtime"))]
+    if args.len() == 5 && args[4] == "--json" {
+        let action = match args[0].to_str() {
+            Some("--isolated-custody-init") => Some("init"),
+            Some("--isolated-custody-open") => Some("open"),
+            Some("--positive-business-existing") => Some("business"),
+            Some("--owned-balance-existing") => Some("scan"),
+            _ => None,
+        };
+        if let Some(action) = action {
+            let result = siworld_native_node::eng2::rehearsal::partition::qualification::custody_session::run(
+                action,
+                std::path::Path::new(&args[1]),
+                args[2].to_str().ok_or("custody_public_pin_rejected")?,
+                std::path::Path::new(&args[3]),
+            )?;
+            println!("{result}");
+            return Ok(());
+        }
+    }
+    #[cfg(all(unix, feature = "eng2-runtime"))]
     if args.len() == 5
         && args[4] == "--json"
         && (args[0] == "--isolated-production-init" || args[0] == "--isolated-production-request")
@@ -313,7 +333,7 @@ fn run() -> Result<(), String> {
         || args[3] != "--blocks"
         || args[5] != "--json"
     {
-        return Err("usage: siworld-eng2-rehearsal NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --isolated-production-init EMPTY_NODE MANIFEST MANIFEST_SHA256 --json; or --isolated-production-request NODE REQUEST REQUEST_SHA256 --json (Unix eng2-runtime owner build); or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json; or --qualification-audit-session NODE RUN_ROOT NEW_OUTPUT BUDGET BUDGET_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json (Unix owner only); or --qualification-audit-history NODE NEW_OUTPUT BUDGET BUDGET_SHA256 BINDING BINDING_SHA256 --json; or --qualification-compare-history NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 BUDGET BUDGET_SHA256 --json; or --qualification-compare-state NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json; or --qualification-send-input IDENTITY_NODE PLAN PLAN_SHA256 BINDING BINDING_SHA256 --json (native-p2p owner build); or --qualification-audit NODE NEW_OUTPUT BINDING BINDING_SHA256 --json; or --qualification-replay-prefix EXPORT MANIFEST_SHA256 EMPTY_NODE HEIGHT BINDING BINDING_SHA256 --json; or --qualification-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH BINDING BINDING_SHA256 --json (Unix owner only); or --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json (Unix owner only)".into());
+        return Err("usage: siworld-eng2-rehearsal --isolated-custody-init|--isolated-custody-open|--positive-business-existing|--owned-balance-existing PLAN PLAN_SHA256 NEW_OUTPUT --json (Unix eng2-runtime owner build, private framed stdin required); or NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --check-continuation SOURCE NEW_DIRECTORY --json; or --continue SOURCE NEW_DIRECTORY --fee-mode legacy-miner --blocks 28 --json; or --partition-init NEW_CAMPAIGN --json; or --partition-node CAMPAIGN NEW_NODE INDEX --json; or --partition-height NODE HEIGHT --json; or --isolated-production-init EMPTY_NODE MANIFEST MANIFEST_SHA256 --json; or --isolated-production-request NODE REQUEST REQUEST_SHA256 --json (Unix eng2-runtime owner build); or --partition-audit NODE NEW_OUTPUT --json; or --partition-replay-prefix EXPORT EMPTY_NODE HEIGHT --json; or --qualification-audit-session NODE RUN_ROOT NEW_OUTPUT BUDGET BUDGET_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json (Unix owner only); or --qualification-audit-history NODE NEW_OUTPUT BUDGET BUDGET_SHA256 BINDING BINDING_SHA256 --json; or --qualification-compare-history NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 BUDGET BUDGET_SHA256 --json; or --qualification-compare-state NODE EXPORT MANIFEST_SHA256 EXPECTATIONS EXPECTATIONS_SHA256 BINDING BINDING_SHA256 --json; or --qualification-send-input IDENTITY_NODE PLAN PLAN_SHA256 BINDING BINDING_SHA256 --json (native-p2p owner build); or --qualification-audit NODE NEW_OUTPUT BINDING BINDING_SHA256 --json; or --qualification-replay-prefix EXPORT MANIFEST_SHA256 EMPTY_NODE HEIGHT BINDING BINDING_SHA256 --json; or --qualification-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH BINDING BINDING_SHA256 --json (Unix owner only); or --partition-driver-case A_EXPORT A_MANIFEST_SHA256 B_EXPORT B_MANIFEST_SHA256 NEW_DIRECTORY DEPTH --json (Unix owner only)".into());
     }
     let blocks = args[4]
         .to_str()

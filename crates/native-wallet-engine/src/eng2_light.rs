@@ -64,7 +64,34 @@ impl Eng2LightState {
             .ok_or("missing initial wallet root")?
             .selector
             .block_id = context.genesis();
-        let mut wallet = Wallet::from_seed(context.config().network, seed, account)?;
+        let wallet = Wallet::from_seed(context.config().network, seed, account)?;
+        Self::from_wallet_context(context, state, wallet)
+    }
+    /// Fresh scan from an authenticated existing custody wallet; no seed export.
+    pub fn from_existing_wallet(
+        genesis: &[u8],
+        expected: Hash,
+        wallet: Wallet,
+    ) -> Result<Self, String> {
+        let context = Context::from_genesis(genesis, expected)?;
+        let mut state = State::new(context.config().clone())?;
+        state.tip = context.genesis();
+        state
+            .snapshots
+            .back_mut()
+            .ok_or("missing initial wallet root")?
+            .selector
+            .block_id = context.genesis();
+        Self::from_wallet_context(context, state, wallet)
+    }
+    fn from_wallet_context(
+        context: Context,
+        state: State,
+        mut wallet: Wallet,
+    ) -> Result<Self, String> {
+        if wallet.head().is_some() || !wallet.receipts().is_empty() {
+            return Err("eng2 wallet requires a fresh existing custody view".into());
+        }
         wallet.scan_light_data(&state, &[], &[], false)?;
         Ok(Self {
             context,
@@ -104,6 +131,10 @@ impl Eng2LightState {
     /// Latest authenticated public root snapshot retained by this wallet.
     pub fn tip_snapshot(&self) -> &CanonicalSnapshot {
         self.state.tip_snapshot()
+    }
+    /// Public asset registry reconstructed from authenticated receipts.
+    pub fn asset_registry(&self) -> &crate::issuance::AssetRegistry {
+        &self.state.assets
     }
     /// Number of public asset declarations scanned from authenticated receipts.
     pub fn asset_count(&self) -> usize {

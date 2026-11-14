@@ -68,6 +68,14 @@ pub struct Peer<S> {
     policy: Policy,
     exact_blocks: Option<bool>,
     competing_head: Option<CompetingHead>,
+    #[cfg(feature = "eng2-runtime")]
+    fetch_observation: Option<super::accept_observation::FetchTiming>,
+    #[cfg(feature = "eng2-runtime")]
+    observation_connection: u64,
+    #[cfg(feature = "eng2-runtime")]
+    fetch_sequence: u64,
+    #[cfg(feature = "eng2-runtime")]
+    fetch_overwritten: u64,
 }
 impl<S: Read + Write> Peer<S> {
     pub fn new(
@@ -87,6 +95,14 @@ impl<S: Read + Write> Peer<S> {
             policy,
             exact_blocks: None,
             competing_head: None,
+            #[cfg(feature = "eng2-runtime")]
+            fetch_observation: None,
+            #[cfg(feature = "eng2-runtime")]
+            observation_connection: 0,
+            #[cfg(feature = "eng2-runtime")]
+            fetch_sequence: 0,
+            #[cfg(feature = "eng2-runtime")]
+            fetch_overwritten: 0,
         })
     }
     pub fn genesis_id(&self) -> Hash {
@@ -344,70 +360,147 @@ impl<S: Read + Write> Peer<S> {
         request: u64,
         header: &Header,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
-        if header.network != self.session.binding().network || header.height == 0 {
-            return Err(p2p::Error::InvalidProtocol);
-        }
-        let id = header.id().map_err(|_| p2p::Error::InvalidProtocol)?;
-        self.send_identity(GET_BODY, request, header.height, id)?;
-        let (received, start, start_charge) = self.receive()?;
-        if received != request {
-            return Err(p2p::Error::InvalidProtocol);
-        }
-        if start.len() == 9 && start[0] == UNAVAILABLE && number(&start[1..]) == header.height {
-            return Ok(None);
-        }
-        if start.len() != 49
-            || start[0] != BODY_START
-            || number(&start[1..9]) != header.height
-            || digest(&start[9..41]) != id
+        #[cfg(feature = "eng2-runtime")]
+        let mut timing = super::accept_observation::FetchTiming {
+            connection: self.observation_connection,
+            attempt: self.fetch_sequence.checked_add(1).unwrap_or(0),
+            height: header.height,
+            start: Some(std::time::Instant::now()),
+            ..Default::default()
+        };
+        #[cfg(feature = "eng2-runtime")]
         {
-            return Err(p2p::Error::InvalidProtocol);
+            self.fetch_sequence = self.fetch_sequence.saturating_add(1);
         }
-        let length =
-            usize::try_from(number(&start[41..])).map_err(|_| p2p::Error::ResourceExhausted)?;
-        if length == 0 || length > self.policy.max_body_bytes {
-            return Err(p2p::Error::ResourceExhausted);
-        }
-        drop(start);
-        drop(start_charge);
-        // Wire ownership plus decoded proof/ciphertext buffers and object
-        // overhead remain charged together until the returned guard is dropped.
-        let reservation = self.reserve_body(length)?;
-        let mut encoded = Vec::new();
-        encoded
-            .try_reserve_exact(length)
-            .map_err(|_| p2p::Error::ResourceExhausted)?;
-        let deadline = p2p::Deadline::new(std::time::Duration::from_secs(180));
-        while encoded.len() < length {
-            let (received, chunk, _charge) = self.receive_before(&deadline)?;
-            if received != request
-                || chunk.len() <= 9
-                || chunk[0] != BODY_CHUNK
-                || number(&chunk[1..9]) != encoded.len() as u64
-                || chunk.len() - 9 != CHUNK_BYTES.min(length - encoded.len())
+        let result = (|| {
+            if header.network != self.session.binding().network || header.height == 0 {
+                return Err(p2p::Error::InvalidProtocol);
+            }
+            let id = header.id().map_err(|_| p2p::Error::InvalidProtocol)?;
+            #[cfg(feature = "eng2-runtime")]
+            {
+                timing.block = id;
+            }
+            self.send_identity(GET_BODY, request, header.height, id)?;
+            let (received, start, start_charge) = self.receive()?;
+            if received != request {
+                return Err(p2p::Error::InvalidProtocol);
+            }
+            if start.len() == 9 && start[0] == UNAVAILABLE && number(&start[1..]) == header.height {
+                return Ok(None);
+            }
+            if start.len() != 49
+                || start[0] != BODY_START
+                || number(&start[1..9]) != header.height
+                || digest(&start[9..41]) != id
             {
                 return Err(p2p::Error::InvalidProtocol);
             }
-            encoded.extend_from_slice(&chunk[9..]);
-        }
-        header
-            .verify_body(&encoded, self.policy.max_body_bytes)
-            .map_err(|_| p2p::Error::InvalidProtocol)?;
-        let body = Body::decode(&encoded, header.network, header.height, self.policy)
-            .map_err(|_| p2p::Error::InvalidProtocol)?;
-        #[cfg(feature = "eng2-runtime")]
-        let observation = super::accept_observation::FrameIdentity::after_authenticated_decode(
-            self.session.peer(),
-            header,
-            &encoded,
-            self.policy.max_body_bytes,
-        );
-        Ok(Some(ReceivedBody {
-            body,
-            reservation,
             #[cfg(feature = "eng2-runtime")]
-            observation,
-        }))
+            {
+                timing.body_start = Some(std::time::Instant::now());
+            }
+            let length =
+                usize::try_from(number(&start[41..])).map_err(|_| p2p::Error::ResourceExhausted)?;
+            if length == 0 || length > self.policy.max_body_bytes {
+                return Err(p2p::Error::ResourceExhausted);
+            }
+            #[cfg(feature = "eng2-runtime")]
+            {
+                timing.bytes = length as u64;
+            }
+            drop(start);
+            drop(start_charge);
+            // Wire ownership plus decoded proof/ciphertext buffers and object
+            // overhead remain charged together until the returned guard is dropped.
+            let reservation = self.reserve_body(length)?;
+            let mut encoded = Vec::new();
+            encoded
+                .try_reserve_exact(length)
+                .map_err(|_| p2p::Error::ResourceExhausted)?;
+            let deadline = p2p::Deadline::new(std::time::Duration::from_secs(180));
+            while encoded.len() < length {
+                let (received, chunk, _charge) = self.receive_before(&deadline)?;
+                if received != request
+                    || chunk.len() <= 9
+                    || chunk[0] != BODY_CHUNK
+                    || number(&chunk[1..9]) != encoded.len() as u64
+                    || chunk.len() - 9 != CHUNK_BYTES.min(length - encoded.len())
+                {
+                    return Err(p2p::Error::InvalidProtocol);
+                }
+                encoded.extend_from_slice(&chunk[9..]);
+                #[cfg(feature = "eng2-runtime")]
+                {
+                    timing.received_bytes = encoded.len() as u64;
+                }
+            }
+            #[cfg(feature = "eng2-runtime")]
+            {
+                timing.chunks_end = Some(std::time::Instant::now());
+            }
+            header
+                .verify_body(&encoded, self.policy.max_body_bytes)
+                .map_err(|_| p2p::Error::InvalidProtocol)?;
+            let body = Body::decode(&encoded, header.network, header.height, self.policy)
+                .map_err(|_| p2p::Error::InvalidProtocol)?;
+            #[cfg(feature = "eng2-runtime")]
+            {
+                timing.decoded = Some(std::time::Instant::now());
+            }
+            #[cfg(feature = "eng2-runtime")]
+            let observation = super::accept_observation::FrameIdentity::after_authenticated_decode(
+                self.session.peer(),
+                header,
+                &encoded,
+                self.policy.max_body_bytes,
+            );
+            Ok(Some(ReceivedBody {
+                body,
+                reservation,
+                #[cfg(feature = "eng2-runtime")]
+                observation,
+            }))
+        })();
+        #[cfg(feature = "eng2-runtime")]
+        {
+            let mut result = result;
+            timing.end = Some(std::time::Instant::now());
+            timing.outcome = match &result {
+                Ok(Some(_)) => 1,
+                Ok(None) => 2,
+                Err(_) => 3,
+            };
+            timing.transport_error = match &result {
+                Err(p2p::Error::InvalidProtocol) => 1,
+                Err(p2p::Error::Unavailable) => 2,
+                Err(p2p::Error::ResourceExhausted) => 3,
+                Err(p2p::Error::Unconfigured) => 4,
+                _ => 0,
+            };
+            if let Ok(Some(received)) = &mut result {
+                received.observation = received
+                    .observation
+                    .map(|frame| frame.with_fetch_timing(timing));
+            }
+            if self.fetch_observation.is_some() {
+                self.fetch_overwritten = self.fetch_overwritten.saturating_add(1);
+            }
+            self.fetch_observation = Some(timing);
+            result
+        }
+        #[cfg(not(feature = "eng2-runtime"))]
+        result
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn observe_connection(&mut self, ordinal: u64) {
+        self.observation_connection = ordinal;
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn take_fetch_observation(
+        &mut self,
+    ) -> (Option<super::accept_observation::FetchTiming>, u64) {
+        (self.fetch_observation.take(), self.fetch_overwritten)
     }
     pub(crate) fn application_network(&self) -> Hash {
         self.session.binding().network
@@ -819,6 +912,14 @@ mod tests {
         .unwrap();
         let received = receiver.fetch_body(5, &header).unwrap().unwrap();
         assert_eq!(received.body, body);
+        #[cfg(feature = "eng2-runtime")]
+        {
+            let timing = received.observation.unwrap().fetch_timing().unwrap();
+            assert_eq!(timing.outcome, 1);
+            assert_eq!(timing.bytes, timing.received_bytes);
+            assert!(timing.start <= timing.body_start && timing.body_start <= timing.chunks_end);
+            assert!(timing.chunks_end <= timing.decoded && timing.decoded <= timing.end);
+        }
         assert!(budget.available().unwrap() < before);
         drop(received);
         assert_eq!(budget.available().unwrap(), before);
@@ -844,6 +945,40 @@ mod tests {
             Err(p2p::Error::ResourceExhausted)
         ));
         assert_eq!(budget.available().unwrap(), before);
+    }
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn fetch_observation_preserves_predecode_errors_and_distinct_attempts() {
+        let g = genesis();
+        let (_, mut header) = body_header(&g);
+        header.height = 0;
+        let mut peer = Peer::new(
+            session(vec![], binding(&g), p2p::Budget::default()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        peer.observe_connection(3);
+        for request in 1..=2 {
+            assert!(matches!(
+                peer.fetch_body(request, &header),
+                Err(p2p::Error::InvalidProtocol)
+            ));
+        }
+        assert!(peer.session.test_channel().output.is_empty());
+        let (timing, overwritten) = peer.take_fetch_observation();
+        let timing = timing.unwrap();
+        assert_eq!(
+            (
+                timing.connection,
+                timing.attempt,
+                timing.outcome,
+                overwritten
+            ),
+            (3, 2, 3, 1)
+        );
+        assert!(timing.decoded.is_none());
+        assert_eq!(timing.received_bytes, 0);
     }
     #[test]
     fn rejects_duplicate_offsets_wrong_ids_and_unsolicited_response_frames() {

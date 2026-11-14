@@ -1,6 +1,30 @@
 use super::*;
 use std::io::Write;
 
+#[test]
+fn diagnostic_size_fallback_preserves_original_status() {
+    let original = json!({"ready":true,"native_accept_observation":{"enabled":true},"payload":"x".repeat(65_400)});
+    let mut value = original.clone();
+    value["peer_round_observation"] = json!({"rounds":["x".repeat(40_000)]});
+    value["native_accept_observation"]["recent"] = json!(["x".repeat(10_000)]);
+    bound_status_observations(&mut value, &original["native_accept_observation"]);
+    assert_eq!(value, original);
+    let mut detail = json!({"rounds":["x".repeat(20_000),"y".repeat(20_000)]});
+    bound_observation(&mut detail, "rounds", 24 * 1024);
+    assert!(status_bytes(&detail) <= 24 * 1024);
+    assert_eq!(detail["omitted_by_byte_limit"], 1);
+    assert!(
+        peers::diagnostic_storage_bytes()
+            + super::super::accept_observation::diagnostic_storage_bytes()
+            <= 32 * 1024
+    );
+    eprintln!(
+        "diagnostic_layout_bytes peers={} admission_and_transport={}",
+        peers::diagnostic_storage_bytes(),
+        super::super::accept_observation::diagnostic_storage_bytes()
+    );
+}
+
 fn directory() -> PathBuf {
     let mut entropy = [0u8; 16];
     getrandom::fill(&mut entropy).unwrap();

@@ -279,6 +279,30 @@ impl Observation {
             .len()
             .map_err(|_| "observation frame count unavailable".into())
     }
+    /// Authenticated compact size for caller allocation reservation, without a body copy.
+    pub fn full_frame_size(&self, height: u64) -> Result<usize, String> {
+        if height == 0 || height > self.engine.state().height() {
+            return Err("observation frame height rejected".into());
+        }
+        let tx = self
+            .database
+            .begin_read()
+            .map_err(|_| "observation size transaction unavailable")?;
+        let table = tx
+            .open_table(INDEX)
+            .map_err(|_| "observation size index unavailable")?;
+        let row = table
+            .get(height)
+            .map_err(|_| "observation size unavailable")?
+            .ok_or("observation size missing")?;
+        let (header, size) = decode_compact(row.value(), self.engine.state().network())?;
+        if header.height != height || size > self.engine.body_policy().max_body_bytes {
+            return Err("observation indexed size rejected".into());
+        }
+        HEADER_BYTES
+            .checked_add(size)
+            .ok_or("observation frame size overflow".into())
+    }
     pub fn full_frame(&self, height: u64) -> Result<Vec<u8>, String> {
         if height == 0 || height > self.engine.state().height() {
             return Err("observation frame height is not accepted".into());

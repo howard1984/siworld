@@ -296,16 +296,38 @@ impl Driver {
     ) -> Result<CommittedBlock, String> {
         self.check_forward_admission()?;
         let attempt = frame.and_then(|frame| self.accept_observation.begin(header, Some(frame)));
-        let committed = match self.store.append_diagnosed(header, body, &self.verifier) {
+        let mut timing = super::accept_observation::ValidationTiming::default();
+        let committed = match self
+            .store
+            .append_diagnosed(header, body, &self.verifier, &mut timing)
+        {
             Ok(committed) => committed,
             Err(failure) => {
                 // Observe this actual typed rejection before returning the same
                 // original error and retaining the original availability handling.
                 self.accept_observation.rejected(attempt.as_ref(), &failure);
+                let outcome =
+                    if failure.commit() == super::accept_observation::CommitKnowledge::NotReached {
+                        2
+                    } else {
+                        3
+                    };
+                self.accept_observation
+                    .completed(attempt.as_ref(), timing, outcome);
                 return Err(self.after_append_error(failure.into_original()));
             }
         };
-        self.finish_accepted(header, body, committed)
+        let result = self.finish_accepted(header, body, committed);
+        self.accept_observation.completed(
+            attempt.as_ref(),
+            timing,
+            if result.is_ok() { 1 } else { 4 },
+        );
+        result
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn accept_timing_json(&self, origin: std::time::Instant) -> serde_json::Value {
+        self.accept_observation.timing_json(origin)
     }
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn attach_accept_observer(

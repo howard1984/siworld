@@ -43,6 +43,10 @@ mod tests;
 const MAX_GENESIS_BYTES: usize = 1024 * 1024;
 const MEMORY_BYTES: usize = 640 * 1024 * 1024;
 const READY_FRESHNESS: Duration = Duration::from_secs(30);
+const _: () = assert!(
+    peers::diagnostic_storage_bytes() + super::accept_observation::diagnostic_storage_bytes()
+        <= 32 * 1024
+);
 
 pub fn limits() -> ImportLimits {
     ImportLimits {
@@ -301,7 +305,9 @@ fn export_status(
         .map_err(|_| "checkpoint observer lock poisoned")?;
     let conflict = observer.conflicted();
     let activities_allowed = owner.activities_allowed();
-    let peer_readiness = shared.network.readiness_at((head.height, head.id))?;
+    let (peer_readiness, peer_observation) = shared
+        .network
+        .observed_readiness_at((head.height, head.id))?;
     let (ready, ready_reason_code) = resident_readiness(
         activities_allowed,
         owner.reorganization_status(),
@@ -362,7 +368,54 @@ fn export_status(
         "error_code":error.map(super::accept_observation::DiagnosticError::code),
         "coverage_established":false,"scope":"ordinary-forward-admission",
     });
+    let original_accept = status["native_accept_observation"].clone();
+    let timing = owner.accept_timing_json(started);
+    status["native_accept_observation"]["recent"] = timing["recent"].clone();
+    status["native_accept_observation"]["overwritten"] = timing["overwritten"].clone();
+    status["peer_round_observation"] = peer_observation.json(started);
+    status["peer_round_observation"]["inputs"] = json!({
+        "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
+        "activities_allowed":activities_allowed,"reorganization_status":owner.reorganization_status(),
+        "checkpoint_conflict":conflict,"peer_reason":peer_readiness.code(),
+    });
+    bound_status_observations(&mut status, &original_accept);
     service::atomic_json(&directory.join(service::STATUS_FILE), &status)
+}
+
+fn status_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len().saturating_add(1))
+}
+fn bound_observation(value: &mut Value, records: &str, limit: usize) {
+    let mut omitted = 0u64;
+    value["omitted_by_byte_limit"] = json!(omitted);
+    while status_bytes(value) > limit {
+        if let Some(records) = value.get_mut(records).and_then(Value::as_array_mut)
+            && !records.is_empty()
+        {
+            records.remove(0);
+            omitted = omitted.saturating_add(1);
+            value["omitted_by_byte_limit"] = json!(omitted);
+        } else {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("connections");
+                object.remove("last_disconnect");
+            }
+            value["detail_unavailable"] = json!("byte_limit");
+            break;
+        }
+    }
+}
+fn bound_status_observations(status: &mut Value, original_accept: &Value) {
+    bound_observation(&mut status["peer_round_observation"], "rounds", 24 * 1024);
+    bound_observation(&mut status["native_accept_observation"], "recent", 8 * 1024);
+    if status_bytes(status) > 65_536 {
+        // Preserve the exact pre-existing value and oversized-base behavior.
+        status
+            .as_object_mut()
+            .unwrap()
+            .remove("peer_round_observation");
+        status["native_accept_observation"] = original_accept.clone();
+    }
 }
 fn resident_readiness(
     activities_allowed: bool,

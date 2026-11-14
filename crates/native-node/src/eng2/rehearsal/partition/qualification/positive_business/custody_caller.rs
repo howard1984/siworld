@@ -127,7 +127,7 @@ impl IsolatedActors {
     /// The external gate must enforce the separately approved hard resource
     /// limit; an arbitrary successful closure does not establish that limit.
     /// The issuer callback must use a separately established issuer custody
-    /// adapter. This method supplies the exact production context and message;
+    /// adapter. This method supplies the production context and typed declaration;
     /// the existing attach_signature path checks the resulting authorization.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
@@ -142,7 +142,7 @@ impl IsolatedActors {
         before_phase: &mut impl FnMut(&str) -> Result<(), String>,
         issuer_signer: &mut impl FnMut(
             &[u8],
-            &[u8],
+            &native::issuance::IssuanceDeclaration,
         )
             -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String>,
     ) -> Result<Value, String> {
@@ -254,7 +254,10 @@ struct JournalCustody<'a, G, S> {
 impl<G, S> Custody for JournalCustody<'_, G, S>
 where
     G: FnMut(&str) -> Result<(), String>,
-    S: FnMut(&[u8], &[u8]) -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String>,
+    S: FnMut(
+        &[u8],
+        &native::issuance::IssuanceDeclaration,
+    ) -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String>,
 {
     fn before_phase(&mut self, phase: &str) -> Result<(), String> {
         (self.before_phase)(phase)
@@ -405,10 +408,10 @@ where
     }
     fn sign_issuance(
         &mut self,
-        message: &[u8],
+        declaration: &native::issuance::IssuanceDeclaration,
     ) -> Result<[u8; native::issuance::ISSUER_SIGNATURE_BYTES], String> {
         (self.before_phase)("before_independent_issuer_signature")?;
-        (self.issuer_signer)(ISSUER_SIGNATURE_CONTEXT, message)
+        (self.issuer_signer)(ISSUER_SIGNATURE_CONTEXT, declaration)
     }
 }
 

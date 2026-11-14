@@ -175,6 +175,7 @@ pub(crate) struct FrameIdentity {
     body: Hash,
     bytes: u64,
     frame: Hash,
+    fetch: Option<FetchTiming>,
 }
 impl FrameIdentity {
     /// The transport invokes this after its actual authenticated read and decode.
@@ -201,7 +202,16 @@ impl FrameIdentity {
             body: header.body_commitment,
             bytes,
             frame: *digest.finalize().as_bytes(),
+            fetch: None,
         })
+    }
+    pub(super) fn with_fetch_timing(mut self, timing: FetchTiming) -> Self {
+        self.fetch = Some(timing);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn fetch_timing(self) -> Option<FetchTiming> {
+        self.fetch
     }
     fn matches(&self, header: &Header) -> bool {
         self.network == header.network
@@ -291,6 +301,61 @@ pub(crate) struct Attempt {
     number: u64,
     frame: FrameIdentity,
 }
+
+/// Process-local diagnostics only; zero ordinals mean unavailable identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FetchTiming {
+    pub connection: u64,
+    pub attempt: u64,
+    pub height: u64,
+    pub block: Hash,
+    pub bytes: u64,
+    pub received_bytes: u64,
+    pub start: Option<Instant>,
+    pub body_start: Option<Instant>,
+    pub chunks_end: Option<Instant>,
+    pub decoded: Option<Instant>,
+    pub end: Option<Instant>,
+    pub outcome: u8,
+    pub transport_error: u8,
+}
+pub(crate) fn monotonic_ns(instant: Option<Instant>, origin: Instant) -> Option<String> {
+    instant?
+        .checked_duration_since(origin)
+        .map(|value| value.as_nanos().to_string())
+}
+impl FetchTiming {
+    pub(crate) fn json(self, origin: Instant) -> serde_json::Value {
+        serde_json::json!({"connection":self.connection,"attempt":self.attempt,
+            "height":self.height,"block":crate::local::hex(&self.block),"announced_bytes":self.bytes,"received_bytes":self.received_bytes,
+            "start":monotonic_ns(self.start,origin),"body_start":monotonic_ns(self.body_start,origin),
+            "chunks_end":monotonic_ns(self.chunks_end,origin),"decoded":monotonic_ns(self.decoded,origin),
+            "end":monotonic_ns(self.end,origin),"outcome":self.outcome,
+            "transport_error":match self.transport_error {1=>Some("invalid_protocol"),2=>Some("unavailable"),3=>Some("resource_exhausted"),4=>Some("unconfigured"),_=>None},
+            "ordinal_available":self.connection!=0 && self.attempt!=0})
+    }
+}
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ValidationTiming {
+    pub start: Option<Instant>,
+    pub end: Option<Instant>,
+}
+#[derive(Clone, Copy)]
+struct AdmissionTiming {
+    attempt: u64,
+    block: Hash,
+    fetch: Option<FetchTiming>,
+    validation: ValidationTiming,
+    end: Instant,
+    outcome: u8,
+}
+const _: () = assert!(std::mem::size_of::<AdmissionTiming>() <= 512);
+pub(crate) const fn diagnostic_storage_bytes() -> usize {
+    // Conservatively include the entire owner observer, plus peer-local trace
+    // slots and the additional trace attached to each bounded received body.
+    std::mem::size_of::<Observation>()
+        + 8 * (2 * std::mem::size_of::<Option<FetchTiming>>() + 3 * std::mem::size_of::<u64>())
+}
 pub(crate) struct Rejection<'a> {
     pub(crate) run: &'a RunIdentity,
     pub(crate) attempt: u64,
@@ -332,8 +397,49 @@ pub(crate) struct Observation {
     sequence: u64,
     dropped: u64,
     error: Option<DiagnosticError>,
+    recent: [Option<AdmissionTiming>; 8],
+    next_recent: usize,
+    overwritten: u64,
 }
 impl Observation {
+    /// Outcomes: 1 committed, 2 rejected before commit, 3 commit unknown,
+    /// 4 committed with a later finishing error. No outcome grants authority.
+    pub(crate) fn completed(
+        &mut self,
+        attempt: Option<&Attempt>,
+        validation: ValidationTiming,
+        outcome: u8,
+    ) {
+        let Some(attempt) = attempt else {
+            return;
+        };
+        if self.recent[self.next_recent].is_some() {
+            self.overwritten = self.overwritten.saturating_add(1);
+        }
+        self.recent[self.next_recent] = Some(AdmissionTiming {
+            attempt: attempt.number,
+            block: attempt.frame.header,
+            fetch: attempt.frame.fetch,
+            validation,
+            end: Instant::now(),
+            outcome,
+        });
+        self.next_recent = (self.next_recent + 1) % self.recent.len();
+    }
+    pub(crate) fn timing_json(&self, origin: Instant) -> serde_json::Value {
+        let recent: Vec<_> = (0..8)
+            .filter_map(|offset| self.recent[(self.next_recent + offset) % 8])
+            .map(|item| {
+                serde_json::json!({"attempt":item.attempt,"block":crate::local::hex(&item.block),
+                "fetch":item.fetch.map(|fetch|fetch.json(origin)),
+                "validation_start":monotonic_ns(item.validation.start,origin),
+                "validation_end":monotonic_ns(item.validation.end,origin),
+                "end":monotonic_ns(Some(item.end),origin),"outcome":item.outcome})
+            })
+            .collect();
+        serde_json::json!({"recent":recent,"overwritten":self.overwritten,
+            "scope":"ordinary-forward-admission","exact_readiness_transitions":false})
+    }
     pub(crate) fn attach(&mut self, run: RunIdentity, observer: Arc<dyn Observer>) -> bool {
         if self.binding.is_some() || self.observer.is_some() {
             self.unavailable(DiagnosticError::Binding);
