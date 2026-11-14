@@ -231,6 +231,14 @@ keep readiness true. Stop requests name the exact active run; a previous run's
 request cannot stop its replacement. `mining_enabled` describes configuration,
 not evidence of active work or an accepted reward.
 
+Checkpoint preparation failures also expose `checkpoint_candidate_failure`, a
+bounded operation code for the publication clock, current proposal, archive
+capture or archive worker start. It supplements `checkpoint_tick_reason` without
+changing the original error or signing decision. Each new tick clears the prior
+candidate diagnostic; unavailable signing readiness is not a preparation error.
+`checkpoint_candidate_detail` maps exact known error literals to fixed codes;
+unrecognized or decorated errors are reported as `unknown`.
+
 Checkpoint exchange follows each completed ordinary block round. It accepts at
 most three canonical messages under a shared ten-second phase deadline and
 retains budget ownership through host consumption. The host reconstructs the

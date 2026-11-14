@@ -233,3 +233,99 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
     assert_eq!(host.wallet_export_state(), Some(false));
     assert!(host.tick(&store, 1001, &[]).is_ok());
 }
+
+#[test]
+fn candidate_diagnostic_preserves_operation_results_and_exports_only_fixed_codes() {
+    for (stage, code) in [
+        (
+            CandidateFailureReason::PublicationClock,
+            "publication_clock",
+        ),
+        (CandidateFailureReason::CurrentProposal, "current_proposal"),
+        (CandidateFailureReason::ArchiveCapture, "archive_capture"),
+        (
+            CandidateFailureReason::ArchiveWorkerStart,
+            "archive_worker_start",
+        ),
+    ] {
+        let mut diagnostic = None;
+        assert_eq!(candidate_result(&mut diagnostic, stage, Ok(7)), Ok(7));
+        assert_eq!(diagnostic, None);
+        let error = String::from("synthetic operation failure");
+        let allocation = error.as_ptr();
+        let result = candidate_result::<()>(&mut diagnostic, stage, Err(error));
+        let returned = result.unwrap_err();
+        assert_eq!(returned.as_ptr(), allocation);
+        assert_eq!(returned, "synthetic operation failure");
+        assert_eq!(diagnostic.map(|failure| failure.stage.code()), Some(code));
+        assert_eq!(diagnostic.map(|failure| failure.detail), Some("unknown"));
+    }
+}
+
+#[test]
+fn candidate_diagnostic_does_not_survive_a_later_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("candidate-diagnostic-export");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.candidate_failure = Some(CandidateFailure {
+        stage: CandidateFailureReason::ArchiveCapture,
+        detail: "archive_budget_unavailable",
+    });
+    assert!(host.tick(&store, 1u64 << 53, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
+    assert_eq!(host.candidate_failure_reason(), None);
+    assert_eq!(host.candidate_failure_detail(), None);
+    host.candidate_failure = Some(CandidateFailure {
+        stage: CandidateFailureReason::ArchiveWorkerStart,
+        detail: "archive_worker_spawn_failed",
+    });
+    assert!(host.tick(&store, 100_000, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
+    assert_eq!(host.candidate_failure_reason(), None);
+    assert_eq!(host.candidate_failure_detail(), None);
+}
+
+#[test]
+fn candidate_detail_requires_an_exact_allowlisted_literal() {
+    for (error, detail) in [
+        (
+            "checkpoint publication clock moved backwards",
+            "publication_clock_regressed",
+        ),
+        (
+            "checkpoint witness differs from the executed current header",
+            "execution_witness_mismatch",
+        ),
+        (
+            "checkpoint preparation archive missing within bounded migration window",
+            "archive_missing",
+        ),
+        (
+            "checkpoint archive preparation budget unavailable",
+            "archive_budget_unavailable",
+        ),
+        (
+            "checkpoint archive worker creation failed",
+            "archive_worker_spawn_failed",
+        ),
+    ] {
+        assert_eq!(candidate_failure_detail(error), detail);
+        assert_eq!(
+            candidate_failure_detail(&format!("{error} extra")),
+            "unknown"
+        );
+        assert_eq!(
+            candidate_failure_detail(&format!("extra {error}")),
+            "unknown"
+        );
+    }
+    assert_eq!(candidate_failure_detail(""), "unknown");
+    assert_eq!(
+        candidate_failure_detail("unrecognized synthetic error"),
+        "unknown"
+    );
+}

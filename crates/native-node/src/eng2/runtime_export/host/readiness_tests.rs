@@ -200,3 +200,24 @@ fn checkpoint_replacement_authority_changes_only_at_the_executed_activation_boun
     assert_eq!(governance.active_roster().activated_height, 25);
     assert_eq!(ActiveRoster::THRESHOLD, 2);
 }
+
+#[test]
+fn unavailable_readiness_does_not_enter_or_diagnose_local_candidate_operations() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("candidate-readiness-export");
+    let mut host = Host::open(&root, &store, crate::eng2::snapshot::tests::limits(), None).unwrap();
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    host.enable_async_preparation(&budget).unwrap();
+    // Genesis has no eligible checkpoint: entering proposal creation would fail.
+    assert!(host.start_local_preparation(&store, None).is_ok());
+    let network = Arc::new(NetworkStatus::new([[1; 32]]));
+    let observer = Observer::default();
+    let gate = readiness(&store, &network, &observer);
+    assert!(host.start_local_preparation(&store, Some(&gate)).is_ok());
+    assert_eq!(host.candidate_failure_reason(), None);
+    let preparation = host.preparation.as_ref().unwrap();
+    assert!(!preparation.worker.is_busy());
+    assert!(preparation.request.is_none());
+    assert!(preparation.completed.is_none());
+}

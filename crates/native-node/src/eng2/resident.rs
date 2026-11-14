@@ -255,9 +255,21 @@ fn export_status(
     started: Instant,
     sequence: u64,
     mode: (bool, bool),
-    export_state: (Option<&str>, Option<bool>, Option<&str>),
+    export_state: (
+        Option<&str>,
+        Option<bool>,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+    ),
 ) -> Result<(), String> {
-    let (checkpoint_error, wallet_export, checkpoint_tick_reason) = export_state;
+    let (
+        checkpoint_error,
+        wallet_export,
+        checkpoint_tick_reason,
+        checkpoint_candidate_failure,
+        checkpoint_candidate_detail,
+    ) = export_state;
     let (mining, listening) = mode;
     let owner = shared
         .owner
@@ -287,7 +299,7 @@ fn export_status(
             "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
-            "checkpoint_error":checkpoint_error,"checkpoint_tick_reason":checkpoint_tick_reason,"checkpoint_archive_error":owner.last_archive_error(),
+            "checkpoint_error":checkpoint_error,"checkpoint_tick_reason":checkpoint_tick_reason,"checkpoint_candidate_failure":checkpoint_candidate_failure,"checkpoint_candidate_detail":checkpoint_candidate_detail,"checkpoint_archive_error":owner.last_archive_error(),
             "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
             "signed_bootstrap_available":owner.bootstrap_available(),
             "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
@@ -525,6 +537,14 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let mut checkpoint_tick_reason = None;
     #[cfg(not(unix))]
     let checkpoint_tick_reason = None;
+    #[cfg(unix)]
+    let mut checkpoint_candidate_failure = None;
+    #[cfg(not(unix))]
+    let checkpoint_candidate_failure = None;
+    #[cfg(unix)]
+    let mut checkpoint_candidate_detail = None;
+    #[cfg(not(unix))]
+    let checkpoint_candidate_detail = None;
     #[cfg(not(unix))]
     let wallet_export = None;
     let result = (|| {
@@ -565,6 +585,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             shared.mailbox.publish(&tick.messages())?;
                             checkpoint_error = None;
                             checkpoint_tick_reason = None;
+                            checkpoint_candidate_failure = None;
+                            checkpoint_candidate_detail = None;
                             if bootstrap_service
                                 && owner
                                     .refresh_bootstrap(
@@ -581,6 +603,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             checkpoint_tick_reason = checkpoint_host
                                 .tick_failure_reason()
                                 .map(super::runtime_export::host::TickFailureReason::code);
+                            checkpoint_candidate_failure =
+                                checkpoint_host.candidate_failure_reason();
+                            checkpoint_candidate_detail =
+                                checkpoint_host.candidate_failure_detail();
                         }
                     }
                     let _ = checkpoint_host.tick_wallet_export(
@@ -615,6 +641,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             }
                         },
                         checkpoint_tick_reason,
+                        checkpoint_candidate_failure,
+                        checkpoint_candidate_detail,
                     ),
                 )?;
                 last_export = Instant::now();
@@ -659,6 +687,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                 }
             },
             checkpoint_tick_reason,
+            checkpoint_candidate_failure,
+            checkpoint_candidate_detail,
         ),
     )?;
     result

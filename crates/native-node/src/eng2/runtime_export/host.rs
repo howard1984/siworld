@@ -192,6 +192,104 @@ impl TickFailureReason {
         }
     }
 }
+/// Bounded operation origins within candidate preparation. Error text stays private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateFailureReason {
+    PublicationClock,
+    CurrentProposal,
+    ArchiveCapture,
+    ArchiveWorkerStart,
+}
+impl CandidateFailureReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::PublicationClock => "publication_clock",
+            Self::CurrentProposal => "current_proposal",
+            Self::ArchiveCapture => "archive_capture",
+            Self::ArchiveWorkerStart => "archive_worker_start",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CandidateFailure {
+    stage: CandidateFailureReason,
+    detail: &'static str,
+}
+
+// Exact public source literals only; decorated or unrecognized errors stay unknown.
+fn candidate_failure_detail(error: &str) -> &'static str {
+    match error {
+        "checkpoint publication clock moved backwards" => "publication_clock_regressed",
+        "eligible checkpoint disappeared" => "eligible_checkpoint_missing",
+        "invalid current checkpoint execution witness" => "execution_witness_invalid",
+        "checkpoint witness differs from the executed current header" => {
+            "execution_witness_mismatch"
+        }
+        "invalid checkpoint anchor" => "checkpoint_anchor_invalid",
+        "invalid checkpoint proposal statement" => "proposal_statement_invalid",
+        "invalid checkpoint proposal witness" => "proposal_witness_invalid",
+        "missing fund allocation" => "fund_allocation_missing",
+        "invalid checkpoint preparation archive height" => "archive_height_invalid",
+        "checkpoint preparation archive read unavailable" => "archive_read_unavailable",
+        "checkpoint preparation archive table unavailable" => "archive_table_unavailable",
+        "checkpoint preparation archive range unavailable" => "archive_range_unavailable",
+        "checkpoint preparation archive missing within bounded migration window" => {
+            "archive_missing"
+        }
+        "checkpoint preparation archive read failed" => "archive_read_failed",
+        "checkpoint preparation archive exceeds byte bound" => "archive_bytes_exceeded",
+        "checkpoint suffix byte bound overflow" => "suffix_bytes_overflow",
+        "checkpoint archive workspace bound overflow" => "archive_workspace_overflow",
+        "checkpoint suffix workspace bound overflow" => "suffix_workspace_overflow",
+        "checkpoint preparation workspace bound overflow" => "preparation_workspace_overflow",
+        "checkpoint archive preparation budget unavailable" => "archive_budget_unavailable",
+        "checkpoint archive capture exceeds its height or byte bound" => "archive_capture_bounds",
+        "checkpoint archive genesis exceeds byte bound" => "archive_genesis_bytes_exceeded",
+        "checkpoint archive preparation is already in flight" => "archive_worker_busy",
+        "checkpoint archive worker creation failed" => "archive_worker_spawn_failed",
+        "ambiguous versioned commit requires verified reopen before export" => {
+            "store_export_ambiguous"
+        }
+        "versioned export metadata unavailable" => "store_export_metadata_unavailable",
+        "versioned export head unavailable" => "store_export_head_unavailable",
+        "versioned export history unavailable" => "store_export_history_unavailable",
+        "versioned export header unavailable" => "store_export_header_unavailable",
+        "versioned export header missing" => "store_export_header_missing",
+        "invalid versioned export identity" => "store_export_identity_invalid",
+        "versioned export engine differs from durable header" => "store_export_header_mismatch",
+        "versioned export head read failed" => "store_export_head_read_failed",
+        "versioned export metadata differs from actual engine head" => "store_export_head_mismatch",
+        "versioned compact index height is not accepted" => "header_height_unaccepted",
+        "versioned header read unavailable" => "header_read_unavailable",
+        "versioned header table unavailable" => "header_table_unavailable",
+        "versioned header lookup failed" => "header_lookup_failed",
+        "versioned header missing" => "header_missing",
+        "invalid accepted compact index context or body bound" => "header_context_invalid",
+        "historical proof body is unavailable before imported checkpoint" => {
+            "body_before_imported_checkpoint"
+        }
+        "versioned block read unavailable" => "body_read_unavailable",
+        "versioned block table unavailable" => "body_table_unavailable",
+        "versioned block lookup failed" => "body_lookup_failed",
+        "versioned block missing" => "body_missing",
+        _ => "unknown",
+    }
+}
+
+fn candidate_result<T>(
+    diagnostic: &mut Option<CandidateFailure>,
+    stage: CandidateFailureReason,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    if let Err(error) = &result {
+        *diagnostic = Some(CandidateFailure {
+            stage,
+            detail: candidate_failure_detail(error),
+        });
+    }
+    result
+}
+
 // Only the resident entry point can construct the production readiness gate.
 // Public observation never accepts an asserted boolean or a caller-made permit.
 struct SigningGuard<'a> {
@@ -293,6 +391,7 @@ pub struct Host {
     last_exported: Option<(u64, Hash, Option<u64>)>,
     last_status: Option<Status>,
     tick_failure: Option<TickFailureReason>,
+    candidate_failure: Option<CandidateFailure>,
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
@@ -309,6 +408,14 @@ impl Host {
     /// The failed operation's bounded origin; the original Result is unchanged.
     pub fn tick_failure_reason(&self) -> Option<TickFailureReason> {
         self.tick_failure
+    }
+    /// A finite candidate-operation code; no original error text is exported.
+    pub fn candidate_failure_reason(&self) -> Option<&'static str> {
+        self.candidate_failure.map(|failure| failure.stage.code())
+    }
+    /// A fixed allowlisted detail or unknown; never the original error text.
+    pub fn candidate_failure_detail(&self) -> Option<&'static str> {
+        self.candidate_failure.map(|failure| failure.detail)
     }
     /// The accepted, durably published capability only; pending proposals and
     /// votes cannot be exposed as signed bootstrap state.
@@ -346,6 +453,7 @@ impl Host {
             last_exported: None,
             last_status: None,
             tick_failure: None,
+            candidate_failure: None,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -466,6 +574,7 @@ impl Host {
         store: &Store,
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<(), String> {
+        let diagnostic = &mut self.candidate_failure;
         let preparation = self
             .preparation
             .as_mut()
@@ -474,16 +583,29 @@ impl Host {
             return Ok(());
         }
         if let Some((request, work)) = with_signing_readiness(store, readiness, || {
-            let (statement, witness) = PreparedCheckpoint::current_proposal(store, self.limits)?
-                .ok_or("eligible checkpoint disappeared")?;
-            let work = store.capture_checkpoint_archive(
-                statement.checkpoint_height,
-                self.limits,
-                &preparation.budget,
+            let (statement, witness) = candidate_result(
+                diagnostic,
+                CandidateFailureReason::CurrentProposal,
+                PreparedCheckpoint::current_proposal(store, self.limits).and_then(|proposal| {
+                    proposal.ok_or_else(|| "eligible checkpoint disappeared".into())
+                }),
+            )?;
+            let work = candidate_result(
+                diagnostic,
+                CandidateFailureReason::ArchiveCapture,
+                store.capture_checkpoint_archive(
+                    statement.checkpoint_height,
+                    self.limits,
+                    &preparation.budget,
+                ),
             )?;
             Ok((Proposal { statement, witness }, work))
         })? {
-            preparation.worker.start(work)?;
+            candidate_result(
+                diagnostic,
+                CandidateFailureReason::ArchiveWorkerStart,
+                preparation.worker.start(work),
+            )?;
             preparation.request = Some(request);
             preparation.certificate_only = false;
         }
@@ -600,6 +722,7 @@ impl Host {
         observer: &crate::eng2::checkpoint_observer::Observer,
     ) -> Result<Tick, String> {
         self.tick_failure = Some(TickFailureReason::Context);
+        self.candidate_failure = None;
         let readiness = ResidentSigningReadiness {
             head: ResidentSigningReadiness::head(store)?,
             network,
@@ -619,6 +742,7 @@ impl Host {
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<Tick, String> {
         self.tick_failure = Some(TickFailureReason::Context);
+        self.candidate_failure = None;
         let result = self.tick_step(store, now, incoming, readiness);
         if result.is_ok() {
             self.tick_failure = None;
@@ -831,7 +955,11 @@ impl Host {
             .signer
             .as_ref()
             .is_some_and(|signer| signer.check_current(store).is_ok());
-        let due = self.export.publication_due(now, state.height())?;
+        let due = candidate_result(
+            &mut self.candidate_failure,
+            CandidateFailureReason::PublicationClock,
+            self.export.publication_due(now, state.height()),
+        )?;
         // Slot zero is the sole local proposer. Other signers wait for its exact
         // independently checked proposal, avoiding competing authorization heads.
         if self.pending.is_none()
