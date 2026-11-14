@@ -42,9 +42,12 @@ fn check_note(actual: &Note, expected: &Note) {
 #[cfg(unix)]
 #[ignore = "requires a separately bounded owner-only grant for one V2 proof generation and a fresh output directory"]
 fn generate_one_encrypted_typed_transaction_fixture() {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
-    assert_ne!(std::env::var("CI").as_deref(), Ok("true"));
+    assert!(!matches!(
+        std::env::var("CI").as_deref(),
+        Ok("true") | Ok("1")
+    ));
     assert_eq!(
         std::env::var("SIWORLD_V2_TYPED_TRANSACTION_GENERATE").as_deref(),
         Ok("1")
@@ -53,6 +56,14 @@ fn generate_one_encrypted_typed_transaction_fixture() {
         .expect("a separately approved absent output directory is required");
     let output = Path::new(&output);
     assert!(output.is_absolute());
+    let parent = output
+        .parent()
+        .expect("a private output parent is required");
+    assert_eq!(parent.canonicalize().unwrap(), parent);
+    let metadata = std::fs::symlink_metadata(parent).unwrap();
+    assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+    assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+    assert_eq!(metadata.mode() & 0o7777, 0o700);
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(output)

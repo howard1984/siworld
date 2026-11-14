@@ -59,3 +59,10 @@ doctest = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(siworld_native_node)'] }
+
+[features]
+receipt-scan-synthetic = []
+
+[[example]]
+name = "receipt-scan-synthetic"
+required-features = ["receipt-scan-synthetic"]
