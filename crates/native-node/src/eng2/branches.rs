@@ -9,6 +9,8 @@ use super::{
     store::{BodyAvailability, Store},
 };
 pub mod discovery;
+#[cfg(feature = "eng2-rehearsal")]
+pub mod observation;
 mod refusal;
 
 use crate::wire::Hash;
