@@ -24,6 +24,48 @@ struct Context {
     roster: Hash,
 }
 
+/// Counters from one reservation attempt, not a process-memory measurement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveReservationObservation {
+    pub archive_bytes: usize,
+    pub suffix_bytes: usize,
+    pub requested_bytes: Option<usize>,
+    pub maximum_bytes: Option<usize>,
+    pub used_before_bytes: Option<usize>,
+    pub failure: Option<&'static str>,
+}
+/// The locally selected archive and candidate for the last reservation attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveCaptureObservation {
+    pub observed_unix_seconds: Option<u64>,
+    pub checkpoint_height: u64,
+    pub base_height: u64,
+    pub reservation: ArchiveReservationObservation,
+}
+
+impl ArchiveReservationObservation {
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "archive_bytes": self.archive_bytes,
+            "suffix_bytes": self.suffix_bytes,
+            "requested_bytes": self.requested_bytes,
+            "maximum_bytes": self.maximum_bytes,
+            "used_before_bytes": self.used_before_bytes,
+            "failure": self.failure,
+        })
+    }
+}
+impl ArchiveCaptureObservation {
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "observed_unix_seconds": self.observed_unix_seconds,
+            "checkpoint_height": self.checkpoint_height,
+            "base_height": self.base_height,
+            "reservation": self.reservation.to_json(),
+        })
+    }
+}
+
 /// Immutable bounded input. Only the local Store can construct this input.
 /// No Store, signer, network guard or journal is transferred to the worker.
 pub struct ArchiveWork {
@@ -99,21 +141,63 @@ impl ArchiveWork {
             .and_then(|n| n.checked_add(8 * 1024 * 1024))
             .ok_or_else(|| "checkpoint archive workspace bound overflow".into())
     }
-    pub(crate) fn reserve(
+    pub(crate) fn reserve_observed(
         bytes: usize,
         suffix_bytes: usize,
         budget: &Budget,
-    ) -> Result<Reservation, String> {
-        let charge = Self::charge(bytes)?
-            .checked_add(
-                suffix_bytes
-                    .checked_mul(4)
-                    .ok_or("checkpoint suffix workspace bound overflow")?,
-            )
-            .ok_or("checkpoint preparation workspace bound overflow")?;
-        budget
-            .reserve(charge)
-            .map_err(|_| "checkpoint archive preparation budget unavailable".into())
+    ) -> (Result<Reservation, String>, ArchiveReservationObservation) {
+        let mut observation = ArchiveReservationObservation {
+            archive_bytes: bytes,
+            suffix_bytes,
+            requested_bytes: None,
+            maximum_bytes: None,
+            used_before_bytes: None,
+            failure: None,
+        };
+        let charge = match Self::charge(bytes) {
+            Ok(charge) => charge,
+            Err(error) => {
+                observation.failure = Some("archive_workspace_overflow");
+                return (Err(error), observation);
+            }
+        };
+        let Some(suffix_charge) = suffix_bytes.checked_mul(4) else {
+            observation.failure = Some("suffix_workspace_overflow");
+            return (
+                Err("checkpoint suffix workspace bound overflow".into()),
+                observation,
+            );
+        };
+        let Some(charge) = charge.checked_add(suffix_charge) else {
+            observation.failure = Some("preparation_workspace_overflow");
+            return (
+                Err("checkpoint preparation workspace bound overflow".into()),
+                observation,
+            );
+        };
+        observation.requested_bytes = Some(charge);
+        match budget.reserve_observed(charge) {
+            Ok((reservation, usage)) => {
+                observation.maximum_bytes = Some(usage.maximum);
+                observation.used_before_bytes = usage.used.checked_sub(charge);
+                (Ok(reservation), observation)
+            }
+            Err(failure) => {
+                observation.failure = Some(match failure {
+                    crate::p2p::ReserveFailure::Exhausted(usage) => {
+                        observation.maximum_bytes = Some(usage.maximum);
+                        observation.used_before_bytes = Some(usage.used);
+                        "budget_exhausted"
+                    }
+                    crate::p2p::ReserveFailure::Overflow => "budget_usage_overflow",
+                    crate::p2p::ReserveFailure::Unavailable => "budget_unavailable",
+                });
+                (
+                    Err("checkpoint archive preparation budget unavailable".into()),
+                    observation,
+                )
+            }
+        }
     }
     fn validate(self, cancelled: &AtomicBool) -> Result<ValidatedArchive, String> {
         if cancelled.load(Ordering::Acquire) {

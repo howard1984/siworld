@@ -713,6 +713,17 @@ impl Store {
         limits: super::snapshot::ImportLimits,
         budget: &crate::p2p::Budget,
     ) -> Result<super::runtime_export::archive_work::ArchiveWork, String> {
+        self.capture_checkpoint_archive_observed(height, limits, budget, &mut None)
+    }
+    /// Preserve the exact reservation attempt without changing capture admission.
+    pub(crate) fn capture_checkpoint_archive_observed(
+        &self,
+        height: u64,
+        limits: super::snapshot::ImportLimits,
+        budget: &crate::p2p::Budget,
+        observation: &mut Option<super::runtime_export::archive_work::ArchiveCaptureObservation>,
+    ) -> Result<super::runtime_export::archive_work::ArchiveWork, String> {
+        *observation = None;
         self.ensure_exportable()?;
         if height == 0 || height > self.engine.state().height() {
             return Err("invalid checkpoint preparation archive height".into());
@@ -745,11 +756,21 @@ impl Store {
                 .checked_add(self.block_size(h)?)
                 .ok_or_else(|| "checkpoint suffix byte bound overflow".to_owned())
         })?;
-        let reservation = super::runtime_export::archive_work::ArchiveWork::reserve(
-            bytes.value().len(),
-            suffix_bytes,
-            budget,
-        )?;
+        let (reservation, attempt) =
+            super::runtime_export::archive_work::ArchiveWork::reserve_observed(
+                bytes.value().len(),
+                suffix_bytes,
+                budget,
+            );
+        *observation = Some(
+            super::runtime_export::archive_work::ArchiveCaptureObservation {
+                observed_unix_seconds: None,
+                checkpoint_height: height,
+                base_height,
+                reservation: attempt,
+            },
+        );
+        let reservation = reservation?;
         let suffix = (base_height + 1..=height)
             .map(|h| self.block(h))
             .collect::<Result<Vec<_>, _>>()?;

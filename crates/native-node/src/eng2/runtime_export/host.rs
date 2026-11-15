@@ -436,6 +436,7 @@ struct ResidentPreparation {
     request: Option<Proposal>,
     completed: Option<PreparedCheckpoint>,
     certificate_only: bool,
+    last_archive_reservation: Option<archive_work::ArchiveCaptureObservation>,
 }
 impl Host {
     /// The failed operation's bounded origin; the original Result is unchanged.
@@ -449,6 +450,10 @@ impl Host {
     /// A fixed allowlisted detail or unknown; never the original error text.
     pub fn candidate_failure_detail(&self) -> Option<&'static str> {
         self.candidate_failure.map(|failure| failure.detail)
+    }
+    /// The last local capture attempt; counters are not a live budget snapshot.
+    pub fn last_archive_reservation(&self) -> Option<archive_work::ArchiveCaptureObservation> {
+        self.preparation.as_ref()?.last_archive_reservation
     }
     /// The accepted, durably published capability only; pending proposals and
     /// votes cannot be exposed as signed bootstrap state.
@@ -526,6 +531,7 @@ impl Host {
         self.preparation = Some(ResidentPreparation {
             budget: budget.clone(),
             worker: archive_work::ArchiveWorker::default(),
+            last_archive_reservation: None,
             request: None,
             completed: None,
             certificate_only: false,
@@ -607,6 +613,7 @@ impl Host {
         store: &Store,
         readiness: Option<&dyn SigningReadiness>,
     ) -> Result<(), String> {
+        let observed_at = self.last_now;
         let diagnostic = &mut self.candidate_failure;
         let preparation = self
             .preparation
@@ -623,15 +630,18 @@ impl Host {
                     proposal.ok_or_else(|| "eligible checkpoint disappeared".into())
                 }),
             )?;
-            let work = candidate_result(
-                diagnostic,
-                CandidateFailureReason::ArchiveCapture,
-                store.capture_checkpoint_archive(
+            let work = candidate_result(diagnostic, CandidateFailureReason::ArchiveCapture, {
+                let captured = store.capture_checkpoint_archive_observed(
                     statement.checkpoint_height,
                     self.limits,
                     &preparation.budget,
-                ),
-            )?;
+                    &mut preparation.last_archive_reservation,
+                );
+                if let Some(observation) = &mut preparation.last_archive_reservation {
+                    observation.observed_unix_seconds = observed_at;
+                }
+                captured
+            })?;
             Ok((Proposal { statement, witness }, work))
         })? {
             candidate_result(
@@ -650,6 +660,7 @@ impl Host {
         proposal: &Proposal,
         certificate_only: bool,
     ) -> Result<(), String> {
+        let observed_at = self.last_now;
         let preparation = self
             .preparation
             .as_mut()
@@ -679,12 +690,16 @@ impl Host {
             }
             return Ok(());
         }
-        let work = store.capture_checkpoint_archive(
+        let captured = store.capture_checkpoint_archive_observed(
             proposal.statement.checkpoint_height,
             self.limits,
             &preparation.budget,
-        )?;
-        preparation.worker.start(work)?;
+            &mut preparation.last_archive_reservation,
+        );
+        if let Some(observation) = &mut preparation.last_archive_reservation {
+            observation.observed_unix_seconds = observed_at;
+        }
+        preparation.worker.start(captured?)?;
         preparation.request = Some(proposal.clone());
         preparation.certificate_only = certificate_only;
         Ok(())

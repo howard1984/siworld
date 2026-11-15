@@ -566,18 +566,18 @@ mod tests {
         let budget = p2p::Budget::new(WORKER_BYTES);
         let pressure = budget.reserve(1).unwrap();
         let accepts = std::cell::Cell::new(0);
-        let mut accept_empty = |_charge| {
+        let accept_empty = |_charge| {
             accepts.set(accepts.get() + 1);
             Ok::<Option<()>, String>(None)
         };
         assert!(matches!(
-            admit_worker(budget.reserve_observed(WORKER_BYTES), &mut accept_empty).unwrap(),
+            admit_worker(budget.reserve_observed(WORKER_BYTES), accept_empty).unwrap(),
             WorkerAdmission::Deferred
         ));
         assert_eq!(accepts.get(), 0);
         drop(pressure);
         assert!(matches!(
-            admit_worker(budget.reserve_observed(WORKER_BYTES), &mut accept_empty).unwrap(),
+            admit_worker(budget.reserve_observed(WORKER_BYTES), accept_empty).unwrap(),
             WorkerAdmission::Ready(None)
         ));
         assert_eq!(accepts.get(), 1);

@@ -268,3 +268,87 @@ fn retained_archive_failures_release_charges_without_borrowing_live_bytes() {
     drop((snapshot, metadata, reservation));
     assert_eq!(budget.available().unwrap(), maximum);
 }
+
+#[test]
+fn archive_reservation_observation_preserves_contention_and_lifetime() {
+    let archive = 23usize;
+    let suffix = 17usize;
+    let charge = 16 * archive + 8 * 1024 * 1024 + 4 * suffix;
+    let maximum = charge + 19;
+    let budget = Budget::new(maximum);
+    let held = budget.reserve(20).unwrap();
+    let (result, rejected) = ArchiveWork::reserve_observed(archive, suffix, &budget);
+    assert_eq!(
+        result.err().unwrap(),
+        "checkpoint archive preparation budget unavailable"
+    );
+    assert_eq!(rejected.archive_bytes, archive);
+    assert_eq!(rejected.suffix_bytes, suffix);
+    assert_eq!(rejected.requested_bytes, Some(charge));
+    assert_eq!(rejected.maximum_bytes, Some(maximum));
+    assert_eq!(rejected.used_before_bytes, Some(20));
+    assert_eq!(rejected.failure, Some("budget_exhausted"));
+    assert_eq!(budget.available().unwrap(), maximum - 20);
+    drop(held);
+    let (result, admitted) = ArchiveWork::reserve_observed(archive, suffix, &budget);
+    let reservation = result.unwrap();
+    assert_eq!(admitted.maximum_bytes, Some(maximum));
+    assert_eq!(admitted.used_before_bytes, Some(0));
+    assert_eq!(admitted.requested_bytes, Some(charge));
+    assert_eq!(admitted.failure, None);
+    assert_eq!(budget.available().unwrap(), 19);
+    let encoded = admitted.to_json();
+    assert_eq!(encoded["requested_bytes"], charge);
+    drop(reservation);
+    assert_eq!(budget.available().unwrap(), maximum);
+}
+
+#[test]
+fn archive_reservation_observation_preserves_all_workspace_overflows() {
+    let budget = Budget::new(1);
+    for (archive, suffix, code, error) in [
+        (
+            usize::MAX,
+            0,
+            "archive_workspace_overflow",
+            "checkpoint archive workspace bound overflow",
+        ),
+        (
+            0,
+            usize::MAX,
+            "suffix_workspace_overflow",
+            "checkpoint suffix workspace bound overflow",
+        ),
+        (
+            (usize::MAX - 8 * 1024 * 1024) / 16,
+            16,
+            "preparation_workspace_overflow",
+            "checkpoint preparation workspace bound overflow",
+        ),
+    ] {
+        let (result, observed) = ArchiveWork::reserve_observed(archive, suffix, &budget);
+        assert_eq!(result.err().unwrap(), error);
+        assert_eq!(observed.archive_bytes, archive);
+        assert_eq!(observed.suffix_bytes, suffix);
+        assert_eq!(observed.failure, Some(code));
+        assert_eq!(observed.requested_bytes, None);
+        assert_eq!(observed.used_before_bytes, None);
+        assert_eq!(observed.maximum_bytes, None);
+        assert_eq!(budget.available().unwrap(), 1);
+    }
+    // Logical counter overflow requires no corresponding allocation.
+    let budget = Budget::new(usize::MAX);
+    let held = budget.reserve(usize::MAX - 1).unwrap();
+    let (result, observation) = ArchiveWork::reserve_observed(0, 0, &budget);
+    assert_eq!(
+        result.err().unwrap(),
+        "checkpoint archive preparation budget unavailable"
+    );
+    assert_eq!(observation.requested_bytes, Some(8 * 1024 * 1024));
+    assert_eq!(observation.failure, Some("budget_usage_overflow"));
+    assert_eq!(observation.used_before_bytes, None);
+    assert_eq!(observation.maximum_bytes, None);
+    assert_eq!(budget.available().unwrap(), 1);
+    drop(held);
+    assert_eq!(budget.available().unwrap(), usize::MAX);
+}

@@ -241,6 +241,19 @@ unavailable signing readiness is not a preparation error.
 `checkpoint_candidate_detail` maps exact known error literals to fixed codes;
 unrecognized or decorated errors are reported as `unknown`.
 
+`checkpoint_archive_reservation` records the last local archive reservation
+attempt, including its tick's Unix seconds, requested checkpoint and selected
+base heights. Its nested `reservation` contains encoded archive and suffix byte
+counts, requested workspace bytes, the shared budget maximum and usage before
+the attempt, and a bounded failure category. The counters come from the same
+locked reservation operation; observing them does not perform a second reserve.
+Overflow or an unavailable budget lock leaves unobserved counters null. The
+workspace request remains `16 * archive_bytes + 8 MiB + 4 * suffix_bytes`.
+This record is retained across ticks, so its timestamp must be checked before
+attributing it to a later status row. It measures logical ownership rather than
+resident memory or filesystem capacity. Capture, native reconstruction, signing
+readiness and checkpoint acceptance retain their existing independent checks.
+
 Checkpoint exchange follows each completed ordinary block round. It accepts at
 most three canonical messages under a shared ten-second phase deadline and
 retains budget ownership through host consumption. The host reconstructs the

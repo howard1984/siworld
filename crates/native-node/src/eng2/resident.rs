@@ -248,6 +248,14 @@ impl Shared {
         Ok(())
     }
 }
+struct ExportState<'a> {
+    checkpoint_error: Option<&'a str>,
+    wallet_export: Option<bool>,
+    checkpoint_tick_reason: Option<&'a str>,
+    checkpoint_candidate_failure: Option<&'a str>,
+    checkpoint_candidate_detail: Option<&'a str>,
+    checkpoint_archive_reservation: Option<&'a serde_json::Value>,
+}
 fn export_status(
     directory: &Path,
     run_id: &str,
@@ -255,21 +263,16 @@ fn export_status(
     started: Instant,
     sequence: u64,
     mode: (bool, bool),
-    export_state: (
-        Option<&str>,
-        Option<bool>,
-        Option<&str>,
-        Option<&str>,
-        Option<&str>,
-    ),
+    export_state: ExportState<'_>,
 ) -> Result<(), String> {
-    let (
+    let ExportState {
         checkpoint_error,
         wallet_export,
         checkpoint_tick_reason,
         checkpoint_candidate_failure,
         checkpoint_candidate_detail,
-    ) = export_state;
+        checkpoint_archive_reservation,
+    } = export_state;
     let (mining, listening) = mode;
     let owner = shared
         .owner
@@ -299,7 +302,7 @@ fn export_status(
             "pow_attempts":production.pow_attempts,"mined_blocks":production.blocks,
             "pow_progress_fresh":production.last_pow.is_some_and(|t|t.elapsed()<=READY_FRESHNESS),
             "padding_ready":owner.padding_count(),"padding_bytes":owner.padding_bytes(),
-            "checkpoint_error":checkpoint_error,"checkpoint_tick_reason":checkpoint_tick_reason,"checkpoint_candidate_failure":checkpoint_candidate_failure,"checkpoint_candidate_detail":checkpoint_candidate_detail,"checkpoint_archive_error":owner.last_archive_error(),
+            "checkpoint_error":checkpoint_error,"checkpoint_tick_reason":checkpoint_tick_reason,"checkpoint_candidate_failure":checkpoint_candidate_failure,"checkpoint_candidate_detail":checkpoint_candidate_detail,"checkpoint_archive_reservation":checkpoint_archive_reservation,"checkpoint_archive_error":owner.last_archive_error(),
             "wallet_export_enabled":wallet_export.is_some(),"wallet_export_paused":wallet_export,
             "signed_bootstrap_available":owner.bootstrap_available(),
             "checkpoint_observation_error":observer.error().map(super::checkpoint_observer::Error::code),
@@ -545,6 +548,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let mut checkpoint_candidate_detail = None;
     #[cfg(not(unix))]
     let checkpoint_candidate_detail = None;
+    #[cfg(unix)]
+    let mut checkpoint_archive_reservation = None;
+    #[cfg(not(unix))]
+    let checkpoint_archive_reservation: Option<serde_json::Value> = None;
     #[cfg(not(unix))]
     let wallet_export = None;
     let result = (|| {
@@ -609,6 +616,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                                 checkpoint_host.candidate_failure_detail();
                         }
                     }
+                    checkpoint_archive_reservation =
+                        checkpoint_host.last_archive_reservation().map(
+                            super::runtime_export::archive_work::ArchiveCaptureObservation::to_json,
+                        );
                     let _ = checkpoint_host.tick_wallet_export(
                         owner.store(),
                         unix_ms()? / 1000,
@@ -628,9 +639,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     started,
                     sequence,
                     (mining, listening),
-                    (
+                    ExportState {
                         checkpoint_error,
-                        {
+                        wallet_export: {
                             #[cfg(unix)]
                             {
                                 checkpoint_host.wallet_export_state()
@@ -643,7 +654,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                         checkpoint_tick_reason,
                         checkpoint_candidate_failure,
                         checkpoint_candidate_detail,
-                    ),
+                        checkpoint_archive_reservation: checkpoint_archive_reservation.as_ref(),
+                    },
                 )?;
                 last_export = Instant::now();
             }
@@ -674,9 +686,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         started,
         sequence.saturating_add(1),
         (mining, false),
-        (
+        ExportState {
             checkpoint_error,
-            {
+            wallet_export: {
                 #[cfg(unix)]
                 {
                     checkpoint_host.wallet_export_state()
@@ -689,7 +701,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             checkpoint_tick_reason,
             checkpoint_candidate_failure,
             checkpoint_candidate_detail,
-        ),
+            checkpoint_archive_reservation: checkpoint_archive_reservation.as_ref(),
+        },
     )?;
     result
 }
