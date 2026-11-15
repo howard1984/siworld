@@ -618,18 +618,24 @@ fn session(
             .insert(fingerprint);
     }
     while !shared.cancel.is_cancelled() {
+        let checkpoint_headers = shared
+            .checkpoint_observer
+            .lock()
+            .map_err(|_| "checkpoint observer lock poisoned")?
+            .retained_target();
         let round = if initiator {
             shared.network.begin_round(fingerprint)?;
-            network::initiate(
+            network::initiate_with_checkpoint_headers(
                 &mut peer,
                 &shared.owner,
                 &mut sequence,
                 network::Limits {
                     blocks: ROUND_BLOCKS,
                 },
+                checkpoint_headers,
             )
         } else {
-            network::respond_with_round_start(
+            network::respond_with_checkpoint_headers(
                 &mut peer,
                 &shared.owner,
                 &mut sequence,
@@ -637,6 +643,7 @@ fn session(
                     blocks: ROUND_BLOCKS,
                 },
                 || shared.network.begin_round(fingerprint),
+                checkpoint_headers,
             )
         };
         shared.network.observe_phase(
@@ -741,12 +748,25 @@ fn checkpoint_phase(
             if !owner.activities_allowed() {
                 continue;
             }
+            let retained = owner.capture_checkpoint_headers()?;
             let mut observer = shared
                 .checkpoint_observer
                 .lock()
                 .map_err(|_| "checkpoint observer lock poisoned")?;
             let was_conflicted = observer.conflicted();
-            let outcome = observer.observe(owner.store(), unix_ms()? / 1000, &item.message);
+            let outcome = observer.observe(
+                owner.store(),
+                unix_ms()? / 1000,
+                &item.message,
+                &|height, id| {
+                    retained
+                        .as_ref()
+                        .map(|headers| headers.header(height, id))
+                        .transpose()
+                        .map(Option::flatten)
+                        .map_err(|_| super::super::checkpoint_observer::Error::Unavailable)
+                },
+            );
             if was_conflicted && !observer.conflicted() {
                 // Recovery must await an actual newly completed block →
                 // checkpoint → transaction round at this exact canonical head.
@@ -776,9 +796,10 @@ fn checkpoint_mailbox_admission(
 ) -> Result<bool, String> {
     use super::super::checkpoint_observer::{Error, Outcome};
     match outcome {
-        Ok(Outcome::Historical | Outcome::PendingAuthorization) | Err(Error::Unavailable) => {
-            Ok(false)
-        }
+        Ok(
+            Outcome::Historical | Outcome::PendingAuthorization | Outcome::ObsoleteAuthorization,
+        )
+        | Err(Error::Unavailable) => Ok(false),
         Ok(_) => Ok(true),
         Err(error) => Err(error.code().into()),
     }

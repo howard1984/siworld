@@ -35,6 +35,76 @@ pub struct PublicExport {
     material_generation: std::cell::Cell<u64>,
 }
 impl PublicExport {
+    /// Restore one restrictive anchor cursor without enumerating evidence files.
+    /// This cursor grants no roster, signing or state-adoption authority.
+    #[cfg(any(test, feature = "eng2-runtime"))]
+    pub(crate) fn observed_retirement(&self) -> Result<Option<Certificate>, String> {
+        let Some(bytes) = self.read_optional("checkpoint-observed-retirement-eng2.bin", 56)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 56 || &bytes[..8] != b"SW2OA001" {
+            return Err("checkpoint observation retirement cursor malformed".into());
+        }
+        let epoch = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let height = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        let name = format!("checkpoint-observed-{epoch:020}-{height:020}.certificate-eng2.bin");
+        let certificate = self.read(&name, super::super::certificate::CERTIFICATE_BYTES)?;
+        let certificate = Certificate::decode(&certificate, self.network)
+            .map_err(|_| "checkpoint observation retirement evidence malformed")?;
+        if certificate.statement.roster_sequence != epoch
+            || certificate.statement.checkpoint_height != height
+            || certificate.statement.checkpoint_block != bytes[24..56]
+        {
+            return Err("checkpoint observation retirement evidence differs".into());
+        }
+        let conflict_name =
+            format!("checkpoint-observed-conflict-{epoch:020}-{height:020}.certificate-eng2.bin");
+        if self
+            .read_optional(&conflict_name, super::super::certificate::CERTIFICATE_BYTES)?
+            .is_some()
+        {
+            return Err("checkpoint observation retirement has conflicting evidence".into());
+        }
+        Ok(Some(certificate))
+    }
+
+    #[cfg(any(test, feature = "eng2-runtime"))]
+    pub(crate) fn record_observed_retirement(
+        &self,
+        certificate: &Certificate,
+    ) -> Result<(u64, Hash), String> {
+        let statement = &certificate.statement;
+        let name = format!(
+            "checkpoint-observed-{:020}-{:020}.certificate-eng2.bin",
+            statement.roster_sequence, statement.checkpoint_height,
+        );
+        let saved = self.read(&name, super::super::certificate::CERTIFICATE_BYTES)?;
+        let saved = Certificate::decode(&saved, self.network)
+            .map_err(|_| "checkpoint observation retirement evidence malformed")?;
+        if saved.statement != *statement {
+            return Err("checkpoint observation retirement statement differs".into());
+        }
+        if let Some(saved) = self.observed_retirement()? {
+            let old = &saved.statement;
+            if old.checkpoint_height > statement.checkpoint_height {
+                return Ok((old.checkpoint_height, old.checkpoint_block));
+            }
+            if old.checkpoint_height == statement.checkpoint_height {
+                if old.checkpoint_block != statement.checkpoint_block {
+                    return Err("checkpoint observation retirement anchor differs".into());
+                }
+                return Ok((old.checkpoint_height, old.checkpoint_block));
+            }
+        }
+        let mut bytes = [0; 56];
+        bytes[..8].copy_from_slice(b"SW2OA001");
+        bytes[8..16].copy_from_slice(&statement.roster_sequence.to_le_bytes());
+        bytes[16..24].copy_from_slice(&statement.checkpoint_height.to_le_bytes());
+        bytes[24..].copy_from_slice(&statement.checkpoint_block);
+        self.replace("checkpoint-observed-retirement-eng2.bin", &bytes)?;
+        Ok((statement.checkpoint_height, statement.checkpoint_block))
+    }
+
     /// Reuse the export's descriptor confinement and network/genesis binding.
     #[cfg(any(test, feature = "eng2-runtime"))]
     pub(crate) fn open_observation_evidence(root: &Path, store: &Store) -> Result<Self, String> {

@@ -606,6 +606,23 @@ impl super::network::Owner for Driver {
             .ok_or("independent branch archive unavailable")?;
         state.discovery.received(request, header, now_ms)
     }
+    fn checkpoint_headers_next(
+        &mut self,
+        remote: (u64, Hash),
+        peer: Hash,
+        now_ms: u64,
+    ) -> Result<super::network::DiscoveryAction, String> {
+        let state = self
+            .reorganization
+            .as_mut()
+            .ok_or("independent branch archive unavailable")?;
+        if state.paused() {
+            return Ok(super::network::DiscoveryAction::Deferred);
+        }
+        state
+            .discovery
+            .next_headers(&mut state.branches, &self.store, remote, peer, now_ms)
+    }
     fn branch_discovery_deferred(
         &mut self,
         request: super::branches::discovery::HeaderRequest,

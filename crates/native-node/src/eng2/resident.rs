@@ -850,11 +850,23 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             .headers
                             .after_commit(|| shared.headers.committed(&owner));
                     }
-                    shared
+                    let retained = owner.capture_checkpoint_headers()?;
+                    let mut observer = shared
                         .checkpoint_observer
                         .lock()
-                        .map_err(|_| "checkpoint observer lock poisoned")?
-                        .reconcile(owner.store());
+                        .map_err(|_| "checkpoint observer lock poisoned")?;
+                    let was_conflicted = observer.conflicted();
+                    observer.reconcile(owner.store(), &|height, id| {
+                        retained
+                            .as_ref()
+                            .map(|headers| headers.header(height, id))
+                            .transpose()
+                            .map(Option::flatten)
+                            .map_err(|_| super::checkpoint_observer::Error::Unavailable)
+                    });
+                    if was_conflicted && !observer.conflicted() {
+                        shared.network.invalidate_head_evidence()?;
+                    }
                 }
                 if !owner.activities_allowed() {
                     #[cfg(unix)]
@@ -880,7 +892,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             // Restoration failure pauses only advertisements and
                             // signing; canonical validation and peers keep running.
                             shared.mailbox.publish(&[])?;
-                            checkpoint_error = Some("checkpoint_retained_restoration_unavailable");
+                            checkpoint_error = Some(if restored.is_err() {
+                                "checkpoint_retained_restoration_failed"
+                            } else {
+                                "checkpoint_retained_restoration_pending"
+                            });
                             checkpoint_tick_reason = Some("retained_restoration");
                         } else {
                             let incoming = shared.mailbox.drain()?;

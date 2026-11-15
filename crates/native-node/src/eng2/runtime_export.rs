@@ -42,6 +42,19 @@ mod retained;
 #[cfg(all(unix, feature = "eng2-runtime"))]
 mod retained_work;
 
+/// Authenticate a saved authorization against canonical and retained headers.
+/// A noncurrent result establishes obsolescence only, never signing authority.
+#[cfg(unix)]
+pub(crate) fn retained_authorization(
+    network: Hash,
+    head: u64,
+    statement: &Statement,
+    canonical: impl FnMut(u64) -> Result<Header, String>,
+    retained: &mut impl FnMut(u64, Hash) -> Result<Option<Header>, String>,
+) -> Result<(Header, bool), String> {
+    retained::authorization(network, head, statement, canonical, retained)
+}
+
 /// The newest eligible actual archive height; no height is synthesized.
 pub fn eligible_checkpoint(head: u64) -> Option<u64> {
     let height =

@@ -43,15 +43,26 @@ pub(crate) enum Outcome {
     CurrentCertificate(u64),
     Historical,
     PendingAuthorization,
+    ObsoleteAuthorization,
 }
 const MAX_PENDING_AUTHORIZATIONS: usize = 8;
+struct RetainedObservation {
+    certificate: Certificate,
+    obsolete: bool,
+    witness: Option<AuthorizationWitness>,
+    _witness_charge: Option<crate::p2p::Reservation>,
+}
 #[derive(Default)]
 pub(crate) struct Observer {
     last_now: Option<u64>,
     observed_height: Option<u64>,
     hard: Option<Error>,
-    pending: Vec<Certificate>,
+    pending: Vec<RetainedObservation>,
+    next_retained: usize,
+    retired_anchor: Option<(u64, Hash)>,
+    retired_anchor_unavailable: bool,
     _evidence_charge: Option<crate::p2p::Reservation>,
+    budget: Option<crate::p2p::Budget>,
     #[cfg(unix)]
     evidence: Option<super::runtime_export::PublicExport>,
     #[cfg(all(test, unix))]
@@ -62,23 +73,32 @@ trait View {
     fn height(&self) -> u64;
     fn governance(&self) -> &GovernanceState;
     fn header(&self, height: u64) -> Result<Header, Error>;
+    fn retained_header(&self, _height: u64, _id: Hash) -> Result<Option<Header>, Error> {
+        Ok(None)
+    }
 }
-struct Accepted<'a>(&'a Store);
+struct Accepted<'a> {
+    store: &'a Store,
+    retained: &'a dyn Fn(u64, Hash) -> Result<Option<Header>, Error>,
+}
 impl View for Accepted<'_> {
     fn height(&self) -> u64 {
-        self.0.engine().state().height()
+        self.store.engine().state().height()
     }
     fn governance(&self) -> &GovernanceState {
-        self.0.engine().state().governance()
+        self.store.engine().state().governance()
     }
     fn header(&self, height: u64) -> Result<Header, Error> {
-        self.0.header(height).map_err(|_| Error::Unavailable)
+        self.store.header(height).map_err(|_| Error::Unavailable)
+    }
+    fn retained_header(&self, height: u64, id: Hash) -> Result<Option<Header>, Error> {
+        (self.retained)(height, id)
     }
 }
 impl Observer {
     pub fn new(budget: &crate::p2p::Budget) -> Result<Self, String> {
         let charge = budget
-            .reserve(MAX_PENDING_AUTHORIZATIONS * std::mem::size_of::<Certificate>())
+            .reserve(MAX_PENDING_AUTHORIZATIONS * std::mem::size_of::<RetainedObservation>())
             .map_err(|_| "checkpoint observation evidence budget unavailable")?;
         let mut observer = Self::default();
         observer
@@ -86,6 +106,7 @@ impl Observer {
             .try_reserve_exact(MAX_PENDING_AUTHORIZATIONS)
             .map_err(|_| "checkpoint observation evidence allocation failed")?;
         observer._evidence_charge = Some(charge);
+        observer.budget = Some(budget.clone());
         Ok(observer)
     }
     #[cfg(unix)]
@@ -93,12 +114,38 @@ impl Observer {
         if self.evidence.is_some() || !self.pending.is_empty() || self.observed_height.is_some() {
             return Err("checkpoint observation evidence already active".into());
         }
-        self.evidence =
-            Some(super::runtime_export::PublicExport::open_observation_evidence(root, store)?);
+        let evidence = super::runtime_export::PublicExport::open_observation_evidence(root, store)?;
+        if let Some(certificate) = evidence.observed_retirement()? {
+            let roster = store.engine().state().governance().active_roster();
+            if certificate.statement.roster_sequence == roster.epoch_sequence {
+                if certificate.statement.roster_digest
+                    != roster.digest(certificate.statement.network)
+                    || roster.activated_height > certificate.statement.authorization_height
+                {
+                    return Err("checkpoint observation retirement roster differs".into());
+                }
+                certificate
+                    .check_signatures(roster.keys())
+                    .map_err(|_| "checkpoint observation retirement signatures invalid")?;
+            }
+            // Historical journal context restores a restriction only. It does
+            // not establish current authorization or permit a new signature.
+            self.retired_anchor = Some((
+                certificate.statement.checkpoint_height,
+                certificate.statement.checkpoint_block,
+            ));
+        }
+        self.evidence = Some(evidence);
+        self.reconcile_view(&Accepted {
+            store,
+            retained: &|_, _| Ok(None),
+        });
         Ok(())
     }
     pub fn conflicted(&self) -> bool {
-        self.hard.is_some() || !self.pending.is_empty()
+        self.hard.is_some()
+            || self.retired_anchor_unavailable
+            || self.pending.iter().any(|saved| !saved.obsolete)
     }
     pub fn observed_height(&self) -> Option<u64> {
         self.observed_height
@@ -108,7 +155,31 @@ impl Observer {
     }
     pub fn gate_reason(&self) -> Option<Error> {
         self.hard
-            .or_else(|| (!self.pending.is_empty()).then_some(Error::PendingAuthorization))
+            .or_else(|| {
+                self.retired_anchor_unavailable
+                    .then_some(Error::Unavailable)
+            })
+            .or_else(|| {
+                self.pending
+                    .iter()
+                    .any(|saved| !saved.obsolete)
+                    .then_some(Error::PendingAuthorization)
+            })
+    }
+    pub fn retained_target(&mut self) -> Option<(u64, Hash)> {
+        for _ in 0..self.pending.len() {
+            let index = self.next_retained % self.pending.len();
+            self.next_retained = index + 1;
+            let saved = &self.pending[index];
+            if !saved.obsolete {
+                let statement = &saved.certificate.statement;
+                return Some((
+                    statement.authorization_height,
+                    statement.authorization_block,
+                ));
+            }
+        }
+        None
     }
     /// The caller holds the canonical owner lock and the decoded packet charge.
     /// No checkpoint key, archive scan, vote creation or outgoing queue is used.
@@ -117,6 +188,7 @@ impl Observer {
         store: &Store,
         now: u64,
         incoming: &Incoming,
+        retained: &impl Fn(u64, Hash) -> Result<Option<Header>, Error>,
     ) -> Result<Outcome, Error> {
         if let Some(error) = self.hard {
             return Err(error);
@@ -125,18 +197,71 @@ impl Observer {
             self.error = Some(Error::Unavailable);
             return Err(Error::Unavailable);
         }
-        self.reconcile_view(&Accepted(store));
-        self.check(&Accepted(store), now, incoming)
+        let view = Accepted { store, retained };
+        self.reconcile_view(&view);
+        self.check(&view, now, incoming)
     }
     /// Called only under the canonical owner lock after an allowed transition.
     /// Matching identities alone never clear pending evidence or grant readiness.
-    pub fn reconcile(&mut self, store: &Store) {
+    pub fn reconcile(
+        &mut self,
+        store: &Store,
+        retained: &impl Fn(u64, Hash) -> Result<Option<Header>, Error>,
+    ) {
         if store.ensure_exportable().is_ok() {
-            self.reconcile_view(&Accepted(store));
+            let view = Accepted { store, retained };
+            self.reconcile_authenticated_view(&view);
         }
     }
+    fn reconcile_authenticated_view(&mut self, view: &impl View) {
+        self.reconcile_view(view);
+        if self.hard.is_some() {
+            return;
+        }
+        #[cfg(unix)]
+        for index in 0..self.pending.len() {
+            let saved = &self.pending[index];
+            if !saved.obsolete
+                && let Some(witness) = &saved.witness
+                && obsolete_authorization(view, &saved.certificate.statement, witness) == Ok(true)
+                && current_quorum(view, &saved.certificate) == Ok(true)
+            {
+                let certificate = saved.certificate.clone();
+                if let Err(error) = self.watch_retired(view, &certificate) {
+                    self.error = Some(error);
+                    if matches!(error, Error::Conflict | Error::EvidenceUnavailable) {
+                        self.hard = Some(error);
+                    }
+                    return;
+                }
+                self.pending[index].obsolete = true;
+            }
+        }
+        self.pending.retain(|saved| !saved.obsolete);
+        self.error = self.gate_reason();
+    }
     fn reconcile_view(&mut self, view: &impl View) {
-        for certificate in &self.pending {
+        self.retired_anchor_unavailable = false;
+        if let Some((height, anchor)) = self.retired_anchor {
+            if height > view.height() {
+                self.retired_anchor_unavailable = true;
+            } else {
+                match view
+                    .header(height)
+                    .and_then(|header| header.id().map_err(|_| Error::Rejected))
+                {
+                    Ok(id) if id != anchor => {
+                        self.hard = Some(Error::Conflict);
+                        self.error = self.hard;
+                        return;
+                    }
+                    Err(_) => self.retired_anchor_unavailable = true,
+                    Ok(_) => (),
+                }
+            }
+        }
+        for saved in &self.pending {
+            let certificate = &saved.certificate;
             if let Ok((_, selected)) = headers(view, &certificate.statement)
                 && selected != certificate.statement.checkpoint_block
             {
@@ -145,6 +270,41 @@ impl Observer {
                 break;
             }
         }
+    }
+    fn watch_retired(&mut self, view: &impl View, certificate: &Certificate) -> Result<(), Error> {
+        let statement = &certificate.statement;
+        if view
+            .header(statement.checkpoint_height)?
+            .id()
+            .map_err(|_| Error::Rejected)?
+            != statement.checkpoint_block
+        {
+            return Err(Error::Conflict);
+        }
+        if let Some((height, anchor)) = self.retired_anchor {
+            if height > view.height() {
+                return Err(Error::Unavailable);
+            }
+            if view.header(height)?.id().map_err(|_| Error::Rejected)? != anchor {
+                return Err(Error::Conflict);
+            }
+        }
+        #[cfg(unix)]
+        if let Some(evidence) = &self.evidence {
+            self.retired_anchor = Some(
+                evidence
+                    .record_observed_retirement(certificate)
+                    .map_err(|_| Error::EvidenceUnavailable)?,
+            );
+            return Ok(());
+        }
+        if self
+            .retired_anchor
+            .is_none_or(|(height, _)| height < statement.checkpoint_height)
+        {
+            self.retired_anchor = Some((statement.checkpoint_height, statement.checkpoint_block));
+        }
+        Ok(())
     }
     #[cfg(unix)]
     fn preserve_quorum(
@@ -223,19 +383,68 @@ impl Observer {
                     #[cfg(not(unix))]
                     let _ = roster;
                 }
-                if result == Err(Error::PendingAuthorization) {
+                if result == Ok(Outcome::ObsoleteAuthorization) {
                     let Incoming::Certified { certificate, .. } = incoming else {
                         unreachable!()
                     };
-                    if !self
+                    self.watch_retired(view, certificate)?;
+                    let statement = &certificate.statement;
+                    self.pending
+                        .retain(|saved| saved.certificate.statement != *statement);
+                    return result;
+                }
+                if result == Err(Error::PendingAuthorization) {
+                    let Incoming::Certified {
+                        certificate,
+                        witness,
+                    } = incoming
+                    else {
+                        unreachable!()
+                    };
+                    if self.pending.iter().any(|saved| {
+                        saved.certificate.statement == certificate.statement
+                            && saved.witness.as_ref() == Some(witness)
+                    }) {
+                        return Ok(Outcome::PendingAuthorization);
+                    }
+                    let (saved_witness, witness_charge) = {
+                        let charge = self
+                            .budget
+                            .as_ref()
+                            .map(|budget| budget.reserve(witness.governance.len()))
+                            .transpose()
+                            .map_err(|_| Error::EvidenceUnavailable)?;
+                        let mut governance = Vec::new();
+                        governance
+                            .try_reserve_exact(witness.governance.len())
+                            .map_err(|_| Error::EvidenceUnavailable)?;
+                        governance.extend_from_slice(&witness.governance);
+                        (
+                            Some(AuthorizationWitness {
+                                descriptors: witness.descriptors,
+                                governance,
+                            }),
+                            charge,
+                        )
+                    };
+                    if let Some(saved) = self
                         .pending
-                        .iter()
-                        .any(|saved| saved.statement == certificate.statement)
+                        .iter_mut()
+                        .find(|saved| saved.certificate.statement == certificate.statement)
                     {
+                        saved.obsolete = false;
+                        saved.witness = saved_witness;
+                        saved._witness_charge = witness_charge;
+                    } else {
                         if self.pending.len() == MAX_PENDING_AUTHORIZATIONS {
                             return Err(Error::EvidenceUnavailable);
                         }
-                        self.pending.push((**certificate).clone());
+                        self.pending.push(RetainedObservation {
+                            certificate: (**certificate).clone(),
+                            obsolete: false,
+                            witness: saved_witness,
+                            _witness_charge: witness_charge,
+                        });
                     }
                     return Ok(Outcome::PendingAuthorization);
                 }
@@ -245,7 +454,7 @@ impl Observer {
                 ) && let Incoming::Certified { certificate, .. } = incoming
                 {
                     self.pending
-                        .retain(|saved| saved.statement != certificate.statement);
+                        .retain(|saved| saved.certificate.statement != certificate.statement);
                 }
                 result
             })()
@@ -255,11 +464,7 @@ impl Observer {
                 if let Outcome::CurrentCertificate(height) = outcome {
                     self.observed_height = Some(self.observed_height.unwrap_or(0).max(height));
                 }
-                self.error = if self.pending.is_empty() {
-                    None
-                } else {
-                    Some(Error::PendingAuthorization)
-                };
+                self.error = self.gate_reason();
             }
             Err(error) => {
                 self.error = Some(error);
@@ -426,6 +631,10 @@ fn evaluate(
                 return Err(Error::Conflict);
             }
             if is_current && !matches_authorization {
+                #[cfg(unix)]
+                if obsolete_authorization(view, statement, witness)? {
+                    return Ok(Outcome::ObsoleteAuthorization);
+                }
                 // Durable public observation evidence is currently available
                 // on Unix. Other platforms retain the previous refusal policy.
                 return Err(if cfg!(unix) {
@@ -451,6 +660,35 @@ fn evaluate(
             ))
         }
     }
+}
+
+#[cfg(unix)]
+fn obsolete_authorization(
+    view: &impl View,
+    statement: &Statement,
+    witness: &AuthorizationWitness,
+) -> Result<bool, Error> {
+    let (_, anchor) = headers(view, statement)?;
+    if anchor != statement.checkpoint_block {
+        return Err(Error::Conflict);
+    }
+    let saved = super::runtime_export::retained_authorization(
+        statement.network,
+        view.height(),
+        statement,
+        |height| view.header(height).map_err(|error| error.code().into()),
+        &mut |height, id| {
+            view.retained_header(height, id)
+                .map_err(|error| error.code().into())
+        },
+    );
+    let Ok((saved, false)) = saved else {
+        return Ok(false);
+    };
+    // Current-quorum signatures are checked independently of this witness.
+    // Binding to the exact old header establishes obsolescence only.
+    authority(view, statement, &saved, witness)?;
+    Ok(true)
 }
 
 #[cfg(test)]

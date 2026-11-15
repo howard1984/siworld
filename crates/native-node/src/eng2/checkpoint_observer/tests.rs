@@ -12,6 +12,7 @@ struct Synthetic {
     headers: BTreeMap<u64, Header>,
     statement: Statement,
     witness: AuthorizationWitness,
+    retained: BTreeMap<Hash, Header>,
 }
 impl View for Synthetic {
     fn height(&self) -> u64 {
@@ -22,6 +23,13 @@ impl View for Synthetic {
     }
     fn header(&self, height: u64) -> Result<Header, Error> {
         self.headers.get(&height).cloned().ok_or(Error::Unavailable)
+    }
+    fn retained_header(&self, height: u64, id: Hash) -> Result<Option<Header>, Error> {
+        Ok(self
+            .retained
+            .get(&id)
+            .filter(|header| header.height == height)
+            .cloned())
     }
 }
 fn fixture() -> Synthetic {
@@ -94,6 +102,7 @@ fn fixture_at(checkpoint: u64) -> Synthetic {
         headers: BTreeMap::from([(checkpoint, anchor), (authorization_height, authorization)]),
         statement,
         witness,
+        retained: BTreeMap::new(),
     }
 }
 fn vote(statement: &Statement, slot: u8, seed: u8) -> Vote {
@@ -379,11 +388,15 @@ fn missing_authorization_and_anchor_changes_cannot_clear_pending() {
 #[cfg(unix)]
 #[test]
 fn pending_capacity_is_fail_closed_and_evidence_budget_is_reserved() {
-    let bytes = MAX_PENDING_AUTHORIZATIONS * std::mem::size_of::<Certificate>();
+    let bytes = MAX_PENDING_AUTHORIZATIONS * std::mem::size_of::<RetainedObservation>();
     assert!(Observer::new(&crate::p2p::Budget::new(bytes - 1)).is_err());
     let budget = crate::p2p::Budget::new(bytes);
-    let mut observer = Observer::new(&budget).unwrap();
+    let observer = Observer::new(&budget).unwrap();
     assert!(budget.reserve(1).is_err());
+    drop(observer);
+    assert_eq!(budget.available().unwrap(), bytes);
+    let budget = crate::p2p::Budget::new(bytes + MAX_PENDING_AUTHORIZATIONS * MAX_GOVERNANCE_BYTES);
+    let mut observer = Observer::new(&budget).unwrap();
     for checkpoint in 1..=MAX_PENDING_AUTHORIZATIONS as u64 + 1 {
         let mut fixture = fixture_at(checkpoint);
         let packet = certified(&fixture, fixture.statement.clone());
@@ -398,7 +411,11 @@ fn pending_capacity_is_fail_closed_and_evidence_budget_is_reserved() {
     assert_eq!(observer.pending.len(), MAX_PENDING_AUTHORIZATIONS);
     assert!(observer.conflicted());
     drop(observer);
-    assert!(budget.reserve(bytes).is_ok());
+    assert!(
+        budget
+            .reserve(bytes + MAX_PENDING_AUTHORIZATIONS * MAX_GOVERNANCE_BYTES)
+            .is_ok()
+    );
 }
 
 fn rotate_roster(fixture: &mut Synthetic) {
@@ -491,4 +508,238 @@ pub(crate) fn synthetic_pending_authorization() -> Observer {
         Ok(Outcome::PendingAuthorization)
     );
     observer
+}
+
+#[cfg(unix)]
+fn orphaned_authorization_fixture() -> Synthetic {
+    let mut fixture = fixture_at(12);
+    let template = fixture.headers[&36].clone();
+    let mut parent = fixture.headers[&12].id().unwrap();
+    for height in 13..=36 {
+        let mut header = template.clone();
+        header.height = height;
+        header.parent = parent;
+        header.nonce = height;
+        if height == 36 {
+            header.execution_commitment = commitment::aggregate_descriptors(
+                header.network,
+                height,
+                parent,
+                &fixture.witness.descriptors,
+            )
+            .unwrap();
+        }
+        parent = header.id().unwrap();
+        fixture.headers.insert(height, header);
+    }
+    fixture.statement.authorization_block = parent;
+    fixture.retained = fixture
+        .headers
+        .values()
+        .map(|header| (header.id().unwrap(), header.clone()))
+        .collect();
+    parent = fixture.headers[&33].id().unwrap();
+    for height in 34..=41 {
+        let mut header = template.clone();
+        header.height = height;
+        header.parent = parent;
+        header.nonce = height + 100;
+        parent = header.id().unwrap();
+        fixture.headers.insert(height, header);
+    }
+    for height in 37..=41 {
+        fixture.governance.apply_block(height, &[]).unwrap();
+    }
+    fixture
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_obsolete_authorization_recovers_same_observer_and_keeps_anchor_watch() {
+    let mut fixture = orphaned_authorization_fixture();
+    let packet = certified(&fixture, fixture.statement.clone());
+    let retained = std::mem::take(&mut fixture.retained);
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::PendingAuthorization)
+    );
+    assert!(observer.conflicted());
+    fixture.retained = retained;
+    observer.reconcile_authenticated_view(&fixture);
+    assert!(!observer.conflicted());
+    assert_eq!(
+        observer.check(&fixture, 2, &packet),
+        Ok(Outcome::ObsoleteAuthorization)
+    );
+    assert_eq!(observer.gate_reason(), None);
+    assert_eq!(observer.observed_height(), None);
+    assert!(observer.pending.is_empty());
+    assert_eq!(
+        observer.retired_anchor,
+        Some((12, fixture.statement.checkpoint_block))
+    );
+    assert_eq!(observer.synthetic_evidence.len(), 1);
+    fixture.headers.get_mut(&12).unwrap().nonce ^= 1;
+    observer.reconcile_view(&fixture);
+    assert_eq!(observer.gate_reason(), Some(Error::Conflict));
+    assert_eq!(observer.check(&fixture, 3, &packet), Err(Error::Conflict));
+}
+
+#[cfg(unix)]
+#[test]
+fn obsolete_authorization_needs_exact_retained_links_and_a_full_bound_witness() {
+    let mut fixture = orphaned_authorization_fixture();
+    let packet = certified(&fixture, fixture.statement.clone());
+    let missing = fixture
+        .retained
+        .values()
+        .find(|header| header.height == 35)
+        .unwrap()
+        .id()
+        .unwrap();
+    let header = fixture.retained.remove(&missing).unwrap();
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::PendingAuthorization)
+    );
+    fixture.retained.insert(missing, header);
+    let mut broken = packet.clone();
+    if let Incoming::Certified { witness, .. } = &mut broken {
+        witness.governance[0] ^= 1;
+    }
+    assert_eq!(observer.check(&fixture, 2, &broken), Err(Error::Rejected));
+    assert!(observer.conflicted());
+    assert_eq!(
+        observer.check(&fixture, 3, &packet),
+        Ok(Outcome::ObsoleteAuthorization)
+    );
+    assert!(!observer.conflicted());
+    let mut changed = fixture.statement.clone();
+    changed.authorization_block = fixture.headers[&36].id().unwrap();
+    assert_eq!(
+        observer.check(&fixture, 4, &certified(&fixture, changed)),
+        Err(Error::Conflict)
+    );
+    assert_eq!(observer.gate_reason(), Some(Error::Conflict));
+}
+
+#[cfg(unix)]
+#[test]
+fn later_full_witness_recovers_and_releases_pending_witness_budget() {
+    let mut fixture = orphaned_authorization_fixture();
+    let packet = certified(&fixture, fixture.statement.clone());
+    let mut broken = packet.clone();
+    if let Incoming::Certified { witness, .. } = &mut broken {
+        witness.governance[0] ^= 1;
+    }
+    let retained = std::mem::take(&mut fixture.retained);
+    let budget = crate::p2p::Budget::new(4 * 1024 * 1024);
+    let mut observer = Observer::new(&budget).unwrap();
+    let before = budget.available().unwrap();
+    assert_eq!(
+        observer.check(&fixture, 1, &broken),
+        Ok(Outcome::PendingAuthorization)
+    );
+    assert!(budget.available().unwrap() < before);
+    fixture.retained = retained;
+    observer.reconcile_authenticated_view(&fixture);
+    assert!(observer.conflicted());
+    assert_eq!(
+        observer.check(&fixture, 2, &packet),
+        Ok(Outcome::ObsoleteAuthorization)
+    );
+    assert_eq!(budget.available().unwrap(), before);
+    assert!(observer.pending.is_empty());
+    assert_eq!(observer.retained_target(), None);
+    for now in 3..=12 {
+        assert_eq!(
+            observer.check(&fixture, now, &packet),
+            Ok(Outcome::ObsoleteAuthorization)
+        );
+    }
+    assert!(!observer.conflicted());
+}
+
+#[cfg(unix)]
+#[test]
+fn retirement_cursor_restarts_without_peer_replay_and_missing_prefix_stays_gated() {
+    use std::os::unix::fs::DirBuilderExt;
+    let directory = crate::eng2::branches::tests::Fixture::new();
+    let state = crate::eng2::snapshot::tests::bootstrap();
+    let genesis = crate::eng2::genesis::Genesis::seal(
+        state.chain.config.clone(),
+        state.governance.clone(),
+        crate::eng2::genesis::FeeMode::LegacyMiner,
+    )
+    .unwrap();
+    let store = Store::create(
+        &directory.0.join("canonical.redb"),
+        genesis,
+        crate::eng2::snapshot::tests::limits().chain,
+    )
+    .unwrap();
+    let root = directory.0.join("retired-observer");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let fixture = orphaned_authorization_fixture();
+    let packet = certified(&fixture, fixture.statement.clone());
+    let mut observer = Observer::default();
+    observer.open_evidence(&root, &store).unwrap();
+    assert_eq!(
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::ObsoleteAuthorization)
+    );
+    assert!(!observer.conflicted());
+    drop(observer);
+    let mut restarted = Observer::default();
+    restarted.open_evidence(&root, &store).unwrap();
+    // Genesis-only local state cannot discharge a saved H12 restriction.
+    assert_eq!(restarted.gate_reason(), Some(Error::Unavailable));
+    assert!(restarted.conflicted());
+    assert_eq!(restarted.observed_height(), None);
+    restarted.reconcile_authenticated_view(&fixture);
+    assert!(!restarted.conflicted());
+    assert_eq!(
+        restarted.retired_anchor,
+        Some((12, fixture.statement.checkpoint_block))
+    );
+    let mut changed = fixture;
+    changed.headers.get_mut(&12).unwrap().nonce ^= 1;
+    restarted.reconcile_authenticated_view(&changed);
+    assert_eq!(restarted.gate_reason(), Some(Error::Conflict));
+}
+
+#[cfg(unix)]
+#[test]
+fn higher_retirement_cannot_hide_missing_or_conflicting_lower_anchor() {
+    let mut fixture = orphaned_authorization_fixture();
+    let packet = certified(&fixture, fixture.statement.clone());
+    let mut observer = Observer::default();
+    assert_eq!(
+        observer.check(&fixture, 1, &packet),
+        Ok(Outcome::ObsoleteAuthorization)
+    );
+    let mut higher = fixture.statement.clone();
+    higher.checkpoint_height = 24;
+    higher.checkpoint_block = fixture.headers[&24].id().unwrap();
+    let higher = Certificate {
+        votes: [vote(&higher, 0, 3), vote(&higher, 1, 4)],
+        statement: higher,
+    };
+    let lower = fixture.headers.remove(&12).unwrap();
+    assert_eq!(
+        observer.watch_retired(&fixture, &higher),
+        Err(Error::Unavailable)
+    );
+    assert_eq!(observer.retired_anchor.unwrap().0, 12);
+    fixture.headers.insert(12, lower);
+    observer.watch_retired(&fixture, &higher).unwrap();
+    assert_eq!(observer.retired_anchor.unwrap().0, 24);
+    fixture.headers.get_mut(&24).unwrap().nonce ^= 1;
+    observer.reconcile_authenticated_view(&fixture);
+    assert_eq!(observer.gate_reason(), Some(Error::Conflict));
 }

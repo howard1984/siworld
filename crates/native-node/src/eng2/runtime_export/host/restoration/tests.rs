@@ -223,3 +223,35 @@ fn warm_pending_reuse_preserves_collected_votes_and_original_snapshot_guard() {
     drop(host);
     assert_eq!(budget.available().unwrap(), 128 * 1024 * 1024);
 }
+
+#[test]
+fn authenticated_retirement_discards_old_pending_without_granting_new_authority() {
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("installed-retirement");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
+    // Isolate installation of a worker-authenticated result. This format-only
+    // candidate is never presented as a natively executed checkpoint.
+    let mut old = crate::eng2::runtime_export::tests::synthetic_candidate();
+    old.statement.checkpoint_height = 12;
+    old.statement.authorization_height = 36;
+    host.pending = Some(old);
+    host.votes[0] = Some(Vote {
+        slot: 0,
+        signature: [5; crate::eng2::certificate::SIGNATURE_BYTES],
+    });
+    let mut result = empty_result(&host, &store);
+    result.pending = Restored::Retired(12);
+    result.authenticated_retired_through = Some(12);
+    host.install_retained(&store, result).unwrap();
+    assert!(host.pending.is_none());
+    assert!(host.votes.iter().all(Option::is_none));
+    assert!(host.anchor_retired(12));
+    assert!(!host.anchor_retired(24));
+    assert!(host.latest_checkpoint().is_none());
+    assert!(host.signer.is_none());
+    assert!(host.tick(&store, 10, &[]).is_err());
+    host.stop_preparation().unwrap();
+    assert_eq!(budget.available().unwrap(), 64 * 1024 * 1024);
+}

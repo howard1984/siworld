@@ -734,3 +734,43 @@ fn observed_quorum_forward_progress_has_no_cumulative_ram_capacity_limit() {
             .unwrap()
     );
 }
+
+#[test]
+fn observed_retirement_cursor_reopens_without_scanning_and_preserves_quorum_evidence() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retirement-cursor");
+    let candidate = synthetic_candidate();
+    let keys = candidate.roster.keys();
+    let higher = observed_certificate(&candidate.statement, [0, 1]);
+    let export = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    assert!(!export.record_observed_quorum(&higher, keys).unwrap());
+    let source = root
+        .join("checkpoint-observed-00000000000000000000-00000000000000000072.certificate-eng2.bin");
+    let original = fs::read(&source).unwrap();
+    assert_eq!(
+        export.record_observed_retirement(&higher).unwrap(),
+        (72, candidate.statement.checkpoint_block)
+    );
+    let mut lower = candidate.statement.clone();
+    lower.checkpoint_height = 12;
+    lower.authorization_height = 36;
+    let lower = observed_certificate(&lower, [0, 2]);
+    assert!(!export.record_observed_quorum(&lower, keys).unwrap());
+    assert_eq!(export.record_observed_retirement(&lower).unwrap().0, 72);
+    assert_eq!(fs::read(&source).unwrap(), original);
+    drop(export);
+    let reopened = PublicExport::open_observation_evidence(&root, &store).unwrap();
+    assert_eq!(
+        reopened.observed_retirement().unwrap().unwrap().statement,
+        higher.statement
+    );
+    let mut cursor = fs::read(root.join("checkpoint-observed-retirement-eng2.bin")).unwrap();
+    assert_eq!(cursor.len(), 56);
+    cursor[24] ^= 1;
+    reopened
+        .replace("checkpoint-observed-retirement-eng2.bin", &cursor)
+        .unwrap();
+    assert!(reopened.observed_retirement().is_err());
+    assert_eq!(fs::read(&source).unwrap(), original);
+}

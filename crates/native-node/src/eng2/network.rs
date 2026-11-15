@@ -55,6 +55,14 @@ pub trait Owner: Send {
     ) -> Result<(), String> {
         Err("branch discovery owner unavailable".into())
     }
+    fn checkpoint_headers_next(
+        &mut self,
+        _remote: (u64, Hash),
+        _authenticated_peer: Hash,
+        _now_ms: u64,
+    ) -> Result<DiscoveryAction, String> {
+        Ok(DiscoveryAction::Deferred)
+    }
     fn branch_discovery_deferred(
         &mut self,
         _request: super::branches::discovery::HeaderRequest,
@@ -191,9 +199,18 @@ pub fn initiate<S: Read + Write, O: Owner>(
     sequence: &mut Sequence,
     limits: Limits,
 ) -> Result<Round, Error> {
+    initiate_with_checkpoint_headers(peer, owner, sequence, limits, None)
+}
+pub(crate) fn initiate_with_checkpoint_headers<S: Read + Write, O: Owner>(
+    peer: &mut Peer<S>,
+    owner: &Arc<Mutex<O>>,
+    sequence: &mut Sequence,
+    limits: Limits,
+    checkpoint: Option<(u64, Hash)>,
+) -> Result<Round, Error> {
     limits.check()?;
     let remote = peer.fetch_tip(sequence.next()?)?;
-    let pulled = pull(peer, owner, sequence, remote, limits)?;
+    let pulled = pull_with_checkpoint_headers(peer, owner, sequence, remote, limits, checkpoint)?;
     let local = with_owner(owner, |o| o.head())?;
     let notice = sequence.next()?;
     peer.advertise_tip(notice, local.0, local.1)?;
@@ -234,6 +251,16 @@ pub(crate) fn respond_with_round_start<S: Read + Write, O: Owner>(
     limits: Limits,
     on_round_started: impl FnOnce() -> Result<(), String>,
 ) -> Result<Round, Error> {
+    respond_with_checkpoint_headers(peer, owner, sequence, limits, on_round_started, None)
+}
+pub(crate) fn respond_with_checkpoint_headers<S: Read + Write, O: Owner>(
+    peer: &mut Peer<S>,
+    owner: &Arc<Mutex<O>>,
+    sequence: &mut Sequence,
+    limits: Limits,
+    on_round_started: impl FnOnce() -> Result<(), String>,
+    checkpoint: Option<(u64, Hash)>,
+) -> Result<Round, Error> {
     limits.check()?;
     let mut started = Some(on_round_started);
     let mut served = 0;
@@ -243,7 +270,14 @@ pub(crate) fn respond_with_round_start<S: Read + Write, O: Owner>(
             notify().map_err(Error::Owner)?;
         }
         if let Request::Tip { height, id } = message {
-            let pulled = pull(peer, owner, sequence, (height, id), limits)?;
+            let pulled = pull_with_checkpoint_headers(
+                peer,
+                owner,
+                sequence,
+                (height, id),
+                limits,
+                checkpoint,
+            )?;
             peer.finish_round(request)?;
             return Ok(Round {
                 accepted: pulled.accepted,
@@ -258,12 +292,23 @@ pub(crate) fn respond_with_round_start<S: Read + Write, O: Owner>(
     }
     Err(Error::RequestLimit)
 }
+#[cfg(test)]
 fn pull<S: Read + Write, O: Owner>(
     peer: &mut Peer<S>,
     owner: &Arc<Mutex<O>>,
     sequence: &mut Sequence,
     remote: (u64, Hash),
     limits: Limits,
+) -> Result<Pulled, Error> {
+    pull_with_checkpoint_headers(peer, owner, sequence, remote, limits, None)
+}
+fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
+    peer: &mut Peer<S>,
+    owner: &Arc<Mutex<O>>,
+    sequence: &mut Sequence,
+    remote: (u64, Hash),
+    limits: Limits,
+    checkpoint: Option<(u64, Hash)>,
 ) -> Result<Pulled, Error> {
     let mut accepted = 0;
     let mut used_requests = 0;
@@ -314,6 +359,16 @@ fn pull<S: Read + Write, O: Owner>(
             Err(error) => return Err(error),
         };
         if caught_up {
+            if let Some(target) = checkpoint {
+                discover_fork_kind(
+                    peer,
+                    owner,
+                    sequence,
+                    target,
+                    usize::from(limits.blocks) * 2 - used_requests,
+                    true,
+                )?;
+            }
             return Ok(Pulled {
                 accepted,
                 checked_head: Some(local),
@@ -366,7 +421,17 @@ fn discover_fork<S: Read + Write, O: Owner>(
     owner: &Arc<Mutex<O>>,
     sequence: &mut Sequence,
     remote: (u64, Hash),
+    remaining: usize,
+) -> Result<(), Error> {
+    discover_fork_kind(peer, owner, sequence, remote, remaining, false)
+}
+fn discover_fork_kind<S: Read + Write, O: Owner>(
+    peer: &mut Peer<S>,
+    owner: &Arc<Mutex<O>>,
+    sequence: &mut Sequence,
+    remote: (u64, Hash),
     mut remaining: usize,
+    headers_only: bool,
 ) -> Result<(), Error> {
     if !with_owner(owner, |o| Ok(o.exact_exchange_enabled()))? {
         return Err(Error::ForkUnsupported);
@@ -381,7 +446,11 @@ fn discover_fork<S: Read + Write, O: Owner>(
         // Reserve before probing: negative capability and repeated reconnects
         // consume the same node-wide source attempt, rather than bypassing it.
         let action = with_owner(owner, |o| {
-            o.branch_discovery_next(remote, peer.peer(), discovery_now_ms())
+            if headers_only {
+                o.checkpoint_headers_next(remote, peer.peer(), discovery_now_ms())
+            } else {
+                o.branch_discovery_next(remote, peer.peer(), discovery_now_ms())
+            }
         })?;
         let (ticket, body_header) = match action {
             DiscoveryAction::Ready | DiscoveryAction::Deferred => return Ok(()),
@@ -390,6 +459,14 @@ fn discover_fork<S: Read + Write, O: Owner>(
         };
         if ticket.peer() != peer.peer() || ticket.is_body() != body_header.is_some() {
             return Err(Error::Protocol);
+        }
+        if headers_only
+            && (body_header.is_some() || remote.0.saturating_sub(ticket.query().0) >= 24)
+        {
+            with_owner(owner, |o| {
+                o.branch_discovery_deferred(ticket, discovery_now_ms())
+            })?;
+            return Ok(());
         }
         if !peer.exact_blocks_supported() {
             remaining -= 1;
@@ -1439,6 +1516,181 @@ mod tests {
             pull.header_by_id(1, [9; 32]),
             Err(Error::RequestLimit)
         ));
+    }
+    #[test]
+    fn same_head_checkpoint_retrieval_qualifies_headers_without_fetching_bodies() {
+        use crate::eng2::{
+            branches::{
+                BranchStore,
+                discovery::{Limits as DiscoveryLimits, runtime::Discovery},
+            },
+            selection::{HeaderRules, VerifiedHeaders},
+            state_components,
+            store::Store,
+        };
+        struct HeaderOwner {
+            canonical: Store,
+            branches: BranchStore,
+            discovery: Discovery,
+        }
+        impl Owner for HeaderOwner {
+            fn exact_exchange_enabled(&self) -> bool {
+                true
+            }
+            fn head(&self) -> Result<(u64, Hash), String> {
+                Ok((
+                    self.canonical.engine().state().height(),
+                    self.canonical.engine().state().tip(),
+                ))
+            }
+            fn header(&self, height: u64) -> Result<Option<Header>, String> {
+                if height == 0 || height > self.canonical.engine().state().height() {
+                    Ok(None)
+                } else {
+                    self.canonical.header(height).map(Some)
+                }
+            }
+            fn block_size(&self, _: u64) -> Result<Option<usize>, String> {
+                panic!("header-only retrieval must not read bodies")
+            }
+            fn block(&self, _: u64) -> Result<(Header, Body), String> {
+                panic!("header-only retrieval must not read bodies")
+            }
+            fn accept(&mut self, _: &Header, _: &Body) -> Result<(), String> {
+                panic!("header-only retrieval must not adopt blocks")
+            }
+            fn branch_header(&self, id: Hash) -> Result<Option<Header>, String> {
+                Ok(self.branches.entry(id)?.map(|entry| entry.header))
+            }
+            fn checkpoint_headers_next(
+                &mut self,
+                remote: (u64, Hash),
+                peer: Hash,
+                now: u64,
+            ) -> Result<DiscoveryAction, String> {
+                self.discovery
+                    .next_headers(&mut self.branches, &self.canonical, remote, peer, now)
+            }
+            fn branch_discovery_received(
+                &mut self,
+                request: crate::eng2::branches::discovery::HeaderRequest,
+                header: Option<Header>,
+                now: u64,
+            ) -> Result<(), String> {
+                self.discovery.received(request, header, now)
+            }
+            fn branch_discovery_deferred(
+                &mut self,
+                request: crate::eng2::branches::discovery::HeaderRequest,
+                now: u64,
+            ) -> Result<(), String> {
+                self.discovery.deferred(request, now)
+            }
+        }
+        fn owner(directory: &std::path::Path) -> HeaderOwner {
+            let g = genesis();
+            let canonical = Store::create(
+                &directory.join("canonical.redb"),
+                Genesis::decode(&g.encode().unwrap()).unwrap(),
+                state_components::Limits {
+                    max_leaves: 1_000_000,
+                    max_nullifiers: 1_000_000,
+                    max_component_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+            let branches = BranchStore::create(
+                &directory.join("branches.redb"),
+                HeaderRules {
+                    network: g.config().network,
+                    genesis: g.id(),
+                    genesis_timestamp: g.config().genesis_timestamp,
+                    genesis_target: g.config().genesis_target,
+                    target_interval: 300,
+                    pow_iterations: 0,
+                    max_headers: 128,
+                },
+                crate::eng2::branches::Limits {
+                    maximum_headers: 128,
+                    maximum_body_bytes: 64 * 1024 * 1024,
+                },
+            )
+            .unwrap();
+            let discovery = Discovery::new(
+                g.config().network,
+                g.id(),
+                DiscoveryLimits {
+                    maximum_candidates: 4,
+                    maximum_peers: 3,
+                    maximum_requests: 32,
+                    maximum_headers: 32,
+                    maximum_body_bytes: 64 * 1024 * 1024,
+                    maximum_headers_per_candidate: 32,
+                    maximum_attempts_per_header: 2,
+                    candidate_lifetime_ms: 1000,
+                    window_ms: 4000,
+                },
+                discovery_now_ms(),
+            )
+            .unwrap();
+            HeaderOwner {
+                canonical,
+                branches,
+                discovery,
+            }
+        }
+        let left = crate::eng2::branches::tests::Fixture::new();
+        let right = crate::eng2::branches::tests::Fixture::new();
+        let client = Arc::new(Mutex::new(owner(&left.0)));
+        let server = Arc::new(Mutex::new(owner(&right.0)));
+        let header = fixture(1).blocks.remove(0).0;
+        let target = (header.height, header.id().unwrap());
+        {
+            let mut server = server.lock().unwrap();
+            let g = genesis();
+            let qualified = VerifiedHeaders::verify(
+                HeaderRules {
+                    network: g.config().network,
+                    genesis: g.id(),
+                    genesis_timestamp: g.config().genesis_timestamp,
+                    genesis_target: g.config().genesis_target,
+                    target_interval: 300,
+                    pow_iterations: 0,
+                    max_headers: 128,
+                },
+                vec![header],
+            )
+            .unwrap();
+            server.branches.retain_verified_headers(&qualified).unwrap();
+        }
+        let (mut a, mut b, budget) = peers();
+        let before = budget.available().unwrap();
+        let remote = server.clone();
+        let worker = std::thread::spawn(move || {
+            respond(&mut b, &remote, &mut Sequence::default(), Limits::default()).unwrap()
+        });
+        let round = initiate_with_checkpoint_headers(
+            &mut a,
+            &client,
+            &mut Sequence::default(),
+            Limits::default(),
+            Some(target),
+        )
+        .unwrap();
+        assert_eq!(round.accepted, 0);
+        assert_eq!(worker.join().unwrap().accepted, 0);
+        let client = client.lock().unwrap();
+        assert_eq!(client.head().unwrap().0, 0);
+        assert_eq!(client.discovery.usage().requests, 1);
+        assert_eq!(client.discovery.usage().headers, 1);
+        assert_eq!(client.discovery.usage().body_bytes, 0);
+        assert_eq!(
+            client.branches.entry(target.1).unwrap().unwrap().status,
+            crate::eng2::branches::Status::HeaderQualified
+        );
+        assert!(client.branches.body_size(target.1).unwrap().is_none());
+        drop(a);
+        assert_eq!(budget.available().unwrap(), before);
     }
     #[test]
     #[ignore = "owner-operated existing native fixture transfer; never selected by CI"]

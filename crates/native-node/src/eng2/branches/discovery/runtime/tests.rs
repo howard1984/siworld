@@ -113,6 +113,25 @@ fn owner_state_machine_discovers_all_raw_materials_without_canonical_adoption() 
             .unwrap();
         now += 2;
     }
+    assert!(matches!(
+        discovery
+            .next_headers(&mut branches, &canonical, remote, [9; 32], now)
+            .unwrap(),
+        DiscoveryAction::Ready
+    ));
+    assert_eq!(discovery.usage().requests, 3);
+    assert_eq!(discovery.usage().body_bytes, 0);
+    for (header, _) in &records {
+        assert_eq!(
+            branches
+                .entry(header.id().unwrap())
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::HeaderQualified
+        );
+        assert!(branches.body_size(header.id().unwrap()).unwrap().is_none());
+    }
     for (header, body) in &records {
         let action = discovery
             .next(&mut branches, &canonical, remote, [9; 32], now)

@@ -35,6 +35,27 @@ impl Discovery {
         peer: Hash,
         now_ms: u64,
     ) -> Result<DiscoveryAction, String> {
+        self.next_kind(branches, canonical, remote, peer, now_ms, false)
+    }
+    pub(crate) fn next_headers(
+        &mut self,
+        branches: &mut BranchStore,
+        canonical: &Store,
+        remote: (u64, Hash),
+        peer: Hash,
+        now_ms: u64,
+    ) -> Result<DiscoveryAction, String> {
+        self.next_kind(branches, canonical, remote, peer, now_ms, true)
+    }
+    fn next_kind(
+        &mut self,
+        branches: &mut BranchStore,
+        canonical: &Store,
+        remote: (u64, Hash),
+        peer: Hash,
+        now_ms: u64,
+        headers_only: bool,
+    ) -> Result<DiscoveryAction, String> {
         if self
             .ledger
             .renew_expired_window(now_ms)
@@ -127,6 +148,9 @@ impl Discovery {
                 .map_err(|_| "discovered branch complete header qualification rejected")?;
             branches.retain_verified_headers(&qualified)?;
             self.qualified.insert(remote.1);
+        }
+        if headers_only {
+            return Ok(DiscoveryAction::Ready);
         }
         // Raw bodies are acquired one at a time. No canonical state changes or
         // native-validity marks occur here, even when every body is retained.
