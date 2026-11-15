@@ -44,7 +44,7 @@ mod retained_work;
 
 /// Authenticate a saved authorization against canonical and retained headers.
 /// A noncurrent result establishes obsolescence only, never signing authority.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "eng2-runtime"))]
 pub(crate) fn retained_authorization(
     network: Hash,
     head: u64,
