@@ -430,6 +430,77 @@ and diagnostics for those conclusions. A negative artifact must be newly created
 branch material, separate from accepted history; this sender cannot establish its
 creation history from bytes alone.
 
+## Native-invalid execution candidates
+
+```text
+siworld-eng2-rehearsal --qualification-negative-branch PLAN PLAN_SHA256 NEW_OUTPUT BINDING BINDING_SHA256 --json
+siworld-eng2-rehearsal --qualification-inspect-branch STOPPED_NODE CANDIDATE_ID BINDING BINDING_SHA256 --json
+```
+
+These Unix owner commands require `eng2-rehearsal,native-p2p`. The generator
+accepts only independently pinned schema-2 full-history exports. Its strict
+16 KiB plan has `version: 1`, `canonical` and `competing` source objects,
+`receiver_height`, `ancestor_height`, `ancestor_id`, `maximum_nonce_attempts`,
+`maximum_elapsed_seconds` and `maximum_body_bytes`. Each source object contains
+`directory`, `height`, `manifest_sha256`, `budget`, `budget_sha256`,
+`audit_binding` and `audit_binding_sha256`. Heights are at most 96, rollback
+depth is 1 through 24, nonce attempts are 1 through 1,000,000, elapsed time is
+1 through 900 seconds and replacement bodies total at most 16 GiB. An external
+supervisor must bound process resources and stop a verifier call that exceeds
+the total deadline; in-process deadline checks run between verifier calls.
+
+The historical audit binding is pinned input provenance. The running helper
+has its own independently verified source declaration and executable binding.
+Historical and helper source commits or executables may differ; their network,
+genesis, rules and proof profile must match. Index, page and frame checks reuse
+the existing full-history and frame decoders. The helper decodes the original
+genesis and verifies the original proofs without changing protocol identifiers.
+A tool built for a different genesis encoding or fee protocol cannot convert an
+old corpus by replacing identifiers. Separate receiver runtime provenance must
+also identify the actual receiving executable.
+
+The generator creates only a new private output directory. A disposable Store
+reaches the declared canonical receiver height by ordinary verified append.
+The original competing replacement must then pass complete native prevalidation.
+All shared-prefix IDs and the declared first divergence are checked. The valid
+competing prefix through the receiver height must have no greater work than the
+canonical receiver; only the next terminal header makes it strictly better.
+This prevents an earlier valid prefix from winning before the negative terminal
+candidate is submitted.
+
+The new terminal candidate preserves the original body, height, parent,
+timestamp and target, changes the execution commitment and solves fresh PoW
+for the new header. Its ID and PoW seed differ from the original terminal.
+Accepted source frames and databases remain intact. The full new header path
+must pass ordinary header qualification and have greater cumulative work. Actual
+`Store::prevalidate_replacement` must return `Rejected` at the terminal index
+with `native execution commitment differs from complete checked state`.
+A deferred local failure, invalid framing, insufficient work or another native
+rejection does not satisfy this command. The preflight Store's head and all
+eleven canonical components must be unchanged.
+
+The output contains `candidate.frame`, a manifest and the disposable preflight
+Store. The manifest pins the original valid terminal record, unchanged body
+hash, new frame hash and ID, exact native preflight rejection, source audit
+bindings and before/after component observations. Use the original competing
+frames after the ancestor through the candidate's parent, followed by the new
+terminal frame, as the existing branch sender's input. Pin the generated
+manifest as its provenance artifact. Its `branch_frames` entries have the
+sender's `{path, sha256, bytes}` shape, and `total_frame_bytes` pins their sum.
+The expected rejection is defined by the input plan and candidate construction
+before submission.
+
+The inspector acquires the existing stopped service lease and opens only a
+read-only retained-branch snapshot. It exports an exact stored header, durable
+status, cumulative work, arrival sequence and any retained body's hash and
+binding. A missing entry is reported as absent. An exact durable `Invalid`
+entry must be matched to the generated header and body, then paired with
+independent before/after canonical eleven-component audits. The inspector does
+not record a native rejection reason or establish canonical nonmutation itself.
+Neither generation, transmission nor inspection alone establishes receiver
+rejection or gate acceptance. Perform any stopped inspection before a continuous
+qualification window starts; acquiring the lease must not interrupt that window.
+
 ## Authenticated persisted-state comparison
 
 ```text
