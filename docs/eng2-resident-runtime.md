@@ -249,6 +249,12 @@ the attempt, and a bounded failure category. The counters come from the same
 locked reservation operation; observing them does not perform a second reserve.
 Overflow or an unavailable budget lock leaves unobserved counters null. The
 workspace request remains `16 * archive_bytes + 8 MiB + 4 * suffix_bytes`.
+The resident shares a finite 1 GiB logical byte budget between proof queues,
+network ownership, retained exports and checkpoint preparation. A new preparation
+may overlap a retained certified generation and bootstrap offers. All live
+reservations remain charged during this overlap, and admission still rejects
+requests that exceed the shared maximum. This limit is separate from process
+memory accounting; larger archives can still exceed the available workspace.
 This record is retained across ticks, so its timestamp must be checked before
 attributing it to a later status row. It measures logical ownership rather than
 resident memory or filesystem capacity. Capture, native reconstruction, signing

@@ -685,3 +685,48 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
         .unwrap()
     }
 }
+
+#[test]
+fn checkpoint_archive_admission_covers_retained_generation_overlap() {
+    use super::super::runtime_export::archive_work::ArchiveWork;
+
+    let archive_bytes = 31_881_389;
+    let retained_bytes = 287_993_906;
+    let requested_bytes = 16 * archive_bytes + 8 * 1024 * 1024;
+    let previous_maximum = 640 * 1024 * 1024;
+    let previous = p2p::Budget::new(previous_maximum);
+    let retained = previous.reserve(retained_bytes).unwrap();
+    let (rejected, observed) = ArchiveWork::reserve_observed(archive_bytes, 0, &previous);
+    assert!(rejected.is_err());
+    assert_eq!(observed.failure, Some("budget_exhausted"));
+    assert_eq!(observed.requested_bytes, Some(requested_bytes));
+    assert_eq!(observed.used_before_bytes, Some(retained_bytes));
+    assert_eq!(
+        previous.available().unwrap(),
+        previous_maximum - retained_bytes
+    );
+    drop(retained);
+    assert_eq!(previous.available().unwrap(), previous_maximum);
+
+    let budget = p2p::Budget::new(MEMORY_BYTES);
+    let retained = budget.reserve(retained_bytes).unwrap();
+    let (accepted, observed) = ArchiveWork::reserve_observed(archive_bytes, 0, &budget);
+    let workspace = accepted.unwrap();
+    assert_eq!(observed.failure, None);
+    assert_eq!(observed.maximum_bytes, Some(MEMORY_BYTES));
+    assert_eq!(observed.used_before_bytes, Some(retained_bytes));
+    assert_eq!(observed.requested_bytes, Some(requested_bytes));
+    assert_eq!(
+        budget.available().unwrap(),
+        MEMORY_BYTES - retained_bytes - requested_bytes
+    );
+    assert!(
+        budget
+            .reserve(MEMORY_BYTES - retained_bytes - requested_bytes + 1)
+            .is_err()
+    );
+    drop(workspace);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES - retained_bytes);
+    drop(retained);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES);
+}
