@@ -21,6 +21,7 @@ use std::{
     time::Instant,
 };
 mod business;
+mod funding;
 mod passwords;
 mod resources;
 mod scan;
@@ -75,6 +76,7 @@ struct Plan {
     genesis: Option<Input>,
     qualification: Option<Input>,
     business: Option<Input>,
+    funding: Option<Input>,
     expectations: Option<Input>,
     head: Option<Head>,
     node_directory: Option<PathBuf>,
@@ -378,6 +380,7 @@ fn frozen_inputs(plan: &Plan) -> Result<Vec<(&Input, Vec<u8>)>> {
         (&plan.genesis, 1024 * 1024),
         (&plan.qualification, 8192),
         (&plan.business, 128 * 1024),
+        (&plan.funding, 128 * 1024),
         (&plan.expectations, 16 * 1024 * 1024),
     ];
     let mut frozen = Vec::new();
@@ -429,7 +432,8 @@ fn execute(action: &str, plan_path: &Path, pin: &str, output: &Path) -> Result<V
         return Err("custody_prerequisite_network_differs".into());
     }
     let initialize = action == "init";
-    if !matches!(action, "init" | "open" | "business" | "scan")
+    if !matches!(action, "init" | "open" | "business" | "funding" | "scan")
+        || (action == "funding") != plan.funding.is_some()
         || initialize
             && (plan.initial_receipt.is_some()
                 || plan.genesis.is_some()
@@ -518,6 +522,15 @@ fn execute(action: &str, plan_path: &Path, pin: &str, output: &Path) -> Result<V
                 json!({"operation":"open","authenticated_custody_reopened":true})
             }
             "business" => business::run(
+                &plan,
+                &binding,
+                &prerequisites,
+                &custody,
+                &passwords,
+                &guard,
+                &mut out,
+            )?,
+            "funding" => funding::run(
                 &plan,
                 &binding,
                 &prerequisites,

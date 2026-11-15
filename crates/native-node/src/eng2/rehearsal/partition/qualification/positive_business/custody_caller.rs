@@ -179,6 +179,7 @@ impl IsolatedActors {
         };
         let mut custody = JournalCustody {
             network: self.network,
+            funding: false,
             payer: &mut payer.vault,
             retained,
             before_phase,
@@ -191,6 +192,76 @@ impl IsolatedActors {
             plan_path,
             plan_pin,
             binding,
+            &mut actors,
+            &mut custody,
+        )
+    }
+
+    /// Fund the existing payer from distinct mature reward notes. Uses the same
+    /// encrypted payment journal, with a separate five-payment bounded mode.
+    #[cfg(feature = "eng2-runtime")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fund_existing(
+        &mut self,
+        store: &mut Store,
+        isolated_directory: &Path,
+        output_directory: &Path,
+        plan_path: &Path,
+        plan_pin: &str,
+        qualification: (&Path, &str),
+        campaign: &str,
+        retained: &mut RetainedMaterial,
+        before_phase: &mut impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<Value, String> {
+        owner_only()?;
+        if self.network != store.engine().state().chain().config.network || !retained.is_empty() {
+            return Err("funding custody network or retained material differs".into());
+        }
+        let node = canonical(isolated_directory)?;
+        let parent = canonical(
+            output_directory
+                .parent()
+                .ok_or("funding output parent missing")?,
+        )?;
+        if parent.join(
+            output_directory
+                .file_name()
+                .ok_or("funding output name missing")?,
+        ) != output_directory
+            || self
+                .directories
+                .iter()
+                .any(|vault| overlaps(vault, &node) || overlaps(vault, output_directory))
+        {
+            return Err("funding output overlaps custody or node".into());
+        }
+        let [payer, recipient, fee_destination, fund_destination, reward] = &mut self.actors;
+        let mut actors = Actors {
+            payer: &mut payer.scanner,
+            recipient: &mut recipient.scanner,
+            fee_destination: &mut fee_destination.scanner,
+            fund_destination: &mut fund_destination.scanner,
+            reward: &mut reward.scanner,
+        };
+        let mut no_issuance = |_: &[u8], _: &native::issuance::IssuanceDeclaration| {
+            Err("funding cannot sign an issuance".into())
+        };
+        let mut custody = JournalCustody {
+            network: self.network,
+            funding: true,
+            payer: &mut reward.vault,
+            retained,
+            before_phase,
+            issuer_signer: &mut no_issuance,
+        };
+        super::funding::generate(
+            store,
+            isolated_directory,
+            output_directory,
+            plan_path,
+            plan_pin,
+            qualification,
+            campaign,
             &mut actors,
             &mut custody,
         )
@@ -246,6 +317,7 @@ impl RetainedMaterial {
 }
 struct JournalCustody<'a, G, S> {
     network: Hash,
+    funding: bool,
     payer: &'a mut UnlockedWallet,
     retained: &'a mut RetainedMaterial,
     before_phase: &'a mut G,
@@ -269,8 +341,8 @@ where
         payment: &PreparedTransfer,
     ) -> Result<(), String> {
         (self.before_phase)("before_payment_reservation_and_memory_retention")?;
-        if !matches!(kind, "standard" | "priority" | "consolidation" | "issuance")
-            || self.retained.payments.len() >= PAYMENT_LIMIT
+        if !payment_kind_allowed(self.funding, kind)
+            || self.retained.payments.len() >= if self.funding { 5 } else { PAYMENT_LIMIT }
             || self.retained.payments.iter().any(|old| {
                 old.kind == kind
                     || old.record.statement_id(&self.network)
@@ -415,6 +487,17 @@ where
     }
 }
 
+fn payment_kind_allowed(funding: bool, kind: &str) -> bool {
+    if funding {
+        matches!(
+            kind,
+            "funding-0" | "funding-1" | "funding-2" | "funding-3" | "funding-4"
+        )
+    } else {
+        matches!(kind, "standard" | "priority" | "consolidation" | "issuance")
+    }
+}
+
 /// Explicit restart inspection, not a native-chain acceptance API. Call only
 /// after the original payer session has been dropped and its lock released.
 /// The owner independently supplies the exact intended statement IDs; no
@@ -488,5 +571,24 @@ fn owner_only() -> Result<(), String> {
         Err("actor custody requires owner-local execution".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn funding_custody_kinds_do_not_expand_the_business_payment_set() {
+        for kind in ["standard", "priority", "consolidation", "issuance"] {
+            assert!(payment_kind_allowed(false, kind));
+            assert!(!payment_kind_allowed(true, kind));
+        }
+        for index in 0..5 {
+            let kind = format!("funding-{index}");
+            assert!(payment_kind_allowed(true, &kind));
+            assert!(!payment_kind_allowed(false, &kind));
+        }
+        assert!(!payment_kind_allowed(true, "funding-5"));
+        assert!(!payment_kind_allowed(true, "funding--1"));
     }
 }

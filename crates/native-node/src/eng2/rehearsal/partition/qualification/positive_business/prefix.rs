@@ -87,6 +87,14 @@ pub(super) struct FrozenPrefix {
     output_parent: PathBuf,
     started: Instant,
 }
+pub(super) struct PrefixRequest<'a> {
+    pub history_budget: &'a PublicInput,
+    pub height: u64,
+    pub tip: &'a str,
+    pub deadline_seconds: u64,
+    pub max_output_bytes: u64,
+    pub directory: &'a Path,
+}
 fn disk(path: &Path, minimum: u64, additional: u64) -> Result<(), String> {
     let stat = rustix::fs::statvfs(path).map_err(|_| "business history disk observation failed")?;
     let free = u64::try_from(stat.f_bavail as u128 * stat.f_frsize as u128)
@@ -118,7 +126,31 @@ impl FrozenPrefix {
         started: Instant,
         custody: &mut impl Custody,
     ) -> Result<Self, String> {
-        let input = &plan.history_budget;
+        Self::prepare_existing(
+            context,
+            store,
+            PrefixRequest {
+                history_budget: &plan.history_budget,
+                height: plan.start_height,
+                tip: &plan.start_tip,
+                deadline_seconds: plan.deadline_seconds,
+                max_output_bytes: plan.max_output_bytes,
+                directory: Path::new(&plan.isolated_directory),
+            },
+            output,
+            started,
+            &mut |phase| gate(started, plan, custody, phase),
+        )
+    }
+    pub(super) fn prepare_existing(
+        context: &Context,
+        store: &Store,
+        request: PrefixRequest<'_>,
+        output: &Path,
+        started: Instant,
+        before_phase: &mut impl FnMut(&str) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let input = request.history_budget;
         if input.path.len() > 2048 || !hex(&input.sha256, 32) {
             return Err("business complete-history budget input rejected".into());
         }
@@ -131,10 +163,10 @@ impl FrozenPrefix {
             .checked_add(store.engine().body_policy().max_body_bytes)
             .ok_or("business history native frame bound overflow")?;
         budget.validate(
-            plan.start_height,
-            &plan.start_tip,
+            request.height,
+            request.tip,
             frame_limit as u64,
-            plan.deadline_seconds,
+            request.deadline_seconds,
         )?;
         let output_parent = output
             .parent()
@@ -143,9 +175,9 @@ impl FrozenPrefix {
         disk(
             &output_parent,
             budget.minimum_disk_free_bytes,
-            plan.max_output_bytes,
+            request.max_output_bytes,
         )?;
-        super::super::full_history::check_database(Path::new(&plan.isolated_directory))?;
+        super::super::full_history::check_database(request.directory)?;
         let memory = MemoryBudget::new(
             usize::try_from(budget.maximum_decode_bytes)
                 .map_err(|_| "business history memory budget width")?,
@@ -166,7 +198,7 @@ impl FrozenPrefix {
         let mut parent = store.engine().genesis().id();
         let mut total = 0u64;
         for height in 1..=budget.height {
-            gate(started, plan, custody, "before_original_prefix_metadata")?;
+            before_phase("before_original_prefix_metadata")?;
             budget.tick(started)?;
             let header = store.header(height)?;
             let body_bytes = store.block_size(height)?;
@@ -192,7 +224,7 @@ impl FrozenPrefix {
                 .map_err(|_| "business original header identity rejected")?;
             frames.push(FrozenFrame { header, bytes });
         }
-        if crate::local::hex(&parent) != plan.start_tip {
+        if crate::local::hex(&parent) != request.tip {
             return Err("business complete original prefix tip differs".into());
         }
         // Reserve complete original frames, four maximum native frames and bounded
@@ -202,7 +234,7 @@ impl FrozenPrefix {
             .and_then(|n| n.checked_add(total))
             .and_then(|n| n.checked_add(OUTPUT_METADATA_BYTES))
             .ok_or("business complete output reservation overflow")?;
-        if required_output > plan.max_output_bytes {
+        if required_output > request.max_output_bytes {
             return Err("business output budget cannot retain original prefix and campaign".into());
         }
         let result = Self {

@@ -37,6 +37,8 @@ use std::{
 use zeroize::Zeroize;
 
 pub mod custody_caller;
+#[cfg(feature = "eng2-runtime")]
+mod funding;
 mod native_business;
 mod prefix;
 const MAX_PLAN: usize = 128 * 1024;

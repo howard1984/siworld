@@ -224,6 +224,36 @@ impl Wallet {
     pub fn receipts(&self) -> &[OwnedNote] {
         &self.receipts
     }
+    /// Predict this recipient's note identity from the original checked payment
+    /// before inclusion. This does not scan, add a receipt or authorize a spend.
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn planned_payment_nullifier(
+        &self,
+        public: &PublicTransaction,
+        opening: &PaymentEncryptionOpening,
+    ) -> Result<DigestBytes, String> {
+        let mut note = opening
+            .verify_payment(
+                &self.address(),
+                &public.cm[0],
+                &public.payment,
+                &EncryptionContext::new(self.keys.network),
+            )
+            .map_err(|_| "planned payment does not authenticate this recipient")?;
+        let hasher = Hasher::new();
+        let valid = note.owner == self.address().owner() && hasher.note_cm(&note) == public.cm[0];
+        let nullifier = encode_digest(&hasher.nullifier(&self.keys.spend_key(), &note.rho));
+        note.owner.fill(F::ZERO);
+        note.asset_id.0.zeroize();
+        note.value.zeroize();
+        note.unlock_height.zeroize();
+        note.rho.fill(F::ZERO);
+        note.rseed.fill(F::ZERO);
+        if !valid {
+            return Err("planned payment commitment differs".into());
+        }
+        Ok(nullifier)
+    }
     /// Replace private receipts atomically after independently replaying the
     /// complete canonical chain. The caller authenticates/selects that chain;
     /// this does not authenticate checkpoints or choose the greatest-work fork.
