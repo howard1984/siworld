@@ -153,6 +153,27 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
+    #[cfg(all(unix, feature = "native-p2p"))]
+    if args.len() == 7 && args[0] == "--qualification-negative-branch" && args[6] == "--json" {
+        println!("{}", siworld_native_node::eng2::rehearsal::partition::qualification::invalid_peer::candidate::generate(
+            std::path::Path::new(&args[1]),
+            args[2].to_str().ok_or("invalid negative plan SHA-256")?,
+            std::path::Path::new(&args[3]),
+            std::path::Path::new(&args[4]),
+            args[5].to_str().ok_or("invalid negative binding SHA-256")?,
+        )?);
+        return Ok(());
+    }
+    #[cfg(all(unix, feature = "native-p2p"))]
+    if args.len() == 6 && args[0] == "--qualification-inspect-branch" && args[5] == "--json" {
+        println!("{}", siworld_native_node::eng2::rehearsal::partition::qualification::invalid_peer::candidate::inspect(
+            std::path::Path::new(&args[1]),
+            args[2].to_str().ok_or("invalid candidate identity")?,
+            std::path::Path::new(&args[3]),
+            args[4].to_str().ok_or("invalid inspector binding SHA-256")?,
+        )?);
+        return Ok(());
+    }
     if args.len() == 6 && args[0] == "--qualification-audit" && args[5] == "--json" {
         println!(
             "{}",

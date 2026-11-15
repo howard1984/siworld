@@ -24,6 +24,8 @@ use std::{
 };
 
 pub mod branch;
+#[cfg(unix)]
+pub mod candidate;
 
 const MAX_PLAN: usize = 16 * 1024;
 const MAX_REQUESTS: usize = 4;
