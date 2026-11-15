@@ -301,6 +301,15 @@ impl ExecutionComponents {
             assets: component(ComponentId::AssetRegistry, &assets.bytes)?,
         })
     }
+    /// The compact components used by native execution, without reconstructing
+    /// permanent leaf or nullifier vectors.
+    pub(crate) fn descriptors(self, external: [Component; 6]) -> [commitment::Descriptor; 11] {
+        let [a, b, c, d] = self.first;
+        let [e, f, g, h, i, j] = external;
+        [a, b, c, d, e, f, g, h, i, j, self.assets]
+            .each_ref()
+            .map(Component::descriptor)
+    }
     pub(crate) fn assemble(self, external: [Component; 6]) -> Result<Hash, String> {
         let components: Vec<_> = self
             .first

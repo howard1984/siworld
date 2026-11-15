@@ -141,8 +141,7 @@ fn miner_configuration_is_outbound_only_with_explicit_existing_signer_selection(
 }
 #[cfg(unix)]
 #[test]
-fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_digest() {
-    use crate::identity::PeerPin;
+fn legacy_checkpoint_routing_only_selects_advertisements_without_peer_admission() {
     let directory = directory();
     let remote_directory = super::tests::directory();
     let genesis = genesis();
@@ -157,32 +156,39 @@ fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_diges
     assert!(current.legacy_checkpoint_peers.is_empty());
     value["legacy_checkpoint_peers"] = json!([fingerprint]);
     service::atomic_json(&path, &value).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    let pin = PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding()).unwrap();
     let pin_path = directory.join(format!("peer-{fingerprint}.pin"));
-    let mut wrong_binding = pin.encode();
-    wrong_binding[6] ^= 1;
-    fs::write(&pin_path, wrong_binding).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    fs::remove_file(&pin_path).unwrap();
-    pin.persist(&directory).unwrap();
+    assert!(!pin_path.exists());
     let legacy = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
     assert!(
         legacy
             .legacy_checkpoint_peers
             .contains(&descriptor.fingerprint())
     );
+    assert!(!pin_path.exists());
     // Ingress routing must not add readiness references or outbound destinations.
     assert_eq!(legacy.peers.len(), current.peers.len());
     assert!(legacy.peers.is_empty());
     assert_ne!(legacy.digest, current.digest);
+    value["peers"] = json!([{
+        "endpoint":"127.0.0.1:9000", "dial":false, "fingerprint":fingerprint,
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]);
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    value["peers"] = json!([]);
     for invalid in [
         Value::Null,
         json!(true),
         json!(["bad"]),
         json!([fingerprint, fingerprint]),
-        json!([crate::local::hex(&[0; 32])]),
-        json!([crate::local::hex(&[9; 32])]),
+        json!([crate::local::hex(
+            &identity.descriptor().unwrap().fingerprint()
+        )]),
+        Value::Array(
+            (0u8..17)
+                .map(|index| json!(crate::local::hex(&[index; 32])))
+                .collect(),
+        ),
     ] {
         value["legacy_checkpoint_peers"] = invalid;
         service::atomic_json(&path, &value).unwrap();
@@ -678,4 +684,49 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
         .block_size(1)
         .unwrap()
     }
+}
+
+#[test]
+fn checkpoint_archive_admission_covers_retained_generation_overlap() {
+    use super::super::runtime_export::archive_work::ArchiveWork;
+
+    let archive_bytes = 31_881_389;
+    let retained_bytes = 287_993_906;
+    let requested_bytes = 16 * archive_bytes + 8 * 1024 * 1024;
+    let previous_maximum = 640 * 1024 * 1024;
+    let previous = p2p::Budget::new(previous_maximum);
+    let retained = previous.reserve(retained_bytes).unwrap();
+    let (rejected, observed) = ArchiveWork::reserve_observed(archive_bytes, 0, &previous);
+    assert!(rejected.is_err());
+    assert_eq!(observed.failure, Some("budget_exhausted"));
+    assert_eq!(observed.requested_bytes, Some(requested_bytes));
+    assert_eq!(observed.used_before_bytes, Some(retained_bytes));
+    assert_eq!(
+        previous.available().unwrap(),
+        previous_maximum - retained_bytes
+    );
+    drop(retained);
+    assert_eq!(previous.available().unwrap(), previous_maximum);
+
+    let budget = p2p::Budget::new(MEMORY_BYTES);
+    let retained = budget.reserve(retained_bytes).unwrap();
+    let (accepted, observed) = ArchiveWork::reserve_observed(archive_bytes, 0, &budget);
+    let workspace = accepted.unwrap();
+    assert_eq!(observed.failure, None);
+    assert_eq!(observed.maximum_bytes, Some(MEMORY_BYTES));
+    assert_eq!(observed.used_before_bytes, Some(retained_bytes));
+    assert_eq!(observed.requested_bytes, Some(requested_bytes));
+    assert_eq!(
+        budget.available().unwrap(),
+        MEMORY_BYTES - retained_bytes - requested_bytes
+    );
+    assert!(
+        budget
+            .reserve(MEMORY_BYTES - retained_bytes - requested_bytes + 1)
+            .is_err()
+    );
+    drop(workspace);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES - retained_bytes);
+    drop(retained);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES);
 }

@@ -56,8 +56,12 @@ Each configured peer specifies an endpoint, a `dial` boolean, a fingerprint and
 a descriptor matching an independently persisted service pin. Duplicate
 identities, endpoints, self-connections and unpinned targets are rejected.
 An optional top-level `legacy_checkpoint_peers` array defaults to empty. Each
-fingerprint must match an independently persisted pin for the current genesis.
-The selection creates no outbound destination or checkpoint-readiness reference.
+entry is an administrator-selected fingerprint; the array is limited to 16
+distinct, nonlocal identities. This advertisement selection does not require or
+create a peer pin, an outbound destination or a checkpoint-readiness reference.
+It grants no admission or signing authority. Before it can affect a connection,
+the peer must complete the existing hybrid handshake with a descriptor bound to
+the current genesis; selection then compares the authenticated peer fingerprint.
 It restricts checkpoint advertisements to each authenticated selected peer
 to statements accepted by the earlier 72-block publisher rule, including its
 24-block confirmation calculation. This filters proposals, votes and
@@ -226,6 +230,35 @@ a run identifier and freshness fields. A disconnected or stale session cannot
 keep readiness true. Stop requests name the exact active run; a previous run's
 request cannot stop its replacement. `mining_enabled` describes configuration,
 not evidence of active work or an accepted reward.
+
+Checkpoint operation failures also expose `checkpoint_candidate_failure`, a
+bounded operation code for the publication clock, local proposal, received
+proposal, archive capture or archive worker start. It supplements
+`checkpoint_tick_reason` without changing the original error or signing decision.
+The `incoming_proposal` operation records a rejected received proposal at its
+existing acceptance boundary. Each new tick clears the prior diagnostic;
+unavailable signing readiness is not a preparation error.
+`checkpoint_candidate_detail` maps exact known error literals to fixed codes;
+unrecognized or decorated errors are reported as `unknown`.
+
+`checkpoint_archive_reservation` records the last local archive reservation
+attempt, including its tick's Unix seconds, requested checkpoint and selected
+base heights. Its nested `reservation` contains encoded archive and suffix byte
+counts, requested workspace bytes, the shared budget maximum and usage before
+the attempt, and a bounded failure category. The counters come from the same
+locked reservation operation; observing them does not perform a second reserve.
+Overflow or an unavailable budget lock leaves unobserved counters null. The
+workspace request remains `16 * archive_bytes + 8 MiB + 4 * suffix_bytes`.
+The resident shares a finite 1 GiB logical byte budget between proof queues,
+network ownership, retained exports and checkpoint preparation. A new preparation
+may overlap a retained certified generation and bootstrap offers. All live
+reservations remain charged during this overlap, and admission still rejects
+requests that exceed the shared maximum. This limit is separate from process
+memory accounting; larger archives can still exceed the available workspace.
+This record is retained across ticks, so its timestamp must be checked before
+attributing it to a later status row. It measures logical ownership rather than
+resident memory or filesystem capacity. Capture, native reconstruction, signing
+readiness and checkpoint acceptance retain their existing independent checks.
 
 Checkpoint exchange follows each completed ordinary block round. It accepts at
 most three canonical messages under a shared ten-second phase deadline and

@@ -103,7 +103,17 @@ fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating
         status
     );
     assert!(host.tick(&store, 100_000, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
     assert!(host.tick(&store, 1u64 << 53, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
+    assert!(host.tick(&store, 100_002, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(store.engine().state().tip(), state_before);
     assert!(!fs::read_dir(&root).unwrap().any(|entry| {
         entry
@@ -140,7 +150,15 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         )
         .is_err()
     );
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
     assert!(host.tick(&store, 100_001, &[proposal]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::Proposal)
+    );
     let vote = Incoming::Vote {
         statement: candidate.statement.clone(),
         vote: Box::new(Vote {
@@ -149,6 +167,10 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         }),
     };
     assert!(host.tick(&store, 100_002, &[vote]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::VoteWithoutCandidate)
+    );
     let mut witness = candidate.witness;
     witness.governance = vec![0; limits().chain.max_component_bytes + 1];
     assert!(
@@ -164,6 +186,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     );
     assert_eq!(store.engine().state().height(), 0);
     let result = host.tick(&store, 100_004, &[]).unwrap();
+    assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(result.status.signer_slot, None);
     assert!(result.status.pruning_paused);
     assert!(result.vote.is_none());
@@ -209,4 +232,149 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
     assert_eq!(progress.published_height, Some(0));
     assert_eq!(host.wallet_export_state(), Some(false));
     assert!(host.tick(&store, 1001, &[]).is_ok());
+}
+
+#[test]
+fn candidate_diagnostic_preserves_operation_results_and_exports_only_fixed_codes() {
+    for (stage, code) in [
+        (
+            CandidateFailureReason::PublicationClock,
+            "publication_clock",
+        ),
+        (CandidateFailureReason::CurrentProposal, "current_proposal"),
+        (CandidateFailureReason::ArchiveCapture, "archive_capture"),
+        (
+            CandidateFailureReason::ArchiveWorkerStart,
+            "archive_worker_start",
+        ),
+    ] {
+        let mut diagnostic = None;
+        assert_eq!(candidate_result(&mut diagnostic, stage, Ok(7)), Ok(7));
+        assert_eq!(diagnostic, None);
+        let error = String::from("synthetic operation failure");
+        let allocation = error.as_ptr();
+        let result = candidate_result::<()>(&mut diagnostic, stage, Err(error));
+        let returned = result.unwrap_err();
+        assert_eq!(returned.as_ptr(), allocation);
+        assert_eq!(returned, "synthetic operation failure");
+        assert_eq!(diagnostic.map(|failure| failure.stage.code()), Some(code));
+        assert_eq!(diagnostic.map(|failure| failure.detail), Some("unknown"));
+    }
+}
+
+#[test]
+fn candidate_diagnostic_does_not_survive_a_later_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("candidate-diagnostic-export");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.candidate_failure = Some(CandidateFailure {
+        stage: CandidateFailureReason::ArchiveCapture,
+        detail: "archive_budget_unavailable",
+    });
+    assert!(host.tick(&store, 1u64 << 53, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
+    assert_eq!(host.candidate_failure_reason(), None);
+    assert_eq!(host.candidate_failure_detail(), None);
+    host.candidate_failure = Some(CandidateFailure {
+        stage: CandidateFailureReason::ArchiveWorkerStart,
+        detail: "archive_worker_spawn_failed",
+    });
+    assert!(host.tick(&store, 100_000, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
+    assert_eq!(host.candidate_failure_reason(), None);
+    assert_eq!(host.candidate_failure_detail(), None);
+}
+
+#[test]
+fn candidate_detail_requires_an_exact_allowlisted_literal() {
+    for (error, detail) in [
+        (
+            "checkpoint publication clock moved backwards",
+            "publication_clock_regressed",
+        ),
+        (
+            "checkpoint witness differs from the executed current header",
+            "execution_witness_mismatch",
+        ),
+        (
+            "checkpoint preparation archive missing within bounded migration window",
+            "archive_missing",
+        ),
+        (
+            "checkpoint archive preparation budget unavailable",
+            "archive_budget_unavailable",
+        ),
+        (
+            "checkpoint archive worker creation failed",
+            "archive_worker_spawn_failed",
+        ),
+    ] {
+        assert_eq!(candidate_failure_detail(error), detail);
+        assert_eq!(
+            candidate_failure_detail(&format!("{error} extra")),
+            "unknown"
+        );
+        assert_eq!(
+            candidate_failure_detail(&format!("extra {error}")),
+            "unknown"
+        );
+    }
+    assert_eq!(candidate_failure_detail(""), "unknown");
+    assert_eq!(
+        candidate_failure_detail("unrecognized synthetic error"),
+        "unknown"
+    );
+}
+
+#[test]
+fn incoming_proposal_diagnostic_preserves_rejection_and_clears_on_the_next_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("incoming-proposal-diagnostic-export");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    let candidate = synthetic_candidate();
+    let proposal = Proposal {
+        statement: candidate.statement,
+        witness: candidate.witness,
+    };
+    let expected = host.accept_proposal(&store, &proposal).unwrap_err();
+    let error = host
+        .tick(&store, 100_000, &[Incoming::Proposal(proposal)])
+        .err()
+        .unwrap();
+    assert_eq!(error, expected);
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::Proposal)
+    );
+    assert_eq!(host.candidate_failure_reason(), Some("incoming_proposal"));
+    assert_eq!(
+        host.candidate_failure_detail(),
+        Some("proposal_anchor_ineligible")
+    );
+    assert_eq!(store.engine().state().height(), 0);
+    assert!(host.pending.is_none());
+    assert!(!root.join("checkpoint-eng2.json").exists());
+
+    let error = format!("{expected} extra");
+    let allocation = error.as_ptr();
+    let mut diagnostic = None;
+    let returned = candidate_result::<()>(
+        &mut diagnostic,
+        CandidateFailureReason::IncomingProposal,
+        Err(error),
+    )
+    .unwrap_err();
+    assert_eq!(returned.as_ptr(), allocation);
+    assert_eq!(returned, format!("{expected} extra"));
+    assert_eq!(diagnostic.unwrap().stage.code(), "incoming_proposal");
+    assert_eq!(diagnostic.unwrap().detail, "unknown");
+    assert!(host.tick(&store, 100_001, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
+    assert_eq!(host.candidate_failure_reason(), None);
+    assert_eq!(host.candidate_failure_detail(), None);
 }
