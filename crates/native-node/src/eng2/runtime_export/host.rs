@@ -192,13 +192,14 @@ impl TickFailureReason {
         }
     }
 }
-/// Bounded operation origins within candidate preparation. Error text stays private.
+/// Bounded checkpoint operation origins. Error text stays private.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CandidateFailureReason {
     PublicationClock,
     CurrentProposal,
     ArchiveCapture,
     ArchiveWorkerStart,
+    IncomingProposal,
 }
 impl CandidateFailureReason {
     fn code(self) -> &'static str {
@@ -207,6 +208,7 @@ impl CandidateFailureReason {
             Self::CurrentProposal => "current_proposal",
             Self::ArchiveCapture => "archive_capture",
             Self::ArchiveWorkerStart => "archive_worker_start",
+            Self::IncomingProposal => "incoming_proposal",
         }
     }
 }
@@ -228,6 +230,37 @@ fn candidate_failure_detail(error: &str) -> &'static str {
         "invalid checkpoint anchor" => "checkpoint_anchor_invalid",
         "invalid checkpoint proposal statement" => "proposal_statement_invalid",
         "invalid checkpoint proposal witness" => "proposal_witness_invalid",
+        "checkpoint proposal does not match the current eligible anchor" => {
+            "proposal_anchor_ineligible"
+        }
+        "checkpoint proposal does not advance the published anchor" => {
+            "proposal_anchor_not_advanced"
+        }
+        "checkpoint proposal conflicts with the durable pending candidate" => {
+            "proposal_pending_conflict"
+        }
+        "checkpoint preparation conflicts with completed candidate" => {
+            "proposal_completed_conflict"
+        }
+        "checkpoint preparation already owns another candidate" => "proposal_request_conflict",
+        "checkpoint preparation unavailable" => "preparation_unavailable",
+        "checkpoint proposal differs from current execution context" => "proposal_context_mismatch",
+        "checkpoint preparation is outside the executed canonical prefix" => {
+            "proposal_prefix_mismatch"
+        }
+        "invalid checkpoint anchor identity" => "checkpoint_anchor_identity_invalid",
+        "invalid checkpoint authorization identity" => "authorization_identity_invalid",
+        "invalid checkpoint authorization witness" => "authorization_witness_invalid",
+        "checkpoint governance witness exceeds bounds" => "governance_witness_bounds",
+        "invalid checkpoint authorization descriptors" => "authorization_descriptors_invalid",
+        "checkpoint witness differs from executed authorization header" => {
+            "authorization_witness_mismatch"
+        }
+        "checkpoint witness does not authorize its signer epoch" => "authorization_epoch_mismatch",
+        "checkpoint signer epoch is no longer current" => "signer_epoch_obsolete",
+        "prepared checkpoint no longer matches the canonical current signer context" => {
+            "prepared_context_mismatch"
+        }
         "missing fund allocation" => "fund_allocation_missing",
         "invalid checkpoint preparation archive height" => "archive_height_invalid",
         "checkpoint preparation archive read unavailable" => "archive_read_unavailable",
@@ -826,7 +859,12 @@ impl Host {
                     ) {
                         continue;
                     }
-                    self.accept_proposal(store, proposal)?;
+                    let result = self.accept_proposal(store, proposal);
+                    candidate_result(
+                        &mut self.candidate_failure,
+                        CandidateFailureReason::IncomingProposal,
+                        result,
+                    )?;
                 }
                 Incoming::Vote { statement, vote } => {
                     self.tick_failure = Some(TickFailureReason::Vote);

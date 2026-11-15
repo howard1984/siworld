@@ -329,3 +329,52 @@ fn candidate_detail_requires_an_exact_allowlisted_literal() {
         "unknown"
     );
 }
+
+#[test]
+fn incoming_proposal_diagnostic_preserves_rejection_and_clears_on_the_next_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("incoming-proposal-diagnostic-export");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    let candidate = synthetic_candidate();
+    let proposal = Proposal {
+        statement: candidate.statement,
+        witness: candidate.witness,
+    };
+    let expected = host.accept_proposal(&store, &proposal).unwrap_err();
+    let error = host
+        .tick(&store, 100_000, &[Incoming::Proposal(proposal)])
+        .err()
+        .unwrap();
+    assert_eq!(error, expected);
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::Proposal)
+    );
+    assert_eq!(host.candidate_failure_reason(), Some("incoming_proposal"));
+    assert_eq!(
+        host.candidate_failure_detail(),
+        Some("proposal_anchor_ineligible")
+    );
+    assert_eq!(store.engine().state().height(), 0);
+    assert!(host.pending.is_none());
+    assert!(!root.join("checkpoint-eng2.json").exists());
+
+    let error = format!("{expected} extra");
+    let allocation = error.as_ptr();
+    let mut diagnostic = None;
+    let returned = candidate_result::<()>(
+        &mut diagnostic,
+        CandidateFailureReason::IncomingProposal,
+        Err(error),
+    )
+    .unwrap_err();
+    assert_eq!(returned.as_ptr(), allocation);
+    assert_eq!(returned, format!("{expected} extra"));
+    assert_eq!(diagnostic.unwrap().stage.code(), "incoming_proposal");
+    assert_eq!(diagnostic.unwrap().detail, "unknown");
+    assert!(host.tick(&store, 100_001, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
+    assert_eq!(host.candidate_failure_reason(), None);
+    assert_eq!(host.candidate_failure_detail(), None);
+}
