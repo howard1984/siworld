@@ -76,6 +76,13 @@ Ordinary miners may connect to service nodes without manual registration. They
 still complete the encrypted hybrid handshake and all consensus verification.
 Services do not admit an unknown validator through the open miner route.
 
+The resident shares a finite 1 GiB logical byte budget between proof queues,
+network ownership, retained exports and checkpoint preparation. A new preparation
+may overlap a retained certified generation and bootstrap offers. All live
+reservations remain charged during this overlap, and admission still rejects
+requests that exceed the shared maximum. This limit is separate from process
+memory accounting; larger archives can still exceed the available workspace.
+
 At most eight connection workers share the node's byte-admission budget.
 Listening service pairs select one deterministic dialer. Failed connections use
 bounded backoff. A live connection alone does not establish readiness: a fresh

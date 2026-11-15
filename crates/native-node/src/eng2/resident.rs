@@ -43,7 +43,7 @@ mod public_fixture;
 mod tests;
 
 const MAX_GENESIS_BYTES: usize = 1024 * 1024;
-const MEMORY_BYTES: usize = 640 * 1024 * 1024;
+const MEMORY_BYTES: usize = 1024 * 1024 * 1024;
 const READY_FRESHNESS: Duration = Duration::from_secs(30);
 const _: () = assert!(
     peers::diagnostic_storage_bytes() + super::accept_observation::diagnostic_storage_bytes()

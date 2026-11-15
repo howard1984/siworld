@@ -780,3 +780,41 @@ fn production_failure_retains_the_first_stable_alarm() {
     assert_eq!(status.error, Some("native_production_failed"));
     assert_eq!(status.phase, "networking");
 }
+
+#[test]
+fn checkpoint_archive_admission_covers_retained_generation_overlap() {
+    use super::super::runtime_export::archive_work::ArchiveWork;
+
+    let archive_bytes = 31_881_389;
+    let retained_bytes = 287_993_906;
+    let requested_bytes = 16 * archive_bytes + 8 * 1024 * 1024;
+    let previous_maximum = 640 * 1024 * 1024;
+    let previous = p2p::Budget::new(previous_maximum);
+    let retained = previous.reserve(retained_bytes).unwrap();
+    let rejected = ArchiveWork::reserve(archive_bytes, 0, &previous);
+    assert!(rejected.is_err());
+    assert_eq!(
+        previous.available().unwrap(),
+        previous_maximum - retained_bytes
+    );
+    drop(retained);
+    assert_eq!(previous.available().unwrap(), previous_maximum);
+
+    let budget = p2p::Budget::new(MEMORY_BYTES);
+    let retained = budget.reserve(retained_bytes).unwrap();
+    let accepted = ArchiveWork::reserve(archive_bytes, 0, &budget);
+    let workspace = accepted.unwrap();
+    assert_eq!(
+        budget.available().unwrap(),
+        MEMORY_BYTES - retained_bytes - requested_bytes
+    );
+    assert!(
+        budget
+            .reserve(MEMORY_BYTES - retained_bytes - requested_bytes + 1)
+            .is_err()
+    );
+    drop(workspace);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES - retained_bytes);
+    drop(retained);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES);
+}
