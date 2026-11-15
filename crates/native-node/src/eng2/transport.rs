@@ -321,6 +321,20 @@ impl<S: Read + Write> Peer<S> {
         header: &Header,
         body: &Body,
     ) -> Result<(), p2p::Error> {
+        self.send_body_before(
+            request,
+            header,
+            body,
+            &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+        )
+    }
+    fn send_body_before(
+        &mut self,
+        request: u64,
+        header: &Header,
+        body: &Body,
+        deadline: &p2p::Deadline,
+    ) -> Result<(), p2p::Error> {
         if header.network != self.session.binding().network
             || body.network != header.network
             || body.height != header.height
@@ -347,9 +361,12 @@ impl<S: Read + Write> Peer<S> {
         buffer
             .try_reserve_exact(CHUNK_BYTES + 9)
             .map_err(|_| p2p::Error::ResourceExhausted)?;
-        self.send(request, &start)?;
+        // A body is one bounded transfer. Slow chunks and their TLS flushes
+        // share its deadline rather than the ordinary control-frame timeout.
+        self.send_application_before(request, &start, deadline)?;
         let mut writer = ChunkWriter {
             peer: self,
+            deadline,
             request,
             offset: 0,
             buffer,
@@ -625,6 +642,7 @@ fn digest(bytes: &[u8]) -> Hash {
 }
 struct ChunkWriter<'a, S> {
     peer: &'a mut Peer<S>,
+    deadline: &'a p2p::Deadline,
     request: u64,
     offset: usize,
     buffer: Vec<u8>,
@@ -645,7 +663,7 @@ impl<S: Read + Write> Write for ChunkWriter<'_, S> {
         self.buffer[0] = BODY_CHUNK;
         self.buffer[1..9].copy_from_slice(&(self.offset as u64).to_le_bytes());
         self.peer
-            .send(self.request, &self.buffer)
+            .send_application_before(self.request, &self.buffer, self.deadline)
             .map_err(|_| io::Error::other("eng2 chunk send failed"))?;
         self.offset += self.buffer.len() - 9;
         self.buffer.truncate(9);
@@ -964,6 +982,105 @@ mod tests {
         assert!(budget.available().unwrap() < before);
         drop(received);
         assert_eq!(budget.available().unwrap(), before);
+    }
+    #[test]
+    fn body_send_start_chunks_and_flush_share_one_deadline() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        struct TimedSend {
+            output: Vec<u8>,
+            clock: Arc<AtomicU64>,
+            times: Vec<u64>,
+            step: usize,
+            cancel_at: Option<(usize, p2p::Cancellation)>,
+        }
+        impl TimedSend {
+            fn advance(&mut self) {
+                self.clock.store(self.times[self.step], Ordering::Relaxed);
+                if let Some((step, cancel)) = &self.cancel_at
+                    && *step == self.step
+                {
+                    cancel.cancel();
+                }
+                self.step += 1;
+            }
+        }
+        impl Read for TimedSend {
+            fn read(&mut self, _bytes: &mut [u8]) -> io::Result<usize> {
+                panic!("body sender must not read");
+            }
+        }
+        impl Write for TimedSend {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.advance();
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.advance();
+                Ok(())
+            }
+        }
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let binding = binding(&g);
+        let mut reference = Peer::new(
+            session(vec![], binding, p2p::Budget::default()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        reference.send_body(5, &header, &body).unwrap();
+        let wire = &reference.session.test_channel().output;
+        // BODY_START and two chunks each perform header/body writes and flush.
+        let steps = 9;
+        let mut cases = vec![(vec![11_001; steps], None, true)];
+        cases.push((
+            vec![0, 0, 0, 11_001, 11_002, 11_003, 179_997, 179_998, 179_999],
+            None,
+            true,
+        ));
+        for step in 0..steps {
+            let mut times = vec![11_001; steps];
+            times[step..].fill(180_000);
+            cases.push((times, None, false));
+            cases.push((vec![0; steps], Some(step), false));
+        }
+        for (times, cancel_at, accepted) in cases {
+            let clock = Arc::new(AtomicU64::new(0));
+            let cancel = p2p::Cancellation::default();
+            let deadline = if cancel_at.is_some() {
+                p2p::Deadline::cancellable(BODY_FETCH_TIMEOUT, cancel.clone())
+            } else {
+                p2p::Deadline::test_clock(BODY_FETCH_TIMEOUT, clock.clone())
+            };
+            let budget = p2p::Budget::new(20 * 1024 * 1024);
+            let before = budget.available().unwrap();
+            let channel = TimedSend {
+                output: Vec::new(),
+                clock,
+                times,
+                step: 0,
+                cancel_at: cancel_at.map(|step| (step, cancel)),
+            };
+            let mut sender = Peer::new(
+                p2p::Session::from_test_channel(channel, binding, budget.clone()),
+                &g,
+                policy(),
+            )
+            .unwrap();
+            let result = sender.send_body_before(5, &header, &body, &deadline);
+            assert_eq!(result.is_ok(), accepted, "cancel_at={cancel_at:?}");
+            if accepted {
+                assert_eq!(&sender.session.test_channel().output, wire);
+                assert_eq!(sender.session.test_channel().step, steps);
+            } else {
+                assert_eq!(result, Err(p2p::Error::Unavailable));
+            }
+            assert_eq!(budget.available().unwrap(), before);
+        }
     }
     #[test]
     fn optional_body_deadline_is_shared_after_the_initial_response_without_renewal() {
