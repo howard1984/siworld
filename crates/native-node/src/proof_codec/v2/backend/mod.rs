@@ -10,6 +10,7 @@ mod issuance_trace;
 mod owner;
 mod pcs;
 mod relations;
+pub mod retained;
 mod settlement_trace;
 pub use relations::{
     IssuanceProver, IssuanceVerifier, SettlementProver, SettlementVerifier, TransactionProver,

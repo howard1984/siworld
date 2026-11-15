@@ -666,3 +666,24 @@ fn branch_store_sigkill_preserves_raw_arrival_and_invalid_marks() {
         "sigkill_reopen=true; first_seen_preserved=true; raw_hash_preserved=true; invalid_mark_preserved=true; full_repair_allowed=false"
     );
 }
+
+#[test]
+#[cfg(feature = "eng2-runtime")]
+fn incremental_archive_qualification_matches_full_path_and_never_marks_bodies_executed() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store();
+    let path = chain(&[], 25, 3);
+    let second = path.header(2).unwrap();
+    assert!(!store.retain_incremental_header(second).unwrap());
+    for height in 1..=25 {
+        let header = path.header(height).unwrap();
+        let mut bad = header.clone();
+        bad.target = [254; 32];
+        assert!(store.retain_incremental_header(&bad).is_err());
+        assert!(store.retain_incremental_header(header).unwrap());
+        let entry = store.entry(header.id().unwrap()).unwrap().unwrap();
+        assert_eq!(entry.cumulative_work, path.work_at(height).unwrap());
+        assert_eq!(entry.status, Status::HeaderQualified);
+        assert!(store.body_size(header.id().unwrap()).unwrap().is_none());
+    }
+}

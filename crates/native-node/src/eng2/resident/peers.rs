@@ -8,7 +8,11 @@ use std::{
     thread::JoinHandle,
 };
 
+mod lanes;
+use lanes::lane_session;
 const MAX_WORKERS: usize = 8;
+const MAX_TOTAL_WORKERS: usize = 3 * MAX_WORKERS;
+use super::super::transport::lanes::Lane;
 const WORKER_BYTES: usize = 2 * 1024 * 1024 + 65536;
 const ROUND_BLOCKS: u16 = 8;
 const ROUND_RECORDS: usize = 8;
@@ -133,6 +137,8 @@ struct Connection {
 #[derive(Default)]
 struct StatusInner {
     connections: BTreeMap<Hash, Connection>,
+    lane_supported: BTreeSet<Hash>,
+    lanes: BTreeSet<(Hash, u8)>,
     rounds: u64,
     next_connection: u64,
     invalidations: u64,
@@ -223,6 +229,8 @@ pub(crate) struct NetworkStatus {
 }
 pub(super) struct Snapshot {
     pub connections: usize,
+    pub header_lanes: usize,
+    pub body_lanes: usize,
     #[cfg(test)]
     pub ready: bool,
     pub last_round_age_ms: Option<String>,
@@ -238,6 +246,7 @@ impl Drop for Connected {
         if let Ok(mut status) = self.status.inner.lock()
             && let Some(connection) = status.connections.remove(&self.peer)
         {
+            status.lane_supported.remove(&self.peer);
             status.last_disconnect = Some(connection.diagnostic);
             status.disconnections = status.disconnections.saturating_add(1);
         }
@@ -465,6 +474,16 @@ impl NetworkStatus {
             .map_err(|_| "connection registry lock poisoned")?;
         Ok(Snapshot {
             connections: status.connections.len(),
+            header_lanes: status
+                .lanes
+                .iter()
+                .filter(|(_, lane)| *lane == Lane::Headers as u8)
+                .count(),
+            body_lanes: status
+                .lanes
+                .iter()
+                .filter(|(_, lane)| *lane == Lane::Bodies as u8)
+                .count(),
             #[cfg(test)]
             ready: status.connections.values().any(|c| {
                 c.caught_up && c.last_round.is_some_and(|t| t.elapsed() <= READY_FRESHNESS)
@@ -480,13 +499,37 @@ impl NetworkStatus {
     }
 }
 enum Job {
-    Dial(SocketAddr, Hash),
+    Dial(SocketAddr, Hash, Option<Lane>),
     Accept(TcpStream, Instant),
 }
 struct Worker {
     handle: JoinHandle<Result<(), String>>,
-    outbound: Option<Hash>,
+    outbound: Option<(Hash, u8)>,
     started: Instant,
+}
+struct AdmissionWorker {
+    handle: Option<JoinHandle<Result<(), String>>>,
+    cancel: p2p::Cancellation,
+}
+impl AdmissionWorker {
+    fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+    fn join(mut self) -> Result<(), String> {
+        self.handle
+            .take()
+            .expect("retained body admission worker")
+            .join()
+            .map_err(|_| "body admission worker panicked")?
+    }
+}
+impl Drop for AdmissionWorker {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancel.cancel();
+            let _ = handle.join();
+        }
+    }
 }
 struct Backoff {
     failures: u32,
@@ -495,9 +538,30 @@ struct Backoff {
 fn session(
     mut peer: Peer<p2p::NativeTlsChannel>,
     initiator: bool,
-    shared: &Shared,
+    shared: &Arc<Shared>,
+    lane: Option<Lane>,
 ) -> Result<(), String> {
     let fingerprint = peer.peer();
+    if initiator {
+        if let Some(lane) = lane {
+            peer.open_lane(1, lane)
+                .map_err(|_| "optional lane opening rejected")?;
+            return lane_session(peer, true, lane, shared);
+        }
+    } else {
+        let initial = peer
+            .receive_request()
+            .map_err(|_| "initial authenticated request rejected")?;
+        if let super::super::transport::Request::Header { height } = initial.1
+            && let Some(lane) = Lane::from_height(height)
+        {
+            peer.accept_lane(initial.0, lane)
+                .map_err(|_| "optional lane acceptance failed")?;
+            return lane_session(peer, false, lane, shared);
+        }
+        peer.retain_initial_request(initial)
+            .map_err(|_| "initial request ownership rejected")?;
+    }
     let connected = shared.network.connected(fingerprint)?;
     peer.observe_connection(connected.ordinal);
     if let Ok(mut status) = shared.network.inner.lock()
@@ -506,6 +570,19 @@ fn session(
         entry.diagnostic.initiator = initiator;
     }
     let mut sequence = network::Sequence::default();
+    if initiator
+        && peer
+            .probe_lanes(sequence.next().map_err(|_| "peer sequence exhausted")?)
+            .map_err(|_| "optional lane probe failed")?
+    {
+        shared
+            .network
+            .inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?
+            .lane_supported
+            .insert(fingerprint);
+    }
     while !shared.cancel.is_cancelled() {
         let round = if initiator {
             shared.network.begin_round(fingerprint)?;
@@ -705,7 +782,7 @@ fn spawn(
     reservation: p2p::Reservation,
 ) -> Result<Worker, String> {
     let outbound = match &job {
-        Job::Dial(_, peer) => Some(*peer),
+        Job::Dial(_, peer, lane) => Some((*peer, lane.map_or(0, |lane| lane as u8))),
         _ => None,
     };
     let started = Instant::now();
@@ -714,20 +791,23 @@ fn spawn(
         .stack_size(2 * 1024 * 1024)
         .spawn(move || {
             let _charge = reservation;
-            let (peer, initiator) = match job {
-                Job::Dial(endpoint, peer) => (
+            let (peer, initiator, lane) = match job {
+                Job::Dial(endpoint, peer, lane) => (
                     connector.connect(endpoint, peer, role, shared.cancel.clone()),
                     true,
+                    lane,
                 ),
                 Job::Accept(socket, accepted) => (
                     connector.accept(socket, accepted, role, shared.cancel.clone()),
                     false,
+                    None,
                 ),
             };
             session(
                 peer.map_err(|_| "peer authentication unavailable")?,
                 initiator,
                 &shared,
+                lane,
             )
         })
         .map_err(|_| "peer worker creation failed")?;
@@ -773,10 +853,30 @@ pub(super) fn run(
             Ok::<_, String>(socket)
         })
         .transpose()?;
+    let admission_charge = shared
+        .budget
+        .reserve(WORKER_BYTES)
+        .map_err(|_| "body admission worker budget unavailable")?;
+    let admission_shared = shared.clone();
+    let admission = std::thread::Builder::new()
+        .name("eng2-body-admission".into())
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let _charge = admission_charge;
+            super::body_admission::run(admission_shared)
+        })
+        .map_err(|_| "body admission worker creation failed")?;
+    let admission = AdmissionWorker {
+        handle: Some(admission),
+        cancel: shared.cancel.clone(),
+    };
     let mut workers: Vec<Worker> = Vec::new();
-    let mut backoff: BTreeMap<Hash, Backoff> = BTreeMap::new();
+    let mut backoff: BTreeMap<(Hash, u8), Backoff> = BTreeMap::new();
     let result = (|| {
         while !shared.cancel.is_cancelled() {
+            if admission.is_finished() {
+                return Err("body admission worker exited unexpectedly".into());
+            }
             let mut index = 0;
             while index < workers.len() {
                 if workers[index].handle.is_finished() {
@@ -804,8 +904,9 @@ pub(super) fn run(
                     index += 1;
                 }
             }
+            shared.headers.tick()?;
             for destination in &config.peers {
-                if workers.len() >= MAX_WORKERS {
+                if workers.len() >= MAX_TOTAL_WORKERS {
                     break;
                 }
                 let peer = destination.expected.fingerprint();
@@ -813,8 +914,10 @@ pub(super) fn run(
                 // outbound-only miners always initiate their pinned route.
                 if !destination.dial
                     || (listener.is_some() && local > peer)
-                    || workers.iter().any(|w| w.outbound == Some(peer))
-                    || backoff.get(&peer).is_some_and(|b| Instant::now() < b.until)
+                    || workers.iter().any(|w| w.outbound == Some((peer, 0)))
+                    || backoff
+                        .get(&(peer, 0))
+                        .is_some_and(|b| Instant::now() < b.until)
                 {
                     continue;
                 }
@@ -830,7 +933,7 @@ pub(super) fn run(
                 }
                 match admit_worker(shared.budget.reserve_observed(WORKER_BYTES), |charge| {
                     spawn(
-                        Job::Dial(destination.endpoint, peer),
+                        Job::Dial(destination.endpoint, peer, None),
                         connector.clone(),
                         config.role,
                         shared.clone(),
@@ -841,8 +944,44 @@ pub(super) fn run(
                     WorkerAdmission::Deferred => break,
                 }
             }
+            for destination in &config.peers {
+                let peer = destination.expected.fingerprint();
+                let supported = shared
+                    .network
+                    .inner
+                    .lock()
+                    .map_err(|_| "connection registry lock poisoned")?
+                    .lane_supported
+                    .contains(&peer);
+                if !supported {
+                    continue;
+                }
+                for lane in [Lane::Headers, Lane::Bodies] {
+                    let key = (peer, lane as u8);
+                    if workers.len() >= MAX_TOTAL_WORKERS {
+                        break;
+                    }
+                    if workers.iter().any(|w| w.outbound == Some(key))
+                        || backoff.get(&key).is_some_and(|b| Instant::now() < b.until)
+                    {
+                        continue;
+                    }
+                    match admit_worker(shared.budget.reserve_observed(WORKER_BYTES), |charge| {
+                        spawn(
+                            Job::Dial(destination.endpoint, peer, Some(lane)),
+                            connector.clone(),
+                            config.role,
+                            shared.clone(),
+                            charge,
+                        )
+                    })? {
+                        WorkerAdmission::Ready(worker) => workers.push(worker),
+                        WorkerAdmission::Deferred => break,
+                    }
+                }
+            }
             for _ in 0..2 {
-                if workers.len() >= MAX_WORKERS {
+                if workers.len() >= MAX_TOTAL_WORKERS {
                     break;
                 }
                 let Some(listener) = &listener else {
@@ -874,7 +1013,9 @@ pub(super) fn run(
     for worker in workers {
         let _ = worker.handle.join();
     }
-    result
+    let admission_result = admission.join();
+    let drained = shared.bodies.clear();
+    result.and(admission_result).and(drained)
 }
 
 #[cfg(test)]

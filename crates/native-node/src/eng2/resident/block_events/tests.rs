@@ -261,3 +261,101 @@ fn missing_runtime_identity_leaves_observation_unavailable() {
     assert_eq!(recorder.diagnostic()["stream_start_written"], false);
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
 }
+
+#[test]
+fn optional_header_and_template_events_do_not_claim_body_acceptance_or_measured_clock_error() {
+    let directory = Directory::new();
+    let recorder = directory.recorder();
+    let header = Header {
+        network: [1; 32],
+        height: 1,
+        parent: [2; 32],
+        timestamp: 1,
+        target: [255; 32],
+        execution_commitment: [3; 32],
+        body_commitment: [4; 32],
+        nonce: 0,
+    };
+    recorder.header_qualified(&header);
+    recorder.header_forwarded(&header);
+    recorder.template_ready(&header, std::time::Duration::from_micros(123));
+    recorder.finish();
+    let records = directory.records();
+    assert_eq!(records.len(), 5);
+    assert_eq!(records[1]["kind"], "native-header-qualified");
+    assert_eq!(records[2]["kind"], "native-header-forwarded");
+    let template = &records[3];
+    assert_eq!(template["assembly_excluding_pow_us"], 123);
+    assert_eq!(template["parent_id"], "02".repeat(32));
+    assert_eq!(template["body_commitment"], "04".repeat(32));
+    assert_eq!(template["template_header_id_is_mined_block_id"], false);
+    for event in &records[1..4] {
+        assert!(event["accepted_unix_ms"].is_null());
+        assert_eq!(event["clock_calibration_measured"], false);
+        assert!(serde_json::to_vec(event).unwrap().len() < RECORD_BYTES);
+    }
+}
+
+#[test]
+fn optional_body_attempts_retain_actual_edges_and_failure_without_claiming_acceptance() {
+    let directory = Directory::new();
+    let recorder = directory.recorder();
+    let header = Header {
+        network: [1; 32],
+        height: 9,
+        parent: [2; 32],
+        timestamp: 1,
+        target: [255; 32],
+        execution_commitment: [3; 32],
+        body_commitment: [4; 32],
+        nonce: 7,
+    };
+    let start = recorder.started + std::time::Duration::from_nanos(10);
+    for (attempt, outcome) in [(1, 1), (2, 3)] {
+        recorder.body_fetch(
+            [8; 32],
+            &header,
+            Some(FetchTiming {
+                connection: 5,
+                attempt,
+                height: header.height,
+                block: header.id().unwrap(),
+                bytes: 1000,
+                received_bytes: if outcome == 1 { 1000 } else { 100 },
+                start: Some(start),
+                body_start: Some(start + std::time::Duration::from_nanos(5)),
+                chunks_end: (outcome == 1).then_some(start + std::time::Duration::from_nanos(10)),
+                decoded: (outcome == 1).then_some(start + std::time::Duration::from_nanos(15)),
+                end: Some(start + std::time::Duration::from_nanos(20)),
+                outcome,
+                transport_error: if outcome == 1 { 0 } else { 2 },
+            }),
+            0,
+        );
+    }
+    recorder.finish();
+    let records = directory.records();
+    assert_eq!(records.len(), 4);
+    for event in &records[1..3] {
+        assert_eq!(event["kind"], "native-body-fetch-observed");
+        assert_eq!(event["peer_id"], "08".repeat(32));
+        assert_eq!(event["block_id"], crate::local::hex(&header.id().unwrap()));
+        assert_eq!(event["fetch_timing"]["start"], "10");
+        assert_eq!(event["fetch_timing"]["body_start"], "15");
+        assert_eq!(event["fetch_timing"]["ordinal_available"], true);
+        assert_eq!(event["native_acceptance_implied"], false);
+        assert!(event["accepted_unix_ms"].is_null());
+        assert_eq!(event["clock_calibration_measured"], false);
+        assert!(serde_json::to_vec(event).unwrap().len() < RECORD_BYTES);
+    }
+    assert_eq!(records[1]["fetch_timing"]["chunks_end"], "20");
+    assert_eq!(records[1]["fetch_timing"]["decoded"], "25");
+    assert!(records[2]["fetch_timing"]["chunks_end"].is_null());
+    assert!(records[2]["fetch_timing"]["decoded"].is_null());
+    assert_eq!(records[2]["fetch_timing"]["transport_error"], "unavailable");
+    assert_ne!(
+        records[1]["deduplication_key"],
+        records[2]["deduplication_key"]
+    );
+    assert_eq!(recorder.diagnostic()["dropped_events"], 0);
+}

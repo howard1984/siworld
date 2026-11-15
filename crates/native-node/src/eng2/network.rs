@@ -166,7 +166,7 @@ impl Default for Limits {
 #[derive(Default)]
 pub struct Sequence(u64);
 impl Sequence {
-    fn next(&mut self) -> Result<u64, Error> {
+    pub(crate) fn next(&mut self) -> Result<u64, Error> {
         self.0 = self.0.checked_add(1).ok_or(Error::RequestLimit)?;
         Ok(self.0)
     }
@@ -450,7 +450,7 @@ fn discover_fork<S: Read + Write, O: Owner>(
     Ok(())
 }
 
-fn serve<S: Read + Write, O: Owner>(
+pub(crate) fn serve<S: Read + Write, O: Owner>(
     peer: &mut Peer<S>,
     owner: &Arc<Mutex<O>>,
     request: u64,
@@ -478,6 +478,11 @@ fn serve<S: Read + Write, O: Owner>(
         Request::GetTip => {
             let head = with_owner(owner, |o| o.head())?;
             peer.advertise_tip(request, head.0, head.1)?;
+        }
+        Request::Header {
+            height: super::transport::lanes::CAPABILITY_HEIGHT,
+        } => {
+            peer.send_lane_capabilities(request)?;
         }
         Request::Header { height: 0 } => {
             let available = with_owner(owner, |o| Ok(o.exact_exchange_enabled()))?;

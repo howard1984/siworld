@@ -106,6 +106,8 @@ pub struct Driver {
     reorganization: Option<reorganization::Reorganization>,
     template_generation: u64,
     #[cfg(feature = "eng2-runtime")]
+    header_hub: Option<std::sync::Arc<super::resident::header_lane::Hub>>,
+    #[cfg(feature = "eng2-runtime")]
     accept_observation: super::accept_observation::Observation,
 }
 impl Driver {
@@ -132,8 +134,17 @@ impl Driver {
             reorganization: None,
             template_generation: 0,
             #[cfg(feature = "eng2-runtime")]
+            header_hub: None,
+            #[cfg(feature = "eng2-runtime")]
             accept_observation: super::accept_observation::Observation::default(),
         })
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn observe_headers(
+        &mut self,
+        hub: std::sync::Arc<super::resident::header_lane::Hub>,
+    ) {
+        self.header_hub = Some(hub);
     }
     fn ensure_activities_allowed(&self) -> Result<(), String> {
         if self.activities_allowed() {
@@ -385,6 +396,10 @@ impl Driver {
             .reconcile(std::time::Instant::now(), |provider| {
                 provider.check_current(&self.store).is_ok()
             });
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(hub) = &self.header_hub {
+            hub.after_commit(|| hub.committed(self));
+        }
         Ok(committed)
     }
     pub fn last_archive_error(&self) -> Option<&str> {

@@ -2,8 +2,9 @@
 """Check native runtime admission limits without rewriting measured profiles.
 
 Policy version one increases only the runtime settlement-proof body allowance.
-The source-bound measurement artifacts, AIR, preprocessing keys and FRI profiles
-remain immutable. This check does not establish resource or network acceptance.
+The legacy source-bound measurement artifacts, AIR, preprocessing keys and FRI
+profiles remain immutable. This check does not qualify the retained salted
+independent-input suite or establish resource or network acceptance.
 """
 import argparse
 import ast
@@ -129,8 +130,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args()
     validate()
-    print('Native envelope policy version 1 and unchanged measured proof identities validated; '
-          'resource acceptance remains a separate measured gate.')
+    print('Legacy native envelope policy version 1 and unchanged historical measurement '
+          'identities validated; the retained independent-input suite requires separate '
+          'proof and resource measurements.')
 
 
 if __name__ == '__main__':

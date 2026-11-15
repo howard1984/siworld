@@ -16,6 +16,7 @@ fn progress(shared: &Shared, attempts: u64) -> Result<(), String> {
 use super::*;
 use crate::producer::MiningSettings;
 mod failure;
+mod padding;
 mod request;
 pub(super) use failure::Failure;
 
@@ -87,7 +88,12 @@ fn ready_prover<T>(
         .map_err(|_| Failure::ProverInit)
 }
 
-fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> Result<(), Failure> {
+fn continuous(
+    directory: &Path,
+    settings: &MiningSettings,
+    shared: &Shared,
+    workers: &Arc<rayon::ThreadPool>,
+) -> Result<(), Failure> {
     let _charge = shared
         .budget
         .reserve(256 * 1024 * 1024)
@@ -102,6 +108,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         crate::eng2::genesis::Genesis::decode(&encoded).map_err(|_| Failure::ProverInit)?
     };
     let mut prover = None;
+    let mut padding = padding::Pipeline::default();
     #[cfg(feature = "eng2-rehearsal")]
     let ceiling_required = {
         let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
@@ -122,12 +129,16 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             && isolated_ready
             && shared.mining_ready().map_err(|_| Failure::Readiness)?;
         let prover = match ready_prover(&mut prover, ready, || {
-            NativeProver::for_genesis(&proof_genesis)
+            NativeProver::for_genesis(&proof_genesis).map(|prover| Arc::new(Mutex::new(prover)))
         })? {
             Some(prover) => prover,
             None => {
                 shared
-                    .phase(if below_ceiling && isolated_ready {
+                    .phase(if shared.headers.error().is_some() {
+                        "header_relay_unavailable"
+                    } else if shared.headers.waiting() {
+                        "awaiting_validated_parent_state"
+                    } else if below_ceiling && isolated_ready {
                         "networking"
                     } else {
                         "rehearsal_paused"
@@ -140,58 +151,25 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         shared
             .phase("refilling")
             .map_err(|_| Failure::StatusUpdate)?;
-        let (generation, task) = {
-            let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
+        padding.maintain(
+            shared,
+            prover,
+            workers,
+            policy_revision,
+            padding::RefillStage::WaitingForPositions,
+        )?;
+        {
+            let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
             if !owner.activities_allowed()
+                || owner.ready_positions() < crate::pool::MIN_READY
                 || !isolated_permission(shared, &owner, Some(policy_revision))
                     .map_err(|_| Failure::ProductionControl)?
                     .0
             {
+                drop(owner);
+                std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            let task = if owner.ready_positions() < crate::pool::MIN_READY {
-                owner
-                    .prepare_padding()
-                    .map_err(|_| Failure::PaddingPrepare)?
-            } else {
-                None
-            };
-            (owner.template_generation(), task)
-        };
-        if let Some(task) = task {
-            {
-                let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
-                if !isolated_permission(shared, &owner, Some(policy_revision))
-                    .map_err(|_| Failure::ProductionControl)?
-                    .0
-                {
-                    continue;
-                }
-            }
-            let padding = task.prove(prover).map_err(|_| Failure::PaddingProve)?;
-            if shared.cancel.is_cancelled() {
-                break;
-            }
-            let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
-            // A long catch-up can expire the witnessed snapshot while a proof
-            // runs. Such work is discarded, with no fallback or queue reuse.
-            if owner.activities_allowed()
-                && isolated_permission(shared, &owner, Some(policy_revision))
-                    .map_err(|_| Failure::ProductionControl)?
-                    .0
-                && owner.template_generation() == generation
-                && owner
-                    .engine()
-                    .state()
-                    .chain()
-                    .snapshot(padding.transaction.record.snapshot)
-                    .is_ok()
-            {
-                owner
-                    .insert_padding(padding)
-                    .map_err(|_| Failure::PaddingInsert)?;
-            }
-            continue;
         }
         if !shared.mining_ready().map_err(|_| Failure::Readiness)? {
             continue;
@@ -199,6 +177,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         shared
             .phase("preparing")
             .map_err(|_| Failure::StatusUpdate)?;
+        let assembly_started = Instant::now();
         let (generation, prepared, mut submission) = {
             let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
             if !owner.activities_allowed()
@@ -253,7 +232,13 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 continue;
             }
         }
-        let proved = match prepared.prove(prover) {
+        let proof_result = {
+            // One prover workspace is shared with background refill. Waiting
+            // here never retains the canonical owner or a chain-state borrow.
+            let prover = prover.lock().map_err(|_| Failure::ProverInit)?;
+            prepared.prove(&prover)
+        };
+        let proved = match proof_result {
             Ok(proved) => proved,
             Err(_) => {
                 if submission.is_some() {
@@ -268,7 +253,8 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
         }
         let mut work = {
             let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
-            if !owner.activities_allowed()
+            if shared.headers.waiting()
+                || !owner.activities_allowed()
                 || !isolated_permission(shared, &owner, Some(policy_revision))
                     .map_err(|_| Failure::ProductionControl)?
                     .0
@@ -291,8 +277,18 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 }
             }
         };
+        shared
+            .block_events
+            .template_ready(work.header(), assembly_started.elapsed());
         shared.phase("mining").map_err(|_| Failure::StatusUpdate)?;
         loop {
+            padding.maintain(
+                shared,
+                prover,
+                workers,
+                policy_revision,
+                padding::RefillStage::NonceSearch,
+            )?;
             if shared.cancel.is_cancelled()
                 || !shared.mining_ready().map_err(|_| Failure::Readiness)?
                 || !below_rehearsal_ceiling(directory, shared, ceiling_required)
@@ -302,7 +298,8 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
             }
             let current_template = {
                 let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
-                owner.activities_allowed()
+                !shared.headers.waiting()
+                    && owner.activities_allowed()
                     && isolated_permission(shared, &owner, Some(policy_revision))
                         .map_err(|_| Failure::ProductionControl)?
                         .0
@@ -316,7 +313,11 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                 break;
             }
             let before = work.next_nonce();
-            let searched = work.search(256).map_err(|_| Failure::WorkSearch)?;
+            let searched = work
+                .search_until(256, || {
+                    shared.cancel.is_cancelled() || shared.headers.waiting()
+                })
+                .map_err(|_| Failure::WorkSearch)?;
             match searched {
                 Search::Pending(next) => {
                     let attempts = next.next_nonce() - before;
@@ -324,9 +325,14 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                     work = next;
                 }
                 Search::Found(block) => {
-                    shared.block_events.produced(&block.header);
-                    let attempts = block
-                        .header
+                    let super::super::producer::ProducedBlock {
+                        header,
+                        body,
+                        reward_secret,
+                    } = block;
+                    let body = Arc::new(body);
+                    shared.block_events.produced(&header);
+                    let attempts = header
                         .nonce
                         .checked_sub(before)
                         .and_then(|n| n.checked_add(1))
@@ -337,9 +343,10 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                         .map_err(|_| Failure::StatusUpdate)?;
                     let committed = {
                         let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
-                        if !isolated_permission(shared, &owner, Some(policy_revision))
-                            .map_err(|_| Failure::ProductionControl)?
-                            .0
+                        if shared.headers.waiting()
+                            || !isolated_permission(shared, &owner, Some(policy_revision))
+                                .map_err(|_| Failure::ProductionControl)?
+                                .0
                         {
                             if submission.is_some() {
                                 submission.fail("isolated_production_policy_changed");
@@ -376,17 +383,24 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                         }
                         if !owner.activities_allowed()
                             || owner.template_generation() != generation
-                            || owner.head().map_err(|_| Failure::CommitHead)?.id
-                                != block.header.parent
+                            || owner.head().map_err(|_| Failure::CommitHead)?.id != header.parent
                         {
                             if submission.is_some() {
                                 submission.fail("stale_parent");
                             }
                             break;
                         }
-                        match owner.accept(&block.header, &block.body) {
+                        shared
+                            .headers
+                            .produced(header.clone(), body.clone())
+                            .map_err(|_| Failure::HeaderPublish)?;
+                        match owner.accept(&header, &body) {
                             Ok(committed) => committed,
                             Err(_) => {
+                                shared
+                                    .headers
+                                    .rejected(&header)
+                                    .map_err(|_| Failure::HeaderPublish)?;
                                 if submission.is_some() {
                                     submission.fail("commit_rejected");
                                     break;
@@ -401,7 +415,7 @@ fn continuous(directory: &Path, settings: &MiningSettings, shared: &Shared) -> R
                     }
                     // This receipt is private. A write failure is an explicit
                     // production alarm and never relabels the committed block.
-                    crate::local::save_reward(directory, &committed.id(), &block.reward_secret)
+                    crate::local::save_reward(directory, &committed.id(), &reward_secret)
                         .map_err(|_| Failure::RewardWrite)?;
                     let mut status = shared
                         .production
@@ -422,12 +436,14 @@ pub(super) fn run(
 ) -> Result<(), String> {
     failure::run_once(
         || {
-            let workers = rayon::ThreadPoolBuilder::new()
-                .num_threads(4)
-                .thread_name(|i| format!("eng2-prover-{i}"))
-                .build()
-                .map_err(|_| Failure::WorkerPool)?;
-            workers.install(|| continuous(directory, &settings, &shared))
+            let workers = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(4)
+                    .thread_name(|i| format!("eng2-prover-{i}"))
+                    .build()
+                    .map_err(|_| Failure::WorkerPool)?,
+            );
+            workers.install(|| continuous(directory, &settings, &shared, &workers))
         },
         |failure| {
             if let Ok(mut status) = shared.production.lock() {

@@ -46,6 +46,7 @@ DOCUMENTS = {
     "reorganization-shared-memory.md",
     "live-reorganization-control.md",
     "eng2-checkpoint-observation.md",
+    "eng2-header-relay.md",
 }
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",

@@ -6,11 +6,11 @@ use super::{
 };
 use crate::proof_codec::v2::{
     Identity, MAX_ISSUANCE_PROOF_BYTES, MAX_TRANSACTION_PROOF_BYTES, ProtocolBinding, Relation,
-    backend::{
+    backend::retained::{
         Config, IssuanceProver, IssuanceVerifier, Profile, SettlementProver, SettlementVerifier,
         TransactionProver, TransactionVerifier, TranscriptContext,
     },
-    native::NativeProofShape,
+    retained_native::NativeProofShape,
 };
 use native::{
     codec::{ProofContext, PublicTransaction},
@@ -52,6 +52,11 @@ fn air_identity() -> [u8; 32] {
             include_bytes!("../proofs.rs").as_slice(),
             include_bytes!("../proof_codec/v2.rs").as_slice(),
             include_bytes!("../proof_codec/v2/native.rs").as_slice(),
+            include_bytes!("../proof_codec/v2/retained_native.rs").as_slice(),
+            include_bytes!("../proof_codec/v2/backend/retained/mod.rs").as_slice(),
+            include_bytes!("../proof_codec/v2/backend/retained/input_leaf.rs").as_slice(),
+            include_bytes!("../proof_codec/v2/backend/retained/pcs.rs").as_slice(),
+            include_bytes!("../proof_codec/v2/backend/retained/relations.rs").as_slice(),
             include_bytes!("../proof_codec/v2/backend/entropy.rs").as_slice(),
             include_bytes!("../proof_codec/v2/backend/owner.rs").as_slice(),
             include_bytes!("../proof_codec/v2/backend/mod.rs").as_slice(),

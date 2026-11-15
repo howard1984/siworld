@@ -27,6 +27,7 @@ pub mod fund_claim;
 pub mod genesis;
 pub mod genesis_tool;
 pub mod header;
+pub mod header_relay;
 pub mod import;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
 pub mod isolated_production;

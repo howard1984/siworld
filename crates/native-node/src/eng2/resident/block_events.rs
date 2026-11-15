@@ -1,7 +1,7 @@
 //! Bounded observations at native production and canonical durable-commit edges.
 //!
 //! Events are diagnostics, never admission, readiness or finality decisions.
-use crate::eng2::accept_observation::{DiagnosticError, Observer, Rejection};
+use crate::eng2::accept_observation::{DiagnosticError, FetchTiming, Observer, Rejection};
 use crate::eng2::{header::Header, store::CommitObserver};
 use crate::wire::Hash;
 use serde_json::{Value, json};
@@ -24,12 +24,29 @@ const RECORD_BYTES: usize = 2048;
 enum Kind {
     Produced,
     Accepted,
+    HeaderQualified,
+    HeaderForwarded,
+    BodyFetch {
+        peer: Hash,
+        body: Hash,
+        timing: Option<FetchTiming>,
+        overwritten: u64,
+    },
+    TemplateReady {
+        micros: u64,
+        parent: Hash,
+        body: Hash,
+    },
 }
 impl Kind {
     fn name(self) -> &'static str {
         match self {
             Self::Produced => "native-block-produced",
             Self::Accepted => "native-block-durably-accepted",
+            Self::HeaderQualified => "native-header-qualified",
+            Self::HeaderForwarded => "native-header-forwarded",
+            Self::BodyFetch { .. } => "native-body-fetch-observed",
+            Self::TemplateReady { .. } => "native-template-ready",
         }
     }
 }
@@ -117,6 +134,42 @@ impl Recorder {
         self.header(Kind::Produced, header);
     }
 
+    pub(super) fn template_ready(&self, header: &Header, elapsed: std::time::Duration) {
+        self.header(
+            Kind::TemplateReady {
+                micros: elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+                parent: header.parent,
+                body: header.body_commitment,
+            },
+            header,
+        );
+    }
+    pub(super) fn header_qualified(&self, header: &Header) {
+        self.header(Kind::HeaderQualified, header);
+    }
+    pub(super) fn header_forwarded(&self, header: &Header) {
+        self.header(Kind::HeaderForwarded, header);
+    }
+    pub(super) fn body_fetch(
+        &self,
+        peer: Hash,
+        header: &Header,
+        timing: Option<FetchTiming>,
+        overwritten: u64,
+    ) {
+        let timing = timing.filter(|timing| {
+            timing.height == header.height && header.id().ok() == Some(timing.block)
+        });
+        self.header(
+            Kind::BodyFetch {
+                peer,
+                body: header.body_commitment,
+                timing,
+                overwritten,
+            },
+            header,
+        );
+    }
     pub(super) fn accept_binding_unavailable(&self) {
         if let Ok(mut state) = self.state.lock() {
             self.disable(&mut state, "native_rejection_binding_unavailable");
@@ -260,6 +313,45 @@ impl Recorder {
         match kind {
             Kind::Produced => value["produced_unix_ms"] = json!(wall),
             Kind::Accepted => value["accepted_unix_ms"] = json!(wall),
+            Kind::HeaderQualified => value["qualified_unix_ms"] = json!(wall),
+            Kind::HeaderForwarded => value["forwarded_unix_ms"] = json!(wall),
+            Kind::BodyFetch {
+                peer,
+                body,
+                timing,
+                overwritten,
+            } => {
+                value["peer_id"] = json!(crate::local::hex(&peer));
+                value["body_commitment"] = json!(crate::local::hex(&body));
+                value["transport_lane"] = json!("optional_body");
+                value["fetch_timing"] = timing
+                    .map(|timing| timing.json(self.started))
+                    .unwrap_or(Value::Null);
+                value["fetch_observations_overwritten"] = json!(overwritten);
+                value["event_timestamp_basis"] = json!("fetch_observation_recorded");
+                value["body_start_basis"] = json!("validated_body_start_control_complete");
+                value["native_acceptance_implied"] = json!(false);
+                value["deduplication_key"] = json!([
+                    kind.name(),
+                    node_id,
+                    self.binding.run,
+                    crate::local::hex(&peer),
+                    timing.map(|timing| timing.connection),
+                    timing.map(|timing| timing.attempt),
+                    block_id
+                ]);
+            }
+            Kind::TemplateReady {
+                micros,
+                parent,
+                body,
+            } => {
+                value["assembly_excluding_pow_us"] = json!(micros);
+                value["parent_id"] = json!(crate::local::hex(&parent));
+                value["body_commitment"] = json!(crate::local::hex(&body));
+                value["validity_basis"] = json!("fully_verified_current_parent_state");
+                value["template_header_id_is_mined_block_id"] = json!(false);
+            }
         }
         let encoded = serde_json::to_vec(&value).map_err(|_| "native_event_encoding_failed");
         let result = encoded.and_then(|mut bytes| {

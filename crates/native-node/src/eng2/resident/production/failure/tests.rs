@@ -11,6 +11,7 @@ fn injected_operation_failures_stop_the_pipeline_and_never_leak_error_text() {
         Failure::PrepareBlock,
         Failure::ProveBlock,
         Failure::WorkSearch,
+        Failure::HeaderPublish,
         Failure::CommitBlock,
         Failure::RewardWrite,
     ] {

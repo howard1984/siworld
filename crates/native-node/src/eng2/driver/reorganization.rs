@@ -206,6 +206,39 @@ impl Driver {
             .retain_verified_headers(headers)
     }
 
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn retain_fast_headers(&mut self, headers: &[Header]) -> Result<(), String> {
+        if !self.activities_allowed() {
+            return Ok(());
+        }
+        if let Some(state) = &mut self.reorganization {
+            for header in headers {
+                if !state.branches.retain_incremental_header(header)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn retain_fast_body(
+        &mut self,
+        header: &Header,
+        body: &Body,
+    ) -> Result<bool, String> {
+        if !self.activities_allowed() {
+            return Ok(false);
+        }
+        let policy = self.store.engine().body_policy();
+        let Some(state) = &mut self.reorganization else {
+            return Ok(false);
+        };
+        if !state.branches.retain_incremental_header(header)? {
+            return Ok(false);
+        }
+        state.branches.retain_body(header, body, policy)?;
+        Ok(true)
+    }
     pub fn retain_competing_body(&mut self, header: &Header, body: &Body) -> Result<(), String> {
         if !self.activities_allowed() {
             return Err("canonical switching pauses competitor admission".into());

@@ -184,6 +184,10 @@ impl ProvedBlock {
     }
 }
 impl Work {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn header(&self) -> &Header {
+        &self.header
+    }
     pub fn parent(&self) -> Hash {
         self.header.parent
     }
@@ -200,7 +204,16 @@ impl Work {
     }
     /// One bounded slice permits resident cancellation, parent refresh and
     /// progress export between slices without rebuilding a proved template.
-    pub fn search(mut self, max_attempts: u64) -> Result<Search, String> {
+    pub fn search(self, max_attempts: u64) -> Result<Search, String> {
+        self.search_until(max_attempts, || false)
+    }
+    /// Cancellation is checked before each hash, preserving the same immutable
+    /// candidate body and returning ownership of unfinished nonce work.
+    pub(crate) fn search_until(
+        mut self,
+        max_attempts: u64,
+        mut stopped: impl FnMut() -> bool,
+    ) -> Result<Search, String> {
         if max_attempts == 0 {
             return Err("production requires a positive work budget".into());
         }
@@ -209,6 +222,9 @@ impl Work {
             .pow_seed()
             .map_err(|_| "invalid production header")?;
         for _ in 0..max_attempts {
+            if stopped() {
+                return Ok(Search::Pending(self));
+            }
             let nonce = self.header.nonce;
             if siworld_core::pow::meets_target(
                 &siworld_core::pow::pow_hash(&seed, nonce, self.pow_iterations),
@@ -224,5 +240,43 @@ impl Work {
             self.header.nonce = nonce.checked_add(1).ok_or("native nonce range exhausted")?;
         }
         Ok(Search::Pending(self))
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn stale_header_cancellation_returns_the_same_unpublished_candidate_before_hashing() {
+        let body = crate::eng2::body::tests::body();
+        let original = body.transactions[0].proof.clone();
+        let work = Work {
+            header: Header {
+                network: [1; 32],
+                height: 1,
+                parent: [2; 32],
+                timestamp: 1,
+                target: [255; 32],
+                execution_commitment: [3; 32],
+                body_commitment: [4; 32],
+                nonce: 17,
+            },
+            body,
+            pow_iterations: 0,
+            reward_secret: Zeroizing::new(Vec::new()),
+        };
+        let mut polls = 0;
+        let searched = work
+            .search_until(1, || {
+                polls += 1;
+                true
+            })
+            .unwrap();
+        let Search::Pending(work) = searched else {
+            panic!("cancelled candidate performed nonce work");
+        };
+        assert_eq!(polls, 1);
+        assert_eq!(work.next_nonce(), 17);
+        assert_eq!(work.body.transactions[0].proof, original);
     }
 }

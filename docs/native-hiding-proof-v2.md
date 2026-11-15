@@ -58,10 +58,32 @@ that per-transaction or per-block fee totals are hidden.
 ## Randomness and commitments
 
 The field is KoalaBear, with modulus `0x7f000001`; challenges use an extension
-of degree eight. The input and FRI MMCSs use the width-24 Poseidon2 permutation,
-a rate-12 sponge, twelve-field digests and nine independent field elements of
-salt per committed matrix row. FRI extension elements are flattened into base
-fields before the salted MMCS. Input and FRI cap heights are one and two.
+of degree eight. The retained input MMCS uses SHAKE256 on a canonical byte encoding under an
+explicit input-leaf suite and backend profile. The FRI MMCS retains the
+width-24 Poseidon2 rate-12 sponge. Both use twelve-field digests and nine
+independent field salts per committed row; internal compression and the
+challenger retain Poseidon2. FRI extension elements are flattened into base
+fields before the salted MMCS. Input and FRI cap heights remain one and two.
+
+The input encoding is the 25-byte tag `SIWORLD-NATIVE-INPUT-LEAF` followed by a
+zero byte, little-endian u16 version 1, one-byte input role 1, little-endian u32
+field modulus, one-byte salt count 9, digest count 12 and map version 1, and
+32-byte backend profile. The header totals 68 bytes. Canonical little-endian
+u32 field elements follow, then a little-endian u64 field count. The hash takes
+256 SHAKE256 output bytes, interprets 64 little-endian u32 words, shifts each
+right by one, rejects values at least the field modulus, and takes the first
+12 accepted values. If fewer are accepted, the remaining digest elements are
+zero. This is a finite deterministic rule, not a retry or private entropy
+fallback. Under uniform XOF output, the mapping distance from a uniform
+12-field digest is less than 2^-307.
+
+The retained backend uses profile version 3. The outer V2 frame layout, fields,
+AIRs, trace heights, codeword counts, FRI parameters and frame limits are
+unchanged. The new input hash changes deterministic preprocessing, keys,
+composite relation identities and genesis binding. The runtime selects the
+retained backend locally and rejects old profiles or old bodies relabeled with
+a new header; it has no legacy fallback. Paused fixed/prototype adapters keep
+the previous backend types and receive no new qualification.
 
 Each private proof attempt obtains 96 bytes from the operating system. Three
 disjoint 32-byte portions are derived under separate BLAKE3 domains for
@@ -122,6 +144,11 @@ Before typed decoding, a bounded parser checks all vector lengths, canonical
 fields, opening counts, salt dimensions and authentication frontiers. Successful
 decoding establishes structure only; independent cryptographic verification
 against the canonical statement remains mandatory.
+
+Existing proof-generation measurements refer to the earlier salted input-hash
+suite. They do not qualify this independent-input suite. The unchanged
+structural geometry can be checked with typed containers; actual proof size,
+resources and fresh-process verification must be measured for the new suite.
 
 | Relation | Complete frame upper bound | Salt encoding increase | New header |
 | --- | ---: | ---: | ---: |
@@ -220,19 +247,19 @@ adapter and genesis registry must connect these boundaries before activation.
 
 ## Review assumptions and remaining evidence
 
-The intended hiding argument assumes unpredictable operating-system entropy,
-secure stream generation and domain separation, the required hiding properties
-of salted Poseidon2 commitments, appropriate Fiat-Shamir/hash assumptions,
-adequate masks for the complete transcript, correct one-time ownership and no
-side-channel or secret export outside the proof. This implementation does not
+The classical retained hiding argument assumes unpredictable operating-system
+entropy, secure stream generation, the independent canonical input-leaf XOF
+model described below, adequate masks for the complete transcript, correct
+one-time ownership and no secret export outside the proof. Proof authentication
+and soundness retain their separate Poseidon2/Fiat-Shamir assumptions. This implementation does not
 make constant-time or forensic memory-erasure claims. Endpoint compromise and
 network traffic correlation are outside the proof-hiding claim.
 
-Required remaining evidence includes real proofs and independently rebuilt
-statements for each relation, independent public preprocessing reproduction,
-complete-fee size qualification, whole-block disclosure analysis and the web
-wallet's new-format generation path. An external cryptographic review must
-assess the combined protocol and its assumptions. The presence of both salted
+Required retained evidence includes real proofs and independently rebuilt
+statements for each enabled relation, independent public preprocessing
+reproduction, whole-block disclosure analysis and the web
+wallet's new-format generation path. A written technical assessment must
+address the combined protocol and its assumptions for the selected suite. The presence of both salted
 MMCSs completes a specific missing configuration obligation; it does not by
 itself close these remaining obligations.
 
@@ -292,3 +319,22 @@ requires rejection by the cryptographic verifier. Passing these checks establish
 it does not establish whole-transcript zero knowledge. No mode connects to a
 network or starts mining. The earlier `measure-pair` and `verify-pair` modes use
 backend-specific synthetic bindings and are separate from runtime qualification.
+
+## Hiding assumptions
+
+The classical hiding argument models the canonical input-leaf XOF domain as
+an independent programmable oracle and uses finite OS/KDF/PRG stream
+assumptions. SHAKE256 is the concrete instantiation of that model; the model
+is not an unconditional theorem about SHAKE256 or a linked raw Keccak oracle.
+The eight full-degree main random codewords and sixteen global random
+columns provide the required polynomial masking for every batching challenge,
+including proper-subfield challenges. No full-degree challenge guard or
+issuance-height increase is introduced. FRI commitments can be computed
+honestly from the sampled batch vector and require no deferred leaf oracle.
+
+This construction does not establish a quantitative QROM hiding claim.
+Classical programming bounds, field entropy and soundness screens do not by
+themselves justify a quantum hiding exponent. Public statement leakage and
+process, timing and traffic side channels remain outside the proof-payload
+claim. Full retained generation/verification measurements and implementation
+qualification must refer to the exact new suite and authenticated artifacts.

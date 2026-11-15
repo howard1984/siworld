@@ -394,6 +394,133 @@ impl BranchStore {
         Ok(())
     }
 
+    /// Qualify one extension from this archive's independently checked parent.
+    /// The retained result remains raw header material, never execution state.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn retain_incremental_header(&mut self, header: &Header) -> Result<bool, String> {
+        use siworld_core::pow;
+        if header.network != self.rules.network
+            || header.height == 0
+            || header.height > self.rules.max_headers as u64
+        {
+            return Err("incremental archive header context rejected".into());
+        }
+        let id = header
+            .id()
+            .map_err(|_| "incremental header identity rejected")?;
+        if let Some(entry) = self.entry(id)? {
+            return if entry.header == *header && entry.status != Status::Invalid {
+                Ok(true)
+            } else {
+                Err("incremental archive record conflicts".into())
+            };
+        }
+        let (parent_work, parent_time) = if header.height == 1 {
+            if header.parent != self.rules.genesis {
+                return Err("incremental genesis parent rejected".into());
+            }
+            (Work::zero(), self.rules.genesis_timestamp)
+        } else {
+            let Some(parent) = self.entry(header.parent)? else {
+                return Ok(false);
+            };
+            if parent.status == Status::Invalid
+                || parent.header.height.checked_add(1) != Some(header.height)
+            {
+                return Err("incremental archive parent rejected".into());
+            }
+            (parent.cumulative_work, parent.header.timestamp)
+        };
+        let mut times = Vec::new();
+        let mut at = header.parent;
+        let mut height = header.height - 1;
+        for _ in 0..siworld_core::params::MEDIAN_TIME_PAST_WINDOW {
+            if height == 0 {
+                if at != self.rules.genesis {
+                    return Err("incremental archive ancestry rejected".into());
+                }
+                times.push(self.rules.genesis_timestamp);
+                break;
+            }
+            let Some(parent) = self.entry(at)? else {
+                return Ok(false);
+            };
+            if parent.status == Status::Invalid || parent.header.height != height {
+                return Err("incremental archive timestamp ancestry rejected".into());
+            }
+            times.push(parent.header.timestamp);
+            at = parent.header.parent;
+            height -= 1;
+        }
+        if header.timestamp
+            <= pow::median_time_past(&times).ok_or("incremental timestamp unavailable")?
+        {
+            return Err("incremental archive median time rejected".into());
+        }
+        let target = pow::asert_target(
+            &self.rules.genesis_target,
+            self.rules.genesis_timestamp,
+            self.rules.target_interval,
+            header.height - 1,
+            parent_time,
+        );
+        if header.target != target {
+            return Err("incremental archive difficulty rejected".into());
+        }
+        let seed = header
+            .pow_seed()
+            .map_err(|_| "incremental archive seed rejected")?;
+        if !pow::meets_target(
+            &pow::pow_hash(&seed, header.nonce, self.rules.pow_iterations),
+            &target,
+        ) {
+            return Err("incremental archive proof of work rejected".into());
+        }
+        let work = parent_work
+            .checked_add(pow::block_work(&target))
+            .ok_or("incremental archive work overflow")?;
+        let mut transaction = self
+            .database
+            .begin_write()
+            .map_err(|_| "branch write unavailable")?;
+        transaction.set_quick_repair(true);
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|_| "branch durability unavailable")?;
+        {
+            use redb::ReadableTableMetadata;
+            let mut headers = transaction
+                .open_table(HEADERS)
+                .map_err(|_| "branch headers unavailable")?;
+            if headers.len().map_err(|_| "branch count unavailable")?
+                >= self.limits.maximum_headers as u64
+            {
+                return Err("branch header capacity reached".into());
+            }
+            let mut meta = transaction
+                .open_table(META)
+                .map_err(|_| "branch metadata unavailable")?;
+            let first_seen = meta_number(&meta, "next-arrival")?;
+            let next = first_seen.checked_add(1).ok_or("branch arrival overflow")?;
+            let entry = Entry {
+                header: header.clone(),
+                cumulative_work: work,
+                first_seen,
+                status: Status::HeaderQualified,
+            };
+            headers
+                .insert(id.as_slice(), entry.encode()?.as_slice())
+                .map_err(|_| "branch header write failed")?;
+            meta.insert("next-arrival", next.to_le_bytes().as_slice())
+                .map_err(|_| "branch arrival write failed")?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| "incremental archive commit failed")?;
+        self.selection_changed();
+        Ok(true)
+    }
+
     pub fn entry(&self, id: Hash) -> Result<Option<Entry>, String> {
         let transaction = self
             .database

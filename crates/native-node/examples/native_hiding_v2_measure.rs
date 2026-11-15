@@ -19,11 +19,13 @@ use p3_field::{PrimeCharacteristicRing, PrimeField32};
 use p3_uni_stark::PreprocessedVerifierKey;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use siworld_native_node::proof_codec::v2::backend::{
+use siworld_native_node::proof_codec::v2::backend::retained::{
     Config, IssuanceProver, IssuanceVerifier, Profile, SettlementProver, SettlementVerifier,
     TransactionProver, TransactionVerifier,
 };
-use siworld_native_node::proof_codec::v2::{ProtocolBinding, Relation, native::NativeProofShape};
+use siworld_native_node::proof_codec::v2::{
+    ProtocolBinding, Relation, retained_native::NativeProofShape,
+};
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},

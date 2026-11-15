@@ -270,6 +270,12 @@ impl Deadline {
             elapsed: None,
         }
     }
+    #[cfg(any(feature = "eng2-runtime", test))]
+    pub(crate) fn cancellable(limit: Duration, cancellation: Cancellation) -> Self {
+        let mut deadline = Self::new(limit);
+        deadline.cancellation = cancellation;
+        deadline
+    }
     #[cfg(test)]
     pub(crate) fn test_clock(limit: Duration, clock: Arc<std::sync::atomic::AtomicU64>) -> Self {
         let mut deadline = Self::new(limit);

@@ -20,8 +20,10 @@ use std::{
 use std::fs;
 
 mod block_events;
+mod body_admission;
 mod bootstrap;
 mod config;
+pub(crate) mod header_lane;
 pub use bootstrap::bootstrap_signed;
 #[cfg(unix)]
 mod mailbox;
@@ -227,6 +229,8 @@ impl ProductionStatus {
     }
 }
 struct Shared {
+    bodies: body_admission::Queue,
+    headers: Arc<header_lane::Hub>,
     owner: Arc<Mutex<Driver>>,
     #[cfg(all(unix, feature = "eng2-rehearsal"))]
     isolated_production: Mutex<Option<super::isolated_production::Controller>>,
@@ -263,7 +267,8 @@ impl Shared {
             .lock()
             .map_err(|_| "resident owner lock poisoned")?;
         let head = owner.head()?;
-        Ok(owner.activities_allowed()
+        Ok(!self.headers.waiting()
+            && owner.activities_allowed()
             && self.network.ready_at((head.height, head.id))?
             && !self.checkpoint_conflict()?)
     }
@@ -314,12 +319,24 @@ fn export_status(
         &observer,
         peer_readiness,
     );
+    let (ready, ready_reason_code) = if let Some(error) = shared.headers.error() {
+        (false, error)
+    } else if ready && shared.headers.waiting() {
+        (false, "higher_work_header_awaiting_validated_body")
+    } else {
+        (ready, ready_reason_code)
+    };
     let event = owner.last_reorganization();
     let mut status = json!({
         "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
         "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
         "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
-        "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {observer.gate_reason().map(super::checkpoint_observer::Error::code).unwrap_or("checkpoint_current_quorum_conflict")} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+        "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {observer.gate_reason().map(super::checkpoint_observer::Error::code).unwrap_or("checkpoint_current_quorum_conflict")} else if shared.headers.error().is_some() {"header_relay_unavailable"} else if shared.headers.waiting() {"awaiting_validated_parent_state"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+        "header_lanes":connections.header_lanes,"body_lanes":connections.body_lanes,
+        "awaiting_validated_parent_state":shared.headers.waiting(),
+        "header_publication_deferred":shared.headers.local_deferred(),
+        "header_relay_error":shared.headers.error(),
+        "body_download_leases":shared.headers.active_downloads(),
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
         "ready_reason_code":ready_reason_code,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
@@ -340,6 +357,7 @@ fn export_status(
     status["reorganization_depth"] = json!(event.map(|event| event.depth));
     status["reorganization_ancestor_height"] = json!(event.map(|event| event.ancestor_height));
     status["template_generation"] = json!(owner.template_generation());
+    status["decoded_body_queue"] = shared.bodies.diagnostic();
     status["wallet_export_enabled"] = json!(wallet_export.is_some());
     status["wallet_export_paused"] = json!(wallet_export);
     status["signed_bootstrap_available"] = json!(owner.bootstrap_available());
@@ -665,7 +683,15 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         genesis.id(),
     )
     .ok();
+    let headers = Arc::new(header_lane::Hub::new(
+        &driver,
+        &budget,
+        event_node.ok_or("local peer identity unavailable")?,
+    )?);
+    driver.observe_headers(headers.clone());
     let shared = Arc::new(Shared {
+        bodies: body_admission::Queue::default(),
+        headers,
         owner: Arc::new(Mutex::new(driver)),
         #[cfg(all(unix, feature = "eng2-rehearsal"))]
         isolated_production: Mutex::new(isolated_production),
@@ -815,6 +841,12 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     Ok(())
                 });
                 if owner.activities_allowed() {
+                    let head = owner.head()?;
+                    if shared.headers.tip()? != (head.height, head.id) {
+                        shared
+                            .headers
+                            .after_commit(|| shared.headers.committed(&owner));
+                    }
                     shared
                         .checkpoint_observer
                         .lock()

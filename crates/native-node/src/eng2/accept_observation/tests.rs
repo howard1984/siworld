@@ -34,7 +34,7 @@ fn admission_timing_retention_and_commit_knowledge_are_bounded() {
     assert_eq!(value["recent"].as_array().unwrap().len(), 8);
     assert_eq!(value["overwritten"], 4);
     assert_eq!(value["recent"][7]["outcome"], 3);
-    assert!(diagnostic_storage_bytes() <= 8 * 1024);
+    assert!(diagnostic_storage_bytes() <= 16 * 1024);
 }
 
 #[test]

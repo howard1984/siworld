@@ -354,7 +354,7 @@ pub(crate) const fn diagnostic_storage_bytes() -> usize {
     // Conservatively include the entire owner observer, plus peer-local trace
     // slots and the additional trace attached to each bounded received body.
     std::mem::size_of::<Observation>()
-        + 8 * (2 * std::mem::size_of::<Option<FetchTiming>>() + 3 * std::mem::size_of::<u64>())
+        + 24 * (2 * std::mem::size_of::<Option<FetchTiming>>() + 3 * std::mem::size_of::<u64>())
 }
 pub(crate) struct Rejection<'a> {
     pub(crate) run: &'a RunIdentity,

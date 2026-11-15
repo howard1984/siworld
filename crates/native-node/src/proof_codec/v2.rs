@@ -22,6 +22,8 @@ pub mod issuance;
 pub mod native;
 #[path = "v2/receive.rs"]
 pub mod receive;
+#[path = "v2/retained_native.rs"]
+pub mod retained_native;
 #[path = "v2/transaction.rs"]
 pub mod transaction;
 
