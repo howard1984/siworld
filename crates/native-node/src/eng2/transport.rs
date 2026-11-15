@@ -28,6 +28,7 @@ const UNAVAILABLE_ID: u8 = 16;
 const EXACT_CAPABILITIES: u8 = 17;
 const EXACT_VERSION: u16 = 1;
 const CHUNK_BYTES: usize = p2p::MAX_CONTROL_BYTES - 9;
+pub(crate) const BODY_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Immutable application binding is checked by the encrypted handshake and
 /// native hello before an eng-2 wrapper can be constructed.
@@ -455,7 +456,7 @@ impl<S: Read + Write> Peer<S> {
             // absolute deadline across the query, response and every chunk.
             let body_deadline = limit
                 .cloned()
-                .unwrap_or_else(|| p2p::Deadline::new(std::time::Duration::from_secs(180)));
+                .unwrap_or_else(|| p2p::Deadline::new(BODY_FETCH_TIMEOUT));
             while encoded.len() < length {
                 let (received, chunk, _charge) = self.receive_before(&body_deadline)?;
                 if received != request
@@ -1007,10 +1008,9 @@ mod tests {
             binding,
         )
         .len() as u64;
-        for (after_initial_ms, accepted) in [(29_999, true), (30_000, false)] {
+        for (after_initial_ms, accepted) in [(30_001, true), (179_999, true), (180_000, false)] {
             let clock = Arc::new(AtomicU64::new(29_000));
-            let deadline =
-                p2p::Deadline::test_clock(std::time::Duration::from_secs(30), clock.clone());
+            let deadline = p2p::Deadline::test_clock(BODY_FETCH_TIMEOUT, clock.clone());
             let budget = p2p::Budget::new(20 * 1024 * 1024);
             let before = budget.available().unwrap();
             let channel = Timed {

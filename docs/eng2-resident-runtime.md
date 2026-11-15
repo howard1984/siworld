@@ -101,6 +101,16 @@ completed bidirectional round must also show that the selected peer's available
 extension was exhausted. An exact full batch requires another round. Readiness
 expires after 30 seconds without a completed round and is revoked on disconnect.
 
+An optional body download has one fixed 180-second budget covering its request,
+initial response and all body chunks. The header cache retains an active
+download until that budget expires, even after its ordinary 30-second retention
+period. Expiry cancels the transfer; its slot and byte reservations remain owned
+until the download and its consumers release them. Cache eviction, rejection and
+shutdown still cancel work. The cache remains limited to 128 headers, four
+downloads globally, two simultaneous peers per body and four distinct peer
+attempts per cached header. A failed attempt does not reset that peer limit or
+retain partial body chunks for a replacement connection.
+
 ## Checkpoint signing readiness
 
 The checkpoint host can observe incoming messages and publish accepted public

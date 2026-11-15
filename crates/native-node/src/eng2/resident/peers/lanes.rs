@@ -145,8 +145,7 @@ fn pull_one(
         .ok_or("body lane sequence exhausted")?;
     if let Some(download) = shared.headers.download(peer.peer())? {
         let path = shared.headers.path(&download.header)?;
-        let deadline = p2p::Deadline::cancellable(Duration::from_secs(30), download.cancel.clone());
-        let received = peer.fetch_body_before(*sequence, &download.header, &deadline);
+        let received = peer.fetch_body_before(*sequence, &download.header, &download.deadline);
         // Preserve every actual attempt, including partial reads and failures,
         // before an error can close this independently authenticated lane.
         let (timing, overwritten) = peer.take_fetch_observation();

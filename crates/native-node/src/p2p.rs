@@ -287,6 +287,9 @@ impl Deadline {
         &self.cancellation
     }
     pub(crate) fn check(&self) -> io::Result<()> {
+        self.check_at(Instant::now())
+    }
+    pub(crate) fn check_at(&self, now: Instant) -> io::Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -295,11 +298,11 @@ impl Deadline {
         }
         #[cfg(test)]
         let elapsed = self.elapsed.as_ref().map_or_else(
-            || self.started.elapsed(),
+            || now.saturating_duration_since(self.started),
             |clock| Duration::from_millis(clock.load(std::sync::atomic::Ordering::Relaxed)),
         );
         #[cfg(not(test))]
-        let elapsed = self.started.elapsed();
+        let elapsed = now.saturating_duration_since(self.started);
         if elapsed >= self.limit {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,

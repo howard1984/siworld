@@ -30,7 +30,7 @@ struct Entry {
     sequence: u64,
     sent: std::collections::BTreeSet<Hash>,
     attempts: std::collections::BTreeSet<Hash>,
-    downloads: BTreeMap<Hash, p2p::Cancellation>,
+    downloads: BTreeMap<Hash, DownloadState>,
     complete: bool,
     body: Option<Arc<LocalBody>>,
 }
@@ -71,9 +71,15 @@ pub(crate) struct Hub {
     failed: AtomicBool,
     _charge: p2p::Reservation,
 }
+#[derive(Clone)]
+struct DownloadState {
+    cancel: p2p::Cancellation,
+    deadline: p2p::Deadline,
+}
 pub(crate) struct Download {
     pub header: Header,
     pub cancel: p2p::Cancellation,
+    pub deadline: p2p::Deadline,
     peer: Hash,
     hub: Arc<Hub>,
 }
@@ -153,8 +159,8 @@ impl Hub {
             self.waiting.store(true, Ordering::Release);
             if let Ok(mut inner) = self.inner.lock() {
                 for entry in &inner.entries {
-                    for cancel in entry.downloads.values() {
-                        cancel.cancel();
+                    for download in entry.downloads.values() {
+                        download.cancel.cancel();
                     }
                 }
                 inner.entries.clear();
@@ -216,8 +222,8 @@ impl Hub {
                 if inner.entries.len() >= MAX_HEADERS
                     && let Some(evicted) = inner.entries.pop_front()
                 {
-                    for cancel in evicted.downloads.values() {
-                        cancel.cancel();
+                    for download in evicted.downloads.values() {
+                        download.cancel.cancel();
                     }
                 }
                 inner.sequence = inner
@@ -243,8 +249,8 @@ impl Hub {
             if entry.context.id == head.id {
                 entry.complete = true;
                 entry.body = None;
-                for cancel in entry.downloads.values() {
-                    cancel.cancel();
+                for download in entry.downloads.values() {
+                    download.cancel.cancel();
                 }
             }
         }
@@ -253,13 +259,17 @@ impl Hub {
     }
     fn reconcile(&self, inner: &mut Inner, now: Instant) {
         inner.entries.retain(|entry| {
-            let keep = now.saturating_duration_since(entry.first) < RETENTION;
-            if !keep {
-                for cancel in entry.downloads.values() {
-                    cancel.cancel();
+            let mut active = false;
+            for download in entry.downloads.values() {
+                if download.deadline.check_at(now).is_ok() {
+                    active = true;
+                } else {
+                    download.cancel.cancel();
                 }
             }
-            keep
+            // A cache sweep cannot shorten an existing transfer's fixed budget.
+            // Expired leases still own their slots until their consumers drop.
+            now.saturating_duration_since(entry.first) < RETENTION || active
         });
         self.waiting.store(
             inner.entries.iter().any(|entry| {
@@ -515,12 +525,21 @@ impl Hub {
             return Ok(None);
         };
         let cancel = p2p::Cancellation::default();
+        let deadline =
+            p2p::Deadline::cancellable(crate::eng2::transport::BODY_FETCH_TIMEOUT, cancel.clone());
         entry.attempts.insert(peer);
-        entry.downloads.insert(peer, cancel.clone());
+        entry.downloads.insert(
+            peer,
+            DownloadState {
+                cancel: cancel.clone(),
+                deadline: deadline.clone(),
+            },
+        );
         self.active_downloads.fetch_add(1, Ordering::AcqRel);
         Ok(Some(Download {
             header: entry.header.clone(),
             cancel,
+            deadline,
             peer,
             hub: self.clone(),
         }))
@@ -559,8 +578,8 @@ impl Hub {
             if entry.context.id == id {
                 entry.complete = true;
                 entry.body = None;
-                for cancel in entry.downloads.values() {
-                    cancel.cancel();
+                for download in entry.downloads.values() {
+                    download.cancel.cancel();
                 }
             }
         }
@@ -591,8 +610,8 @@ impl Hub {
         }
         inner.entries.retain(|entry| {
             if rejected.contains(&entry.context.id) {
-                for cancel in entry.downloads.values() {
-                    cancel.cancel();
+                for download in entry.downloads.values() {
+                    download.cancel.cancel();
                 }
                 false
             } else {
@@ -800,6 +819,50 @@ mod tests {
         assert_eq!(hub.budget.available().unwrap(), available);
     }
     #[test]
+    fn active_download_survives_cache_retention_but_not_its_fixed_body_budget() {
+        let hub = hub();
+        let first = header([2; 32], 1, 3);
+        hub.offer(first, [8; 32]).unwrap();
+        let download = hub.download([1; 32]).unwrap().unwrap();
+        let now = Instant::now();
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            hub.reconcile(&mut inner, now + RETENTION + Duration::from_secs(1));
+            assert_eq!(inner.entries.len(), 1);
+            assert!(!download.cancel.is_cancelled());
+            hub.reconcile(&mut inner, now + Duration::from_secs(179));
+            assert_eq!(inner.entries.len(), 1);
+            assert!(!download.cancel.is_cancelled());
+            hub.reconcile(&mut inner, now + crate::eng2::transport::BODY_FETCH_TIMEOUT);
+            assert!(inner.entries.is_empty());
+        }
+        assert!(download.cancel.is_cancelled());
+        assert!(download.deadline.check().is_err());
+        assert_eq!(hub.active_downloads(), 1);
+        drop(download);
+        assert_eq!(hub.active_downloads(), 0);
+    }
+    #[test]
+    fn idle_retention_and_failed_download_peer_attempt_cap_remain_bounded() {
+        let hub = hub();
+        let first = header([2; 32], 1, 3);
+        hub.offer(first, [8; 32]).unwrap();
+        for peer in 1..=MAX_ATTEMPTS {
+            let download = hub.download([peer as u8; 32]).unwrap().unwrap();
+            drop(download);
+            assert!(hub.download([peer as u8; 32]).unwrap().is_none());
+        }
+        assert_eq!(hub.active_downloads(), 0);
+        assert!(hub.download([9; 32]).unwrap().is_none());
+        let mut inner = hub.inner.lock().unwrap();
+        assert_eq!(inner.entries[0].attempts.len(), MAX_ATTEMPTS);
+        let expires = inner.entries[0].first + RETENTION;
+        hub.reconcile(&mut inner, expires - Duration::from_nanos(1));
+        assert_eq!(inner.entries.len(), 1);
+        hub.reconcile(&mut inner, expires);
+        assert!(inner.entries.is_empty());
+    }
+    #[test]
     fn expired_headers_do_not_release_slots_owned_by_queued_or_active_bodies() {
         let hub = hub();
         let first = header([2; 32], 1, 3);
@@ -812,11 +875,11 @@ mod tests {
         }
         {
             let mut inner = hub.inner.lock().unwrap();
-            for entry in &mut inner.entries {
-                entry.first = Instant::now() - RETENTION;
-            }
+            hub.reconcile(
+                &mut inner,
+                Instant::now() + crate::eng2::transport::BODY_FETCH_TIMEOUT,
+            );
         }
-        hub.tick().unwrap();
         assert!(leases.iter().all(|lease| lease.cancel.is_cancelled()));
         assert!(hub.inner.lock().unwrap().entries.is_empty());
         let replacement = header([2; 32], 1, 4);
