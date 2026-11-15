@@ -7,7 +7,7 @@ pub use siworld_native_wallet_engine::wire;
 use siworld_native_wallet_engine::{
     eng2_history::{BODY_DOMAIN, Context, Header, MAX_BODY_BYTES},
     eng2_light::{Eng2LightState, native_profile},
-    state::Config,
+    state::{Config, ORDINARY_FEE_RULES},
     wire::*,
 };
 use zeroize::Zeroizing;
@@ -25,11 +25,12 @@ fn genesis(config: &Config) -> (Vec<u8>, Hash) {
     rules.update(&(governance.len() as u64).to_le_bytes());
     rules.update(governance);
     rules.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
+    rules.update(ORDINARY_FEE_RULES);
     let id = blake3::derive_key(
         "siworld eng2 internal genesis v1",
         rules.finalize().as_bytes(),
     );
-    let mut bytes = b"SWE2GEN1".to_vec();
+    let mut bytes = b"SWE2GEN2".to_vec();
     bytes.push(0);
     bytes.extend(profile);
     bytes.extend(config.encode_rules());

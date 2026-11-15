@@ -118,11 +118,12 @@ fn genesis(config: &Config) -> (Vec<u8>, Hash) {
     rules.update(&(governance.len() as u64).to_le_bytes());
     rules.update(governance);
     rules.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
+    rules.update(crate::state::ORDINARY_FEE_RULES);
     let id = blake3::derive_key(
         "siworld eng2 internal genesis v1",
         rules.finalize().as_bytes(),
     );
-    let mut bytes = b"SWE2GEN1".to_vec();
+    let mut bytes = b"SWE2GEN2".to_vec();
     bytes.push(0);
     bytes.extend(profile);
     bytes.extend(config.encode_rules());
@@ -147,8 +148,8 @@ fn expected_nullifier(network: Hash, note: &Note) -> DigestBytes {
     while count < key.len() {
         let mut bytes = [0u8; 64];
         reader.fill(&mut bytes);
-        for word in bytes.chunks_exact(4) {
-            let value = u32::from_le_bytes(word.try_into().expect("fixed synthetic word"));
+        for word in bytes.as_chunks::<4>().0 {
+            let value = u32::from_le_bytes(*word);
             if value < F::ORDER_U32 {
                 key[count] = F::from_u32(value);
                 count += 1;

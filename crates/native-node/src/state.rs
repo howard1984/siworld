@@ -789,7 +789,8 @@ impl State {
     }
 }
 
-pub(crate) const ORDINARY_FEE_RULES: &[u8] =
+/// Immutable fee encoding bound by native and engineering genesis identifiers.
+pub const ORDINARY_FEE_RULES: &[u8] =
     b"ordinary-fee:v2;standard:floor(v1-base/10);priority:4x-standard;recipient:miner-note-zero";
 
 pub fn base_fee(height: u64) -> u64 {

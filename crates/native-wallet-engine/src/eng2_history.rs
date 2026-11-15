@@ -42,7 +42,7 @@ impl Context {
         let prefix = end + 4;
         if bytes.len() < prefix + 8
             || bytes.len() > prefix + 131072
-            || &bytes[..8] != b"SWE2GEN1"
+            || &bytes[..8] != b"SWE2GEN2"
             || bytes[8] != 0
             || bytes[9..41] != crate::proofs::protocol_profile_fingerprint()
             || expected == [0; 32]
@@ -66,6 +66,7 @@ impl Context {
         hash.update(&(length as u64).to_le_bytes());
         hash.update(&bytes[prefix..]);
         hash.update(RULES_SUFFIX);
+        hash.update(crate::state::ORDINARY_FEE_RULES);
         let rules = *hash.finalize().as_bytes();
         let genesis = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
         if genesis != expected {

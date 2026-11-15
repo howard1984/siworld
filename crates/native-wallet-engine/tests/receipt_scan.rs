@@ -46,10 +46,10 @@ fn fresh_replacement_removes_orphans_restores_spends_and_origins() {
     // The moved note retains its commitment, but its complete origin changes.
     let mut moved_count = 0;
     for (commitment, expected) in &a.expected.notes {
-        if let Some(next) = b.expected.notes.get(commitment) {
-            if expected.origin != next.origin {
-                moved_count += 1;
-            }
+        if let Some(next) = b.expected.notes.get(commitment)
+            && expected.origin != next.origin
+        {
+            moved_count += 1;
         }
     }
     assert_eq!(moved_count, 1);

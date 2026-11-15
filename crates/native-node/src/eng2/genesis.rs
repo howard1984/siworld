@@ -149,6 +149,48 @@ impl Genesis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_context_accepts_native_genesis_and_rejects_the_previous_fee_identity() {
+        let parent = crate::eng2::snapshot::tests::bootstrap();
+        let genesis = Genesis::seal(
+            parent.chain.config.clone(),
+            parent.governance.clone(),
+            FeeMode::LegacyMiner,
+        )
+        .unwrap();
+        let bytes = genesis.encode().unwrap();
+        use crate::eng2::wallet_history::codec::Context;
+        let context = Context::from_genesis(&bytes, genesis.id()).unwrap();
+        assert_eq!(context.config(), genesis.config());
+        assert_eq!(context.genesis(), genesis.id());
+        assert_eq!(context.rules(), genesis.rules_commitment());
+        assert_eq!(
+            context.profile(),
+            crate::proofs::protocol_profile_fingerprint()
+        );
+        assert_eq!(context.fee_mode(), FeeMode::LegacyMiner as u8);
+
+        let governance = parent.governance.canonical_component_bytes().unwrap();
+        let mut old = blake3::Hasher::new_derive_key("siworld eng2 internal immutable rules v1");
+        old.update(&[FeeMode::LegacyMiner as u8]);
+        old.update(&genesis.config().encode_rules());
+        old.update(&crate::proofs::protocol_profile_fingerprint());
+        old.update(&(governance.len() as u64).to_le_bytes());
+        old.update(&governance);
+        old.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
+        let old_id = blake3::derive_key(
+            "siworld eng2 internal genesis v1",
+            old.finalize().as_bytes(),
+        );
+        assert_ne!(old_id, genesis.id());
+        assert!(Context::from_genesis(&bytes, old_id).is_err());
+        let mut old_encoding = bytes;
+        old_encoding[..8].copy_from_slice(b"SWE2GEN1");
+        assert!(Context::from_genesis(&old_encoding, old_id).is_err());
+        assert!(Context::from_genesis(&old_encoding, genesis.id()).is_err());
+    }
+
     #[test]
     fn explicit_internal_genesis_binds_native_rules_and_governance_and_refuses_candidate_fallback()
     {
