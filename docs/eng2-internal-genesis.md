@@ -7,8 +7,11 @@ Neither entry point establishes a completed production deployment or native
 block and wallet rehearsal merely by being available.
 
 The internal genesis explicitly selects `LegacyMiner` for ordinary transaction
-fees. Their standard and priority amounts and native settlement payment to miner
-note zero retain the existing native rule. Public issuance fees use the separate
+fees. The standard fee is the original V1 base fee divided by ten, rounded down
+to atoms. The priority fee is four times that reduced standard fee; rounding
+occurs before the multiplication. Both fees remain transfers to miner note zero
+through the existing native settlement relation. Subsidies, issuance fees and
+proof circuits are unchanged. Public issuance fees use the separate
 governance-frozen amount and active dedicated destination, bound in the genesis
 rules and complete execution state. The confidential destination candidate is
 rejected by the genesis
@@ -19,16 +22,17 @@ The immutable rules digest uses BLAKE3 derive-key context
 `siworld eng2 internal immutable rules v1`. It binds the fee-mode byte, complete
 native canonical configuration, exact existing transaction/settlement/issuance
 profile fingerprint, length-prefixed initial governance component and fixed
-header/execution/fund/governance revision string. The genesis identifier derives
-from that digest with context `siworld eng2 internal genesis v1`.
+header/execution/fund/governance revision string and the explicit ordinary-fee
+rule (standard divisor, priority multiplier and miner recipient). The genesis
+identifier derives from that digest with context `siworld eng2 internal genesis v1`.
 
-The canonical public genesis file consists of `SWE2GEN1`, fee-mode byte zero,
+The canonical public genesis file consists of `SWE2GEN2`, fee-mode byte zero,
 the 32-byte complete native proof-profile fingerprint, fixed-width native
 configuration, little-endian u32 governance length and canonical governance
 component. Governance bytes are bounded by 131,072. Decoding verifies the exact
 local native profile, network, initial height and sequence, complete fund
 membership, exact lengths and canonical re-encoding. Unsupported modes, altered
-profiles, truncation and trailing bytes are rejected.
+profiles, the earlier `SWE2GEN1` format, truncation and trailing bytes are rejected.
 
 All founder, revocation, checkpoint and immutable fund authorization keys in the
 file are public verification material. The file contains no signing key, seed,
@@ -37,11 +41,12 @@ match the configured member count.
 
 The actual `SnapshotState` retains its selected fee mode. Genesis recent roots,
 compact execution commitments, full component reconstruction and checked-delta
-previews use that same fee kernel. The legacy mode uses the existing fee base;
-the separately unactivated destination prototype uses its reduced base. A
-state encoded under one kernel cannot silently pass reconstruction under the
-other. Existing native V1 configuration bytes and genesis identifiers are not
-modified by this new format.
+previews use that same reduced fee kernel. The inactive destination prototype
+uses the same amounts but remains unavailable for genesis activation. Native
+configuration bytes retain their existing layout; native and internal genesis
+identifiers bind the reduced ordinary-fee rule, so earlier full-fee peers and
+state cannot share the new network identity. Existing deployments require
+separately sealed genesis material and matching binaries before using this rule.
 
 The legacy engine verifies actual native transaction and issuance proofs, the
 existing fixed-576 settlement relation, public fund-claim authorization and debit,

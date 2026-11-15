@@ -322,6 +322,7 @@ impl Config {
         let mut h = blake3::Hasher::new_derive_key("siworld native engineering genesis v2");
         h.update(&self.encode_rules());
         h.update(b"asert:14400;mtp:11;sequential-blake3");
+        h.update(ORDINARY_FEE_RULES);
         h.update(native::codec::SUITE_ID);
         h.update(profile);
         *h.finalize().as_bytes()
@@ -788,9 +789,12 @@ impl State {
     }
 }
 
+pub(crate) const ORDINARY_FEE_RULES: &[u8] =
+    b"ordinary-fee:v2;standard:floor(v1-base/10);priority:4x-standard;recipient:miner-note-zero";
+
 pub fn base_fee(height: u64) -> u64 {
     // The genesis snapshot has no subsidy but selects the first paid-block tier.
-    economics::fee_base(height.max(1)).expect("positive bounded subsidy schedule")
+    economics::fee_base(height.max(1)).expect("positive bounded subsidy schedule") / 10
 }
 /// Top-level miner base and independently rounded wallet credits.
 pub fn subsidy_split(height: u64, funds: &FundAllocation) -> (u64, Vec<u64>) {
@@ -870,6 +874,44 @@ mod tests;
 #[cfg(test)]
 mod proof_profile_tests {
     use super::*;
+
+    #[test]
+    fn reduced_ordinary_fees_preserve_tiers_across_subsidy_boundaries() {
+        let tail = economics::tail_entry_height();
+        for (height, standard) in [
+            (0, 339_452),
+            (1, 339_452),
+            (economics::EPOCH_BLOCKS, 339_452),
+            (tail, 10_000),
+            (tail + 1, 10_000),
+            (u64::MAX, 10_000),
+        ] {
+            assert_eq!(base_fee(height), standard);
+            assert_eq!(crate::eng2_economics::fee_base(height).unwrap(), standard);
+            assert_eq!(
+                crate::eng2_economics::fee_priority(height).unwrap(),
+                standard * 4
+            );
+        }
+        for height in [economics::EPOCH_BLOCKS + 1, tail - 1] {
+            assert_eq!(
+                base_fee(height),
+                economics::subsidy(height).unwrap() / 10_000
+            );
+        }
+        assert_eq!(economics::INITIAL_REWARD, 3_394_524_515);
+    }
+
+    #[test]
+    fn reduced_fee_genesis_cannot_reuse_the_full_fee_identity() {
+        let config = Config::development([93; 32], 0).unwrap();
+        let mut old = blake3::Hasher::new_derive_key("siworld native engineering genesis v2");
+        old.update(&config.encode_rules());
+        old.update(b"asert:14400;mtp:11;sequential-blake3");
+        old.update(native::codec::SUITE_ID);
+        old.update(&crate::proofs::protocol_profile_fingerprint());
+        assert_ne!(config.genesis_id(), *old.finalize().as_bytes());
+    }
 
     #[test]
     fn genesis_authenticates_the_selected_proof_profile() {

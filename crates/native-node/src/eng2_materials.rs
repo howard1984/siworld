@@ -207,7 +207,7 @@ pub fn bind_checkpoint(
     // Config::encode_rules; fixture is its fixed byte33. Reject it before
     // Config::decode_rules can invoke development fixture constructors.
     if bytes.len() < 41 + crate::state::CONFIG_RULE_BYTES
-        || &bytes[..8] != b"SWE2GEN1"
+        || &bytes[..8] != b"SWE2GEN2"
         || bytes[8] != crate::eng2::genesis::FeeMode::LegacyMiner as u8
         || bytes[41 + 33] != 0
     {

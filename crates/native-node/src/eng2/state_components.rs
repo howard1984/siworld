@@ -1023,18 +1023,23 @@ mod tests {
         let versioned = genesis_chain(config, [7; 32]).unwrap();
         assert_eq!(versioned.tip, [7; 32]);
         assert_eq!(versioned.tip_snapshot().selector.block_id, [7; 32]);
-        assert_ne!(
+        assert_eq!(
             versioned.tip_snapshot().recent_root,
             legacy.tip_snapshot().recent_root
         );
         let (mut state, binding) = populated();
-        state.snapshots.back_mut().unwrap().recent_root = encode_digest(
-            &state
-                .recent_roots()
-                .unwrap()
-                .tree(&native::multi_asset::Hasher::new())
-                .root(),
-        );
+        let hasher = native::multi_asset::Hasher::new();
+        let mut full_fee_roots = native::multi_asset::RecentRoots::new();
+        for snapshot in &state.snapshots {
+            full_fee_roots.insert(
+                &hasher,
+                snapshot.selector.height,
+                &decode_digest(&snapshot.commitment_root).unwrap(),
+                siworld_core::v1_economics::fee_base(snapshot.selector.height.max(1)).unwrap(),
+            );
+        }
+        state.snapshots.back_mut().unwrap().recent_root =
+            encode_digest(&full_fee_roots.tree(&hasher).root());
         assert!(
             ChainComponents::recompute(
                 &state,

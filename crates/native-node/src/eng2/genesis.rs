@@ -13,7 +13,7 @@ impl FeeMode {
         let fee = siworld_core::v1_economics::fee_base(height.max(1))
             .map_err(|error| error.to_string())?;
         Ok(match self {
-            Self::LegacyMiner => fee,
+            Self::LegacyMiner => crate::state::base_fee(height),
             Self::ConfidentialDestination => fee / 10,
         })
     }
@@ -59,6 +59,7 @@ impl Genesis {
         hash.update(&(governance_bytes.len() as u64).to_le_bytes());
         hash.update(&governance_bytes);
         hash.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
+        hash.update(crate::state::ORDINARY_FEE_RULES);
         let rules = *hash.finalize().as_bytes();
         let id = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
         Ok(Self {
@@ -108,7 +109,7 @@ impl Genesis {
         let governance = self.governance.canonical_component_bytes()?;
         let length =
             u32::try_from(governance.len()).map_err(|_| "initial governance length overflow")?;
-        let mut bytes = b"SWE2GEN1".to_vec();
+        let mut bytes = b"SWE2GEN2".to_vec();
         bytes.push(self.mode as u8);
         bytes.extend_from_slice(&crate::proofs::protocol_profile_fingerprint());
         bytes.extend_from_slice(&self.config.encode_rules());
@@ -120,7 +121,7 @@ impl Genesis {
         let prefix = 8 + 1 + 32 + crate::state::CONFIG_RULE_BYTES + 4;
         if bytes.len() < prefix
             || bytes.len() > prefix + 131_072
-            || &bytes[..8] != b"SWE2GEN1"
+            || &bytes[..8] != b"SWE2GEN2"
             || bytes[8] != FeeMode::LegacyMiner as u8
             || bytes[9..41] != crate::proofs::protocol_profile_fingerprint()
         {
@@ -185,7 +186,7 @@ mod tests {
             crate::state::base_fee(0)
         );
         assert_eq!(
-            FeeMode::LegacyMiner.base_fee(1).unwrap() / 10,
+            FeeMode::LegacyMiner.base_fee(1).unwrap(),
             FeeMode::ConfidentialDestination.base_fee(1).unwrap()
         );
     }
@@ -248,7 +249,7 @@ mod tests {
                 SnapshotTip::Materialized(state.tip()),
                 limits
             )
-            .is_err()
+            .is_ok()
         );
         assert!(state.canonical_components(binding, limits).is_ok());
     }
@@ -262,6 +263,9 @@ mod tests {
         )
         .unwrap();
         let bytes = genesis.encode().unwrap();
+        let mut old = bytes.clone();
+        old[..8].copy_from_slice(b"SWE2GEN1");
+        assert!(Genesis::decode(&old).is_err());
         assert_eq!(Genesis::decode(&bytes).unwrap().id(), genesis.id());
         assert_eq!(
             Genesis::decode(&bytes).unwrap().rules_commitment(),
