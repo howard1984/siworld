@@ -458,7 +458,10 @@ impl<S: Read + Write> Peer<S> {
                 .cloned()
                 .unwrap_or_else(|| p2p::Deadline::new(BODY_FETCH_TIMEOUT));
             while encoded.len() < length {
-                let (received, chunk, _charge) = self.receive_before(&body_deadline)?;
+                // Chunk payloads share the body's absolute deadline; ordinary
+                // control frames otherwise reset their payload limit to ten seconds.
+                let (received, chunk, _charge) =
+                    self.receive_application_before(&body_deadline, p2p::MAX_CONTROL_BYTES)?;
                 if received != request
                     || chunk.len() <= 9
                     || chunk[0] != BODY_CHUNK
@@ -1031,6 +1034,141 @@ mod tests {
                 assert_eq!(received.as_ref().unwrap().as_ref().unwrap().body, body);
             }
             drop(received);
+            assert_eq!(budget.available().unwrap(), before);
+        }
+    }
+    #[test]
+    fn body_chunk_payloads_keep_the_absolute_deadline_and_cancellation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+        struct TimedChunks {
+            input: Cursor<Vec<u8>>,
+            clock: Arc<AtomicU64>,
+            chunk_ends: Vec<u64>,
+            final_ms: u64,
+            cancel: Option<p2p::Cancellation>,
+        }
+        impl Read for TimedChunks {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let read = self.input.read(bytes)?;
+                if self.chunk_ends.contains(&self.input.position()) {
+                    let last = self.input.position() == self.input.get_ref().len() as u64;
+                    self.clock
+                        .store(if last { self.final_ms } else { 11_001 }, Ordering::Relaxed);
+                    if let Some(cancel) = &self.cancel {
+                        cancel.cancel();
+                    }
+                }
+                Ok(read)
+            }
+        }
+        impl Write for TimedChunks {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let binding = binding(&g);
+        let mut sender = Peer::new(
+            session(vec![], binding, p2p::Budget::default()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        sender.send_body(5, &header, &body).unwrap();
+        let wire = sender.session.test_channel().output.clone();
+        let mut offset = frame(
+            5,
+            &start(&header, body.encoded_len(policy()).unwrap()),
+            binding,
+        )
+        .len();
+        let mut chunk_ends = Vec::new();
+        while offset < wire.len() {
+            let length = u32::from_le_bytes(wire[offset + 47..offset + 51].try_into().unwrap());
+            offset += 51 + length as usize;
+            chunk_ends.push(offset as u64);
+        }
+        assert!(chunk_ends.len() >= 2);
+        for (final_ms, cancelled, accepted) in [
+            (11_002, false, true),
+            (179_999, false, true),
+            (180_000, false, false),
+            (11_002, true, false),
+        ] {
+            let clock = Arc::new(AtomicU64::new(0));
+            let cancellation = p2p::Cancellation::default();
+            let deadline = if cancelled {
+                p2p::Deadline::cancellable(BODY_FETCH_TIMEOUT, cancellation.clone())
+            } else {
+                p2p::Deadline::test_clock(BODY_FETCH_TIMEOUT, clock.clone())
+            };
+            let budget = p2p::Budget::new(20 * 1024 * 1024);
+            let before = budget.available().unwrap();
+            let channel = TimedChunks {
+                input: Cursor::new(wire.clone()),
+                clock,
+                chunk_ends: chunk_ends.clone(),
+                final_ms,
+                cancel: cancelled.then_some(cancellation),
+            };
+            let mut receiver = Peer::new(
+                p2p::Session::from_test_channel(channel, binding, budget.clone()),
+                &g,
+                policy(),
+            )
+            .unwrap();
+            let received = receiver.fetch_body_before(5, &header, &deadline);
+            assert_eq!(
+                received.is_ok(),
+                accepted,
+                "{final_ms}ms/cancel={cancelled}"
+            );
+            if accepted {
+                assert_eq!(received.as_ref().unwrap().as_ref().unwrap().body, body);
+            } else {
+                assert_eq!(received.as_ref().err(), Some(&p2p::Error::Unavailable));
+            }
+            drop(received);
+            assert_eq!(budget.available().unwrap(), before);
+        }
+    }
+    #[test]
+    fn body_chunk_type_and_envelope_limit_reject_before_payload_read() {
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let binding = binding(&g);
+        let initial = frame(
+            5,
+            &start(&header, body.encoded_len(policy()).unwrap()),
+            binding,
+        );
+        for oversized in [false, true] {
+            let mut chunk = frame(5, &[BODY_CHUNK; 10], binding);
+            let expected = if oversized {
+                chunk[47..51].copy_from_slice(&((p2p::MAX_CONTROL_BYTES + 1) as u32).to_le_bytes());
+                p2p::Error::ResourceExhausted
+            } else {
+                chunk[6] = p2p::TRANSACTION;
+                p2p::Error::InvalidProtocol
+            };
+            let mut wire = initial.clone();
+            wire.extend_from_slice(&chunk);
+            let budget = p2p::Budget::new(20 * 1024 * 1024);
+            let before = budget.available().unwrap();
+            let mut receiver =
+                Peer::new(session(wire, binding, budget.clone()), &g, policy()).unwrap();
+            assert_eq!(receiver.fetch_body(5, &header).err(), Some(expected));
+            assert_eq!(
+                receiver.session.test_channel().input.position(),
+                (initial.len() + 51) as u64
+            );
             assert_eq!(budget.available().unwrap(), before);
         }
     }

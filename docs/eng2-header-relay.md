@@ -103,11 +103,14 @@ by an eligible competing tip are scheduled before descendants. A retained lease
 owns each download and releases its in-flight slot only when the lease drops,
 including after header expiration or eviction. The status field
 `body_download_leases` counts these retained downloads and admission jobs; cache
-removal alone cannot free a slot. A 30-second
+removal alone cannot free a slot. A 180-second
 absolute download deadline and an individual cancellation flag apply to the
-request and all chunks. Decoded body buffers keep the original shared memory
+request and all chunks, including each chunk's framed payload. Receiving a frame
+header does not renew that deadline or substitute a ten-second control-payload
+deadline. Decoded body buffers keep the original shared memory
 reservation through every consumer. The ordinary legacy body's ten-second
-initial response and 180-second chunk deadline are preserved.
+initial response and absolute 180-second chunk deadline are preserved. Other
+control messages retain their existing ten-second payload limit.
 
 The canonical owner independently qualifies retained raw header extensions before
 storing competing bodies. Raw archive status confers no execution validity. A
