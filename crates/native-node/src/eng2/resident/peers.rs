@@ -225,6 +225,7 @@ impl PeerReadiness {
 #[derive(Default)]
 pub(crate) struct NetworkStatus {
     inner: Mutex<StatusInner>,
+    lane_identities: BTreeSet<Hash>,
     checkpoint_references: BTreeSet<Hash>,
 }
 pub(super) struct Snapshot {
@@ -268,11 +269,44 @@ impl NetworkStatus {
     }
     /// Only independently pinned configuration identities can establish or block
     /// checkpoint readiness. Open miner ingress supplies no reference evidence.
+    #[cfg(test)]
     pub(crate) fn new(checkpoint_references: impl IntoIterator<Item = Hash>) -> Self {
+        Self::with_pinned_peers(checkpoint_references.into_iter().map(|peer| (peer, true)))
+    }
+    /// Lane identity pins do not themselves confer checkpoint reference status.
+    pub(crate) fn with_pinned_peers(peers: impl IntoIterator<Item = (Hash, bool)>) -> Self {
+        let mut lane_identities = BTreeSet::new();
+        let mut checkpoint_references = BTreeSet::new();
+        for (peer, checkpoint_reference) in peers {
+            lane_identities.insert(peer);
+            if checkpoint_reference {
+                checkpoint_references.insert(peer);
+            }
+        }
         Self {
             inner: Mutex::default(),
-            checkpoint_references: checkpoint_references.into_iter().collect(),
+            lane_identities,
+            checkpoint_references,
         }
+    }
+    fn admit_lane(&self, peer: Hash, lane: Lane) -> Result<u64, String> {
+        let mut status = self
+            .inner
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?;
+        let ordinal = status
+            .next_connection
+            .checked_add(1)
+            .ok_or("lane connection ordinal exhausted")?;
+        if !self.lane_identities.contains(&peer)
+            || !status.connections.contains_key(&peer)
+            || status.lanes.len() >= 2 * MAX_WORKERS
+            || !status.lanes.insert((peer, lane as u8))
+        {
+            return Err("optional lane requires a unique pinned active ordinary peer".into());
+        }
+        status.next_connection = ordinal;
+        Ok(ordinal)
     }
     pub(crate) fn connected(self: &Arc<Self>, peer: Hash) -> Result<Connected, String> {
         let mut status = self
@@ -1360,6 +1394,41 @@ mod tests {
         drop(connection);
         assert!(!status.ready_at(old).unwrap());
     }
+    #[test]
+    fn pinned_lane_only_peer_does_not_establish_or_block_checkpoint_readiness() {
+        let status = Arc::new(NetworkStatus::with_pinned_peers([
+            ([1; 32], true),
+            ([2; 32], false),
+        ]));
+        let head = (96, [3; 32]);
+        let _miner = status.connected([2; 32]).unwrap();
+        status.round([2; 32], 0, Some(head)).unwrap();
+        assert!(status.checkpoint_ready(head).is_err());
+        let _service = status.connected([1; 32]).unwrap();
+        status.round([1; 32], 0, Some(head)).unwrap();
+        status.round([2; 32], 0, Some((95, [4; 32]))).unwrap();
+        assert!(status.checkpoint_ready(head).is_ok());
+        status.expire_checkpoint_round_for_test([2; 32]);
+        assert!(status.checkpoint_ready(head).is_ok());
+        assert!(status.admit_lane([2; 32], Lane::Headers).is_ok());
+        assert!(status.admit_lane([2; 32], Lane::Bodies).is_ok());
+        assert!(status.admit_lane([2; 32], Lane::Headers).is_err());
+        status.expire_checkpoint_round_for_test([1; 32]);
+        assert!(status.checkpoint_ready(head).is_err());
+    }
+
+    #[test]
+    fn optional_lane_still_requires_independent_pin_and_active_ordinary_connection() {
+        let status = Arc::new(NetworkStatus::with_pinned_peers([([1; 32], false)]));
+        assert!(status.admit_lane([1; 32], Lane::Headers).is_err());
+        let _open_miner = status.connected([2; 32]).unwrap();
+        assert!(status.admit_lane([2; 32], Lane::Headers).is_err());
+        let pinned = status.connected([1; 32]).unwrap();
+        assert!(status.admit_lane([1; 32], Lane::Headers).is_ok());
+        drop(pinned);
+        assert!(status.admit_lane([1; 32], Lane::Bodies).is_err());
+    }
+
     #[test]
     fn checkpoint_ready_guard_pins_exact_head_and_expires_without_changing_mining_readiness() {
         let status = Arc::new(NetworkStatus::new([[1; 32]]));

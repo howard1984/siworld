@@ -53,8 +53,19 @@ A bootstrap, validator or miner may explicitly select an existing checkpoint
 key; the host separately validates that key against the verified local roster.
 
 Each configured peer specifies an endpoint, a `dial` boolean, a fingerprint and
-a descriptor matching an independently persisted service pin. Duplicate
+a descriptor matching an independently persisted identity pin. Duplicate
 identities, endpoints, self-connections and unpinned targets are rejected.
+An optional per-peer `checkpoint_reference` boolean defaults to `true` for
+version 2 compatibility. All independently pinned configured identities may
+establish optional header and body lanes while their ordinary connection is
+active. Only peers selected as checkpoint references contribute to checkpoint
+readiness; a lane alone grants no reference or signing authority. To pin an
+outbound-only miner on a service node, set `dial: false` and
+`checkpoint_reference: false`. Its endpoint remains a required unique, valid
+configuration value; this selection creates no listener or reverse connection.
+Identity descriptors contain no mining or validation role. Configuration
+generators must explicitly exclude known miner identities from checkpoint
+references rather than infer a role from descriptor bytes.
 An optional top-level `legacy_checkpoint_peers` array defaults to empty. Each
 entry is an administrator-selected fingerprint; the array is limited to 16
 distinct, nonlocal identities. This advertisement selection does not require or

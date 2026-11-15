@@ -27,23 +27,7 @@ pub(super) fn lane_session(
 ) -> Result<(), String> {
     let fingerprint = peer.peer();
     let _connected = {
-        let mut status = shared
-            .network
-            .inner
-            .lock()
-            .map_err(|_| "connection registry lock poisoned")?;
-        let ordinal = status
-            .next_connection
-            .checked_add(1)
-            .ok_or("lane connection ordinal exhausted")?;
-        if !shared.network.checkpoint_references.contains(&fingerprint)
-            || !status.connections.contains_key(&fingerprint)
-            || status.lanes.len() >= 2 * MAX_WORKERS
-            || !status.lanes.insert((fingerprint, lane as u8))
-        {
-            return Err("optional lane requires a unique pinned active ordinary peer".into());
-        }
-        status.next_connection = ordinal;
+        let ordinal = shared.network.admit_lane(fingerprint, lane)?;
         ConnectedLane {
             ordinal,
             status: shared.network.clone(),

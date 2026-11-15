@@ -697,8 +697,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         isolated_production: Mutex::new(isolated_production),
         block_events,
         cancel: p2p::Cancellation::default(),
-        network: Arc::new(peers::NetworkStatus::new(
-            config.peers.iter().map(|peer| peer.expected.fingerprint()),
+        network: Arc::new(peers::NetworkStatus::with_pinned_peers(
+            config
+                .peers
+                .iter()
+                .map(|peer| (peer.expected.fingerprint(), peer.checkpoint_reference)),
         )),
         production: Mutex::new(ProductionStatus {
             phase: "starting",

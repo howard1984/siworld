@@ -1,4 +1,5 @@
 use super::*;
+use crate::identity::PeerPin;
 use std::io::Write;
 
 #[test]
@@ -162,6 +163,56 @@ fn miner_configuration_is_outbound_only_with_explicit_existing_signer_selection(
     assert!(loaded.listen.is_none() && loaded.mining);
     drop(identity);
     fs::remove_dir_all(directory).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn pinned_outbound_only_miner_can_be_selected_as_lane_identity_without_checkpoint_reference() {
+    let directory = directory();
+    let miner_directory = super::tests::directory();
+    let genesis = genesis();
+    let identity = NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap();
+    let miner = NativeIdentity::initialize(&miner_directory, genesis.peer_binding()).unwrap();
+    let descriptor = miner.descriptor().unwrap();
+    let miner_path = miner_directory.join("peers.json");
+    let miner_configuration = json!({"version":2,"engineering":true,"role":"miner","listen":null,
+        "mining":false,"checkpoint_key":null,"peers":[]});
+    service::atomic_json(&miner_path, &miner_configuration).unwrap();
+    let miner_config =
+        config::Configuration::load(&miner_directory, &miner_path, &genesis, &miner).unwrap();
+    assert_eq!(miner_config.role, p2p::Role::Miner);
+    assert!(miner_config.listen.is_none());
+
+    let path = directory.join("peers.json");
+    let mut value = json!({"version":2,"engineering":true,"role":"validator","listen":null,
+    "mining":false,"checkpoint_key":null,"peers":[{
+        "endpoint":"127.0.0.1:9000","dial":false,"checkpoint_reference":false,
+        "fingerprint":crate::local::hex(&descriptor.fingerprint()),
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]});
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding())
+        .unwrap()
+        .persist(&directory)
+        .unwrap();
+    let selected = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
+    assert_eq!(selected.peers.len(), 1);
+    let peer = &selected.peers[0];
+    assert!(!peer.dial && !peer.checkpoint_reference);
+    assert!(peer.expected.independently_pinned());
+    assert_eq!(peer.expected.descriptor(), &descriptor);
+    value["peers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("checkpoint_reference");
+    service::atomic_json(&path, &value).unwrap();
+    let original = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
+    assert!(original.peers[0].checkpoint_reference);
+    assert_ne!(selected.digest, original.digest);
+    drop(identity);
+    drop(miner);
+    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(miner_directory).unwrap();
 }
 #[cfg(unix)]
 #[test]

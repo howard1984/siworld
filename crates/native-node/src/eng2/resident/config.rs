@@ -10,6 +10,7 @@ use std::{collections::BTreeSet, net::SocketAddr};
 pub(super) struct Destination {
     pub endpoint: SocketAddr,
     pub dial: bool,
+    pub checkpoint_reference: bool,
     pub expected: ExpectedPeer,
 }
 pub(super) struct Configuration {
@@ -31,6 +32,14 @@ fn unhex<const N: usize>(value: &Value) -> Result<[u8; N], String> {
     crate::eng2_operations::public_bytes(value, N)?
         .try_into()
         .map_err(|_| "public configuration field width differs".into())
+}
+fn checkpoint_reference(entry: &Value) -> Result<bool, String> {
+    match entry.get("checkpoint_reference") {
+        None => Ok(true),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "peer checkpoint reference selection requires a boolean".into()),
+    }
 }
 impl Configuration {
     pub fn load(
@@ -120,9 +129,9 @@ impl Configuration {
         let mut peers = Vec::new();
         for entry in entries {
             let object = entry.as_object().ok_or("invalid resident peer entry")?;
-            if object.len() != 4 {
+            if object.len() != 4 + usize::from(object.contains_key("checkpoint_reference")) {
                 return Err(
-                    "resident peer requires endpoint, dial, fingerprint and descriptor".into(),
+                    "resident peer requires endpoint, dial, fingerprint and descriptor with optional checkpoint_reference".into(),
                 );
             }
             let endpoint: SocketAddr = entry["endpoint"]
@@ -140,6 +149,7 @@ impl Configuration {
             let dial = entry["dial"]
                 .as_bool()
                 .ok_or("explicit peer dial selection required")?;
+            let checkpoint_reference = checkpoint_reference(entry)?;
             let fingerprint = unhex::<32>(&entry["fingerprint"])?;
             if fingerprint == local || !fingerprints.insert(fingerprint) {
                 return Err("duplicate or local peer fingerprint".into());
@@ -157,6 +167,7 @@ impl Configuration {
             peers.push(Destination {
                 endpoint,
                 dial,
+                checkpoint_reference,
                 expected,
             });
         }
@@ -186,5 +197,20 @@ impl Configuration {
             legacy_checkpoint_peers,
             digest: crate::local::hex(&Sha256::digest(&bytes)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_reference_selection_preserves_existing_peers_and_rejects_ambiguous_values() {
+        assert!(checkpoint_reference(&json!({})).unwrap());
+        assert!(checkpoint_reference(&json!({"checkpoint_reference": true})).unwrap());
+        assert!(!checkpoint_reference(&json!({"checkpoint_reference": false})).unwrap());
+        for value in [Value::Null, json!(0), json!("false"), json!([])] {
+            assert!(checkpoint_reference(&json!({"checkpoint_reference": value})).is_err());
+        }
     }
 }
