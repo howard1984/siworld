@@ -39,7 +39,7 @@ impl Host {
             last_retained_material: None,
         };
         // Startup has no authenticated retained capability to reuse. Existing
-        // immutable wallet generations remain, but their mutable head waits.
+        // wallet history remains readable without granting current readiness.
         value.export.pause_wallet_head()?;
         value.enable_async_preparation(budget)?;
         Ok(value)
@@ -55,8 +55,8 @@ impl Host {
         let result = self.reconcile_retained_step(store, headers);
         if result.is_err() {
             // A real authentication/context failure is different from pending
-            // inspection: withdraw old mutable advertisements and invalidate
-            // every earlier task, even if the canonical head is unchanged.
+            // inspection: pause current publication and invalidate every earlier
+            // task, even if the canonical head is unchanged. History stays readable.
             self.pause_reorganization_exports()?;
         }
         result

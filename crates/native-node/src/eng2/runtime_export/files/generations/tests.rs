@@ -279,6 +279,7 @@ fn changed_source_prefix_and_midpublication_head_never_relabel_an_old_generation
         .unwrap();
     assert_eq!(progress.scanned_height, 1);
     assert!(!progress.published);
+    assert!(!progress.current);
     assert_eq!(replacement.receipts.get(), old_calls + 1);
     finish(&mut publisher, &export, &replacement, 1004, &budget);
     assert_eq!(
@@ -528,4 +529,258 @@ fn failed_immutable_write_keeps_its_durable_charge_across_restart() {
             .contains("budget exhausted")
     );
     assert!(!root.join("wallet-head.json").exists());
+}
+
+// A reader brackets both mutable metadata files. An old generation is history,
+// not evidence that the native canonical head has remained unchanged.
+fn read_complete_generation(root: &std::path::Path, binding: &Binding) -> Option<(u64, Hash)> {
+    let before = fs::read(root.join("wallet-head.json")).unwrap();
+    let catalog_before = fs::read(root.join("wallet-generations.json")).unwrap();
+    let cursor: Value = serde_json::from_slice(&before).unwrap();
+    let height = cursor["height"].as_u64().unwrap();
+    let tip = decode_hash(cursor["tip"].as_str().unwrap()).unwrap();
+    let catalog = Catalog::decode(binding, &catalog_before).unwrap();
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|e| (e.height, e.tip) == (height, tip))
+        .unwrap();
+    let bytes = fs::read(root.join(format!(
+        "wallet-generation-{height}-{}.bin",
+        crate::local::hex(&tip)
+    )))
+    .unwrap();
+    assert_eq!(wire::digest(&bytes), entry.digest);
+    let manifest = Manifest::decode(binding, &bytes).unwrap();
+    assert_eq!((manifest.height, manifest.tip), (height, tip));
+    let mut previous = binding.genesis();
+    for descriptor in &manifest.chunks {
+        let chunk = descriptor
+            .decode_chunk(binding, &fs::read(root.join(descriptor.name())).unwrap())
+            .unwrap();
+        for (index, record) in chunk.records.iter().enumerate() {
+            assert_eq!(record.decoded(binding).unwrap().parent, previous);
+            let receipt =
+                fs::read(root.join(record.receipt_name(chunk.from + index as u64))).unwrap();
+            assert_eq!(wire::digest(&receipt), record.receipt_digest);
+            previous = record.id;
+        }
+    }
+    assert_eq!(previous, tip);
+    let catalog_after = fs::read(root.join("wallet-generations.json")).unwrap();
+    let after = fs::read(root.join("wallet-head.json")).unwrap();
+    (before == after && catalog_before == catalog_after).then_some((height, tip))
+}
+
+fn pause_after_catalog_for_reader(
+    signal: &std::sync::mpsc::Sender<()>,
+    completed: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>,
+) {
+    let signal = signal.clone();
+    let completed = completed.clone();
+    AFTER_CATALOG.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            signal.send(()).unwrap();
+            completed
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }));
+    });
+}
+
+#[test]
+fn paused_publication_remains_readable_to_a_concurrent_reader() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("paused-publication");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let source = Synthetic::new(binding(&store), 4, 300);
+    source.height.set(1);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    std::thread::scope(|scope| {
+        let (send, recv) = std::sync::mpsc::channel();
+        let (ack, observed) = std::sync::mpsc::channel();
+        let root = &root;
+        let binding = source.binding.clone();
+        scope.spawn(move || {
+            for expected in recv {
+                assert_eq!(read_complete_generation(root, &binding), Some(expected));
+                ack.send(()).unwrap();
+            }
+        });
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overlaps = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started, ready) = std::sync::mpsc::channel();
+        let (read_midpoint, requested) = std::sync::mpsc::channel();
+        let (ack_midpoint, completed) = std::sync::mpsc::channel();
+        let completed = std::sync::Arc::new(std::sync::Mutex::new(completed));
+        let binding = source.binding.clone();
+        let done_ref = done.clone();
+        let writing_ref = writing.clone();
+        let overlaps_ref = overlaps.clone();
+        let reader = scope.spawn(move || {
+            let mut reads = 0;
+            let mut sent = false;
+            let mut pending = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done_ref.load(std::sync::atomic::Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                pending |= requested.try_recv().is_ok();
+                if read_complete_generation(root, &binding).is_some() {
+                    if pending {
+                        assert!(writing_ref.load(std::sync::atomic::Ordering::Acquire));
+                        overlaps_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        ack_midpoint.send(()).unwrap();
+                        pending = false;
+                    }
+                    reads += 1;
+                    if writing_ref.load(std::sync::atomic::Ordering::Acquire) {
+                        overlaps_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if reads > 0 && !sent {
+                    started.send(()).unwrap();
+                    sent = true;
+                }
+                std::thread::yield_now();
+            }
+            reads
+        });
+        ready
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        for next in 2..=4 {
+            let committed = source.head();
+            export.pause_wallet_head().unwrap();
+            publisher.invalidate_advertisement();
+            send.send(committed).unwrap();
+            observed
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+            source.height.set(next);
+            pause_after_catalog_for_reader(&read_midpoint, &completed);
+            writing.store(true, std::sync::atomic::Ordering::Release);
+            finish(&mut publisher, &export, &source, 1000 + next, &budget);
+            writing.store(false, std::sync::atomic::Ordering::Release);
+            send.send(source.head()).unwrap();
+            observed
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap();
+        }
+        // Repeated metadata replacement also overlaps the uninterrupted reader
+        // without exhausting the finite retained-generation catalog.
+        for now in 1005..1021 {
+            publisher.invalidate_advertisement();
+            pause_after_catalog_for_reader(&read_midpoint, &completed);
+            writing.store(true, std::sync::atomic::Ordering::Release);
+            finish(&mut publisher, &export, &source, now, &budget);
+            writing.store(false, std::sync::atomic::Ordering::Release);
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        assert!(reader.join().unwrap() > 1);
+        assert!(overlaps.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    });
+}
+
+#[test]
+fn invalidation_pins_the_committed_generation_past_retention_and_interruption() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("paused-retention");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let source = Synthetic::new(binding(&store), 3, 300);
+    source.height.set(1);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    let committed = source.head();
+    for (height, now) in [(2, 1001), (3, 2002)] {
+        publisher.invalidate_advertisement();
+        source.height.set(height);
+        FAIL_BEFORE_HEAD.with(|flag| flag.set(true));
+        assert!(publisher.step(&export, &source, now, &budget).is_err());
+        assert_eq!(
+            read_complete_generation(&root, &source.binding),
+            Some(committed)
+        );
+    }
+    drop(publisher);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(
+        publisher.published.map(|(height, tip, _)| (height, tip)),
+        Some(committed)
+    );
+    finish(&mut publisher, &export, &source, 2003, &budget);
+    assert_eq!(
+        read_complete_generation(&root, &source.binding),
+        Some(source.head())
+    );
+}
+
+#[test]
+fn paused_refresh_failures_preserve_complete_metadata_until_the_head_commits() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("paused-failure");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let source = Synthetic::new(binding(&store), 2, 300);
+    source.height.set(1);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    let committed = source.head();
+    publisher.invalidate_advertisement();
+    for fail in [
+        &FAIL_BEFORE_MANIFEST,
+        &FAIL_BEFORE_CATALOG,
+        &FAIL_BEFORE_HEAD,
+    ] {
+        fail.with(|flag| flag.set(true));
+        assert!(publisher.step(&export, &source, 1001, &budget).is_err());
+        assert_eq!(
+            read_complete_generation(&root, &source.binding),
+            Some(committed)
+        );
+    }
+    assert!(
+        publisher
+            .step(&export, &source, 1001, &budget)
+            .unwrap()
+            .published
+    );
+    assert_eq!(head(&export)["published_unix_seconds"], 1001);
 }

@@ -64,6 +64,22 @@ zero-height generation uses the pinned genesis identifier and no chunks.
 The source checks its actual accepted head before committing publication.
 HTTP requests cannot refresh the source publication timestamp.
 
+Restoration and authentication failures preserve the last complete wallet head.
+They pause new publication without deleting historical data or refreshing its
+publication time. A separate refresh flag forces publication after successful
+restoration, including an unchanged head. Until that commit succeeds, the old
+committed generation remains pinned even past its nominal retention expiry.
+`wallet_export_paused` remains true during backfill or a pending refresh. An old
+complete wallet head does not assert the current native head or grant signing
+or checkpoint authority. Consumers compare it with the exporting node's native
+status separately from propagation between different nodes.
+
+The head and catalog are separate atomic file replacements, not one filesystem
+transaction. Readers bracket both metadata files around immutable dependency
+reads and retry if either changes, within the original acquisition deadline.
+They resolve the head's exact catalog entry and verify its manifest, chunks and
+receipts. Missing, malformed or inconsistent data grants no verified prefix.
+
 `Store::materialize_permanent_receipt` explicitly materializes one accepted
 height under the same shared budget. It authenticates the immutable context,
 exact canonical header and body length, then durably commits the receipt and its

@@ -235,7 +235,7 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
 }
 
 #[test]
-fn reorganization_withdraws_wallet_cursor_and_republishes_same_complete_head() {
+fn reorganization_retains_wallet_cursor_and_republishes_same_complete_head() {
     let dir = Directory::new();
     let store = dir.store();
     let root = dir.private("wallet-pause");
@@ -251,7 +251,7 @@ fn reorganization_withdraws_wallet_cursor_and_republishes_same_complete_head() {
     );
     assert!(root.join("wallet-head.json").exists());
     host.pause_reorganization_exports().unwrap();
-    assert!(!root.join("wallet-head.json").exists());
+    assert!(root.join("wallet-head.json").is_file());
     assert_eq!(host.wallet_export_state(), Some(true));
     host.pause_reorganization_exports().unwrap();
     assert!(
@@ -345,4 +345,52 @@ fn ancestor_barrier_retires_later_authorizations_and_preserves_earlier_ones() {
     assert_eq!(value["published_unix_seconds"], 100_000);
     retired.pause_reorganization_exports_at(95).unwrap();
     assert_eq!(fs::read(publication).unwrap(), original);
+}
+
+#[test]
+fn wallet_open_and_restart_stay_paused_until_a_new_complete_publication() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-initial-pause");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert!(!root.join("wallet-head.json").exists());
+    assert!(
+        host.tick_wallet_export(&store, 1000, &budget)
+            .unwrap()
+            .unwrap()
+            .current
+    );
+    let committed = std::fs::read(root.join("wallet-head.json")).unwrap();
+    assert_eq!(host.wallet_export_state(), Some(false));
+    drop(host);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert_eq!(
+        std::fs::read(root.join("wallet-head.json")).unwrap(),
+        committed
+    );
+    host.restore_required = true;
+    host.retained_ready = false;
+    assert!(host.tick_wallet_export(&store, 1001, &budget).is_err());
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert_eq!(
+        std::fs::read(root.join("wallet-head.json")).unwrap(),
+        committed
+    );
+    host.retained_ready = true;
+    let progress = host
+        .tick_wallet_export(&store, 1001, &budget)
+        .unwrap()
+        .unwrap();
+    assert!(progress.current && progress.published);
+    assert_eq!(host.wallet_export_state(), Some(false));
+    let head: Value =
+        serde_json::from_slice(&std::fs::read(root.join("wallet-head.json")).unwrap()).unwrap();
+    assert_eq!(head["published_unix_seconds"], 1001);
 }

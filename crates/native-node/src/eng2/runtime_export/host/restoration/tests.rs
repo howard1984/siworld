@@ -109,7 +109,7 @@ fn late_restore_result_cannot_cross_same_head_barrier_or_reopened_store() {
     host.export.publish_wallet_head(&store, 10).unwrap();
     assert!(root.join("wallet-head.json").is_file());
     host.pause_reorganization_exports_at(0).unwrap();
-    assert!(!root.join("wallet-head.json").exists());
+    assert!(root.join("wallet-head.json").is_file());
     // The barrier survives even when a subsequent restoration never commits.
     assert_eq!(
         before,
@@ -138,7 +138,7 @@ fn late_restore_result_cannot_cross_same_head_barrier_or_reopened_store() {
 }
 
 #[test]
-fn initial_and_failed_authentication_withdraw_mutable_wallet_head() {
+fn initial_and_failed_authentication_preserve_history_without_restoring_authority() {
     use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
     let directory = Directory::new();
     let store = directory.store();
@@ -149,7 +149,7 @@ fn initial_and_failed_authentication_withdraw_mutable_wallet_head() {
     drop(export);
     let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
     let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
-    assert!(!root.join("wallet-head.json").exists());
+    assert!(root.join("wallet-head.json").is_file());
     host.export.publish_wallet_head(&store, 11).unwrap();
     let before = host.preparation.as_ref().unwrap().generation;
     fs::OpenOptions::new()
@@ -168,7 +168,7 @@ fn initial_and_failed_authentication_withdraw_mutable_wallet_head() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(!root.join("wallet-head.json").exists());
+    assert!(root.join("wallet-head.json").is_file());
     assert!(host.preparation.as_ref().unwrap().generation > before);
     assert!(!host.retained_ready);
     assert!(host.latest_checkpoint().is_none());

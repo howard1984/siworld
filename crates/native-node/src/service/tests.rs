@@ -716,3 +716,50 @@ fn recovery_transport_rejects_mining_listeners_and_miner_cli_before_start() {
         assert!(check_recovery_transport(false, mining, listening, private_view).is_ok());
     }
 }
+
+#[test]
+fn atomic_status_replacements_remain_complete_to_a_concurrent_reader() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let directory = Directory::new();
+    let path = directory.0.join("status.json");
+    atomic_json(&path, &json!({"sequence":0,"values":vec![0;128]})).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let (send, recv) = std::sync::mpsc::channel();
+        let stop = &stop;
+        let path = &path;
+        let reader = scope.spawn(move || {
+            let mut count = 0;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                let sequence = value["sequence"].as_u64().unwrap();
+                assert_eq!(value["values"].as_array().unwrap().len(), 128);
+                assert!(
+                    value["values"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|v| v.as_u64() == Some(sequence))
+                );
+                count += 1;
+                if count == 1 {
+                    send.send(()).unwrap();
+                }
+                std::thread::yield_now();
+            }
+            count
+        });
+        recv.recv_timeout(Duration::from_secs(3)).unwrap();
+        for sequence in 1..=32 {
+            atomic_json(
+                path,
+                &json!({"sequence":sequence,"values":vec![sequence;128]}),
+            )
+            .unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        assert!(reader.join().unwrap() > 1);
+    });
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}

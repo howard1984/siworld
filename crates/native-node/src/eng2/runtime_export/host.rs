@@ -579,7 +579,6 @@ impl Host {
         self.wallet_requested = true;
         self.wallet_paused = true;
         self.wallet = Some(WalletPublisher::open(&self.export, store, policy, budget)?);
-        self.wallet_paused = false;
         Ok(())
     }
     /// Called under the canonical owner lock before restoring any savepoint.
@@ -837,6 +836,7 @@ impl Host {
             return Ok(None);
         }
         if self.restore_required && !self.retained_ready {
+            self.wallet_paused = true;
             return Err("wallet publication waits for retained authentication".into());
         }
         let result = self
@@ -844,7 +844,7 @@ impl Host {
             .as_mut()
             .ok_or_else(|| "wallet publisher unavailable".to_string())
             .and_then(|publisher| publisher.tick(&self.export, store, now, budget));
-        self.wallet_paused = result.is_err();
+        self.wallet_paused = !result.as_ref().is_ok_and(|progress| progress.current);
         result.map(Some)
     }
     /// Observe public messages and publish accepted data without creating a new

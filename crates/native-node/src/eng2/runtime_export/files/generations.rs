@@ -41,6 +41,7 @@ pub struct WalletProgress {
     pub target_height: u64,
     pub published_height: Option<u64>,
     pub published: bool,
+    pub current: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -234,11 +235,12 @@ pub struct WalletPublisher {
     tail: Vec<Record>,
     catalog: Catalog,
     published: Option<(u64, Hash, u64)>,
+    refresh_required: bool,
     last_now: Option<u64>,
 }
 impl WalletPublisher {
     pub fn invalidate_advertisement(&mut self) {
-        self.published = None;
+        self.refresh_required = true;
     }
     pub fn open(
         export: &PublicExport,
@@ -373,6 +375,7 @@ impl WalletPublisher {
             tail: Vec::new(),
             catalog,
             published: None,
+            refresh_required: true,
             last_now: None,
         };
         if let Some(bytes) = export.read_optional("wallet-head.json", 2048)? {
@@ -614,9 +617,10 @@ impl WalletPublisher {
         let mut published = false;
         if self.height == target
             && self.tip == tip
-            && self.published.is_none_or(|(h, id, time)| {
-                (h, id) != (target, tip) || now.saturating_sub(time) >= 60
-            })
+            && (self.refresh_required
+                || self.published.is_none_or(|(h, id, time)| {
+                    (h, id) != (target, tip) || now.saturating_sub(time) >= 60
+                }))
         {
             self.publish(export, source, now)?;
             published = true;
@@ -626,6 +630,10 @@ impl WalletPublisher {
             target_height: target,
             published_height: self.published.map(|v| v.0),
             published,
+            current: !self.refresh_required
+                && self
+                    .published
+                    .is_some_and(|(h, id, _)| (h, id) == (target, tip)),
         })
     }
     fn publish(
@@ -676,6 +684,12 @@ impl WalletPublisher {
         )?;
         self.catalog = next;
         #[cfg(test)]
+        AFTER_CATALOG.with(|hook| {
+            if let Some(barrier) = hook.borrow_mut().take() {
+                barrier();
+            }
+        });
+        #[cfg(test)]
         if FAIL_BEFORE_HEAD.with(|flag| flag.replace(false)) {
             return Err("injected interruption before wallet head".into());
         }
@@ -694,11 +708,13 @@ impl WalletPublisher {
             &serde_json::to_vec(&head).map_err(|_| "wallet current head encoding failed")?,
         )?;
         self.published = Some((self.height, self.tip, now));
+        self.refresh_required = false;
         Ok(())
     }
 }
 #[cfg(test)]
 thread_local! {
+    static AFTER_CATALOG: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {std::cell::RefCell::new(None)};
     static FAIL_BEFORE_HEAD: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};
     static FAIL_BEFORE_MANIFEST: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};
     static FAIL_BEFORE_CATALOG: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};

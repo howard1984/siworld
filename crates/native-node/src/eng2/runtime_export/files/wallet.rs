@@ -3,16 +3,10 @@ use super::*;
 use crate::{eng2::wallet_history, p2p};
 
 impl PublicExport {
-    /// Withdraw the mutable wallet cursor before canonical restoration. Immutable
-    /// generations remain retained, but no incomplete prefix is advertised.
+    /// Keep the last complete generation readable while current publication is
+    /// paused. This cursor is historical data, not canonical-state readiness.
     pub fn pause_wallet_head(&self) -> Result<(), String> {
-        if self.read_optional("wallet-head.json", 2048)?.is_some() {
-            match unlinkat(&self.root, "wallet-head.json", AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => (),
-                Err(_) => return Err("wallet cursor withdrawal failed".into()),
-            }
-            fsync(&self.root).map_err(|_| "wallet cursor withdrawal sync failed")?;
-        }
+        self.read_optional("wallet-head.json", 2048)?;
         Ok(())
     }
     /// Historical synthetic fixture helper. Production publication uses the
