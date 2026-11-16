@@ -811,7 +811,12 @@ fn unauthenticated_slow_socket_never_holds_the_consensus_owner_or_peer_identity(
     let mut node = Endpoint::new();
     let mut socket = TcpStream::connect(node.address()).unwrap();
     socket.write_all(ROUTE_MAGIC).unwrap();
-    node.tick();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while node.driver.workers.is_empty() {
+        assert!(Instant::now() < deadline, "slow socket was not admitted");
+        node.tick();
+        std::thread::sleep(POLL);
+    }
     assert_eq!(node.driver.workers.len(), 1);
     assert_eq!(node.driver.connections, 0);
     assert_eq!(node.driver.scheduler.status().pending, 0);

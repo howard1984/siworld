@@ -386,22 +386,33 @@ impl<S: Read + Write> Peer<S> {
         request: u64,
         header: &Header,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
-        self.fetch_body_internal(request, header, None)
+        self.fetch_body_internal(request, header, None, None)
     }
-    #[cfg(any(feature = "eng2-runtime", test))]
+    #[cfg(test)]
     pub(crate) fn fetch_body_before(
         &mut self,
         request: u64,
         header: &Header,
         deadline: &p2p::Deadline,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
-        self.fetch_body_internal(request, header, Some(deadline))
+        self.fetch_body_internal(request, header, Some(deadline), None)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn fetch_body_before_observed(
+        &mut self,
+        request: u64,
+        header: &Header,
+        deadline: &p2p::Deadline,
+        progress: &dyn Fn(usize, usize),
+    ) -> Result<Option<ReceivedBody>, p2p::Error> {
+        self.fetch_body_internal(request, header, Some(deadline), Some(progress))
     }
     fn fetch_body_internal(
         &mut self,
         request: u64,
         header: &Header,
         limit: Option<&p2p::Deadline>,
+        progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
         let start_deadline = limit
             .cloned()
@@ -488,6 +499,9 @@ impl<S: Read + Write> Peer<S> {
                     return Err(p2p::Error::InvalidProtocol);
                 }
                 encoded.extend_from_slice(&chunk[9..]);
+                if let Some(progress) = progress {
+                    progress(encoded.len(), length);
+                }
                 #[cfg(feature = "eng2-runtime")]
                 {
                     timing.received_bytes = encoded.len() as u64;
@@ -1153,6 +1167,44 @@ mod tests {
             drop(received);
             assert_eq!(budget.available().unwrap(), before);
         }
+    }
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn observed_body_progress_tracks_each_received_chunk_without_changing_decoding() {
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let binding = binding(&g);
+        let mut sender = Peer::new(
+            session(vec![], binding, p2p::Budget::default()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        sender.send_body(5, &header, &body).unwrap();
+        let wire = sender.session.test_channel().output.clone();
+        let mut receiver =
+            Peer::new(session(wire, binding, p2p::Budget::default()), &g, policy()).unwrap();
+        let observations = std::cell::RefCell::new(Vec::new());
+        let received = receiver
+            .fetch_body_before_observed(
+                5,
+                &header,
+                &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+                &|bytes, total| observations.borrow_mut().push((bytes, total)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.body, body);
+        let observations = observations.into_inner();
+        let total = body.encoded_len(policy()).unwrap();
+        assert!(observations.len() >= 2);
+        assert_eq!(observations.last(), Some(&(total, total)));
+        assert!(
+            observations
+                .iter()
+                .all(|(bytes, length)| *bytes <= total && *length == total)
+        );
+        assert!(observations.windows(2).all(|pair| pair[0].0 < pair[1].0));
     }
     #[test]
     fn body_chunk_payloads_keep_the_absolute_deadline_and_cancellation() {

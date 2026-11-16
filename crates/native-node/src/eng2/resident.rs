@@ -337,6 +337,7 @@ fn export_status(
         "header_publication_deferred":shared.headers.local_deferred(),
         "header_relay_error":shared.headers.error(),
         "body_download_leases":shared.headers.active_downloads(),
+        "sync_progress":shared.headers.sync_progress(),
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
         "ready_reason_code":ready_reason_code,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,

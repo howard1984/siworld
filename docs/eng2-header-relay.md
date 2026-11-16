@@ -112,6 +112,22 @@ reservation through every consumer. The ordinary legacy body's ten-second
 initial response and absolute 180-second chunk deadline are preserved. Other
 control messages retain their existing ten-second payload limit.
 
+The optional `sync_progress` status object describes the highest-work uncompleted
+remote header in this qualified cache. It reports the candidate and canonical
+height, block identity and cumulative work, candidate age and cache sequence, and
+at most two body attempts. Each attempt reports its index, absolute age, deadline
+activity, received and announced byte counts, phase, and age of the last actual
+chunk or completed decode. Waiting for a response supplies no progress event;
+repeated or decreasing byte counts cannot refresh progress. A completed decode
+is reported as `decoded_awaiting_admission`, not native validation success.
+The object is null when no eligible header is available or the cache diagnostic
+fails. It is not evidence about ordinary peer-round downloads, and cannot grant
+readiness, block validity, canonical selection or checkpoint-signing permission.
+Consumers must bind it to the process and run identities, compare canonical
+identity with the same status sample, and account for missing, cancelled, stalled
+or changed attempts conservatively. A new attempt is not a new availability
+episode.
+
 The canonical owner independently qualifies retained raw header extensions before
 storing competing bodies. Raw archive status confers no execution validity. A
 forward child invokes complete native admission; a competing path uses the

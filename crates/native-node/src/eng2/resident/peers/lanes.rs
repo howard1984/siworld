@@ -145,7 +145,12 @@ fn pull_one(
         .ok_or("body lane sequence exhausted")?;
     if let Some(download) = shared.headers.download(peer.peer())? {
         let path = shared.headers.path(&download.header)?;
-        let received = peer.fetch_body_before(*sequence, &download.header, &download.deadline);
+        let received = peer.fetch_body_before_observed(
+            *sequence,
+            &download.header,
+            &download.deadline,
+            &|bytes, total| download.received(bytes, total),
+        );
         // Preserve every actual attempt, including partial reads and failures,
         // before an error can close this independently authenticated lane.
         let (timing, overwritten) = peer.take_fetch_observation();
@@ -154,6 +159,7 @@ fn pull_one(
             .body_fetch(peer.peer(), &download.header, timing, overwritten);
         let received = received.map_err(|_| "body lane download interrupted or rejected")?;
         if let Some(received) = received {
+            download.decoded();
             // Socket turns finish after authenticated decode. The retained,
             // bounded admission owner alone can validate or append this body.
             shared.bodies.submit(super::super::body_admission::Ready {

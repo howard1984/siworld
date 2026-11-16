@@ -75,13 +75,79 @@ pub(crate) struct Hub {
 struct DownloadState {
     cancel: p2p::Cancellation,
     deadline: p2p::Deadline,
+    progress: Arc<DownloadProgress>,
+}
+struct DownloadProgress {
+    attempt_index: usize,
+    started: Instant,
+    state: Mutex<ProgressState>,
+}
+struct ProgressState {
+    received_bytes: u64,
+    total_bytes: u64,
+    last_progress: Option<Instant>,
+    phase: &'static str,
+}
+impl DownloadProgress {
+    fn new(attempt_index: usize) -> Self {
+        Self {
+            attempt_index,
+            started: Instant::now(),
+            state: Mutex::new(ProgressState {
+                received_bytes: 0,
+                total_bytes: 0,
+                last_progress: None,
+                phase: "waiting_for_body",
+            }),
+        }
+    }
+    fn received(&self, bytes: usize, total: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            let bytes = bytes as u64;
+            let total = total as u64;
+            if bytes > state.received_bytes && bytes <= total {
+                state.received_bytes = bytes;
+                state.total_bytes = total;
+                state.last_progress = Some(Instant::now());
+                state.phase = "receiving_body";
+            }
+        }
+    }
+    fn decoded(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_progress = Some(Instant::now());
+            state.phase = "decoded_awaiting_admission";
+        }
+    }
+    fn diagnostic(&self, now: Instant) -> serde_json::Value {
+        let Ok(state) = self.state.lock() else {
+            return json!({"phase":"unavailable"});
+        };
+        json!({
+            "attempt_index":self.attempt_index,
+            "phase":state.phase,
+            "attempt_age_ms":now.saturating_duration_since(self.started).as_millis(),
+            "received_bytes":state.received_bytes,
+            "total_bytes":state.total_bytes,
+            "last_progress_age_ms":state.last_progress.map(|at| now.saturating_duration_since(at).as_millis()),
+        })
+    }
 }
 pub(crate) struct Download {
     pub header: Header,
     pub cancel: p2p::Cancellation,
     pub deadline: p2p::Deadline,
+    progress: Arc<DownloadProgress>,
     peer: Hash,
     hub: Arc<Hub>,
+}
+impl Download {
+    pub(crate) fn received(&self, bytes: usize, total: usize) {
+        self.progress.received(bytes, total);
+    }
+    pub(crate) fn decoded(&self) {
+        self.progress.decoded();
+    }
 }
 impl Drop for Download {
     fn drop(&mut self) {
@@ -288,6 +354,50 @@ impl Hub {
     }
     pub(crate) fn waiting(&self) -> bool {
         self.failed.load(Ordering::Acquire) || self.waiting.load(Ordering::Acquire)
+    }
+    pub(crate) fn sync_progress(&self) -> serde_json::Value {
+        if self.failed.load(Ordering::Acquire) {
+            return serde_json::Value::Null;
+        }
+        let Ok(inner) = self.inner.lock() else {
+            return serde_json::Value::Null;
+        };
+        let now = Instant::now();
+        let Some(entry) = inner
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.source != self.local
+                    && !entry.complete
+                    && entry.context.work > inner.canonical.work
+            })
+            .max_by_key(|entry| (entry.context.work, entry.context.height))
+        else {
+            return serde_json::Value::Null;
+        };
+        let downloads: Vec<_> = entry
+            .downloads
+            .values()
+            .take(2)
+            .map(|download| {
+                let mut value = download.progress.diagnostic(now);
+                value["active"] = json!(download.deadline.check_at(now).is_ok());
+                value
+            })
+            .collect();
+        json!({
+            "scope":"validated_header_body",
+            "candidate_height":entry.context.height,
+            "candidate_id":crate::local::hex(&entry.context.id),
+            "candidate_sequence":entry.sequence,
+            "candidate_work":entry.context.work.to_string(),
+            "candidate_age_ms":now.saturating_duration_since(entry.first).as_millis(),
+            "canonical_height":inner.canonical.height,
+            "canonical_id":crate::local::hex(&inner.canonical.id),
+            "canonical_work":inner.canonical.work.to_string(),
+            "lag_blocks":entry.context.height.checked_sub(inner.canonical.height),
+            "downloads":downloads,
+        })
     }
     pub(crate) fn tick(&self) -> Result<(), String> {
         if self.failed.load(Ordering::Acquire) {
@@ -527,12 +637,14 @@ impl Hub {
         let cancel = p2p::Cancellation::default();
         let deadline =
             p2p::Deadline::cancellable(crate::eng2::transport::BODY_FETCH_TIMEOUT, cancel.clone());
+        let progress = Arc::new(DownloadProgress::new(entry.attempts.len() + 1));
         entry.attempts.insert(peer);
         entry.downloads.insert(
             peer,
             DownloadState {
                 cancel: cancel.clone(),
                 deadline: deadline.clone(),
+                progress: progress.clone(),
             },
         );
         self.active_downloads.fetch_add(1, Ordering::AcqRel);
@@ -540,6 +652,7 @@ impl Hub {
             header: entry.header.clone(),
             cancel,
             deadline,
+            progress,
             peer,
             hub: self.clone(),
         }))
@@ -709,6 +822,73 @@ mod tests {
         hub.rejected(&first).unwrap();
         assert!(!hub.waiting());
         assert!(hub.outgoing([6; 32]).unwrap().is_empty());
+    }
+    #[test]
+    fn sync_progress_requires_a_qualified_higher_work_header_and_actual_body_progress() {
+        let hub = hub();
+        assert!(hub.sync_progress().is_null());
+        let first = header([2; 32], 1, 3);
+        let id = first.id().unwrap();
+        assert!(hub.offer(first.clone(), [8; 32]).unwrap());
+        let before = hub.sync_progress();
+        assert_eq!(before["candidate_height"], 1);
+        assert_eq!(before["candidate_id"], crate::local::hex(&id));
+        assert_eq!(before["lag_blocks"], 1);
+        assert_eq!(before["downloads"].as_array().unwrap().len(), 0);
+
+        let download = hub.download([7; 32]).unwrap().unwrap();
+        let pending = hub.sync_progress();
+        assert_eq!(pending["downloads"][0]["phase"], "waiting_for_body");
+        assert_eq!(pending["downloads"][0]["attempt_index"], 1);
+        assert_eq!(pending["downloads"][0]["active"], true);
+        assert!(pending["downloads"][0]["last_progress_age_ms"].is_null());
+        download.received(1024, 2048);
+        let partial = hub.sync_progress();
+        assert_eq!(partial["downloads"][0]["received_bytes"], 1024);
+        assert_eq!(partial["downloads"][0]["total_bytes"], 2048);
+        assert_eq!(partial["downloads"][0]["phase"], "receiving_body");
+        assert!(partial["downloads"][0]["last_progress_age_ms"].is_number());
+        download.received(512, 2048);
+        assert_eq!(hub.sync_progress()["downloads"][0]["received_bytes"], 1024);
+        download.decoded();
+        assert_eq!(
+            hub.sync_progress()["downloads"][0]["phase"],
+            "decoded_awaiting_admission"
+        );
+        hub.completed(&first).unwrap();
+        assert!(hub.sync_progress().is_null());
+    }
+    #[test]
+    fn diagnostic_does_not_refresh_progress_or_reuse_a_failed_attempt_identity() {
+        let hub = hub();
+        let first = header([2; 32], 1, 3);
+        hub.offer(first, [8; 32]).unwrap();
+        let download = hub.download([7; 32]).unwrap().unwrap();
+        download.received(1024, 2048);
+        let old = Instant::now() - Duration::from_secs(60);
+        download.progress.state.lock().unwrap().last_progress = Some(old);
+        download.received(1024, 2048);
+        download.received(512, 2048);
+        let value = hub.sync_progress();
+        assert!(
+            value["downloads"][0]["last_progress_age_ms"]
+                .as_u64()
+                .unwrap()
+                >= 60_000
+        );
+        assert_eq!(
+            download.progress.state.lock().unwrap().last_progress,
+            Some(old)
+        );
+        download.cancel.cancel();
+        assert_eq!(hub.sync_progress()["downloads"][0]["active"], false);
+        drop(download);
+        let replacement = hub.download([6; 32]).unwrap().unwrap();
+        let value = hub.sync_progress();
+        assert_eq!(value["downloads"][0]["attempt_index"], 2);
+        assert_eq!(value["downloads"][0]["received_bytes"], 0);
+        assert!(value["downloads"][0]["last_progress_age_ms"].is_null());
+        drop(replacement);
     }
     #[test]
     fn multi_peer_download_caps_cancellation_and_retained_ownership_are_enforced() {
