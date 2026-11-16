@@ -415,15 +415,7 @@ impl WalletPublisher {
                 return Err("wallet restored generation head differs".into());
             }
             let current = source.head();
-            let canonical = height <= current.0
-                && (height == 0 && tip == value.binding.genesis()
-                    || height > 0
-                        && source
-                            .header(height)?
-                            .id()
-                            .map_err(|_| "wallet restored canonical identity rejected")?
-                            == tip);
-            if canonical {
+            {
                 let mut previous = value.binding.genesis();
                 for descriptor in &manifest.chunks {
                     let chunk = descriptor.decode_chunk(
@@ -449,6 +441,7 @@ impl WalletPublisher {
                 value.height = height;
                 value.tip = tip;
             }
+            value.reconcile_prefix(export, source, current.0)?;
             value.published = Some((height, tip, published));
         }
         value.persist_reservation(export)?;
@@ -565,19 +558,7 @@ impl WalletPublisher {
         if target > wire::MAX_HEIGHT {
             return Err("wallet public header capacity exceeded".into());
         }
-        if self.height > target
-            || self.height > 0
-                && source
-                    .header(self.height)?
-                    .id()
-                    .map_err(|_| "wallet prefix identity rejected")?
-                    != self.tip
-        {
-            self.height = 0;
-            self.tip = self.binding.genesis();
-            self.full.clear();
-            self.tail.clear();
-        }
+        self.reconcile_prefix(export, source, target)?;
         let genesis = source.genesis()?;
         if genesis.len() > MAX_GENESIS {
             return Err("wallet public genesis exceeds bound".into());
@@ -635,6 +616,62 @@ impl WalletPublisher {
                     .published
                     .is_some_and(|(h, id, _)| (h, id) == (target, tip)),
         })
+    }
+    /// Reuse only the immutable prefix that still matches the accepted Store.
+    /// Reconciliation is metadata-only and never regenerates earlier receipts.
+    fn reconcile_prefix(
+        &mut self,
+        export: &PublicExport,
+        source: &impl Source,
+        target: u64,
+    ) -> Result<(), String> {
+        let mut height = self.height;
+        let mut tip = self.tip;
+        let mut full = self.full.clone();
+        let mut tail = self.tail.clone();
+        while height > target
+            || height > 0
+                && source
+                    .header(height)?
+                    .id()
+                    .map_err(|_| "wallet prefix identity rejected")?
+                    != tip
+        {
+            if tail.is_empty() {
+                let descriptor = full.last().ok_or("wallet rewind chunk missing")?;
+                let chunk = descriptor.decode_chunk(
+                    &self.binding,
+                    &export.read(&descriptor.name(), wire::MAX_CHUNK_BYTES)?,
+                )?;
+                if chunk.records.len() != wire::CHUNK_HEADERS
+                    || chunk.from + chunk.records.len() as u64 - 1 != height
+                {
+                    return Err("wallet rewind chunk height differs".into());
+                }
+                tail = chunk.records;
+                full.pop();
+            }
+            let record = tail.pop().ok_or("wallet rewind record missing")?;
+            let header = record.decoded(&self.binding)?;
+            if header.height != height || record.id != tip {
+                return Err("wallet rewind record context differs".into());
+            }
+            height = height
+                .checked_sub(1)
+                .ok_or("wallet rewind height underflow")?;
+            tip = header.parent;
+        }
+        if height == 0 && tip != self.binding.genesis() {
+            return Err("wallet rewind genesis differs".into());
+        }
+        if height != self.height {
+            self.height = height;
+            self.tip = tip;
+            self.full = full;
+            self.tail = tail;
+            self.refresh_required = true;
+        }
+        Ok(())
     }
     fn publish(
         &mut self,

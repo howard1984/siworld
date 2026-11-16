@@ -117,6 +117,233 @@ fn finish(
     }
     panic!("bounded synthetic backfill did not publish");
 }
+
+fn replace_suffix(source: &mut Synthetic, ancestor: usize, salt: u64) {
+    let mut parent = if ancestor == 0 {
+        source.binding.genesis()
+    } else {
+        source.headers[ancestor - 1].id().unwrap()
+    };
+    for header in &mut source.headers[ancestor..] {
+        header.parent = parent;
+        header.timestamp = salt + header.height;
+        parent = header.id().unwrap();
+    }
+}
+
+fn suffix_depth_reuses_only_the_common_prefix(depth: usize) {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("reorg-depth");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let mut source = Synthetic::new(binding(&store), 300, 300);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    let old_head = fs::read(root.join("wallet-head.json")).unwrap();
+    let old_manifest = manifest(&export, &publisher);
+    let old_name = old_manifest.name();
+    let old_bytes = fs::read(root.join(&old_name)).unwrap();
+    replace_suffix(&mut source, 300 - depth, 9000);
+    publisher.invalidate_advertisement();
+    let started = std::time::Instant::now();
+    for offset in 1..=depth {
+        let progress = publisher.step(&export, &source, 1001, &budget).unwrap();
+        assert_eq!(progress.scanned_height, (300 - depth + offset) as u64);
+        assert_eq!(progress.published, offset == depth);
+        assert_eq!(progress.current, offset == depth);
+        if offset < depth {
+            assert_eq!(fs::read(root.join("wallet-head.json")).unwrap(), old_head);
+        }
+    }
+    let elapsed = started.elapsed();
+    assert_eq!(source.receipts.get(), 300 + depth);
+    assert_eq!(fs::read(root.join(old_name)).unwrap(), old_bytes);
+    assert_eq!(
+        manifest(&export, &publisher).chunks[..2],
+        old_manifest.chunks[..2]
+    );
+    assert_eq!(head(&export)["tip"], crate::local::hex(&source.head().1));
+    eprintln!(
+        "wallet_reorg_synthetic depth={depth} replacement_receipts={depth} publisher_steps={depth} elapsed_us={}",
+        elapsed.as_micros()
+    );
+}
+#[test]
+fn reorganization_depth_1_reuses_common_prefix() {
+    suffix_depth_reuses_only_the_common_prefix(1);
+}
+#[test]
+fn reorganization_depth_2_reuses_common_prefix() {
+    suffix_depth_reuses_only_the_common_prefix(2);
+}
+#[test]
+fn reorganization_depth_7_reuses_common_prefix() {
+    suffix_depth_reuses_only_the_common_prefix(7);
+}
+
+#[test]
+fn reorganization_reuses_common_wallet_prefix_without_reexporting_receipts() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("reorg-prefix");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let mut source = Synthetic::new(binding(&store), 300, 300);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    let previous = manifest(&export, &publisher);
+    let previous_name = previous.name();
+    let previous_bytes = fs::read(root.join(&previous_name)).unwrap();
+    let common_path = root.join(previous.chunks[0].name());
+    let common_inode = fs::metadata(&common_path).unwrap().ino();
+    let common_bytes = fs::read(&common_path).unwrap();
+    assert_eq!(source.receipts.get(), 300);
+    replace_suffix(&mut source, 299, 9000);
+    publisher.invalidate_advertisement();
+    let progress = publisher.step(&export, &source, 1001, &budget).unwrap();
+    assert_eq!(progress.scanned_height, 300);
+    assert!(progress.published && progress.current);
+    assert_eq!(source.receipts.get(), 301);
+    let current = manifest(&export, &publisher);
+    assert_eq!(current.chunks[..2], previous.chunks[..2]);
+    assert_eq!(fs::metadata(&common_path).unwrap().ino(), common_inode);
+    assert_eq!(fs::read(&common_path).unwrap(), common_bytes);
+    assert_eq!(fs::read(root.join(previous_name)).unwrap(), previous_bytes);
+}
+
+#[test]
+fn reorganization_rewinds_across_immutable_chunk_boundary() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("reorg-chunk");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let mut source = Synthetic::new(binding(&store), 130, 300);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    replace_suffix(&mut source, 127, 9000);
+    for expected in 128..=130 {
+        let progress = publisher.step(&export, &source, 1001, &budget).unwrap();
+        assert_eq!(progress.scanned_height, expected);
+        assert_eq!(progress.published, expected == 130);
+    }
+    assert_eq!(source.receipts.get(), 133);
+    assert_eq!(head(&export)["tip"], crate::local::hex(&source.head().1));
+}
+
+#[test]
+fn reorganization_rejects_corrupt_immutable_chunk_before_reusing_prefix() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("reorg-corrupt");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let mut source = Synthetic::new(binding(&store), 130, 300);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    let original_cursor = fs::read(root.join("wallet-head.json")).unwrap();
+    let chunk = root.join(publisher.full[0].name());
+    let mut bytes = fs::read(&chunk).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    fs::write(&chunk, bytes).unwrap();
+    replace_suffix(&mut source, 127, 9000);
+    assert!(publisher.step(&export, &source, 1001, &budget).is_err());
+    assert_eq!(
+        fs::read(root.join("wallet-head.json")).unwrap(),
+        original_cursor
+    );
+    assert_eq!(source.receipts.get(), 130);
+}
+
+#[test]
+fn reorganization_restore_reuses_old_generation_common_prefix() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("reorg-reopen");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let mut source = Synthetic::new(binding(&store), 130, 300);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    drop(publisher);
+    replace_suffix(&mut source, 127, 9000);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(publisher.height, 127);
+    assert_eq!(source.receipts.get(), 130);
+    for _ in 0..3 {
+        publisher.step(&export, &source, 1001, &budget).unwrap();
+    }
+    assert_eq!(head(&export)["tip"], crate::local::hex(&source.head().1));
+    assert_eq!(source.receipts.get(), 133);
+}
+
+#[test]
+fn reorganization_to_shorter_common_prefix_does_not_reexport_receipts() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("reorg-shorter");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let source = Synthetic::new(binding(&store), 130, 300);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1000, &budget);
+    source.height.set(127);
+    let progress = publisher.step(&export, &source, 1001, &budget).unwrap();
+    assert!(progress.published && progress.current);
+    assert_eq!(progress.scanned_height, 127);
+    assert_eq!(source.receipts.get(), 130);
+}
 #[test]
 fn incremental_backfill_reuses_full_chunks_and_restores_without_receipt_replay() {
     let dir = Directory::new();
