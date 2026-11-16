@@ -102,6 +102,23 @@ pub(crate) struct CheckpointRevision {
 }
 #[cfg(feature = "eng2-runtime")]
 impl CheckpointRevision {
+    /// Reject a different owner or inconsistent revision. A successfully
+    /// authenticated capture from an older revision is obsolete, not current.
+    pub(crate) fn is_current_revision(&self, store: &Store) -> Result<bool, String> {
+        store.ensure_exportable()?;
+        if !std::sync::Arc::ptr_eq(&self.instance, &store.revision) {
+            return Err("checkpoint captured store identity changed".into());
+        }
+        let current = store.revision.load(std::sync::atomic::Ordering::Acquire);
+        if self.revision > current {
+            return Err("checkpoint canonical revision moved backward".into());
+        }
+        if self.revision < current {
+            return Ok(false);
+        }
+        self.check(store)?;
+        Ok(true)
+    }
     pub(crate) fn check(&self, store: &Store) -> Result<(), String> {
         store.ensure_exportable()?;
         if !std::sync::Arc::ptr_eq(&self.instance, &store.revision)

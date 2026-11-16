@@ -86,6 +86,13 @@ impl Host {
             preparation.retained_request = false;
             match result {
                 Ok(Some(result)) => {
+                    // Authentication errors remain errors. Only a successful
+                    // result captured before a canonical advance is discarded
+                    // as pending; it cannot restore signing or wallet readiness.
+                    if !result.revision.is_current_revision(store)? {
+                        self.pause_reorganization_exports()?;
+                        return Ok(false);
+                    }
                     self.install_retained(store, result)?;
                     self.retained_ready = true;
                     return Ok(true);
