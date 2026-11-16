@@ -33,6 +33,7 @@ mod operations;
 pub use operations::{result as operations_result, submit as submit_operations};
 pub(crate) mod peers;
 mod production;
+mod progress_clock;
 #[cfg(unix)]
 pub(crate) mod submission;
 #[cfg(unix)]
@@ -327,6 +328,8 @@ fn export_status(
         (ready, ready_reason_code)
     };
     let event = owner.last_reorganization();
+    let (sync_progress, sync_progress_clock) =
+        progress_clock::snapshot(|| shared.headers.sync_progress());
     let mut status = json!({
         "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
         "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
@@ -337,7 +340,8 @@ fn export_status(
         "header_publication_deferred":shared.headers.local_deferred(),
         "header_relay_error":shared.headers.error(),
         "body_download_leases":shared.headers.active_downloads(),
-        "sync_progress":shared.headers.sync_progress(),
+        "sync_progress":sync_progress,
+        "sync_progress_clock":sync_progress_clock,
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
         "ready_reason_code":ready_reason_code,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,

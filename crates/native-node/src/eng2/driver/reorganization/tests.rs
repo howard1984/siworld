@@ -539,3 +539,95 @@ fn real_native_checkpoint_archives_follow_restore_append_and_restart() {
     .unwrap();
     eprintln!("{result}");
 }
+
+fn alarm_event(depth: usize, frequent: bool) -> SwitchEvent {
+    SwitchEvent {
+        depth,
+        ancestor_height: 10,
+        old_tip: [1; 32],
+        new_tip: [2; 32],
+        frequent,
+    }
+}
+
+#[test]
+fn current_frequency_alarm_uses_four_live_switches_without_a_new_switch() {
+    let now = Instant::now();
+    let recent: VecDeque<_> = (0..4)
+        .map(|n| now - std::time::Duration::from_secs(n))
+        .collect();
+    let historical = alarm_event(1, false);
+    assert_eq!(
+        current_alarm_at(None, false, Some(historical), &recent, now),
+        Some("reorganization_frequency_exceeds_three_per_hour")
+    );
+    let expired = now + std::time::Duration::from_secs(3600);
+    assert_eq!(
+        current_alarm_at(None, false, Some(historical), &recent, expired),
+        None
+    );
+}
+
+#[test]
+fn current_frequency_alarm_expires_without_changing_historical_event() {
+    let now = Instant::now();
+    let recent: VecDeque<_> = (0..4)
+        .map(|n| now - std::time::Duration::from_secs(n))
+        .collect();
+    let historical = alarm_event(1, true);
+    let before = historical;
+    assert_eq!(
+        current_alarm_at(None, false, Some(historical), &recent, now),
+        Some("reorganization_frequency_exceeds_three_per_hour")
+    );
+    assert_eq!(
+        current_alarm_at(
+            None,
+            false,
+            Some(historical),
+            &recent,
+            now + std::time::Duration::from_secs(3600)
+        ),
+        None
+    );
+    assert_eq!(historical, before);
+    assert!(historical.frequent);
+    assert_eq!(recent.len(), 4);
+}
+
+#[test]
+fn current_frequency_alarm_boundary_excludes_exactly_one_hour_old_switch() {
+    let now = Instant::now();
+    let mut recent: VecDeque<_> = (0..3)
+        .map(|n| now - std::time::Duration::from_secs(n))
+        .collect();
+    recent.push_back(now - std::time::Duration::from_secs(3600));
+    assert_eq!(
+        current_alarm_at(None, false, Some(alarm_event(1, true)), &recent, now),
+        None
+    );
+    *recent.back_mut().unwrap() += std::time::Duration::from_nanos(1);
+    assert_eq!(
+        current_alarm_at(None, false, Some(alarm_event(1, false)), &recent, now),
+        Some("reorganization_frequency_exceeds_three_per_hour")
+    );
+}
+
+#[test]
+fn current_frequency_alarm_preserves_depth_hard_stop_and_memory_priority() {
+    let now = Instant::now();
+    let recent = VecDeque::new();
+    let last = Some(alarm_event(7, true));
+    assert_eq!(
+        current_alarm_at(None, false, last, &recent, now),
+        Some("reorganization_depth_exceeds_six")
+    );
+    assert_eq!(
+        current_alarm_at(Some(DEEP_REFUSAL), false, last, &recent, now),
+        Some(DEEP_REFUSAL)
+    );
+    assert_eq!(
+        current_alarm_at(None, true, last, &recent, now),
+        Some("reorganization_shared_byte_budget_waiting")
+    );
+}

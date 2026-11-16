@@ -50,6 +50,30 @@ pub struct SwitchEvent {
     pub frequent: bool,
 }
 
+fn current_alarm_at(
+    stopped: Option<&'static str>,
+    memory_waiting: bool,
+    last: Option<SwitchEvent>,
+    recent: &VecDeque<Instant>,
+    now: Instant,
+) -> Option<&'static str> {
+    stopped.or_else(|| {
+        if memory_waiting {
+            return Some("reorganization_shared_byte_budget_waiting");
+        }
+        if last.is_some_and(|event| event.depth > 6) {
+            return Some("reorganization_depth_exceeds_six");
+        }
+        // Keep the recorded SwitchEvent unchanged. Only the current frequency
+        // alarm expires as retained switch instants leave the rolling hour.
+        let active = recent
+            .iter()
+            .filter(|time| now.saturating_duration_since(**time).as_secs() < 3600)
+            .count();
+        (active > 3).then_some("reorganization_frequency_exceeds_three_per_hour")
+    })
+}
+
 impl Reorganization {
     fn best_candidate(&mut self) -> Result<Option<Hash>, String> {
         let revision = self.branches.selection_revision();
@@ -167,20 +191,13 @@ impl Driver {
 
     pub fn reorganization_alarm(&self) -> Option<&'static str> {
         self.reorganization.as_ref().and_then(|state| {
-            state.stopped.or_else(|| {
-                if state.memory_admission.is_waiting() {
-                    return Some("reorganization_shared_byte_budget_waiting");
-                }
-                state.last.and_then(|event| {
-                    if event.depth > 6 {
-                        Some("reorganization_depth_exceeds_six")
-                    } else if event.frequent {
-                        Some("reorganization_frequency_exceeds_three_per_hour")
-                    } else {
-                        None
-                    }
-                })
-            })
+            current_alarm_at(
+                state.stopped,
+                state.memory_admission.is_waiting(),
+                state.last,
+                &state.recent,
+                Instant::now(),
+            )
         })
     }
 
