@@ -281,6 +281,12 @@ impl Shared {
         Ok(())
     }
 }
+struct ExportState<'a> {
+    checkpoint_error: Option<&'a str>,
+    wallet_export: Option<bool>,
+    checkpoint_tick_reason: Option<&'a str>,
+    wallet_diagnostic: Option<(&'a str, Option<&'a str>)>,
+}
 fn export_status(
     directory: &Path,
     run_id: &str,
@@ -288,9 +294,14 @@ fn export_status(
     started: Instant,
     sequence: u64,
     mode: (bool, bool),
-    export_state: (Option<&str>, Option<bool>, Option<&str>),
+    export_state: ExportState<'_>,
 ) -> Result<(), String> {
-    let (checkpoint_error, wallet_export, checkpoint_tick_reason) = export_state;
+    let ExportState {
+        checkpoint_error,
+        wallet_export,
+        checkpoint_tick_reason,
+        wallet_diagnostic,
+    } = export_state;
     let (mining, listening) = mode;
     let owner = shared
         .owner
@@ -365,6 +376,8 @@ fn export_status(
     status["decoded_body_queue"] = shared.bodies.diagnostic();
     status["wallet_export_enabled"] = json!(wallet_export.is_some());
     status["wallet_export_paused"] = json!(wallet_export);
+    status["wallet_export_stage"] = json!(wallet_diagnostic.map(|v| v.0));
+    status["wallet_export_error"] = json!(wallet_diagnostic.and_then(|v| v.1));
     status["signed_bootstrap_available"] = json!(owner.bootstrap_available());
     status["checkpoint_observation_error"] = json!(
         observer
@@ -967,9 +980,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     started,
                     sequence,
                     (mining, listening),
-                    (
+                    ExportState {
                         checkpoint_error,
-                        {
+                        wallet_export: {
                             #[cfg(unix)]
                             {
                                 checkpoint_host.wallet_export_state()
@@ -980,7 +993,17 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             }
                         },
                         checkpoint_tick_reason,
-                    ),
+                        wallet_diagnostic: {
+                            #[cfg(unix)]
+                            {
+                                Some(checkpoint_host.wallet_export_diagnostic())
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                None
+                            }
+                        },
+                    },
                 )?;
                 last_export = Instant::now();
             }
@@ -1012,9 +1035,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         started,
         sequence.saturating_add(1),
         (mining, false),
-        (
+        ExportState {
             checkpoint_error,
-            {
+            wallet_export: {
                 #[cfg(unix)]
                 {
                     checkpoint_host.wallet_export_state()
@@ -1025,7 +1048,17 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                 }
             },
             checkpoint_tick_reason,
-        ),
+            wallet_diagnostic: {
+                #[cfg(unix)]
+                {
+                    Some(checkpoint_host.wallet_export_diagnostic())
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
+        },
     )?;
     result
 }

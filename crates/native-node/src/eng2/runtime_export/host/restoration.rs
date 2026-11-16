@@ -31,6 +31,8 @@ impl Host {
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
+            wallet_stage: "disabled",
+            wallet_error: None,
             retired_through: None,
             retained_head: None,
             preparation: None,

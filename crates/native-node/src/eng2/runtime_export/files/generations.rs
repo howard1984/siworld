@@ -132,45 +132,9 @@ impl Catalog {
         }
         Ok(Self { sequence, entries })
     }
-    fn staged(
-        &self,
-        height: u64,
-        tip: Hash,
-        digest: Hash,
-        now: u64,
-        committed: Option<(u64, Hash)>,
-    ) -> Result<Self, String> {
-        let mut next = self.clone();
-        next.entries
-            .retain(|e| e.expires == 0 || now < e.expires || committed == Some((e.height, e.tip)));
-        // An orphan active generation can exist after catalog/head interruption.
-        // Preserve its complete immutable data as a bounded retained pin.
-        for entry in &mut next.entries {
-            if entry.expires == 0 || committed == Some((entry.height, entry.tip)) {
-                entry.expires = now
-                    .checked_add(RETAIN_SECONDS)
-                    .filter(|v| *v < (1 << 53))
-                    .ok_or("wallet retention clock overflow")?;
-            }
-        }
-        next.entries.retain(|e| (e.height, e.tip) != (height, tip));
-        if next.entries.len() >= RETAINED_HEADS {
-            return Err("wallet retained generation catalog full".into());
-        }
-        next.entries.push(Entry {
-            height,
-            tip,
-            digest,
-            expires: 0,
-        });
-        next.sequence = next
-            .sequence
-            .checked_add(1)
-            .filter(|v| *v < (1 << 53))
-            .ok_or("wallet catalog sequence exhausted")?;
-        Ok(next)
-    }
 }
+include!("generations/retained_index.rs");
+
 struct Acquired {
     native: Option<wallet_history::Export>,
     #[cfg(test)]
@@ -234,6 +198,7 @@ pub struct WalletPublisher {
     full: Vec<Descriptor>,
     tail: Vec<Record>,
     catalog: Catalog,
+    retained: RetainedIndex,
     published: Option<(u64, Hash, u64)>,
     refresh_required: bool,
     last_now: Option<u64>,
@@ -274,7 +239,9 @@ impl WalletPublisher {
     ) -> Result<Self, String> {
         let policy = policy.check()?;
         let memory = budget
-            .reserve(4 * (wire::MAX_MANIFEST_BYTES + wire::MAX_CHUNK_BYTES))
+            .reserve(
+                4 * (wire::MAX_MANIFEST_BYTES + wire::MAX_CHUNK_BYTES) + 3 * RETAINED_INDEX_BYTES,
+            )
             .map_err(|_| "wallet publisher retained metadata memory unavailable")?;
         let descriptor = openat(
             &export.root,
@@ -361,6 +328,7 @@ impl WalletPublisher {
             .map(|bytes| Catalog::decode(&binding, &bytes))
             .transpose()?
             .unwrap_or_default();
+        let retained = RetainedIndex::read(export, &binding)?;
         let mut value = Self {
             tip: binding.genesis(),
             binding,
@@ -374,6 +342,7 @@ impl WalletPublisher {
             full: Vec::new(),
             tail: Vec::new(),
             catalog,
+            retained,
             published: None,
             refresh_required: true,
             last_now: None,
@@ -705,13 +674,21 @@ impl WalletPublisher {
         if FAIL_BEFORE_CATALOG.with(|flag| flag.replace(false)) {
             return Err("injected interruption before wallet catalog".into());
         }
-        let next = self.catalog.staged(
+        let (next, retained) = self.catalog.staged_advertisement(
+            &self.retained,
             self.height,
             self.tip,
             hash,
             now,
             self.published.map(|(height, tip, _)| (height, tip)),
         )?;
+        // Durable retention precedes cache eviction and the final head commit.
+        self.replace_metadata(
+            export,
+            RETAINED_INDEX_NAME,
+            &retained.encode(&self.binding)?,
+        )?;
+        self.retained = retained;
         // These are complete immutable dependencies, even if a later cursor
         // replacement fails. The previous advertised head remains resolvable.
         self.replace_metadata(

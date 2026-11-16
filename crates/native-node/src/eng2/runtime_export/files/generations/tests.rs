@@ -515,7 +515,7 @@ fn changed_source_prefix_and_midpublication_head_never_relabel_an_old_generation
     );
 }
 #[test]
-fn unexpired_pin_saturation_pauses_exports_and_expiry_removes_no_artifacts() {
+fn advertisement_eviction_preserves_pins_and_expiry_removes_no_artifacts() {
     let dir = Directory::new();
     let store = dir.store();
     let root = dir.private("export");
@@ -537,13 +537,10 @@ fn unexpired_pin_saturation_pauses_exports_and_expiry_removes_no_artifacts() {
     }
     let before = head(&export);
     source.height.set(5);
-    assert!(
-        publisher
-            .step(&export, &source, 1005, &budget)
-            .unwrap_err()
-            .contains("catalog full")
-    );
-    assert_eq!(head(&export), before);
+    finish(&mut publisher, &export, &source, 1005, &budget);
+    assert_ne!(head(&export), before);
+    assert_eq!(head(&export)["height"], 5);
+    assert_eq!(publisher.retained.entries.len(), 4);
     assert_eq!(publisher.catalog.entries.len(), 4);
     let artifacts: Vec<_> = fs::read_dir(&root)
         .unwrap()
@@ -551,7 +548,7 @@ fn unexpired_pin_saturation_pauses_exports_and_expiry_removes_no_artifacts() {
         .collect();
     finish(&mut publisher, &export, &source, 2000, &budget);
     assert_eq!(head(&export)["height"], 5);
-    assert_eq!(publisher.catalog.entries.len(), 2);
+    assert_eq!(publisher.catalog.entries.len(), 1);
     assert!(artifacts.iter().all(|p| p.exists()));
 }
 #[test]
@@ -1010,4 +1007,248 @@ fn paused_refresh_failures_preserve_complete_metadata_until_the_head_commits() {
             .published
     );
     assert_eq!(head(&export)["published_unix_seconds"], 1001);
+}
+
+#[test]
+fn rapid_heads_keep_current_publication_and_exact_unexpired_pins() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-index");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let source = Synthetic::new(binding(&store), 8, 300);
+    source.height.set(1);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    let mut heads = Vec::new();
+    for height in 1..=8 {
+        source.height.set(height);
+        finish(&mut publisher, &export, &source, 1000 + height, &budget);
+        heads.push(source.head());
+        assert_eq!(
+            read_complete_generation(&root, &source.binding),
+            Some(source.head())
+        );
+        assert!(publisher.catalog.entries.len() <= RETAINED_HEADS);
+    }
+    assert_eq!(publisher.retained.entries.len(), 7);
+    for &(height, tip) in &heads {
+        assert_eq!(
+            export
+                .wallet_generation_manifest(height, tip, 1008)
+                .unwrap()
+                .height,
+            height
+        );
+    }
+    let page = export
+        .wallet_generation_header_page(heads[0], 1, 128, 1008, &budget)
+        .unwrap();
+    assert_eq!(&page.as_ref()[..8], b"SWE2WHP1");
+    assert_eq!(
+        &page.as_ref()[187..],
+        source.headers[0].encode().unwrap().as_slice()
+    );
+    assert!(
+        export
+            .wallet_generation_header_page(heads[0], 1, 128, 1902, &budget)
+            .is_err()
+    );
+    assert!(
+        export
+            .wallet_generation_header_page(heads[0], 0, 128, 1008, &budget)
+            .is_err()
+    );
+    drop(page);
+    let before = publisher
+        .retained
+        .entries
+        .iter()
+        .map(|e| ((e.height, e.tip), e.expires))
+        .collect::<Vec<_>>();
+    for now in 1010..1020 {
+        publisher.invalidate_advertisement();
+        finish(&mut publisher, &export, &source, now, &budget);
+    }
+    assert_eq!(
+        before,
+        publisher
+            .retained
+            .entries
+            .iter()
+            .map(|e| ((e.height, e.tip), e.expires))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        export
+            .wallet_generation_manifest(heads[0].0, heads[0].1, 1902)
+            .is_err()
+    );
+    assert!(
+        export
+            .wallet_generation_manifest(heads[7].0, heads[7].1, 3000)
+            .is_ok()
+    );
+    drop(publisher);
+    let reopened = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    assert_eq!(reopened.retained.entries.len(), 7);
+    let path = root.join(format!(
+        "wallet-generation-{}-{}.bin",
+        heads[0].0,
+        crate::local::hex(&heads[0].1)
+    ));
+    fs::remove_file(path).unwrap();
+    assert!(
+        export
+            .wallet_generation_manifest(heads[0].0, heads[0].1, 1008)
+            .is_err()
+    );
+}
+#[test]
+fn bounded_retention_exhaustion_and_malformed_records_remain_errors() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let binding = binding(&store);
+    let index = RetainedIndex {
+        entries: (0..MAX_RETAINED_PINS)
+            .map(|i| Entry {
+                height: i as u64,
+                tip: [i as u8; 32],
+                digest: [42; 32],
+                expires: 2000,
+            })
+            .collect(),
+    };
+    let catalog = Catalog {
+        sequence: 1,
+        entries: vec![Entry {
+            height: 300,
+            tip: [43; 32],
+            digest: [44; 32],
+            expires: 0,
+        }],
+    };
+    assert_eq!(
+        catalog
+            .staged_advertisement(&index, 301, [45; 32], [46; 32], 1000, Some((300, [43; 32])))
+            .unwrap_err(),
+        "wallet retained pin index full"
+    );
+    assert_eq!(index.entries.len(), MAX_RETAINED_PINS);
+    let raw = index.encode(&binding).unwrap();
+    assert_eq!(
+        RetainedIndex::decode(&binding, &raw).unwrap().entries.len(),
+        MAX_RETAINED_PINS
+    );
+    assert!(RetainedIndex::decode(&binding, &raw[..raw.len() - 1]).is_err());
+    let mut corrupt = raw.clone();
+    corrupt[8] ^= 1;
+    assert!(RetainedIndex::decode(&binding, &corrupt).is_err());
+    let mut duplicate = index.clone();
+    duplicate.entries[1] = duplicate.entries[0].clone();
+    assert!(RetainedIndex::decode(&binding, &duplicate.encode(&binding).unwrap()).is_err());
+    let index = RetainedIndex {
+        entries: vec![Entry {
+            height: 300,
+            tip: [43; 32],
+            digest: [99; 32],
+            expires: 2000,
+        }],
+    };
+    assert!(
+        catalog
+            .staged_advertisement(&index, 301, [45; 32], [46; 32], 1000, Some((300, [43; 32])))
+            .is_err()
+    );
+}
+#[test]
+fn unchanged_head_refresh_does_not_extend_an_uncommitted_orphan() {
+    let old = Entry {
+        height: 5,
+        tip: [5; 32],
+        digest: [6; 32],
+        expires: 1500,
+    };
+    let retained = RetainedIndex {
+        entries: vec![old.clone()],
+    };
+    let catalog = Catalog {
+        sequence: 9,
+        entries: vec![
+            Entry {
+                expires: 0,
+                ..old.clone()
+            },
+            Entry {
+                height: 4,
+                tip: [4; 32],
+                digest: [3; 32],
+                expires: 1400,
+            },
+        ],
+    };
+    let (_, next) = catalog
+        .staged_advertisement(&retained, 4, [4; 32], [3; 32], 1200, Some((4, [4; 32])))
+        .unwrap();
+    assert_eq!(
+        next.entries.iter().find(|e| e.height == 5).unwrap().expires,
+        1500
+    );
+}
+
+#[test]
+fn interrupted_reactivation_preserves_the_old_unexpired_pin() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-reactivation");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let budget = p2p::Budget::new(2 * 1024 * 1024);
+    let source = Synthetic::new(binding(&store), 3, 300);
+    source.height.set(1);
+    let mut publisher = WalletPublisher::restore(
+        &export,
+        source.binding.clone(),
+        &source,
+        WalletPolicy::default(),
+        &budget,
+    )
+    .unwrap();
+    finish(&mut publisher, &export, &source, 1001, &budget);
+    let pin = source.head();
+    for height in 2..=3 {
+        source.height.set(height);
+        finish(&mut publisher, &export, &source, 1000 + height, &budget);
+    }
+    let committed = source.head();
+    publisher.invalidate_advertisement();
+    source.height.set(1);
+    FAIL_BEFORE_HEAD.with(|flag| flag.set(true));
+    assert!(publisher.step(&export, &source, 1004, &budget).is_err());
+    assert_eq!(
+        read_complete_generation(&root, &source.binding),
+        Some(committed)
+    );
+    assert!(
+        export
+            .wallet_generation_manifest(pin.0, pin.1, 1004)
+            .is_ok()
+    );
+    assert!(
+        export
+            .wallet_generation_manifest(committed.0, committed.1, 1004)
+            .is_ok()
+    );
 }

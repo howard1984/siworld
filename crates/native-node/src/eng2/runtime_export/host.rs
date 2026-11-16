@@ -298,6 +298,8 @@ pub struct Host {
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
+    wallet_stage: &'static str,
+    wallet_error: Option<&'static str>,
     retired_through: Option<u64>,
     retained_head: Option<(u64, Hash)>,
     preparation: Option<ResidentPreparation>,
@@ -337,6 +339,19 @@ impl ResidentPreparation {
             }
         }
         Ok(())
+    }
+}
+fn wallet_failure_code(error: &str) -> &'static str {
+    match error {
+        "wallet retained pin index full" => "retained_pin_capacity_exhausted",
+        "wallet artifact budget exhausted" => "artifact_budget_exhausted",
+        "wallet export metadata memory unavailable"
+        | "wallet publisher retained metadata memory unavailable" => "shared_memory_unavailable",
+        "wallet publisher unavailable" => "publisher_unavailable",
+        "wallet publication waits for retained authentication" => "retained_authentication_pending",
+        "wallet retained pin digest conflict"
+        | "wallet generation digest changed for exact head" => "generation_binding_conflict",
+        _ => "publication_failed",
     }
 }
 impl Host {
@@ -388,6 +403,8 @@ impl Host {
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
+            wallet_stage: "disabled",
+            wallet_error: None,
             retired_through: None,
             retained_head: None,
             preparation: None,
@@ -426,6 +443,8 @@ impl Host {
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
+            wallet_stage: "disabled",
+            wallet_error: None,
             retired_through: None,
             retained_head: None,
             preparation: None,
@@ -578,7 +597,16 @@ impl Host {
         }
         self.wallet_requested = true;
         self.wallet_paused = true;
-        self.wallet = Some(WalletPublisher::open(&self.export, store, policy, budget)?);
+        self.wallet_stage = "backfill";
+        self.wallet_error = None;
+        match WalletPublisher::open(&self.export, store, policy, budget) {
+            Ok(wallet) => self.wallet = Some(wallet),
+            Err(error) => {
+                self.wallet_stage = "open_error";
+                self.wallet_error = Some(wallet_failure_code(&error));
+                return Err(error);
+            }
+        }
         Ok(())
     }
     /// Called under the canonical owner lock before restoring any savepoint.
@@ -594,7 +622,13 @@ impl Host {
             wallet.invalidate_advertisement();
         }
         self.wallet_paused = self.wallet_requested;
+        if self.wallet_requested {
+            self.wallet_stage = "invalidated";
+        }
         Ok(())
+    }
+    pub fn wallet_export_diagnostic(&self) -> (&'static str, Option<&'static str>) {
+        (self.wallet_stage, self.wallet_error)
     }
     pub fn wallet_export_state(&self) -> Option<bool> {
         self.wallet_requested.then_some(self.wallet_paused)
@@ -837,6 +871,8 @@ impl Host {
         }
         if self.restore_required && !self.retained_ready {
             self.wallet_paused = true;
+            self.wallet_stage = "retained_authentication";
+            self.wallet_error = Some("retained_authentication_pending");
             return Err("wallet publication waits for retained authentication".into());
         }
         let result = self
@@ -845,6 +881,15 @@ impl Host {
             .ok_or_else(|| "wallet publisher unavailable".to_string())
             .and_then(|publisher| publisher.tick(&self.export, store, now, budget));
         self.wallet_paused = !result.as_ref().is_ok_and(|progress| progress.current);
+        self.wallet_stage = match &result {
+            Err(_) => "publication_error",
+            Ok(progress) if progress.current => "current",
+            Ok(_) => "backfill",
+        };
+        self.wallet_error = result
+            .as_ref()
+            .err()
+            .map(|error| wallet_failure_code(error));
         result.map(Some)
     }
     /// Observe public messages and publish accepted data without creating a new

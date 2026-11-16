@@ -394,3 +394,43 @@ fn wallet_open_and_restart_stay_paused_until_a_new_complete_publication() {
         serde_json::from_slice(&std::fs::read(root.join("wallet-head.json")).unwrap()).unwrap();
     assert_eq!(head["published_unix_seconds"], 1001);
 }
+
+#[test]
+fn wallet_publication_diagnostic_survives_successful_checkpoint_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-error-origin");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    let budget = crate::p2p::Budget::new(2 * 1024 * 1024);
+    assert_eq!(host.wallet_export_diagnostic(), ("disabled", None));
+    assert!(
+        host.enable_wallet_export(
+            &store,
+            WalletPolicy {
+                max_artifact_bytes: 1
+            },
+            &budget
+        )
+        .is_err()
+    );
+    assert_eq!(host.wallet_export_diagnostic().0, "open_error");
+    assert!(host.tick_wallet_export(&store, 1000, &budget).is_err());
+    let before = host.wallet_export_diagnostic().1.unwrap().to_owned();
+    assert_eq!(host.wallet_export_diagnostic().0, "publication_error");
+    host.tick(&store, 1000, &[]).unwrap();
+    assert_eq!(
+        host.wallet_export_diagnostic(),
+        ("publication_error", Some(before.as_str()))
+    );
+}
+
+#[test]
+fn public_wallet_error_codes_never_include_untrusted_runtime_details() {
+    let code: &'static str = wallet_failure_code("untrusted private runtime context");
+    assert_eq!(code, "publication_failed");
+    assert_eq!(
+        wallet_failure_code("wallet retained pin index full"),
+        "retained_pin_capacity_exhausted"
+    );
+    assert!(!code.contains("untrusted"));
+}
