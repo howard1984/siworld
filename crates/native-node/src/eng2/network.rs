@@ -374,6 +374,9 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
                 checked_head: Some(local),
             });
         }
+        if used_requests >= usize::from(limits.blocks) * 2 {
+            break;
+        }
         let next = local.0.checked_add(1).ok_or(Error::Protocol)?;
         let header = peer
             .fetch_header(sequence.next()?, next)?
@@ -399,22 +402,48 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
         if next == remote.0 && header.id().map_err(|_| Error::Protocol)? != remote.1 {
             return Err(Error::Protocol);
         }
+        // A concurrent connection may have committed this exact block while
+        // the header was in flight. Avoid fetching its body again.
+        if with_owner(owner, |o| canonical_contains(o, &header))? {
+            continue;
+        }
+        if used_requests >= usize::from(limits.blocks) * 2 {
+            break;
+        }
         let received = peer
             .fetch_body(sequence.next()?, &header)?
             .ok_or(Error::Unavailable)?;
         used_requests += 1;
         // The transport reservation stays live during full native admission.
-        #[cfg(feature = "eng2-runtime")]
-        with_owner(owner, |o| o.accept_received(&header, &received))?;
-        #[cfg(not(feature = "eng2-runtime"))]
-        with_owner(owner, |o| o.accept(&header, &received.body))?;
+        let newly_accepted = with_owner(owner, |o| {
+            // Keep the canonical recheck and native admission in the same
+            // critical section when another download wins during body I/O.
+            if canonical_contains(o, &header)? {
+                return Ok(false);
+            }
+            #[cfg(feature = "eng2-runtime")]
+            o.accept_received(&header, &received)?;
+            #[cfg(not(feature = "eng2-runtime"))]
+            o.accept(&header, &received.body)?;
+            Ok(true)
+        })?;
         drop(received);
-        accepted += 1;
+        accepted += u16::from(newly_accepted);
     }
     Ok(Pulled {
         accepted,
         checked_head: None,
     })
+}
+fn canonical_contains<O: Owner>(owner: &O, header: &Header) -> Result<bool, String> {
+    if owner.head()?.0 < header.height {
+        return Ok(false);
+    }
+    match owner.header(header.height)? {
+        Some(canonical) => Ok(canonical.id().map_err(|e| format!("{e:?}"))?
+            == header.id().map_err(|e| format!("{e:?}"))?),
+        None => Ok(false),
+    }
 }
 fn discover_fork<S: Read + Write, O: Owner>(
     peer: &mut Peer<S>,
@@ -935,6 +964,122 @@ mod tests {
             Peer::new(b, &g, policy()).unwrap(),
             budget,
         )
+    }
+    #[test]
+    fn concurrent_canonical_acceptance_before_header_response_avoids_body_download() {
+        let (mut client_peer, mut server_peer, _) = peers();
+        let client = Arc::new(Mutex::new(fixture(0)));
+        let advance = client.clone();
+        let remote = Arc::new(Mutex::new(fixture(1)));
+        let target = remote.lock().unwrap().head().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (request, message) = server_peer.receive_request().unwrap();
+            assert!(matches!(message, Request::Header { height: 1 }));
+            *advance.lock().unwrap() = fixture(1);
+            serve(&mut server_peer, &remote, request, message).unwrap();
+            // No body frame is provided. The independently committed exact
+            // canonical header must make another body fetch unnecessary.
+        });
+        let result = pull(
+            &mut client_peer,
+            &client,
+            &mut Sequence::default(),
+            target,
+            Limits::default(),
+        );
+        worker.join().unwrap();
+        let result = result.expect("the exact canonical block is already committed");
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.checked_head, Some(target));
+        assert_eq!(client.lock().unwrap().blocks.len(), 1);
+    }
+    #[test]
+    fn concurrent_canonical_acceptance_during_body_response_preserves_the_round() {
+        let (mut client_peer, mut server_peer, _) = peers();
+        let client = Arc::new(Mutex::new(fixture(0)));
+        let advance = client.clone();
+        let remote = Arc::new(Mutex::new(fixture(1)));
+        let target = remote.lock().unwrap().head().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (request, message) = server_peer.receive_request().unwrap();
+            assert!(matches!(message, Request::Header { height: 1 }));
+            serve(&mut server_peer, &remote, request, message).unwrap();
+            let (request, message) = server_peer.receive_request().unwrap();
+            assert!(matches!(message, Request::Body { height: 1, .. }));
+            *advance.lock().unwrap() = fixture(1);
+            serve(&mut server_peer, &remote, request, message).unwrap();
+        });
+        let result = pull(
+            &mut client_peer,
+            &client,
+            &mut Sequence::default(),
+            target,
+            Limits::default(),
+        );
+        worker.join().unwrap();
+        let result = result.expect("a competing successful download is not a peer failure");
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.checked_head, Some(target));
+        assert_eq!(client.lock().unwrap().blocks.len(), 1);
+    }
+    #[test]
+    fn concurrent_conflicting_head_does_not_make_a_downloaded_block_canonical() {
+        let (mut client_peer, mut server_peer, _) = peers();
+        let client = Arc::new(Mutex::new(fixture(0)));
+        let advance = client.clone();
+        let remote = Arc::new(Mutex::new(fixture(1)));
+        let target = remote.lock().unwrap().head().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (request, message) = server_peer.receive_request().unwrap();
+            serve(&mut server_peer, &remote, request, message).unwrap();
+            let (request, message) = server_peer.receive_request().unwrap();
+            assert!(matches!(message, Request::Body { height: 1, .. }));
+            let mut competing = fixture(1);
+            competing.blocks[0].0.nonce += 1;
+            *advance.lock().unwrap() = competing;
+            serve(&mut server_peer, &remote, request, message).unwrap();
+        });
+        let result = pull(
+            &mut client_peer,
+            &client,
+            &mut Sequence::default(),
+            target,
+            Limits::default(),
+        );
+        worker.join().unwrap();
+        assert!(matches!(result, Err(Error::Owner(_))));
+        assert_ne!(client.lock().unwrap().head().unwrap(), target);
+        assert_eq!(client.lock().unwrap().blocks.len(), 1);
+    }
+    #[test]
+    fn concurrent_canonical_advances_preserve_the_round_request_limit() {
+        let (mut client_peer, mut server_peer, _) = peers();
+        let client = Arc::new(Mutex::new(fixture(0)));
+        let advance = client.clone();
+        let remote = Arc::new(Mutex::new(fixture(3)));
+        let target = remote.lock().unwrap().head().unwrap();
+        let worker = std::thread::spawn(move || {
+            for height in 1..=2 {
+                let (request, message) = server_peer.receive_request().unwrap();
+                assert!(matches!(message, Request::Header { height: h } if h == height));
+                *advance.lock().unwrap() = fixture(height);
+                serve(&mut server_peer, &remote, request, message).unwrap();
+            }
+            // A one-block pull has at most two header/body requests, even
+            // when another connection commits every requested block.
+        });
+        let result = pull(
+            &mut client_peer,
+            &client,
+            &mut Sequence::default(),
+            target,
+            Limits { blocks: 1 },
+        );
+        worker.join().unwrap();
+        let result = result.expect("concurrent advances must not exhaust the transport");
+        assert_eq!(result.accepted, 0);
+        assert_eq!(result.checked_head, None);
+        assert_eq!(client.lock().unwrap().head().unwrap().0, 2);
     }
     fn rounds(client_count: u64, server_count: u64) -> (Round, Round) {
         let (mut a, mut b, budget) = peers();

@@ -152,8 +152,8 @@ impl Discovery {
         if headers_only {
             return Ok(DiscoveryAction::Ready);
         }
-        // Raw bodies are acquired one at a time. No canonical state changes or
-        // native-validity marks occur here, even when every body is retained.
+        // Request raw bodies in path order, allowing bounded source overlap.
+        // Retention never changes canonical state or marks native validity.
         for header in path {
             let id = header
                 .id()

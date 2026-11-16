@@ -13,6 +13,8 @@ use std::{
 pub mod runtime;
 
 static NEXT_LEDGER: AtomicU64 = AtomicU64::new(1);
+const BODY_HEDGE_DELAY_MS: u64 = 30_000;
+const MAXIMUM_PENDING_BODIES: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -89,8 +91,15 @@ struct Candidate {
     seen: BTreeSet<Hash>,
     attempted_peers: BTreeSet<Hash>,
     pending: Option<u64>,
+    pending_bodies: BTreeMap<u64, PendingBody>,
     body_attempts: BTreeMap<Hash, BTreeSet<Hash>>,
     received_bodies: BTreeSet<Hash>,
+}
+#[derive(Debug)]
+struct PendingBody {
+    id: Hash,
+    peer: Hash,
+    started_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +241,7 @@ impl Ledger {
                 seen: BTreeSet::new(),
                 attempted_peers: BTreeSet::new(),
                 pending: None,
+                pending_bodies: BTreeMap::new(),
                 body_attempts: BTreeMap::new(),
                 received_bodies: BTreeSet::new(),
             },
@@ -264,7 +274,7 @@ impl Ledger {
             return Err(Error::AncestorMismatch);
         }
         let entry = self.candidates.get_mut(&candidate).unwrap();
-        if entry.pending.is_some() {
+        if entry.pending.is_some() || !entry.pending_bodies.is_empty() {
             return Err(Error::InFlight);
         }
         entry.cursor.ancestor_confirmed = true;
@@ -287,7 +297,7 @@ impl Ledger {
             return Err(Error::AncestorMismatch);
         }
         let entry = self.candidates.get(&candidate).unwrap();
-        if entry.pending.is_some() {
+        if entry.pending.is_some() || !entry.pending_bodies.is_empty() {
             return Err(Error::InFlight);
         }
         if entry.attempted_peers.contains(&peer) {
@@ -317,8 +327,9 @@ impl Ledger {
             body: false,
         })
     }
-    /// Body requests consume the same node-wide request and peer caps. A
-    /// successful body is never requested twice inside this candidate window.
+    /// Body requests retain the node-wide request, peer and byte caps. After a
+    /// bounded wait a second source may run, with at most two live body tickets
+    /// per candidate. Retention prevents new requests, not late completions.
     pub fn request_body(
         &mut self,
         candidate: Hash,
@@ -336,6 +347,17 @@ impl Ledger {
         }
         if entry.received_bodies.contains(&id) {
             return Err(Error::Complete);
+        }
+        if entry.pending_bodies.len() >= MAXIMUM_PENDING_BODIES
+            || entry
+                .pending_bodies
+                .values()
+                .filter(|pending| pending.id == id)
+                .map(|pending| pending.started_ms)
+                .min()
+                .is_some_and(|started| now_ms - started < BODY_HEDGE_DELAY_MS)
+        {
+            return Err(Error::InFlight);
         }
         let header = entry
             .descending
@@ -358,7 +380,14 @@ impl Ledger {
         self.peers.insert(peer);
         let entry = self.candidates.get_mut(&candidate).unwrap();
         entry.body_attempts.entry(id).or_default().insert(peer);
-        entry.pending = Some(self.requests);
+        entry.pending_bodies.insert(
+            self.requests,
+            PendingBody {
+                id,
+                peer,
+                started_ms: now_ms,
+            },
+        );
         Ok(HeaderRequest {
             ledger: self.identity,
             sequence: self.requests,
@@ -399,10 +428,22 @@ impl Ledger {
                 && entry.cursor.id == request.id
                 && entry.attempted_peers.contains(&request.peer)
         };
-        if entry.pending != Some(request.sequence) || !identity_matches {
+        let pending_matches = if request.body {
+            entry
+                .pending_bodies
+                .get(&request.sequence)
+                .is_some_and(|pending| pending.id == request.id && pending.peer == request.peer)
+        } else {
+            entry.pending == Some(request.sequence)
+        };
+        if !pending_matches || !identity_matches {
             return Err(Error::StaleRequest);
         }
-        entry.pending = None;
+        if request.body {
+            entry.pending_bodies.remove(&request.sequence);
+        } else {
+            entry.pending = None;
+        }
         Ok((request.candidate, entry.cursor))
     }
     /// Transport failure or a missing answer consumes the attempt but leaves
@@ -458,7 +499,7 @@ impl Ledger {
     ) -> Result<Cursor, Error> {
         let cursor = self.cursor(candidate, now_ms)?;
         let entry = self.candidates.get(&candidate).unwrap();
-        if entry.pending.is_some() {
+        if entry.pending.is_some() || !entry.pending_bodies.is_empty() {
             return Err(Error::InFlight);
         }
         if cursor.ancestor_confirmed {

@@ -167,3 +167,122 @@ fn owner_state_machine_discovers_all_raw_materials_without_canonical_adoption() 
     assert_eq!(discovery.usage().requests, 6);
     assert_eq!(discovery.usage().headers, 3);
 }
+
+#[test]
+fn delayed_body_alternative_completes_raw_path_while_primary_is_pending() {
+    let fixture = super::super::super::tests::Fixture::new();
+    let bootstrap = crate::eng2::snapshot::tests::bootstrap();
+    let genesis = Genesis::seal(
+        bootstrap.chain.config.clone(),
+        bootstrap.governance.clone(),
+        FeeMode::LegacyMiner,
+    )
+    .unwrap();
+    let canonical = Store::create(
+        &fixture.0.join("canonical.redb"),
+        Genesis::decode(&genesis.encode().unwrap()).unwrap(),
+        state_components::Limits {
+            max_leaves: 1_000_000,
+            max_nullifiers: 1_000_000,
+            max_component_bytes: 64 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let policy = canonical.engine().body_policy();
+    let mut branches = BranchStore::create(
+        &fixture.path(),
+        crate::eng2::selection::HeaderRules {
+            network: genesis.config().network,
+            genesis: genesis.id(),
+            genesis_timestamp: genesis.config().genesis_timestamp,
+            genesis_target: genesis.config().genesis_target,
+            target_interval: 300,
+            pow_iterations: 0,
+            max_headers: 128,
+        },
+        crate::eng2::branches::Limits {
+            maximum_headers: 128,
+            maximum_body_bytes: 64 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let mut body = crate::eng2::body::tests::body();
+    body.network = genesis.config().network;
+    body.profile = policy.profile;
+    body.height = 1;
+    body.governance.clear();
+    body.fund_claims.clear();
+    body.transactions
+        .sort_by_key(|tx| tx.record.statement_id(&body.network));
+    let header = Header {
+        network: body.network,
+        height: 1,
+        parent: genesis.id(),
+        timestamp: genesis.config().genesis_timestamp + 300,
+        target: genesis.config().genesis_target,
+        execution_commitment: [4; 32],
+        body_commitment: body.commitment(policy).unwrap(),
+        nonce: 0,
+    };
+    let mut discovery = Discovery::new(
+        genesis.config().network,
+        genesis.id(),
+        Limits {
+            maximum_candidates: 4,
+            maximum_peers: 3,
+            maximum_requests: 32,
+            maximum_headers: 32,
+            maximum_body_bytes: 64 * 1024 * 1024,
+            maximum_headers_per_candidate: 32,
+            maximum_attempts_per_header: 2,
+            candidate_lifetime_ms: 120_000,
+            window_ms: 240_000,
+        },
+        10,
+    )
+    .unwrap();
+    let remote = (1, header.id().unwrap());
+    let DiscoveryAction::Header(request) = discovery
+        .next(&mut branches, &canonical, remote, [9; 32], 11)
+        .unwrap()
+    else {
+        panic!("exact header expected")
+    };
+    discovery
+        .received(request, Some(header.clone()), 12)
+        .unwrap();
+    let DiscoveryAction::Body { request: slow, .. } = discovery
+        .next(&mut branches, &canonical, remote, [9; 32], 14)
+        .unwrap()
+    else {
+        panic!("primary raw-body request expected")
+    };
+    let DiscoveryAction::Body { request: fast, .. } = discovery
+        .next(&mut branches, &canonical, remote, [8; 32], 30_014)
+        .unwrap()
+    else {
+        panic!("delayed alternative must not wait for the primary deadline")
+    };
+    discovery
+        .body(&mut branches, fast, &header, &body, policy, 30_015)
+        .unwrap();
+    assert!(matches!(
+        discovery
+            .next(&mut branches, &canonical, remote, [7; 32], 30_016)
+            .unwrap(),
+        DiscoveryAction::Ready
+    ));
+    discovery
+        .body(&mut branches, slow, &header, &body, policy, 30_017)
+        .unwrap();
+    assert_eq!(canonical.engine().state().height(), 0);
+    assert_eq!(
+        branches.body_size(header.id().unwrap()).unwrap(),
+        Some(body.encoded_len(policy).unwrap())
+    );
+    assert_eq!(
+        discovery.usage().body_bytes,
+        2 * body.encoded_len(policy).unwrap() as u64
+    );
+    assert_eq!(discovery.usage().requests, 3);
+}

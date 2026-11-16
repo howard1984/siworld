@@ -35,6 +35,115 @@ fn chain(count: u64) -> Vec<Header> {
         })
         .collect()
 }
+fn body_hedge_fixture(count: u64) -> (Ledger, Vec<Header>, Hash) {
+    let headers = chain(count);
+    let tip = headers.last().unwrap().id().unwrap();
+    let mut bounds = limits();
+    bounds.maximum_peers = 4;
+    bounds.maximum_attempts_per_header = 4;
+    bounds.candidate_lifetime_ms = 120_000;
+    bounds.window_ms = 240_000;
+    let mut ledger = Ledger::new([1; 32], [2; 32], bounds, 10).unwrap();
+    ledger.begin(count, tip, 10).unwrap();
+    for (index, header) in headers.iter().rev().enumerate() {
+        let now = 11 + index as u64;
+        let request = ledger.request(tip, [10; 32], now).unwrap();
+        ledger.receive(request, header.clone(), now).unwrap();
+    }
+    (ledger, headers, tip)
+}
+#[test]
+fn body_hedge_allows_a_second_source_after_bounded_primary_wait() {
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    let slow = ledger.request_body(tip, tip, [10; 32], 20).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [11; 32], 30_019).unwrap_err(),
+        Error::InFlight
+    );
+    let fast = ledger
+        .request_body(tip, tip, [11; 32], 30_020)
+        .expect("one slow body source must not exclude a bounded delayed alternative");
+    ledger.body_retained(fast, 100, 30_021).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [12; 32], 30_022).unwrap_err(),
+        Error::Complete
+    );
+    ledger.defer(slow, 30_023).unwrap();
+    assert_eq!(ledger.usage().requests, 3);
+    assert_eq!(ledger.usage().body_bytes, 100);
+}
+#[test]
+fn body_hedge_late_completion_does_not_consume_the_next_body_ticket() {
+    let (mut ledger, headers, tip) = body_hedge_fixture(2);
+    let first_id = headers[0].id().unwrap();
+    let slow = ledger.request_body(tip, first_id, [10; 32], 20).unwrap();
+    let fast = ledger
+        .request_body(tip, first_id, [11; 32], 30_020)
+        .unwrap();
+    ledger.body_retained(fast, 100, 30_021).unwrap();
+    let next = ledger.request_body(tip, tip, [12; 32], 30_022).unwrap();
+    ledger.body_retained(slow, 100, 30_023).unwrap();
+    ledger.body_retained(next, 200, 30_024).unwrap();
+    assert_eq!(ledger.usage().requests, 5);
+    // Count both completed transfers, including the late duplicate, within
+    // the original node-wide byte budget.
+    assert_eq!(ledger.usage().body_bytes, 400);
+}
+#[test]
+fn body_hedge_keeps_concurrency_attempt_and_expiry_bounds() {
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    let slow = ledger.request_body(tip, tip, [10; 32], 20).unwrap();
+    let second = ledger.request_body(tip, tip, [11; 32], 30_020).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [12; 32], 30_021).unwrap_err(),
+        Error::InFlight
+    );
+    assert_eq!(ledger.usage().requests, 3);
+    ledger.defer(second, 30_022).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [11; 32], 30_023).unwrap_err(),
+        Error::DuplicatePeer
+    );
+    let third = ledger.request_body(tip, tip, [12; 32], 30_024).unwrap();
+    ledger.defer(third, 30_025).unwrap();
+    let fourth = ledger.request_body(tip, tip, [13; 32], 30_026).unwrap();
+    ledger.defer(fourth, 30_027).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [14; 32], 30_028).unwrap_err(),
+        Error::Capacity
+    );
+    assert_eq!(ledger.usage().requests, 5);
+    assert_eq!(ledger.defer(slow, 120_010).unwrap_err(), Error::Expired);
+    assert_eq!(ledger.usage().requests, 5);
+}
+#[test]
+fn body_hedge_cannot_refund_request_or_completed_transfer_byte_budgets() {
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    ledger.limits.maximum_requests = 2;
+    let slow = ledger.request_body(tip, tip, [10; 32], 20).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [11; 32], 30_020).unwrap_err(),
+        Error::Capacity
+    );
+    ledger.defer(slow, 30_021).unwrap();
+    assert_eq!(
+        ledger.request_body(tip, tip, [12; 32], 30_022).unwrap_err(),
+        Error::Capacity
+    );
+    assert_eq!(ledger.usage().requests, 2);
+
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    ledger.limits.maximum_body_bytes = 150;
+    let slow = ledger.request_body(tip, tip, [10; 32], 20).unwrap();
+    let fast = ledger.request_body(tip, tip, [11; 32], 30_020).unwrap();
+    ledger.body_retained(fast, 100, 30_021).unwrap();
+    assert_eq!(
+        ledger.body_retained(slow, 100, 30_022).unwrap_err(),
+        Error::Capacity
+    );
+    assert_eq!(ledger.usage().body_bytes, 100);
+    assert_eq!(ledger.remaining_body_bytes(), 50);
+}
 #[test]
 fn thirty_block_replacement_is_independent_of_twenty_four_block_rollback() {
     let headers = chain(30);
