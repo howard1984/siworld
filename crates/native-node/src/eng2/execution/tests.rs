@@ -453,3 +453,48 @@ fn legacy_engine_rejects_profile_fee_output_and_native_proof_substitution_atomic
     assert_eq!(engine.state().fund, initial.fund);
     assert_eq!(engine.state().governance, initial.governance);
 }
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn exact_transaction_receipts_never_skip_native_settlement_or_state_validation() {
+    let engine = candidate_engine();
+    let verifier = NativeVerifier::for_genesis(engine.genesis()).unwrap();
+    let before = engine.state().chain().fingerprint();
+    let (mut header, mut body) = fixture(engine.state());
+    body.profile = engine.body_policy().profile;
+    body.fee_output = legacy_fee_output();
+    header.body_commitment = body.commitment(engine.body_policy()).unwrap();
+    let receipts = super::super::native_pipeline::final_gate_test_receipts(&engine, &header, &body);
+    // All transaction crypto checks have test-only receipts. The malformed
+    // settlement must still pass through the unchanged actual native decoder.
+    let error = engine
+        .stage_diagnosed_with_receipts(&header, &body, &verifier, Some(&receipts))
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.commit(),
+        super::super::accept_observation::CommitKnowledge::NotReached
+    );
+    assert!(error.into_original().contains("proof"));
+    assert_eq!(engine.state().chain().fingerprint(), before);
+    assert_eq!(engine.state().height(), 0);
+
+    // Even matching transaction receipts cannot bypass state uniqueness. Build
+    // both receipt and body with the same duplicate nullifiers on purpose.
+    let first_public =
+        native::codec::PublicTransaction::decode(&body.transactions[0].record.body).unwrap();
+    let mut second_public =
+        native::codec::PublicTransaction::decode(&body.transactions[1].record.body).unwrap();
+    second_public.nf = first_public.nf;
+    body.transactions[1].record.body = second_public.encode();
+    body.transactions
+        .sort_by_key(|transaction| transaction.record.statement_id(&body.network));
+    header.body_commitment = body.commitment(engine.body_policy()).unwrap();
+    let receipts = super::super::native_pipeline::final_gate_test_receipts(&engine, &header, &body);
+    let error = engine
+        .stage_diagnosed_with_receipts(&header, &body, &verifier, Some(&receipts))
+        .err()
+        .unwrap();
+    assert!(error.into_original().contains("nullifier already used"));
+    assert_eq!(engine.state().chain().fingerprint(), before);
+}

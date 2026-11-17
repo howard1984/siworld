@@ -359,3 +359,69 @@ fn optional_body_attempts_retain_actual_edges_and_failure_without_claiming_accep
     );
     assert_eq!(recorder.diagnostic()["dropped_events"], 0);
 }
+
+#[test]
+fn piece_source_failure_and_completion_preserve_counters_under_the_original_record_cap() {
+    use crate::eng2::propagation::pipeline::SourceBytes;
+    let directory = Directory::new();
+    let mut recorder = directory.recorder();
+    recorder.binding.source = Some("a".repeat(40));
+    recorder.state.lock().unwrap().sequence = u64::MAX - 3;
+    let edge = recorder.started + std::time::Duration::from_secs(3600);
+    let timing = FetchTiming {
+        attempt: u64::MAX,
+        start: Some(edge),
+        body_start: Some(edge),
+        chunks_end: Some(edge),
+        decoded: Some(edge),
+        end: Some(edge),
+        ..Default::default()
+    };
+    let source = SourceBytes {
+        peer: [255; 32],
+        requested: u64::MAX,
+        queries: u64::MAX,
+        received: u64::MAX,
+        sent: u64::MAX,
+        reserved_wire: u64::MAX,
+        bad_pieces: u64::MAX,
+        failures: u64::MAX,
+    };
+    for outcome in ["incomplete_or_cancelled", "authenticated_body_decoded"] {
+        recorder.record(
+            Kind::PieceSource {
+                source,
+                timing,
+                outcome,
+            },
+            u64::MAX,
+            Some([255; 32]),
+            Some(u64::MAX),
+            u128::MAX.to_string(),
+        );
+    }
+    let records = directory.records();
+    assert_eq!(records.len(), 3, "{:?}", recorder.diagnostic());
+    assert_ne!(
+        records[1]["deduplication_key"],
+        records[2]["deduplication_key"]
+    );
+    for record in &records[1..] {
+        assert!(serde_json::to_vec(record).unwrap().len() < RECORD_BYTES);
+        assert_eq!(
+            record["source_counters"]["received_application_bytes"],
+            u64::MAX
+        );
+        assert_eq!(record["source_counters"]["queries"], u64::MAX);
+        assert_eq!(record["native_acceptance_implied"], false);
+        assert_eq!(record["transfer_times_ns"]["body"], "3600000000000");
+        assert!(
+            !record
+                .as_object()
+                .unwrap()
+                .keys()
+                .any(|key| key.contains("endpoint") || key.contains("transaction"))
+        );
+    }
+    assert_eq!(recorder.diagnostic()["dropped_events"], 0);
+}

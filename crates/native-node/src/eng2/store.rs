@@ -1071,12 +1071,13 @@ impl Store {
         self.append_staged(header, body, staged)
     }
     #[cfg(feature = "eng2-runtime")]
-    pub(super) fn append_diagnosed(
+    pub(super) fn append_diagnosed_with_receipts(
         &mut self,
         header: &Header,
         body: &Body,
         verifier: &NativeVerifier,
         timing: &mut super::accept_observation::ValidationTiming,
+        receipts: Option<&super::native_pipeline::CandidateReceipts>,
     ) -> Result<CommittedBlock, super::accept_observation::Failure> {
         use super::accept_observation::{CommitKnowledge, Failure, OtherClass, Phase};
         if !self.usable {
@@ -1089,7 +1090,9 @@ impl Store {
         }
         // Every actual native verifier rejection precedes the write transaction.
         timing.start = Some(std::time::Instant::now());
-        let staged = self.engine.stage_diagnosed(header, body, verifier);
+        let staged = self
+            .engine
+            .stage_diagnosed_with_receipts(header, body, verifier, receipts);
         timing.end = Some(std::time::Instant::now());
         let staged = staged?;
         // This unchanged writer may fail before or after the durable commit.

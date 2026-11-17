@@ -100,7 +100,9 @@ pub struct Driver {
     #[cfg(feature = "eng2-runtime")]
     historical_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     store: Store,
-    verifier: NativeVerifier,
+    verifier: std::sync::Arc<NativeVerifier>,
+    #[cfg(feature = "eng2-runtime")]
+    verification_invalidated: std::sync::Arc<std::sync::atomic::AtomicBool>,
     padding: Pool,
     pending: Mempool,
     imports: ImportLimits,
@@ -108,6 +110,7 @@ pub struct Driver {
     bootstrap: super::bootstrap::leases::Registry,
     bootstrap_receipt_height: u64,
     reorganization: Option<reorganization::Reorganization>,
+    forward_discovery: Option<super::branches::discovery::runtime::Discovery>,
     template_generation: u64,
     #[cfg(feature = "eng2-runtime")]
     header_hub: Option<std::sync::Arc<super::resident::header_lane::Hub>>,
@@ -132,12 +135,17 @@ impl Driver {
             padding: Pool::new(store.engine().state().network()),
             pending: pending_pool(store.engine().state().network())?,
             store,
-            verifier,
+            verifier: std::sync::Arc::new(verifier),
+            #[cfg(feature = "eng2-runtime")]
+            verification_invalidated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             imports,
             last_archive_error: None,
             bootstrap: super::bootstrap::leases::Registry::default(),
             bootstrap_receipt_height: 0,
             reorganization: None,
+            forward_discovery: None,
             template_generation: 0,
             #[cfg(feature = "eng2-runtime")]
             header_hub: None,
@@ -150,6 +158,9 @@ impl Driver {
         &mut self,
         hub: std::sync::Arc<super::resident::header_lane::Hub>,
     ) {
+        if let Some(state) = &mut self.reorganization {
+            state.progress_hub = Some(std::sync::Arc::downgrade(&hub));
+        }
         self.header_hub = Some(hub);
     }
     fn ensure_activities_allowed(&self) -> Result<(), String> {
@@ -232,6 +243,27 @@ impl Driver {
             .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
         self.bootstrap.body_pins(now)
     }
+    #[cfg(feature = "eng2-runtime")]
+    fn invalidate_verification(&mut self) {
+        self.verification_invalidated
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.verification_invalidated =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn capture_verification(
+        &self,
+        budget: &crate::p2p::Budget,
+    ) -> Result<super::native_pipeline::Capture, super::native_pipeline::Error> {
+        self.check_forward_admission()
+            .map_err(|_| super::native_pipeline::Error::Context)?;
+        super::native_pipeline::Capture::new(
+            self.store.engine(),
+            std::sync::Arc::clone(&self.verifier),
+            budget,
+            std::sync::Arc::clone(&self.verification_invalidated),
+        )
+    }
     pub fn engine(&self) -> &Engine {
         self.store.engine()
     }
@@ -278,7 +310,7 @@ impl Driver {
         #[cfg(not(feature = "eng2-runtime"))]
         {
             self.check_forward_admission()?;
-            let committed = match self.store.append(header, body, &self.verifier) {
+            let committed = match self.store.append(header, body, self.verifier.as_ref()) {
                 Ok(committed) => committed,
                 Err(original) => return Err(self.after_append_error(original)),
             };
@@ -297,10 +329,12 @@ impl Driver {
         self.store.ensure_exportable()
     }
     fn after_append_error(&mut self, original: String) -> String {
+        #[cfg(feature = "eng2-runtime")]
+        self.invalidate_verification();
         if self.store.ensure_exportable().is_err()
             && let Some(state) = &mut self.reorganization
         {
-            state.stopped = Some("reorganization_canonical_store_unavailable");
+            state.stop("reorganization_canonical_store_unavailable");
         }
         original
     }
@@ -311,13 +345,30 @@ impl Driver {
         body: &Body,
         frame: Option<super::accept_observation::FrameIdentity>,
     ) -> Result<CommittedBlock, String> {
+        self.accept_observed_with_receipts(header, body, frame, None)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn accept_observed_with_receipts(
+        &mut self,
+        header: &Header,
+        body: &Body,
+        frame: Option<super::accept_observation::FrameIdentity>,
+        receipts: Option<&super::native_pipeline::CandidateReceipts>,
+    ) -> Result<CommittedBlock, String> {
         self.check_forward_admission()?;
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(hub) = &self.header_hub {
+            hub.invalidate_progress_context();
+        }
         let attempt = frame.and_then(|frame| self.accept_observation.begin(header, Some(frame)));
         let mut timing = super::accept_observation::ValidationTiming::default();
-        let committed = match self
-            .store
-            .append_diagnosed(header, body, &self.verifier, &mut timing)
-        {
+        let committed = match self.store.append_diagnosed_with_receipts(
+            header,
+            body,
+            self.verifier.as_ref(),
+            &mut timing,
+            receipts,
+        ) {
             Ok(committed) => committed,
             Err(failure) => {
                 // Observe this actual typed rejection before returning the same
@@ -371,6 +422,8 @@ impl Driver {
         body: &Body,
         committed: CommittedBlock,
     ) -> Result<CommittedBlock, String> {
+        #[cfg(feature = "eng2-runtime")]
+        self.invalidate_verification();
         if let Some(state) = &mut self.reorganization
             && let Err(error) = state.branches.retain_committed(
                 header,
@@ -381,7 +434,7 @@ impl Driver {
         {
             // Canonical commit already succeeded. Preserve that fact and
             // stop production instead of reporting the block uncommitted.
-            state.stopped = Some("reorganization_committed_archive_failed");
+            state.stop("reorganization_committed_archive_failed");
             self.last_archive_error = Some(error);
         }
         // The pool is created for this immutable network, so pruning cannot
@@ -404,9 +457,19 @@ impl Driver {
             });
         #[cfg(feature = "eng2-runtime")]
         if let Some(hub) = &self.header_hub {
-            hub.after_commit(|| hub.committed(self));
+            hub.after_commit(|| {
+                hub.accepted_body(header)?;
+                hub.committed(self)
+            });
         }
         Ok(committed)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn body_scope(&self) -> Result<crate::p2p::BodyScope, String> {
+        self.reorganization
+            .as_ref()
+            .map(|s| s.discovery.body_scope())
+            .ok_or("body lifecycle owner unavailable".into())
     }
     pub fn last_archive_error(&self) -> Option<&str> {
         self.last_archive_error.as_deref()
@@ -486,7 +549,7 @@ impl Driver {
                 envelope,
                 Some(&packet[4 + length..]),
                 &TimedAdmission {
-                    verifier: &self.verifier,
+                    verifier: self.verifier.as_ref(),
                     deadline,
                 },
             )
@@ -530,8 +593,11 @@ impl Driver {
     pub fn insert_padding(&mut self, padding: Padding) -> Result<(), String> {
         self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
-        self.padding
-            .insert(self.store.engine().state().chain(), padding, &self.verifier)
+        self.padding.insert(
+            self.store.engine().state().chain(),
+            padding,
+            self.verifier.as_ref(),
+        )
     }
     pub fn prepare_block(
         &mut self,
@@ -575,11 +641,101 @@ impl Driver {
     pub fn prepare_work(&self, proved: ProvedBlock) -> Result<Work, String> {
         self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
-        proved.prepare_work(self.store.engine(), &self.verifier)
+        proved.prepare_work(self.store.engine(), self.verifier.as_ref())
     }
 }
 
 impl super::network::Owner for Driver {
+    fn authorize_body(
+        &mut self,
+        header: &Header,
+        budget: &crate::p2p::Budget,
+        peer_binding: crate::p2p::Binding,
+        expires: std::time::Instant,
+    ) -> Result<Option<crate::p2p::BodyAuthorization>, String> {
+        use siworld_core::pow;
+        self.store.ensure_exportable()?;
+        let binding = self.store.engine().genesis().peer_binding();
+        if peer_binding != binding || header.network != binding.network || header.height == 0 {
+            return Err("body authorization immutable context differs".into());
+        }
+        let id = header.id().map_err(|_| "body identity rejected")?;
+        let state = self.store.engine().state();
+        if header.height <= state.height()
+            && self
+                .store
+                .header(header.height)?
+                .id()
+                .map_err(|_| "canonical identity unavailable")?
+                == id
+        {
+            return Ok(None);
+        }
+        if state.height().checked_add(1) != Some(header.height)
+            || header.parent != state.tip()
+            || header.timestamp <= state.chain().median_time_past()
+            || header.target != state.chain().next_target()
+            || !pow::meets_target(
+                &pow::pow_hash(
+                    &header.pow_seed().map_err(|_| "body header seed rejected")?,
+                    header.nonce,
+                    self.store.engine().genesis().config().pow_iterations,
+                ),
+                &header.target,
+            )
+        {
+            return Err("body forward header qualification rejected".into());
+        }
+        let now_ms = super::network::discovery_now_ms();
+        let discovery = if let Some(reorganization) = &mut self.reorganization {
+            if reorganization
+                .branches
+                .entry(id)?
+                .is_some_and(|entry| entry.status == super::branches::Status::Invalid)
+            {
+                return Err("body header is durably invalid".into());
+            }
+            &mut reorganization.discovery
+        } else {
+            if self.forward_discovery.is_none() {
+                self.forward_discovery = Some(
+                    super::branches::discovery::runtime::Discovery::new(
+                        binding.network,
+                        binding.genesis,
+                        super::branches::discovery::runtime::resident_limits(),
+                        now_ms,
+                        budget.clone(),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+            }
+            self.forward_discovery
+                .as_mut()
+                .ok_or("forward body owner unavailable")?
+        };
+        discovery.renew_body_window(now_ms)?;
+        let now = std::time::Instant::now();
+        let deadline = crate::p2p::Deadline::from_started(
+            now,
+            expires.saturating_duration_since(now),
+            crate::p2p::Cancellation::default(),
+        );
+        match budget.authorize_body(
+            &discovery.body_scope(),
+            binding,
+            header.height,
+            id,
+            &deadline,
+        ) {
+            Ok(authorization) => Ok(Some(authorization)),
+            Err(
+                crate::p2p::BodyClaimError::Capacity
+                | crate::p2p::BodyClaimError::Expired
+                | crate::p2p::BodyClaimError::QueryLimit,
+            ) => Ok(None),
+            Err(_) => Err("body owner authorization unavailable".into()),
+        }
+    }
     fn exact_exchange_enabled(&self) -> bool {
         self.reorganization.is_some()
     }
@@ -740,13 +896,30 @@ impl super::network::Owner for Driver {
         Driver::accept(self, header, body).map(|_| ())
     }
     #[cfg(feature = "eng2-runtime")]
+    fn body_progress(
+        &self,
+        header: &Header,
+        peer: Hash,
+        claim: &crate::p2p::BodyClaim,
+    ) -> Result<Option<super::network::BodyProgress>, String> {
+        Ok(self
+            .header_hub
+            .as_ref()
+            .and_then(|hub| hub.observe_body(header, peer, claim)))
+    }
+    #[cfg(feature = "eng2-runtime")]
     fn accept_received(
         &mut self,
         header: &Header,
         received: &super::transport::ReceivedBody,
     ) -> Result<(), String> {
-        self.accept_observed(header, &received.body, received.observation)
-            .map(|_| ())
+        self.accept_observed_with_receipts(
+            header,
+            &received.body,
+            received.observation,
+            received.receipts.as_ref(),
+        )
+        .map(|_| ())
     }
 }
 
@@ -852,6 +1025,148 @@ mod tests {
             assert_eq!(pool.bytes(), 0);
             assert_eq!(pool.peer_count(), 0);
         }
+    }
+    #[test]
+    fn actual_driver_authorization_keeps_failed_accounts_without_exhausting_io_slots() {
+        let initial = super::super::snapshot::tests::bootstrap();
+        let genesis = super::super::genesis::Genesis::seal(
+            initial.chain.config.clone(),
+            initial.governance.clone(),
+            super::super::genesis::FeeMode::LegacyMiner,
+        )
+        .unwrap();
+        let imports = ImportLimits {
+            chain: super::super::state_components::Limits {
+                max_leaves: 10_000,
+                max_nullifiers: 10_000,
+                max_component_bytes: 16 * 1024 * 1024,
+            },
+            max_snapshot_bytes: 32 * 1024 * 1024,
+        };
+        let directory =
+            std::env::temp_dir().join(format!("driver-body-authority-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let store = Store::create(&directory.join("chain.redb"), genesis, imports.chain).unwrap();
+        let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+        let mut owner = Driver::new(store, verifier, imports).unwrap();
+        let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+        let binding = owner.engine().genesis().peer_binding();
+        let mut header = super::super::header::Header {
+            network: binding.network,
+            height: 1,
+            parent: binding.genesis,
+            timestamp: owner.engine().genesis().config().genesis_timestamp + 300,
+            target: owner.engine().state().chain().next_target(),
+            execution_commitment: [3; 32],
+            body_commitment: [4; 32],
+            nonce: 0,
+        };
+        for tag in 1u8..=100 {
+            header.execution_commitment = [tag; 32];
+            let auth = super::super::network::Owner::authorize_body(
+                &mut owner,
+                &header,
+                &budget,
+                binding,
+                std::time::Instant::now() + std::time::Duration::from_secs(180),
+            )
+            .unwrap()
+            .unwrap();
+            let session = crate::p2p::Session::from_test_channel(
+                std::io::Cursor::new(Vec::<u8>::new()),
+                binding,
+                budget.clone(),
+            );
+            let mut peer = super::super::transport::Peer::new(
+                session,
+                owner.engine().genesis(),
+                owner.engine().body_policy(),
+            )
+            .unwrap();
+            let lease = peer
+                .claim_body_authorized(&header, &auth, crate::p2p::BodyMode::Legacy)
+                .unwrap();
+            // The actual ordinary transport writes a request and observes a disconnected
+            // response, releasing physical ownership without completing its account.
+            assert!(
+                peer.fetch_body_owned(u64::from(tag), &header, lease, None)
+                    .is_err()
+            );
+            assert_eq!(
+                budget
+                    .claim_body_authorized(&auth, [9; 32], crate::p2p::BodyMode::Pieces)
+                    .unwrap_err(),
+                crate::p2p::BodyClaimError::SourceUsed
+            );
+        }
+        #[cfg(unix)]
+        {
+            let mut body = super::super::body::tests::body();
+            body.network = binding.network;
+            body.height = 1;
+            body.profile = owner.engine().body_policy().profile;
+            body.governance.clear();
+            body.fund_claims.clear();
+            body.transactions
+                .sort_by_key(|transaction| transaction.record.statement_id(&body.network));
+            header.execution_commitment = [201; 32];
+            header.body_commitment = body.commitment(owner.engine().body_policy()).unwrap();
+            let auth = super::super::network::Owner::authorize_body(
+                &mut owner,
+                &header,
+                &budget,
+                binding,
+                std::time::Instant::now() + super::super::transport::BODY_FETCH_TIMEOUT,
+            )
+            .unwrap()
+            .unwrap();
+            let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+            a.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut receiver = super::super::transport::Peer::new(
+                crate::p2p::Session::from_test_channel(a, binding, budget.clone()),
+                owner.engine().genesis(),
+                owner.engine().body_policy(),
+            )
+            .unwrap();
+            let mut sender = super::super::transport::Peer::new(
+                crate::p2p::Session::from_test_channel(b, binding, budget.clone()),
+                owner.engine().genesis(),
+                owner.engine().body_policy(),
+            )
+            .unwrap();
+            let expected = body.clone();
+            let sent_header = header.clone();
+            let worker = std::thread::spawn(move || {
+                let (request, _) = sender.receive_request().unwrap();
+                sender.send_body(request, &sent_header, &body).unwrap();
+            });
+            let lease = receiver
+                .claim_body_authorized(&header, &auth, crate::p2p::BodyMode::Legacy)
+                .unwrap();
+            let received = receiver
+                .fetch_body_owned(101, &header, lease, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(received.body, expected);
+            drop(received);
+            worker.join().unwrap();
+        }
+        assert_eq!(owner.engine().state().height(), 0);
+        let mut wrong = binding;
+        wrong.genesis = [9; 32];
+        assert!(
+            super::super::network::Owner::authorize_body(
+                &mut owner,
+                &header,
+                &budget,
+                wrong,
+                std::time::Instant::now() + std::time::Duration::from_secs(180)
+            )
+            .is_err()
+        );
+        drop(owner);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn resident_owner_rejects_synthetic_native_proofs_without_publication() {

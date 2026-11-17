@@ -257,6 +257,18 @@ pub(crate) struct CheckpointReady<'a> {
     _guard: std::sync::MutexGuard<'a, StatusInner>,
 }
 impl NetworkStatus {
+    pub(super) fn body_sources(&self) -> Result<BTreeSet<Hash>, String> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| "peer status lock poisoned")?
+            .lanes
+            .iter()
+            .filter(|(_, lane)| *lane == Lane::Bodies as u8)
+            .map(|(peer, _)| *peer)
+            .collect())
+    }
+
     #[cfg(test)]
     pub(crate) fn expire_checkpoint_round_for_test(&self, peer: Hash) {
         self.inner
@@ -960,15 +972,14 @@ pub(super) fn run(
                 }
             }
             shared.headers.tick()?;
-            for destination in &config.peers {
+            for destination in config.outbound_peers() {
                 if workers.len() >= MAX_TOTAL_WORKERS {
                     break;
                 }
                 let peer = destination.expected.fingerprint();
                 // One deterministic dialer for two listening service peers;
                 // outbound-only miners always initiate their pinned route.
-                if !destination.dial
-                    || (listener.is_some() && local > peer)
+                if (listener.is_some() && local > peer)
                     || workers.iter().any(|w| w.outbound == Some((peer, 0)))
                     || backoff
                         .get(&(peer, 0))
@@ -999,7 +1010,7 @@ pub(super) fn run(
                     WorkerAdmission::Deferred => break,
                 }
             }
-            for destination in &config.peers {
+            for destination in config.outbound_peers() {
                 let peer = destination.expected.fingerprint();
                 let supported = shared
                     .network

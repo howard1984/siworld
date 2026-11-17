@@ -32,6 +32,11 @@ enum Kind {
         timing: Option<FetchTiming>,
         overwritten: u64,
     },
+    PieceSource {
+        source: super::super::propagation::pipeline::SourceBytes,
+        timing: FetchTiming,
+        outcome: &'static str,
+    },
     TemplateReady {
         micros: u64,
         parent: Hash,
@@ -47,6 +52,7 @@ impl Kind {
             Self::HeaderForwarded => "native-header-forwarded",
             Self::BodyFetch { .. } => "native-body-fetch-observed",
             Self::TemplateReady { .. } => "native-template-ready",
+            Self::PieceSource { .. } => "native-piece-source-observed",
         }
     }
 }
@@ -166,6 +172,22 @@ impl Recorder {
                 body: header.body_commitment,
                 timing,
                 overwritten,
+            },
+            header,
+        );
+    }
+    pub(super) fn piece_source(
+        &self,
+        header: &Header,
+        source: super::super::propagation::pipeline::SourceBytes,
+        timing: FetchTiming,
+        outcome: &'static str,
+    ) {
+        self.header(
+            Kind::PieceSource {
+                source,
+                timing,
+                outcome,
             },
             header,
         );
@@ -339,6 +361,39 @@ impl Recorder {
                     timing.map(|timing| timing.connection),
                     timing.map(|timing| timing.attempt),
                     block_id
+                ]);
+            }
+            Kind::PieceSource {
+                source,
+                timing,
+                outcome,
+            } => {
+                use crate::eng2::accept_observation::monotonic_ns;
+                value["peer_id"] = json!(crate::local::hex(&source.peer));
+                value["transport_lane"] = json!("pieces");
+                value["owner_generation"] = json!(timing.attempt);
+                value["source_counters"] = json!({
+                    "attempts":source.requested,"queries":source.queries,
+                    "received_application_bytes":source.received,"sent_application_bytes":source.sent,
+                    "reserved_wire_bytes":source.reserved_wire,"bad_pieces":source.bad_pieces,"failures":source.failures,
+                });
+                value["transfer_times_ns"] = json!({
+                    "start":monotonic_ns(timing.start,self.started),
+                    "metadata":monotonic_ns(timing.body_start,self.started),
+                    "body":monotonic_ns(timing.chunks_end,self.started),
+                    "decoded":monotonic_ns(timing.decoded,self.started),
+                    "end":monotonic_ns(timing.end,self.started),
+                });
+                value["outcome"] = json!(outcome);
+                value["native_acceptance_implied"] = json!(false);
+                value["deduplication_key"] = json!([
+                    kind.name(),
+                    node_id,
+                    self.binding.run,
+                    block_id,
+                    crate::local::hex(&source.peer),
+                    timing.attempt,
+                    outcome,
                 ]);
             }
             Kind::TemplateReady {

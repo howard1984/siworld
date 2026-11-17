@@ -209,7 +209,6 @@ impl FrameIdentity {
         self.fetch = Some(timing);
         self
     }
-    #[cfg(test)]
     pub(crate) fn fetch_timing(self) -> Option<FetchTiming> {
         self.fetch
     }

@@ -362,6 +362,9 @@ fn verify_bounded<T: Sync>(
     // Bound simultaneous proof decoders independently of the pool size. Keep
     // errors in canonical input order and stop before starting another batch.
     for batch in values.chunks(4) {
+        #[cfg(siworld_native_node)]
+        let results = crate::verification_executor::map(batch, &verify);
+        #[cfg(not(siworld_native_node))]
         let results = crate::transaction_proof_results(batch, &verify);
         for result in results {
             result?;
@@ -420,6 +423,8 @@ impl BlockVerifier for NativeVerifier {
         })
     }
     fn issuance(&self, record: &crate::issuance::IssuanceRecord) -> Result<(), String> {
+        #[cfg(siworld_native_node)]
+        let _permit = crate::verification_executor::acquire();
         self.verify_issuance(record)
     }
     fn transaction(
@@ -430,6 +435,8 @@ impl BlockVerifier for NativeVerifier {
         root: &Digest,
         proof: &[u8],
     ) -> Result<(), String> {
+        #[cfg(siworld_native_node)]
+        let _permit = crate::verification_executor::acquire();
         self.verify_transaction(public, context, fee, root, proof)
     }
     fn settlement(
@@ -441,6 +448,8 @@ impl BlockVerifier for NativeVerifier {
         rewards: &[Digest],
         proof: &[u8],
     ) -> Result<(), String> {
+        #[cfg(siworld_native_node)]
+        let _permit = crate::verification_executor::acquire();
         self.verify_settlement(fees, plan, network, list_hash, rewards, proof)
     }
 }

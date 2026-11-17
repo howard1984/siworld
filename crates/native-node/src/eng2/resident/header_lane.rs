@@ -29,12 +29,16 @@ struct Entry {
     first: Instant,
     sequence: u64,
     sent: std::collections::BTreeSet<Hash>,
+    relay_sent: std::collections::BTreeSet<Hash>,
     attempts: std::collections::BTreeSet<Hash>,
     downloads: BTreeMap<Hash, DownloadState>,
+    authorization: Option<p2p::BodyAuthorization>,
     complete: bool,
     body: Option<Arc<LocalBody>>,
 }
 struct Inner {
+    progress_owner: Option<super::progress_runs::OwnerContext>,
+    progress_epoch: u64,
     canonical: Context,
     anchors: BTreeMap<Hash, Context>,
     entries: VecDeque<Entry>,
@@ -60,9 +64,12 @@ impl LocalBody {
     }
 }
 pub(crate) struct Hub {
+    binding: p2p::Binding,
+    progress_runs: super::progress_runs::Recorder,
     local: Hash,
     policy: Policy,
     budget: p2p::Budget,
+    body_scope: p2p::BodyScope,
     local_deferred: AtomicU64,
     active_downloads: AtomicUsize,
     rules: HeaderRules,
@@ -133,7 +140,35 @@ impl DownloadProgress {
         })
     }
 }
+struct ProgressObservation {
+    hub: Arc<Hub>,
+    candidate: super::progress_runs::Candidate,
+    deadline: p2p::Deadline,
+}
+impl ProgressObservation {
+    fn received(&self, bytes: usize, total: usize) {
+        let token = self.hub.progress_runs.token(self.candidate.clone());
+        if self.deadline.check().is_ok() && !self.hub.failed.load(Ordering::Acquire) {
+            if let Some(token) = token {
+                self.hub.progress_runs.received(token, bytes, total);
+            }
+        } else {
+            self.hub
+                .progress_runs
+                .end(self.candidate.id, self.candidate.attempt_index);
+        }
+    }
+}
+impl Drop for ProgressObservation {
+    fn drop(&mut self) {
+        self.hub
+            .progress_runs
+            .end(self.candidate.id, self.candidate.attempt_index);
+    }
+}
 pub(crate) struct Download {
+    ownership: Option<p2p::BodyClaim>,
+    candidate: super::progress_runs::Candidate,
     pub header: Header,
     pub cancel: p2p::Cancellation,
     pub deadline: p2p::Deadline,
@@ -142,15 +177,43 @@ pub(crate) struct Download {
     hub: Arc<Hub>,
 }
 impl Download {
+    pub(crate) fn ownership(&self) -> Result<&p2p::BodyClaim, String> {
+        self.ownership
+            .as_ref()
+            .ok_or_else(|| "body acquisition ownership already transferred".into())
+    }
+
+    pub(crate) fn take_ownership(&mut self) -> Result<p2p::BodyClaim, String> {
+        self.ownership
+            .take()
+            .ok_or_else(|| "body acquisition ownership already transferred".into())
+    }
+
     pub(crate) fn received(&self, bytes: usize, total: usize) {
+        let token = self.hub.progress_runs.token(self.candidate.clone());
         self.progress.received(bytes, total);
+        if self.deadline.check().is_ok() && !self.hub.failed.load(Ordering::Acquire) {
+            if let Some(token) = token {
+                self.hub.progress_runs.received(token, bytes, total);
+            }
+        } else {
+            self.hub
+                .progress_runs
+                .end(self.candidate.id, self.candidate.attempt_index);
+        }
     }
     pub(crate) fn decoded(&self) {
         self.progress.decoded();
+        self.hub
+            .progress_runs
+            .end(self.candidate.id, self.candidate.attempt_index);
     }
 }
 impl Drop for Download {
     fn drop(&mut self) {
+        self.hub
+            .progress_runs
+            .end(self.candidate.id, self.candidate.attempt_index);
         if let Ok(mut inner) = self.hub.inner.lock() {
             for entry in &mut inner.entries {
                 if entry.header == self.header {
@@ -186,13 +249,18 @@ impl Hub {
         };
         let now = Instant::now();
         let hub = Self {
+            binding: owner.engine().genesis().peer_binding(),
+            progress_runs: super::progress_runs::Recorder::default(),
             local,
             policy: owner.engine().body_policy(),
             budget: budget.clone(),
+            body_scope: owner.body_scope()?,
             local_deferred: AtomicU64::new(0),
             active_downloads: AtomicUsize::new(0),
             rules,
             inner: Mutex::new(Inner {
+                progress_owner: None,
+                progress_epoch: 0,
                 canonical: genesis,
                 anchors: BTreeMap::new(),
                 entries: VecDeque::new(),
@@ -221,6 +289,7 @@ impl Hub {
     /// disables optional paths but cannot change that committed result.
     pub(crate) fn after_commit(&self, update: impl FnOnce() -> Result<(), String>) {
         if update().is_err() {
+            self.invalidate_progress_context();
             self.failed.store(true, Ordering::Release);
             self.waiting.store(true, Ordering::Release);
             if let Ok(mut inner) = self.inner.lock() {
@@ -236,6 +305,7 @@ impl Hub {
     // Only accepted canonical Store records seed work/timestamp contexts. There
     // is no remote/context constructor and no speculative canonical head.
     pub(crate) fn committed(&self, owner: &Driver) -> Result<(), String> {
+        self.invalidate_progress_context();
         self.ensure_available()?;
         let head = owner.head()?;
         let mut contexts = Vec::new();
@@ -304,8 +374,10 @@ impl Hub {
                     first: Instant::now(),
                     sequence,
                     sent: Default::default(),
+                    relay_sent: Default::default(),
                     attempts: Default::default(),
                     downloads: Default::default(),
+                    authorization: None,
                     complete: true,
                     body: None,
                 });
@@ -314,7 +386,9 @@ impl Hub {
         for entry in &mut inner.entries {
             if entry.context.id == head.id {
                 entry.complete = true;
-                entry.body = None;
+                if entry.source != self.local {
+                    entry.body = None;
+                }
                 for download in entry.downloads.values() {
                     download.cancel.cancel();
                 }
@@ -399,6 +473,74 @@ impl Hub {
             "downloads":downloads,
         })
     }
+    /// The canonical owner calls this immediately after its state transition.
+    /// Status export only reads history and never changes event eligibility.
+    pub(crate) fn publish_progress_context(&self, eligible: bool) {
+        self.set_progress_context(eligible, false);
+    }
+    /// Call before a canonical switch, recovery, or owner error transition.
+    pub(crate) fn invalidate_progress_context(&self) {
+        self.set_progress_context(false, true);
+    }
+    fn set_progress_context(&self, eligible: bool, force: bool) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let mut context = super::progress_runs::OwnerContext {
+            state_epoch: inner.progress_epoch,
+            canonical_height: inner.canonical.height,
+            canonical_id: inner.canonical.id,
+            canonical_work: inner.canonical.work,
+            eligible: eligible && !self.failed.load(Ordering::Acquire),
+        };
+        if !force && inner.progress_owner.as_ref() == Some(&context) {
+            return;
+        }
+        let Some(epoch) = inner.progress_epoch.checked_add(1) else {
+            return;
+        };
+        context.state_epoch = epoch;
+        inner.progress_epoch = epoch;
+        inner.progress_owner = Some(context.clone());
+        self.progress_runs.publish(context);
+    }
+    pub(crate) fn observe_body(
+        self: &Arc<Self>,
+        header: &Header,
+        peer: Hash,
+        claim: &p2p::BodyClaim,
+    ) -> Option<super::super::network::BodyProgress> {
+        let observation = self.body_observation(header, peer, claim)?;
+        Some(Box::new(move |bytes, total| {
+            observation.received(bytes, total)
+        }))
+    }
+    fn body_observation(
+        self: &Arc<Self>,
+        header: &Header,
+        peer: Hash,
+        claim: &p2p::BodyClaim,
+    ) -> Option<ProgressObservation> {
+        self.offer(header.clone(), peer).ok()?;
+        let id = header.id().ok()?;
+        let attempt_index = claim.source_ordinal()?;
+        let inner = self.inner.lock().ok()?;
+        let entry = inner.entries.iter().find(|e| e.context.id == id)?;
+        Some(ProgressObservation {
+            hub: self.clone(),
+            candidate: super::progress_runs::Candidate {
+                id,
+                sequence: entry.sequence,
+                height: entry.context.height,
+                work: entry.context.work,
+                attempt_index,
+            },
+            deadline: claim.deadline().clone(),
+        })
+    }
+    pub(crate) fn sync_progress_runs(&self) -> serde_json::Value {
+        self.progress_runs.snapshot()
+    }
     pub(crate) fn tick(&self) -> Result<(), String> {
         if self.failed.load(Ordering::Acquire) {
             return Ok(());
@@ -412,6 +554,22 @@ impl Hub {
     }
     pub(crate) fn active_downloads(&self) -> usize {
         self.active_downloads.load(Ordering::Acquire)
+    }
+    pub(crate) fn accepted_body(&self, header: &Header) -> Result<(), String> {
+        if header.network != self.binding.network {
+            return Err("accepted body context differs".into());
+        }
+        self.budget
+            .accepted_body(
+                self.binding,
+                header.height,
+                header.id().map_err(|_| "accepted body identity rejected")?,
+            )
+            .map_err(|_| "accepted body retirement unavailable")?;
+        Ok(())
+    }
+    pub(crate) fn body_policy(&self) -> Policy {
+        self.policy
     }
     pub(crate) fn local_deferred(&self) -> u64 {
         self.local_deferred.load(Ordering::Relaxed)
@@ -446,6 +604,44 @@ impl Hub {
         });
         if !self.offer_inner(header, self.local, Some(cached))? {
             self.local_deferred.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    pub(crate) fn relay_body(
+        &self,
+        peer: Hash,
+    ) -> Result<Option<(Arc<LocalBody>, p2p::Deadline)>, String> {
+        self.ensure_available()?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "header cache lock poisoned")?;
+        Ok(inner
+            .entries
+            .iter()
+            .filter(|e| e.source == self.local && !e.relay_sent.contains(&peer))
+            .filter_map(|e| {
+                e.body.as_ref().map(|body| {
+                    (
+                        body.clone(),
+                        p2p::Deadline::from_started(
+                            e.first,
+                            crate::eng2::transport::BODY_FETCH_TIMEOUT,
+                            p2p::Cancellation::default(),
+                        ),
+                    )
+                })
+            })
+            .find(|(_, deadline)| deadline.check().is_ok()))
+    }
+    pub(crate) fn relay_offered(&self, header: &Header, peer: Hash) -> Result<(), String> {
+        let id = header.id().map_err(|_| "relay header identity rejected")?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "header cache lock poisoned")?;
+        if let Some(entry) = inner.entries.iter_mut().find(|e| e.context.id == id) {
+            entry.relay_sent.insert(peer);
         }
         Ok(())
     }
@@ -567,8 +763,10 @@ impl Hub {
             first: now,
             sequence,
             sent: Default::default(),
+            relay_sent: Default::default(),
             attempts: Default::default(),
             downloads: Default::default(),
+            authorization: None,
             complete: body.is_some(),
             body,
         });
@@ -595,6 +793,28 @@ impl Hub {
             .collect())
     }
     pub(crate) fn download(self: &Arc<Self>, peer: Hash) -> Result<Option<Download>, String> {
+        self.download_mode(peer, p2p::BodyMode::Legacy)
+    }
+    pub(crate) fn download_mode(
+        self: &Arc<Self>,
+        peer: Hash,
+        mode: p2p::BodyMode,
+    ) -> Result<Option<Download>, String> {
+        self.download_selected(peer, mode, None)
+    }
+    pub(crate) fn download_exact(
+        self: &Arc<Self>,
+        peer: Hash,
+        id: Hash,
+    ) -> Result<Option<Download>, String> {
+        self.download_selected(peer, p2p::BodyMode::Pieces, Some(id))
+    }
+    fn download_selected(
+        self: &Arc<Self>,
+        peer: Hash,
+        mode: p2p::BodyMode,
+        target: Option<Hash>,
+    ) -> Result<Option<Download>, String> {
         self.ensure_available()?;
         let mut inner = self
             .inner
@@ -620,24 +840,75 @@ impl Hub {
                 pending.push(entry.header.parent);
             }
         }
-        let next = inner
+        // A busy exact body does not block independent candidates. Failed
+        // claims consume neither a peer attempt nor a download slot.
+        let mut eligible: Vec<_> = inner
             .entries
-            .iter_mut()
-            .filter(|e| {
-                !e.complete
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                target.is_none_or(|id| id == e.context.id)
+                    && !e.complete
                     && needed.contains(&e.context.id)
-                    && e.downloads.len() < 2
                     && e.attempts.len() < MAX_ATTEMPTS
                     && !e.attempts.contains(&peer)
             })
-            .min_by_key(|e| (e.header.height, e.sequence));
-        let Some(entry) = next else {
+            .map(|(index, e)| (e.header.height, e.sequence, index))
+            .collect();
+        eligible.sort_unstable();
+        let mut selected = None;
+        for (_, _, index) in eligible {
+            let entry = &mut inner.entries[index];
+            let cancel = p2p::Cancellation::default();
+            let deadline = p2p::Deadline::cancellable(
+                crate::eng2::transport::BODY_FETCH_TIMEOUT,
+                cancel.clone(),
+            );
+            if entry.authorization.is_none() {
+                match self.budget.authorize_body(
+                    &self.body_scope,
+                    self.binding,
+                    entry.header.height,
+                    entry.context.id,
+                    &deadline,
+                ) {
+                    Ok(authorization) => entry.authorization = Some(authorization),
+                    Err(
+                        p2p::BodyClaimError::Capacity
+                        | p2p::BodyClaimError::Expired
+                        | p2p::BodyClaimError::QueryLimit,
+                    ) => continue,
+                    Err(_) => return Err("body owner authorization unavailable".into()),
+                }
+            }
+            let authorization = entry
+                .authorization
+                .as_ref()
+                .ok_or("body authorization missing")?;
+            match self.budget.claim_body_authorized(authorization, peer, mode) {
+                Ok(claim) => {
+                    selected = Some((index, claim.cancellation(), claim));
+                    break;
+                }
+                Err(
+                    p2p::BodyClaimError::Busy
+                    | p2p::BodyClaimError::Capacity
+                    | p2p::BodyClaimError::Expired
+                    | p2p::BodyClaimError::SourceUsed
+                    | p2p::BodyClaimError::QueryLimit,
+                ) => continue,
+                Err(_) => return Err("node body ownership unavailable".into()),
+            }
+        }
+        let Some((index, cancel, ownership)) = selected else {
             return Ok(None);
         };
-        let cancel = p2p::Cancellation::default();
-        let deadline =
-            p2p::Deadline::cancellable(crate::eng2::transport::BODY_FETCH_TIMEOUT, cancel.clone());
-        let progress = Arc::new(DownloadProgress::new(entry.attempts.len() + 1));
+        let entry = &mut inner.entries[index];
+        let deadline = ownership.deadline().clone();
+        let source_ordinal = ownership
+            .source_ordinal()
+            .ok_or("body source ordinal unavailable")?;
+        let progress = Arc::new(DownloadProgress::new(source_ordinal));
         entry.attempts.insert(peer);
         entry.downloads.insert(
             peer,
@@ -649,6 +920,14 @@ impl Hub {
         );
         self.active_downloads.fetch_add(1, Ordering::AcqRel);
         Ok(Some(Download {
+            ownership: Some(ownership),
+            candidate: super::progress_runs::Candidate {
+                id: entry.context.id,
+                sequence: entry.sequence,
+                height: entry.context.height,
+                work: entry.context.work,
+                attempt_index: progress.attempt_index,
+            },
             header: entry.header.clone(),
             cancel,
             deadline,
@@ -690,7 +969,9 @@ impl Hub {
         for entry in &mut inner.entries {
             if entry.context.id == id {
                 entry.complete = true;
-                entry.body = None;
+                if entry.source != self.local {
+                    entry.body = None;
+                }
                 for download in entry.downloads.values() {
                     download.cancel.cancel();
                 }
@@ -762,18 +1043,31 @@ mod tests {
             work: Work::zero(),
             times: VecDeque::from([1]),
         };
+        let budget = p2p::Budget::new(32 * 1024 * 1024);
+        let body_scope = budget
+            .resident_body_scope(1, Instant::now() + Duration::from_secs(3600))
+            .unwrap();
         Arc::new(Hub {
+            binding: p2p::Binding {
+                network: rules.network,
+                genesis: rules.genesis,
+                verifier: [0; 32],
+            },
+            progress_runs: super::super::progress_runs::Recorder::default(),
             local: [99; 32],
             policy: Policy {
                 profile: crate::proofs::protocol_profile_fingerprint(),
                 max_body_bytes: 4 * 1024 * 1024,
                 max_settlement_proof_bytes: 3 * 1024 * 1024,
             },
-            budget: p2p::Budget::new(32 * 1024 * 1024),
+            budget,
+            body_scope,
             local_deferred: AtomicU64::new(0),
             active_downloads: AtomicUsize::new(0),
             rules,
             inner: Mutex::new(Inner {
+                progress_owner: None,
+                progress_epoch: 0,
                 canonical: context.clone(),
                 anchors: BTreeMap::from([(context.id, context)]),
                 entries: VecDeque::new(),
@@ -824,6 +1118,57 @@ mod tests {
         assert!(hub.outgoing([6; 32]).unwrap().is_empty());
     }
     #[test]
+    fn legacy_discovery_and_optional_progress_keep_candidate_source_ordinals_after_many_claims() {
+        let hub = hub();
+        // Burn only unrelated claims. Their process-wide generations must not
+        // become this candidate's public source-attempt index.
+        for tag in 10..18 {
+            let claim = hub
+                .budget
+                .claim_body(
+                    hub.binding,
+                    1,
+                    [tag; 32],
+                    [7; 32],
+                    p2p::BodyMode::Legacy,
+                    &p2p::Deadline::new(Duration::from_secs(180)),
+                )
+                .unwrap();
+            claim.begin_query([7; 32]).unwrap();
+            drop(claim);
+            hub.budget.accepted_body(hub.binding, 1, [tag; 32]).unwrap();
+        }
+        let header = header([2; 32], 1, 3);
+        let claim = hub
+            .budget
+            .claim_body(
+                hub.binding,
+                1,
+                header.id().unwrap(),
+                [7; 32],
+                p2p::BodyMode::Legacy,
+                &p2p::Deadline::new(Duration::from_secs(180)),
+            )
+            .unwrap();
+        assert!(claim.progress_attempt().unwrap() > 4);
+        let observation = hub.body_observation(&header, [7; 32], &claim).unwrap();
+        assert_eq!(observation.candidate.attempt_index, 1);
+        claim.begin_query([7; 32]).unwrap();
+        let ordinary = hub.observe_body(&header, [7; 32], &claim).unwrap();
+        ordinary(1, 10);
+        drop(ordinary);
+        let discovery = hub.observe_body(&header, [7; 32], &claim).unwrap();
+        discovery(2, 10);
+        drop(discovery);
+        drop(observation);
+        drop(claim);
+        let download = hub.download([6; 32]).unwrap().unwrap();
+        assert_eq!(download.candidate.attempt_index, 2);
+        download.ownership().unwrap().begin_query([6; 32]).unwrap();
+        assert_eq!(download.ownership().unwrap().source_ordinal(), Some(2));
+    }
+
+    #[test]
     fn sync_progress_requires_a_qualified_higher_work_header_and_actual_body_progress() {
         let hub = hub();
         assert!(hub.sync_progress().is_null());
@@ -864,6 +1209,7 @@ mod tests {
         let first = header([2; 32], 1, 3);
         hub.offer(first, [8; 32]).unwrap();
         let download = hub.download([7; 32]).unwrap().unwrap();
+        download.ownership().unwrap().begin_query([7; 32]).unwrap();
         download.received(1024, 2048);
         let old = Instant::now() - Duration::from_secs(60);
         download.progress.state.lock().unwrap().last_progress = Some(old);
@@ -894,19 +1240,33 @@ mod tests {
     fn multi_peer_download_caps_cancellation_and_retained_ownership_are_enforced() {
         let hub = hub();
         let first = header([2; 32], 1, 3);
-        let second = header(first.id().unwrap(), 2, 4);
         hub.offer(first.clone(), [8; 32]).unwrap();
-        hub.offer(second, [8; 32]).unwrap();
+        let mut parent = first.id().unwrap();
+        for height in 2..=5 {
+            let next = header(parent, height, 4);
+            parent = next.id().unwrap();
+            hub.offer(next, [8; 32]).unwrap();
+        }
         let one = hub.download([1; 32]).unwrap().unwrap();
         let two = hub.download([2; 32]).unwrap().unwrap();
         assert_eq!(one.header, first);
-        assert_eq!(two.header, first);
+        assert_eq!(two.header.height, 2);
         let three = hub.download([3; 32]).unwrap().unwrap();
         let four = hub.download([4; 32]).unwrap().unwrap();
+        assert_eq!(three.header.height, 3);
+        assert_eq!(four.header.height, 4);
         assert!(hub.download([5; 32]).unwrap().is_none());
+        assert!(
+            hub.inner
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .all(|e| e.attempts.len() <= 1)
+        );
         hub.completed(&first).unwrap();
         assert!(one.cancel.is_cancelled());
-        assert!(two.cancel.is_cancelled());
+        assert!(!two.cancel.is_cancelled());
         assert!(!three.cancel.is_cancelled());
         drop(one);
         drop(two);
@@ -1023,6 +1383,46 @@ mod tests {
         assert_eq!(hub.active_downloads(), 0);
     }
     #[test]
+    fn actual_hub_legacy_and_pieces_downloads_share_one_exact_account() {
+        let hub = hub();
+        let first = header([2; 32], 1, 3);
+        hub.offer(first.clone(), [8; 32]).unwrap();
+        let pieces = hub
+            .download_mode([5; 32], p2p::BodyMode::Pieces)
+            .unwrap()
+            .unwrap();
+        let first_deadline = pieces.deadline.expires_at();
+        pieces.ownership().unwrap().begin_query([5; 32]).unwrap();
+        assert!(
+            hub.download_mode([6; 32], p2p::BodyMode::Legacy)
+                .unwrap()
+                .is_none()
+        );
+        drop(pieces);
+        assert!(
+            hub.download_mode([5; 32], p2p::BodyMode::Legacy)
+                .unwrap()
+                .is_none()
+        );
+        let legacy = hub
+            .download_mode([6; 32], p2p::BodyMode::Legacy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.deadline.expires_at(), first_deadline);
+        for _ in 0..3 {
+            legacy.ownership().unwrap().begin_query([6; 32]).unwrap();
+        }
+        assert!(legacy.ownership().unwrap().begin_query([6; 32]).is_err());
+        drop(legacy);
+        assert!(
+            hub.download_mode([7; 32], p2p::BodyMode::Pieces)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(hub.budget.retained_body_accounting().0, 1);
+        assert_eq!(hub.active_downloads(), 0);
+    }
+    #[test]
     fn idle_retention_and_failed_download_peer_attempt_cap_remain_bounded() {
         let hub = hub();
         let first = header([2; 32], 1, 3);
@@ -1046,9 +1446,13 @@ mod tests {
     fn expired_headers_do_not_release_slots_owned_by_queued_or_active_bodies() {
         let hub = hub();
         let first = header([2; 32], 1, 3);
-        let second = header(first.id().unwrap(), 2, 3);
         hub.offer(first.clone(), [8; 32]).unwrap();
-        hub.offer(second, [8; 32]).unwrap();
+        let mut parent = first.id().unwrap();
+        for height in 2..=4 {
+            let next = header(parent, height, 3);
+            parent = next.id().unwrap();
+            hub.offer(next, [8; 32]).unwrap();
+        }
         let mut leases = Vec::new();
         for peer in 1..=4 {
             leases.push(hub.download([peer; 32]).unwrap().unwrap());

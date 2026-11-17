@@ -23,7 +23,10 @@ mod block_events;
 mod body_admission;
 mod bootstrap;
 mod config;
+mod fixed_relay;
 pub(crate) mod header_lane;
+mod relay;
+mod transfers;
 pub use bootstrap::bootstrap_signed;
 #[cfg(unix)]
 pub(crate) mod historical;
@@ -41,6 +44,7 @@ pub use operations::{result as operations_result, submit as submit_operations};
 pub(crate) mod peers;
 mod production;
 mod progress_clock;
+mod progress_runs;
 #[cfg(unix)]
 pub(crate) mod submission;
 #[cfg(unix)]
@@ -238,6 +242,8 @@ impl ProductionStatus {
 }
 struct Shared {
     bodies: body_admission::Queue,
+    transfers: transfers::Transfers,
+    relay: relay::Relay,
     headers: Arc<header_lane::Hub>,
     owner: Arc<Mutex<Driver>>,
     #[cfg(all(unix, feature = "eng2-rehearsal"))]
@@ -262,6 +268,28 @@ impl Drop for CancelOnDrop {
     }
 }
 impl Shared {
+    // The owner lock is held by the caller. Download callbacks can only read
+    // this context; they cannot infer eligibility from status export timing.
+    fn publish_progress(
+        &self,
+        owner: &Driver,
+        checkpoint_error: Option<&str>,
+    ) -> Result<(), String> {
+        let observer = self
+            .checkpoint_observer
+            .lock()
+            .map_err(|_| "checkpoint observer lock poisoned")?;
+        let eligible = owner.activities_allowed()
+            && owner.last_archive_error().is_none()
+            && owner.reorganization_alarm().is_none()
+            && checkpoint_error.is_none()
+            && !observer.conflicted()
+            && observer.error().is_none()
+            && owner.head().is_ok();
+        self.headers.publish_progress_context(eligible);
+        Ok(())
+    }
+
     fn checkpoint_conflict(&self) -> Result<bool, String> {
         Ok(self
             .checkpoint_observer
@@ -316,7 +344,10 @@ fn export_status(
         .map_err(|_| "resident owner lock poisoned")?;
     let head = match owner.head() {
         Ok(head) => head,
-        Err(_) => return export_unavailable_status(directory, run_id, started, sequence),
+        Err(_) => {
+            shared.headers.invalidate_progress_context();
+            return export_unavailable_status(directory, run_id, started, sequence);
+        }
     };
     let production = shared
         .production
@@ -358,8 +389,10 @@ fn export_status(
         "header_publication_deferred":shared.headers.local_deferred(),
         "header_relay_error":shared.headers.error(),
         "body_download_leases":shared.headers.active_downloads(),
+        "piece_jobs":shared.transfers.diagnostic(),
         "sync_progress":sync_progress,
         "sync_progress_clock":sync_progress_clock,
+        "sync_progress_runs":shared.headers.sync_progress_runs(),
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
         "ready_reason_code":ready_reason_code,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
@@ -458,6 +491,9 @@ fn bound_status_observations(status: &mut Value, original_accept: &Value) {
             .unwrap()
             .remove("peer_round_observation");
         status["native_accept_observation"] = original_accept.clone();
+        if status_bytes(status) > 65_536 {
+            status.as_object_mut().unwrap().remove("sync_progress_runs");
+        }
     }
 }
 fn resident_readiness(
@@ -714,7 +750,12 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         event_node.ok_or("local peer identity unavailable")?,
     )?);
     driver.observe_headers(headers.clone());
+    let mut checkpoint_observer = super::checkpoint_observer::Observer::new(&budget)?;
+    checkpoint_observer.observe_progress(&headers);
+    let relay = relay::Relay::new(&config, driver.engine().body_policy(), &budget)?;
     let shared = Arc::new(Shared {
+        transfers: transfers::Transfers::new(&config, &budget)?,
+        relay,
         bodies: body_admission::Queue::default(),
         headers,
         owner: Arc::new(Mutex::new(driver)),
@@ -732,7 +773,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             phase: "starting",
             ..Default::default()
         }),
-        checkpoint_observer: Mutex::new(super::checkpoint_observer::Observer::new(&budget)?),
+        checkpoint_observer: Mutex::new(checkpoint_observer),
         legacy_checkpoint_peers: config.legacy_checkpoint_peers.clone(),
         budget: budget.clone(),
         _pool_charge: budget
@@ -867,6 +908,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     .lock()
                     .map_err(|_| "resident owner lock poisoned")?;
                 let _switch_result = owner.reorganization_tick(|ancestor_height| {
+                    shared.headers.invalidate_progress_context();
+                    shared.transfers.cancel();
                     shared.network.invalidate_head_evidence()?;
                     #[cfg(unix)]
                     {
@@ -909,6 +952,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                         shared.mailbox.publish(&[])?;
                     }
                 }
+                shared.publish_progress(&owner, checkpoint_error)?;
             }
             if last_checkpoint.elapsed() >= Duration::from_secs(1) {
                 #[cfg(unix)]
@@ -926,6 +970,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             // Restoration failure pauses only advertisements and
                             // signing; canonical validation and peers keep running.
                             shared.mailbox.publish(&[])?;
+                            shared.headers.invalidate_progress_context();
                             checkpoint_error = Some(if restored.is_err() {
                                 "checkpoint_retained_restoration_failed"
                             } else {
@@ -961,10 +1006,12 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                                             )
                                             .is_err()
                                     {
+                                        shared.headers.invalidate_progress_context();
                                         checkpoint_error = Some("signed_bootstrap_unavailable");
                                     }
                                 }
                                 Err(_) => {
+                                    shared.headers.invalidate_progress_context();
                                     checkpoint_error =
                                         Some("checkpoint_tick_rejected_or_unavailable");
                                     checkpoint_tick_reason = checkpoint_host
@@ -982,6 +1029,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             }
                         }
                     }
+                    shared.publish_progress(&owner, checkpoint_error)?;
                 }
                 last_checkpoint = Instant::now();
             }

@@ -28,6 +28,8 @@ struct Active {
 }
 
 pub(super) struct Reorganization {
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) progress_hub: Option<std::sync::Weak<super::super::resident::header_lane::Hub>>,
     pub(super) branches: BranchStore,
     pub(super) discovery: crate::eng2::branches::discovery::runtime::Discovery,
     memory: crate::p2p::Budget,
@@ -75,6 +77,21 @@ fn current_alarm_at(
 }
 
 impl Reorganization {
+    fn invalidate_progress(&self) {
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(hub) = self
+            .progress_hub
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            hub.invalidate_progress_context();
+        }
+    }
+    pub(super) fn stop(&mut self, reason: &'static str) {
+        self.invalidate_progress();
+        self.stopped = Some(reason);
+    }
+
     fn best_candidate(&mut self) -> Result<Option<Hash>, String> {
         let revision = self.branches.selection_revision();
         if revision != self.cached_revision {
@@ -125,32 +142,35 @@ impl Driver {
         if self.reorganization.is_some() {
             return Err("reorganization archive already configured".into());
         }
+        if self
+            .forward_discovery
+            .as_ref()
+            .is_some_and(|discovery| !discovery.uses_budget(&memory))
+        {
+            return Err("body lifecycle budget differs from original discovery owner".into());
+        }
         let height = self.store.engine().state().height();
         let refused = branches.has_deep_refusal(height, self.store.engine().state().tip())?;
         branches.archive_canonical_suffix(&self.store, height)?;
         self.archive_reorganization_boundary()?;
-        let discovery = crate::eng2::branches::discovery::runtime::Discovery::new(
-            self.store.engine().state().network(),
-            self.store.engine().genesis().id(),
-            crate::eng2::branches::discovery::Limits {
-                maximum_candidates: 8,
-                maximum_peers: 8,
-                maximum_requests: 1024,
-                maximum_headers: 2048,
-                maximum_headers_per_candidate: 256,
-                maximum_body_bytes: 4 * 1024 * 1024 * 1024,
-                maximum_attempts_per_header: 4,
-                candidate_lifetime_ms: 900_000,
-                window_ms: 3_600_000,
-            },
-            crate::eng2::network::discovery_now_ms(),
-        )
-        .map_err(|error| error.to_string())?;
+        let discovery = match self.forward_discovery.take() {
+            Some(discovery) => discovery,
+            None => crate::eng2::branches::discovery::runtime::Discovery::new(
+                self.store.engine().state().network(),
+                self.store.engine().genesis().id(),
+                crate::eng2::branches::discovery::runtime::resident_limits(),
+                crate::eng2::network::discovery_now_ms(),
+                memory.clone(),
+            )
+            .map_err(|e| e.to_string())?,
+        };
         let cached_candidate = branches.best_candidate()?;
         let cached_revision = branches.selection_revision();
         let pending_restart = cached_candidate
             .is_some_and(|candidate| candidate != self.store.engine().state().tip());
         self.reorganization = Some(Reorganization {
+            #[cfg(feature = "eng2-runtime")]
+            progress_hub: self.header_hub.as_ref().map(std::sync::Arc::downgrade),
             branches,
             discovery,
             memory,
@@ -321,7 +341,7 @@ impl Driver {
             .ok_or("independent branch archive unavailable")?;
         let result = self.begin_switch_inner(&mut state, candidate, before_restore);
         if result.is_err() && state.stopped.is_none() {
-            state.stopped = Some("reorganization_preflight_unavailable");
+            state.stop("reorganization_preflight_unavailable");
         }
         self.reorganization = Some(state);
         result
@@ -346,12 +366,13 @@ impl Driver {
             Ok(true) => (),
             Ok(false) => return Ok(false),
             Err(failure) => {
-                state.stopped = Some(failure.alarm());
+                state.stop(failure.alarm());
                 return Err(failure.alarm().into());
             }
         }
         let path = state.branches.candidate_path(current, candidate)?;
         if path.removed.len() > 24 {
+            state.invalidate_progress();
             return refuse_depth(&mut state.stopped, || {
                 state.branches.persist_deep_refusal(
                     self.store.engine().state().height(),
@@ -368,7 +389,7 @@ impl Driver {
             max_elapsed: std::time::Duration::from_secs(900),
         };
         if path.replacement.len() > budget.max_blocks {
-            state.stopped = Some("reorganization_local_block_budget_deferred");
+            state.stop("reorganization_local_block_budget_deferred");
             return Err("replacement exceeds local block budget".into());
         }
         // Read only persisted lengths before any archive copy, body decode or
@@ -392,12 +413,13 @@ impl Driver {
             largest_body = largest_body.max(bytes);
         }
         if body_bytes > budget.max_body_bytes || largest_body > policy.max_body_bytes {
-            state.stopped = Some("reorganization_local_byte_budget_deferred");
+            state.stop("reorganization_local_byte_budget_deferred");
             return Err("replay materials exceed local byte budget".into());
         }
         // Plans and append load one body at a time. Hold the shared reservation
         // through preflight, prevalidation and every replay transaction. This
         // accounts for encoded/decoded proof-byte scratch, not total process RSS.
+        state.invalidate_progress();
         let raw_memory =
             match state
                 .memory_admission
@@ -409,7 +431,7 @@ impl Driver {
                 // existing network guards can finish and release their own charge.
                 Ok(None) => return Ok(false),
                 Err(failure) => {
-                    state.stopped = Some(failure.alarm());
+                    state.stop(failure.alarm());
                     return Err(failure.alarm().into());
                 }
             };
@@ -422,7 +444,7 @@ impl Driver {
         let plan = match prepared {
             Ok(plan) => plan,
             Err(error) => {
-                state.stopped = Some("reorganization_original_material_or_preflight_failed");
+                state.stop("reorganization_original_material_or_preflight_failed");
                 return Err(error);
             }
         };
@@ -433,7 +455,7 @@ impl Driver {
             ancestor,
             &plan.path.replacement,
             budget,
-            &self.verifier,
+            self.verifier.as_ref(),
             |index| {
                 state
                     .branches
@@ -449,7 +471,7 @@ impl Driver {
                     .get(index)
                     .ok_or("rejected index missing")?;
                 if let Err(error) = state.branches.mark_invalid(id) {
-                    state.stopped = Some("reorganization_invalid_mark_unavailable");
+                    state.stop("reorganization_invalid_mark_unavailable");
                     return Err(error);
                 }
                 state.pending_restart = state
@@ -458,32 +480,34 @@ impl Driver {
                 return Ok(false);
             }
             Err(error) => {
-                state.stopped = Some("reorganization_prevalidation_deferred");
+                state.stop("reorganization_prevalidation_deferred");
                 return Err(error.to_string());
             }
         };
         if preview.tip() != candidate || preview.cumulative_work() != plan.path.cumulative_work {
-            state.stopped = Some("reorganization_verified_work_or_identity_differs");
+            state.stop("reorganization_verified_work_or_identity_differs");
             return Err("complete replacement differs from qualified header path".into());
         }
         let generation = match self.template_generation.checked_add(1) {
             Some(value) => value,
             None => {
-                state.stopped = Some("reorganization_template_generation_exhausted");
+                state.stop("reorganization_template_generation_exhausted");
                 return Err("template generation exhausted".into());
             }
         };
         if let Err(error) = before_restore(height) {
-            state.stopped = Some("reorganization_output_barrier_failed");
+            state.stop("reorganization_output_barrier_failed");
             return Err(error);
         }
+        #[cfg(feature = "eng2-runtime")]
+        self.invalidate_verification();
         self.template_generation = generation;
         self.padding = Pool::new(self.store.engine().state().network());
         // Do not automatically resurrect transactions from the removed suffix.
         self.pending = match pending_pool(self.store.engine().state().network()) {
             Ok(pool) => pool,
             Err(error) => {
-                state.stopped = Some("reorganization_pending_pool_unavailable");
+                state.stop("reorganization_pending_pool_unavailable");
                 return Err(error);
             }
         };
@@ -505,12 +529,12 @@ impl Driver {
         }) {
             Ok(replay) => replay,
             Err(error) => {
-                state.stopped = Some("reorganization_ancestor_restore_failed");
+                state.stop("reorganization_ancestor_restore_failed");
                 return Err(error.to_string());
             }
         };
         if let Err(error) = self.archive_reorganization_boundary() {
-            state.stopped = Some("reorganization_ancestor_checkpoint_archive_failed");
+            state.stop("reorganization_ancestor_checkpoint_archive_failed");
             return Err(error);
         }
         state.active = Some(Active {
@@ -529,7 +553,7 @@ impl Driver {
         };
         let result = self.advance_switch_inner(&mut state);
         if result.is_err() && state.stopped.is_none() {
-            state.stopped = Some("reorganization_completion_unavailable");
+            state.stop("reorganization_completion_unavailable");
         }
         self.reorganization = Some(state);
         result
@@ -551,7 +575,7 @@ impl Driver {
             )?;
             let committed = self
                 .store
-                .append_prevalidated(&mut active.replay, &header, &body, &self.verifier)
+                .append_prevalidated(&mut active.replay, &header, &body, self.verifier.as_ref())
                 .map_err(|error| error.to_string())?;
             state.branches.record_execution(&committed)?;
             self.archive_reorganization_boundary()?;
@@ -560,7 +584,7 @@ impl Driver {
         if let Err(error) = result {
             // Unexpected storage/material/re-execution failures are local. They
             // must not permanently invalidate a branch or release activity gates.
-            state.stopped = Some("reorganization_append_or_material_failed");
+            state.stop("reorganization_append_or_material_failed");
             state.active = Some(active);
             return Err(error);
         }
@@ -569,17 +593,17 @@ impl Driver {
             return Ok(true);
         }
         if let Err(error) = self.store.ensure_exportable() {
-            state.stopped = Some("reorganization_final_authentication_failed");
+            state.stop("reorganization_final_authentication_failed");
             state.active = Some(active);
             return Err(error);
         }
         if self.store.engine().state().tip() != active.replay.tip() {
-            state.stopped = Some("reorganization_final_state_differs");
+            state.stop("reorganization_final_state_differs");
             return Err("replacement final identity differs".into());
         }
         #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
         if let Err(error) = self.store.complete_owner_fault() {
-            state.stopped = Some("owner_fault_boundary_not_reached");
+            state.stop("owner_fault_boundary_not_reached");
             state.active = Some(active);
             return Err(error);
         }
@@ -623,6 +647,11 @@ impl Driver {
         &mut self,
         before_restore: impl FnOnce(u64) -> Result<(), String>,
     ) -> Result<(), String> {
+        if let Some(state) = &mut self.reorganization {
+            state
+                .discovery
+                .renew_body_window(crate::eng2::network::discovery_now_ms())?;
+        }
         if self
             .reorganization
             .as_ref()
@@ -640,7 +669,7 @@ impl Driver {
             Ok(candidate) => candidate.flatten(),
             Err(error) => {
                 if let Some(state) = &mut self.reorganization {
-                    state.stopped = Some("reorganization_branch_store_unavailable");
+                    state.stop("reorganization_branch_store_unavailable");
                 }
                 return Err(error);
             }
@@ -709,9 +738,12 @@ mod memory_gate_tests {
                 window_ms: 3_600_000,
             },
             0,
+            crate::p2p::Budget::default(),
         )
         .unwrap();
         let mut state = Reorganization {
+            #[cfg(feature = "eng2-runtime")]
+            progress_hub: None,
             branches,
             discovery,
             memory: crate::p2p::Budget::new(65540),

@@ -294,6 +294,7 @@ fn operation_deadline_covers_header_and_body_without_resetting() {
     };
     let mut session = Session::from_test_channel(channel, binding(), Budget::default());
     let deadline = Deadline {
+        body_cancellation: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -314,6 +315,7 @@ fn expired_deadlines_fail_before_touching_the_channel() {
         Budget::default(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -359,6 +361,7 @@ fn reused_exchange_deadline_does_not_reset_between_missing_proof_frames() {
         Budget::default(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -404,6 +407,7 @@ fn paired_request_header_can_arrive_after_the_ordinary_control_deadline() {
         budget.clone(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
         started: Instant::now(),
         limit: Duration::from_secs(180),
         cancellation: Cancellation::default(),
@@ -454,6 +458,7 @@ fn paired_request_header_deadline_is_absolute_under_fragmentation() {
         budget.clone(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
         started: Instant::now(),
         limit: Duration::from_secs(180),
         cancellation: Cancellation::default(),
@@ -783,4 +788,135 @@ fn reserved_block_send_rejects_foreign_or_small_guards_before_output() {
         Err(Error::ResourceExhausted)
     );
     assert!(sender.channel.into_inner().is_empty());
+}
+
+mod wire_fence {
+    use super::super::*;
+    use std::io::{self, Cursor, Read, Write};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    struct Fence {
+        maximum: u64,
+        actual: AtomicU64,
+    }
+    impl WireFence for Fence {
+        fn check_wire(&self, bytes: u64) -> io::Result<()> {
+            if self
+                .actual
+                .load(Ordering::SeqCst)
+                .checked_add(bytes)
+                .is_none_or(|n| n > self.maximum)
+            {
+                Err(io::Error::other("wire ceiling"))
+            } else {
+                Ok(())
+            }
+        }
+        fn account_wire(&self, bytes: u64) -> io::Result<()> {
+            self.actual.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Channel {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        fail_write_after: Option<usize>,
+    }
+    impl Read for Channel {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for Channel {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let n = match self.fail_write_after {
+                Some(maximum) => {
+                    let remaining = maximum.saturating_sub(self.output.len());
+                    if remaining == 0 {
+                        return Err(io::Error::other("interrupted source"));
+                    }
+                    bytes.len().min(remaining)
+                }
+                None => bytes.len(),
+            };
+            self.output.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn fixture(
+        input: Vec<u8>,
+        fail_write_after: Option<usize>,
+        maximum: u64,
+    ) -> (Session<Channel>, Arc<Fence>, Budget) {
+        let budget = Budget::new(1024 * 1024);
+        let binding = Binding {
+            network: [1; 32],
+            genesis: [2; 32],
+            verifier: [3; 32],
+        };
+        let mut session = Session::from_test_channel(
+            Channel {
+                input: Cursor::new(input),
+                output: Vec::new(),
+                fail_write_after,
+            },
+            binding,
+            budget.clone(),
+        );
+        let fence = Arc::new(Fence {
+            maximum,
+            actual: AtomicU64::new(0),
+        });
+        session.set_wire_fence(Some(fence.clone())).unwrap();
+        (session, fence, budget)
+    }
+    fn frame() -> Vec<u8> {
+        let mut frame = frame_header(ENG2_MESSAGE, 7, &[1; 32], 20)
+            .unwrap()
+            .to_vec();
+        frame.extend_from_slice(&[5; 20]);
+        frame
+    }
+    #[test]
+    fn overrun_refused_before_write_or_received_payload_allocation() {
+        let (mut sender, fence, budget) = fixture(vec![], None, (HEADER_BYTES + 19) as u64);
+        let before = budget.available().unwrap();
+        assert!(sender.send_control(ENG2_MESSAGE, 7, &[5; 20]).is_err());
+        assert!(sender.test_channel().output.is_empty());
+        assert_eq!(fence.actual.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.available().unwrap(), before);
+        let (mut receiver, fence, budget) = fixture(frame(), None, HEADER_BYTES as u64);
+        let before = budget.available().unwrap();
+        assert!(receiver.receive().is_err());
+        assert_eq!(
+            receiver.test_channel().input.position(),
+            HEADER_BYTES as u64
+        );
+        assert_eq!(fence.actual.load(Ordering::SeqCst), HEADER_BYTES as u64);
+        assert_eq!(receiver.io_totals().received, HEADER_BYTES as u64);
+        assert_eq!(budget.available().unwrap(), before);
+    }
+    #[test]
+    fn partial_failed_frames_preserve_exact_actual_bytes_and_release_buffers() {
+        let partial = HEADER_BYTES + 10;
+        let (mut sender, fence, budget) = fixture(vec![], Some(partial), 1024);
+        let before = budget.available().unwrap();
+        assert!(sender.send_control(ENG2_MESSAGE, 7, &[5; 20]).is_err());
+        assert_eq!(sender.io_totals().sent, partial as u64);
+        assert_eq!(fence.actual.load(Ordering::SeqCst), partial as u64);
+        assert_eq!(budget.available().unwrap(), before);
+        let mut input = frame();
+        input.truncate(partial);
+        let (mut receiver, fence, budget) = fixture(input, None, 1024);
+        let before = budget.available().unwrap();
+        assert!(receiver.receive().is_err());
+        assert_eq!(receiver.io_totals().received, partial as u64);
+        assert_eq!(fence.actual.load(Ordering::SeqCst), partial as u64);
+        assert_eq!(budget.available().unwrap(), before);
+    }
 }

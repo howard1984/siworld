@@ -13,16 +13,69 @@ use crate::eng2::{
 use crate::wire::Hash;
 use std::collections::BTreeSet;
 
+pub(crate) fn resident_limits() -> Limits {
+    Limits {
+        maximum_candidates: 8,
+        maximum_peers: 8,
+        maximum_requests: 1024,
+        maximum_headers: 2048,
+        maximum_headers_per_candidate: 256,
+        maximum_body_bytes: 4 * 1024 * 1024 * 1024,
+        maximum_attempts_per_header: 4,
+        candidate_lifetime_ms: 900_000,
+        window_ms: 3_600_000,
+    }
+}
 pub struct Discovery {
     ledger: Ledger,
     qualified: BTreeSet<Hash>,
+    body_budget: crate::p2p::Budget,
+    body_scope: crate::p2p::BodyScope,
 }
 impl Discovery {
-    pub fn new(network: Hash, genesis: Hash, limits: Limits, now_ms: u64) -> Result<Self, Error> {
+    pub fn new(
+        network: Hash,
+        genesis: Hash,
+        limits: Limits,
+        now_ms: u64,
+        body_budget: crate::p2p::Budget,
+    ) -> Result<Self, Error> {
+        let ledger = Ledger::new(network, genesis, limits, now_ms)?;
+        let (identity, expires, _) = ledger.body_window();
+        let body_scope = body_budget
+            .resident_body_scope(
+                identity,
+                std::time::Instant::now() + std::time::Duration::from_millis(expires - now_ms),
+            )
+            .map_err(|_| Error::Capacity)?;
+        body_budget
+            .restrict_body_limits(&body_scope, limits.maximum_headers, limits.maximum_requests)
+            .map_err(|_| Error::Configuration)?;
         Ok(Self {
-            ledger: Ledger::new(network, genesis, limits, now_ms)?,
+            ledger,
             qualified: BTreeSet::new(),
+            body_budget,
+            body_scope,
         })
+    }
+    pub(crate) fn uses_budget(&self, budget: &crate::p2p::Budget) -> bool {
+        budget.owns_body_scope(&self.body_scope)
+    }
+    pub(crate) fn body_scope(&self) -> crate::p2p::BodyScope {
+        self.body_scope.clone()
+    }
+    pub(crate) fn renew_body_window(&mut self, now_ms: u64) -> Result<(), String> {
+        if let Some(advance) = self
+            .ledger
+            .renew_body_window(now_ms)
+            .map_err(|e| e.to_string())?
+        {
+            self.body_budget
+                .advance_body_window(&advance)
+                .map_err(|_| "body accounting window renewal rejected")?;
+            self.qualified.clear();
+        }
+        Ok(())
     }
     pub fn usage(&self) -> Usage {
         self.ledger.usage()
@@ -56,13 +109,7 @@ impl Discovery {
         now_ms: u64,
         headers_only: bool,
     ) -> Result<DiscoveryAction, String> {
-        if self
-            .ledger
-            .renew_expired_window(now_ms)
-            .map_err(|e| e.to_string())?
-        {
-            self.qualified.clear();
-        }
+        self.renew_body_window(now_ms)?;
         canonical.ensure_exportable()?;
         if canonical.engine().genesis().id() != self.ledger.genesis
             || canonical.engine().state().network() != self.ledger.network
@@ -159,8 +206,38 @@ impl Discovery {
                 .id()
                 .map_err(|_| "discovered body identity rejected")?;
             if branches.body_size(id)?.is_none() {
+                // Defer before reserving a real source ticket. Ordinary and
+                // optional body lanes share this exact node Budget instance.
+                let authorization = match self.body_budget.authorize_body(
+                    &self.body_scope,
+                    canonical.engine().genesis().peer_binding(),
+                    header.height,
+                    id,
+                    &crate::p2p::Deadline::new(crate::eng2::transport::BODY_FETCH_TIMEOUT),
+                ) {
+                    Ok(authorization) => authorization,
+                    Err(_) => return Ok(DiscoveryAction::Deferred),
+                };
+                let ownership = match self.body_budget.claim_body_authorized(
+                    &authorization,
+                    peer,
+                    crate::p2p::BodyMode::Legacy,
+                ) {
+                    Ok(claim) => claim,
+                    Err(
+                        crate::p2p::BodyClaimError::Busy
+                        | crate::p2p::BodyClaimError::Capacity
+                        | crate::p2p::BodyClaimError::SourceUsed
+                        | crate::p2p::BodyClaimError::QueryLimit,
+                    ) => return Ok(DiscoveryAction::Deferred),
+                    Err(_) => return Ok(DiscoveryAction::Deferred),
+                };
                 return match self.ledger.request_body(remote.1, id, peer, now_ms) {
-                    Ok(request) => Ok(DiscoveryAction::Body { request, header }),
+                    Ok(request) => Ok(DiscoveryAction::Body {
+                        request,
+                        header,
+                        ownership: Box::new(ownership),
+                    }),
                     Err(error) if deferred(error) => Ok(DiscoveryAction::Deferred),
                     Err(error) => Err(error.to_string()),
                 };

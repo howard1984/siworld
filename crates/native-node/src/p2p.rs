@@ -17,6 +17,10 @@ pub(crate) mod hybrid_tls;
 #[cfg(feature = "native-p2p")]
 pub use hybrid_tls::native::{NativeTlsAuthenticator, NativeTlsChannel};
 
+mod body_ownership;
+pub use body_ownership::Authorization as BodyAuthorization;
+pub(crate) use body_ownership::Scope as BodyScope;
+pub use body_ownership::{ClaimError as BodyClaimError, Mode as BodyMode};
 pub const VERSION: u16 = 1;
 pub const MAX_CONTROL_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_CHECKPOINT_EXCHANGE_BYTES: usize = 16 * 1024;
@@ -70,6 +74,7 @@ struct Usage {
 }
 #[derive(Debug)]
 struct BudgetInner {
+    bodies: Arc<body_ownership::Registry>,
     maximum: usize,
     usage: Mutex<Usage>,
 }
@@ -95,9 +100,160 @@ pub struct Budget(Arc<BudgetInner>);
 impl Budget {
     pub fn new(maximum: usize) -> Self {
         Self(Arc::new(BudgetInner {
+            bodies: Arc::new(body_ownership::Registry::default()),
             maximum,
             usage: Mutex::new(Usage::default()),
         }))
+    }
+    #[cfg(any(feature = "eng2-runtime", test))]
+    pub(crate) fn accepted_body(
+        &self,
+        binding: Binding,
+        height: u64,
+        id: Hash,
+    ) -> Result<bool, BodyClaimError> {
+        self.0.bodies.accepted(body_ownership::Key {
+            context: [binding.network, binding.genesis, binding.verifier],
+            height,
+            id,
+        })
+    }
+    fn body_book_charge(&self, bytes: usize) -> Result<BodyBookCharge, BodyClaimError> {
+        let mut reservation = self.reserve(bytes).map_err(|_| BodyClaimError::Capacity)?;
+        reservation.bytes = 0;
+        Ok(BodyBookCharge {
+            budget: std::sync::Arc::downgrade(&self.0),
+            bytes,
+        })
+    }
+    pub(crate) fn resident_body_scope(
+        &self,
+        identity: u64,
+        expires: std::time::Instant,
+    ) -> Result<BodyScope, BodyClaimError> {
+        self.0.bodies.resident_scope_charged(
+            identity,
+            std::time::Instant::now(),
+            expires,
+            Some(self.body_book_charge(body_ownership::scope_charge())?),
+        )
+    }
+    pub(crate) fn restrict_body_limits(
+        &self,
+        scope: &BodyScope,
+        maximum_entries: usize,
+        maximum_queries: u64,
+    ) -> Result<(), BodyClaimError> {
+        self.0
+            .bodies
+            .restrict_limits(scope, maximum_entries, maximum_queries)
+    }
+    pub(crate) fn owns_body_scope(&self, scope: &BodyScope) -> bool {
+        scope.matches(&self.0.bodies)
+    }
+    pub(crate) fn bootstrap_body_scope(
+        &self,
+        expires: std::time::Instant,
+    ) -> Result<BodyScope, BodyClaimError> {
+        self.0.bodies.bootstrap_scope_charged(
+            std::time::Instant::now(),
+            expires,
+            Some(self.body_book_charge(body_ownership::scope_charge())?),
+        )
+    }
+    pub(crate) fn advance_body_window(
+        &self,
+        advance: &crate::eng2::branches::discovery::BodyWindowAdvance,
+    ) -> Result<(), BodyClaimError> {
+        let (old, new) = advance.identities();
+        let now = std::time::Instant::now();
+        self.0.bodies.advance_window(
+            old,
+            new,
+            now,
+            now + std::time::Duration::from_millis(advance.remaining()),
+        )
+    }
+    pub(crate) fn authorize_body(
+        &self,
+        scope: &BodyScope,
+        binding: Binding,
+        height: u64,
+        id: Hash,
+        deadline: &Deadline,
+    ) -> Result<BodyAuthorization, BodyClaimError> {
+        let record_charge = self.body_book_charge(body_ownership::record_charge())?;
+        let pin_charge = self.body_book_charge(body_ownership::pin_charge())?;
+        self.0.bodies.authorize(
+            scope,
+            body_ownership::Key {
+                context: [binding.network, binding.genesis, binding.verifier],
+                height,
+                id,
+            },
+            std::time::Instant::now(),
+            deadline.expires_at(),
+            Some((record_charge, pin_charge)),
+        )
+    }
+    pub(crate) fn authorization_matches(
+        &self,
+        authorization: &BodyAuthorization,
+        binding: Binding,
+        height: u64,
+        id: Hash,
+    ) -> bool {
+        authorization.matches(
+            body_ownership::Key {
+                context: [binding.network, binding.genesis, binding.verifier],
+                height,
+                id,
+            },
+            &self.0.bodies,
+        )
+    }
+    pub(crate) fn claim_body_authorized(
+        &self,
+        authorization: &BodyAuthorization,
+        source: Hash,
+        mode: BodyMode,
+    ) -> Result<BodyClaim, BodyClaimError> {
+        let charge = self
+            .reserve(std::mem::size_of::<BodyClaim>() + std::mem::size_of::<body_ownership::Key>())
+            .map_err(|_| BodyClaimError::Capacity)?;
+        let lease = self.0.bodies.claim_authorized(
+            authorization,
+            source,
+            mode,
+            std::time::Instant::now(),
+        )?;
+        let deadline = Deadline::new(std::time::Duration::from_secs(180)).for_body_lease(&lease);
+        Ok(BodyClaim {
+            lease,
+            deadline,
+            _charge: charge,
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn claim_body(
+        &self,
+        binding: Binding,
+        height: u64,
+        id: Hash,
+        source: Hash,
+        mode: BodyMode,
+        deadline: &Deadline,
+    ) -> Result<BodyClaim, BodyClaimError> {
+        let scope = self.resident_body_scope(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )?;
+        let authorization = self.authorize_body(&scope, binding, height, id, deadline)?;
+        self.claim_body_authorized(&authorization, source, mode)
+    }
+    #[cfg(test)]
+    pub(crate) fn retained_body_accounting(&self) -> (usize, usize) {
+        self.0.bodies.retained_accounting()
     }
     pub fn reserve(&self, bytes: usize) -> Result<Reservation, Error> {
         let mut usage = self.0.usage.lock().map_err(|_| Error::Unavailable)?;
@@ -179,6 +335,86 @@ impl Default for Budget {
         Self::new(CONNECTION_BYTES)
     }
 }
+/// One exact candidate owner across Legacy and Pieces. Piece requests borrow it.
+#[derive(Debug)]
+pub struct BodyClaim {
+    lease: body_ownership::Lease,
+    deadline: Deadline,
+    _charge: Reservation,
+}
+impl BodyClaim {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn cancellation(&self) -> Cancellation {
+        Cancellation(self.lease.cancel.clone())
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn progress_attempt(&self) -> Option<usize> {
+        usize::try_from(self.lease.generation()).ok()
+    }
+    #[cfg(any(feature = "eng2-runtime", test))]
+    pub(crate) fn source_ordinal(&self) -> Option<usize> {
+        self.deadline.check().ok()?;
+        self.lease.source_ordinal()
+    }
+    pub(crate) fn begin_query(&self, source: Hash) -> Result<(), Error> {
+        self.deadline.check().map_err(io_error)?;
+        self.lease
+            .begin_query(source, Instant::now())
+            .map_err(|error| match error {
+                BodyClaimError::Capacity
+                | BodyClaimError::SourceUsed
+                | BodyClaimError::QueryLimit => Error::ResourceExhausted,
+                _ => Error::Unavailable,
+            })
+    }
+
+    pub(crate) fn deadline(&self) -> &Deadline {
+        &self.deadline
+    }
+    pub(crate) fn received(&self, bytes: usize, total: usize) -> Result<(), Error> {
+        self.lease
+            .received(bytes as u64, total as u64, Instant::now())
+            .map_err(|_| Error::Unavailable)
+    }
+    pub(crate) fn decoded(&self) -> Result<(), Error> {
+        self.deadline.check().map_err(io_error)?;
+        self.lease
+            .decoded(Instant::now())
+            .map_err(|_| Error::Unavailable)
+    }
+    pub(crate) fn check_active(&self) -> Result<(), Error> {
+        self.deadline.check().map_err(io_error)?;
+        self.lease
+            .check_active(Instant::now())
+            .map_err(|_| Error::Unavailable)
+    }
+    pub(crate) fn complete(&self) {
+        self.lease.complete();
+    }
+    pub(crate) fn matches(&self, budget: &Budget, binding: Binding, height: u64, id: Hash) -> bool {
+        self.lease.matches(
+            body_ownership::Key {
+                context: [binding.network, binding.genesis, binding.verifier],
+                height,
+                id,
+            },
+            &budget.0.bodies,
+        )
+    }
+}
+#[derive(Debug)]
+struct BodyBookCharge {
+    budget: std::sync::Weak<BudgetInner>,
+    bytes: usize,
+}
+impl Drop for BodyBookCharge {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.upgrade() {
+            let mut usage = budget.usage.lock().unwrap_or_else(|e| e.into_inner());
+            usage.bytes = usage.bytes.saturating_sub(self.bytes);
+        }
+    }
+}
 /// Retain this guard for as long as the associated packet or extracted buffers
 /// remain owned. Moving a payload out of Packet also requires moving its guard.
 #[derive(Debug)]
@@ -252,23 +488,32 @@ impl Drop for HandshakeReservation {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Deadline {
     started: Instant,
     limit: Duration,
     cancellation: Cancellation,
+    body_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     elapsed: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 impl Deadline {
-    pub(crate) fn new(limit: Duration) -> Self {
+    pub(crate) fn from_started(
+        started: Instant,
+        limit: Duration,
+        cancellation: Cancellation,
+    ) -> Self {
         Self {
-            started: Instant::now(),
+            started,
             limit,
-            cancellation: Cancellation::default(),
+            cancellation,
+            body_cancellation: None,
             #[cfg(test)]
             elapsed: None,
         }
+    }
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self::from_started(Instant::now(), limit, Cancellation::default())
     }
     #[cfg(any(feature = "eng2-runtime", test))]
     pub(crate) fn cancellable(limit: Duration, cancellation: Cancellation) -> Self {
@@ -286,11 +531,30 @@ impl Deadline {
     pub(crate) fn cancellation(&self) -> &Cancellation {
         &self.cancellation
     }
+    pub(crate) fn for_body_claim(&self, claim: &BodyClaim) -> Self {
+        self.for_body_lease(&claim.lease)
+    }
+    fn for_body_lease(&self, lease: &body_ownership::Lease) -> Self {
+        let mut result = self.clone();
+        let expires = result.expires_at().min(lease.expires);
+        result.started = lease.first;
+        result.limit = expires.saturating_duration_since(lease.first);
+        result.body_cancellation = Some(lease.cancel.clone());
+        result
+    }
+    pub(crate) fn expires_at(&self) -> Instant {
+        self.started + self.limit
+    }
     pub(crate) fn check(&self) -> io::Result<()> {
         self.check_at(Instant::now())
     }
     pub(crate) fn check_at(&self, now: Instant) -> io::Result<()> {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled()
+            || self
+                .body_cancellation
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "native admission cancelled",
@@ -473,14 +737,34 @@ impl NegotiatedParameters<'_> {
         Ok(())
     }
 }
+pub(crate) trait WireFence: Send + Sync {
+    /// Check the complete bounded frame/range before allocation or I/O.
+    fn check_wire(&self, bytes: u64) -> io::Result<()>;
+    /// Record only actual bytes, including a partial failed frame.
+    fn account_wire(&self, bytes: u64) -> io::Result<()>;
+}
 struct Timed<'a, S> {
+    fence: Option<&'a dyn WireFence>,
     channel: &'a mut S,
     deadline: Deadline,
+    totals: Option<&'a mut IoTotals>,
 }
 impl<S: Read> Read for Timed<'_, S> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         self.deadline.check()?;
+        if let Some(fence) = self.fence {
+            fence.check_wire(bytes.len() as u64)?;
+        }
         let read = self.channel.read(bytes)?;
+        if let Some(totals) = self.totals.as_mut() {
+            totals.received = totals
+                .received
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("application byte counter exhausted"))?;
+        }
+        if let Some(fence) = self.fence {
+            fence.account_wire(read as u64)?;
+        }
         self.deadline.check()?;
         Ok(read)
     }
@@ -488,7 +772,19 @@ impl<S: Read> Read for Timed<'_, S> {
 impl<S: Write> Write for Timed<'_, S> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.deadline.check()?;
+        if let Some(fence) = self.fence {
+            fence.check_wire(bytes.len() as u64)?;
+        }
         let written = self.channel.write(bytes)?;
+        if let Some(totals) = self.totals.as_mut() {
+            totals.sent = totals
+                .sent
+                .checked_add(written as u64)
+                .ok_or_else(|| io::Error::other("application byte counter exhausted"))?;
+        }
+        if let Some(fence) = self.fence {
+            fence.account_wire(written as u64)?;
+        }
         self.deadline.check()?;
         Ok(written)
     }
@@ -649,12 +945,22 @@ pub trait HybridAuthenticator {
 /// No default authenticator or unauthenticated production constructor exists.
 /// Discard a session after any framing/I/O error; reconnecting requires a fresh
 /// provider authentication rather than continuing a partially consumed frame.
+/// Authenticated application-stream bytes, including frame headers and partial
+/// transfers. These counters exclude the underlying encrypted record format.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoTotals {
+    pub received: u64,
+    pub sent: u64,
+}
+
 pub struct Session<S> {
+    wire_fence: Option<Arc<dyn WireFence>>,
     channel: S,
     binding: Binding,
     peer: Hash,
     role: Role,
     budget: Budget,
+    totals: IoTotals,
     _transport: Option<Reservation>,
     #[cfg(feature = "native-p2p")]
     checkpoints: bool,
@@ -700,6 +1006,8 @@ impl<S: Read + Write> Session<S> {
         let mut timed = Timed {
             channel: &mut channel,
             deadline: admission.deadline.clone(),
+            fence: None,
+            totals: None,
         };
         timed
             .write_all(&Hello { binding, role }.encode())
@@ -715,6 +1023,8 @@ impl<S: Read + Write> Session<S> {
             peer: admission.expected.fingerprint(),
             role: hello.role,
             budget,
+            totals: IoTotals::default(),
+            wire_fence: None,
             _transport: Some(permit.established()),
             #[cfg(feature = "native-p2p")]
             checkpoints,
@@ -722,6 +1032,26 @@ impl<S: Read + Write> Session<S> {
     }
     pub(crate) fn shares_budget(&self, budget: &Budget) -> bool {
         Arc::ptr_eq(&self.budget.0, &budget.0)
+    }
+    #[cfg(any(feature = "eng2-runtime", test))]
+    pub(crate) fn set_wire_fence(
+        &mut self,
+        fence: Option<Arc<dyn WireFence>>,
+    ) -> Result<(), Error> {
+        if self.wire_fence.is_some() && fence.is_some() {
+            return Err(Error::InvalidProtocol);
+        }
+        self.wire_fence = fence;
+        Ok(())
+    }
+    fn check_wire(&self, bytes: usize) -> Result<(), Error> {
+        if let Some(fence) = &self.wire_fence {
+            fence.check_wire(bytes as u64).map_err(io_error)?;
+        }
+        Ok(())
+    }
+    pub fn io_totals(&self) -> IoTotals {
+        self.totals
     }
     pub(crate) fn binding(&self) -> Binding {
         self.binding
@@ -754,6 +1084,11 @@ impl<S: Read + Write> Session<S> {
             return Err(Error::InvalidProtocol);
         }
         let header = frame_header(kind, request, &self.binding.network, body.len())?;
+        self.check_wire(
+            HEADER_BYTES
+                .checked_add(body.len())
+                .ok_or(Error::ResourceExhausted)?,
+        )?;
         let _reservation = self.budget.reserve(
             body.len()
                 .checked_add(HEADER_BYTES + 64)
@@ -762,6 +1097,8 @@ impl<S: Read + Write> Session<S> {
         let mut timed = Timed {
             channel: &mut self.channel,
             deadline: deadline.clone(),
+            totals: Some(&mut self.totals),
+            fence: self.wire_fence.as_deref(),
         };
         timed.write_all(&header).map_err(io_error)?;
         timed.write_all(body).map_err(io_error)?;
@@ -804,6 +1141,8 @@ impl<S: Read + Write> Session<S> {
         let mut timed = Timed {
             channel: &mut self.channel,
             deadline: Deadline::new(BLOCK_TIMEOUT),
+            totals: Some(&mut self.totals),
+            fence: self.wire_fence.as_deref(),
         };
         timed.write_all(&header).map_err(io_error)?;
         block.write_to(&mut timed).map_err(io_error)?;
@@ -886,6 +1225,8 @@ impl<S: Read + Write> Session<S> {
         Timed {
             channel: &mut self.channel,
             deadline: deadline.clone(),
+            totals: Some(&mut self.totals),
+            fence: self.wire_fence.as_deref(),
         }
         .read_exact(&mut header)
         .map_err(io_error)?;
@@ -910,6 +1251,7 @@ impl<S: Read + Write> Session<S> {
             body_deadline.cancellation = deadline.cancellation.clone();
             deadline = body_deadline;
         }
+        self.check_wire(length)?;
         let extra = if kind == BLOCK {
             MAX_ENVELOPE_BYTES + 65536
         } else {
@@ -923,6 +1265,8 @@ impl<S: Read + Write> Session<S> {
             let mut timed = Timed {
                 channel: &mut self.channel,
                 deadline,
+                totals: Some(&mut self.totals),
+                fence: self.wire_fence.as_deref(),
             };
             let block =
                 Block::read_from(&mut timed, length, &self.binding.network).map_err(io_error)?;
@@ -940,6 +1284,8 @@ impl<S: Read + Write> Session<S> {
             let mut timed = Timed {
                 channel: &mut self.channel,
                 deadline,
+                totals: Some(&mut self.totals),
+                fence: self.wire_fence.as_deref(),
             };
             timed.read_exact(&mut body).map_err(io_error)?;
             timed.deadline.check().map_err(io_error)?;
@@ -955,6 +1301,19 @@ impl<S: Read + Write> Session<S> {
     pub(crate) fn test_channel(&self) -> &S {
         &self.channel
     }
+    #[cfg(all(test, feature = "eng2-runtime"))]
+    pub(crate) fn from_test_peer_channel(
+        channel: S,
+        binding: Binding,
+        budget: Budget,
+        peer: Hash,
+        role: Role,
+    ) -> Self {
+        let mut session = Self::from_test_channel(channel, binding, budget);
+        session.peer = peer;
+        session.role = role;
+        session
+    }
     #[cfg(test)]
     pub(crate) fn from_test_channel(channel: S, binding: Binding, budget: Budget) -> Self {
         Self {
@@ -963,6 +1322,8 @@ impl<S: Read + Write> Session<S> {
             peer: [9; 32],
             role: Role::Validator,
             budget,
+            totals: IoTotals::default(),
+            wire_fence: None,
             _transport: None,
             #[cfg(feature = "native-p2p")]
             checkpoints: false,

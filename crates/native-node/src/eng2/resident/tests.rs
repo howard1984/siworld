@@ -214,6 +214,123 @@ fn pinned_outbound_only_miner_can_be_selected_as_lane_identity_without_checkpoin
     fs::remove_dir_all(directory).unwrap();
     fs::remove_dir_all(miner_directory).unwrap();
 }
+
+#[test]
+fn passive_fixed_miner_reference_shares_endpoint_without_becoming_an_outbound_destination() {
+    let directory = directory();
+    let genesis = genesis();
+    let identity = NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap();
+    let mut identities = Vec::new();
+    let mut identity_directories = Vec::new();
+    for _ in 0..3 {
+        let path = super::tests::directory();
+        identities.push(NativeIdentity::initialize(&path, genesis.peer_binding()).unwrap());
+        identity_directories.push(path);
+    }
+    let entry = |index: usize, endpoint: &str, dial: bool| {
+        let descriptor = identities[index].descriptor().unwrap();
+        json!({"endpoint":endpoint,"dial":dial,
+            "fingerprint":crate::local::hex(&descriptor.fingerprint()),
+            "descriptor":crate::local::hex(&descriptor.encode())})
+    };
+    let old = entry(0, "127.0.0.1:9000", true);
+    let mut miner = entry(1, "127.0.0.1:9000", false);
+    miner["fixed_relay_role"] = json!("miner");
+    miner["checkpoint_reference"] = json!(false);
+    let active = entry(2, "127.0.0.1:9001", true);
+    for index in [0, 2] {
+        PeerPin::from_trusted_descriptor(
+            &identities[index].descriptor().unwrap(),
+            &genesis.peer_binding(),
+        )
+        .unwrap()
+        .persist(&directory)
+        .unwrap();
+    }
+    let path = directory.join("peers.json");
+    let load = |role: &str, peers: Vec<Value>| {
+        service::atomic_json(
+            &path,
+            &json!({"version":2,"engineering":true,"role":role,"listen":null,
+                "mining":false,"checkpoint_key":null,"peers":peers}),
+        )
+        .unwrap();
+        config::Configuration::load(&directory, &path, &genesis, &identity)
+    };
+    assert!(
+        load(
+            "validator",
+            vec![old.clone(), miner.clone(), active.clone()]
+        )
+        .is_err()
+    );
+    PeerPin::from_trusted_descriptor(
+        &identities[1].descriptor().unwrap(),
+        &genesis.peer_binding(),
+    )
+    .unwrap()
+    .persist(&directory)
+    .unwrap();
+    for role in ["validator", "bootstrap"] {
+        for entries in [
+            vec![old.clone(), miner.clone(), active.clone()],
+            vec![miner.clone(), active.clone(), old.clone()],
+        ] {
+            let loaded = load(role, entries).unwrap();
+            assert_eq!(loaded.peers.len(), 3);
+            assert!(loaded.peers.iter().any(|peer| {
+                peer.expected.fingerprint() == identities[0].descriptor().unwrap().fingerprint()
+                    && peer.dial
+                    && peer.checkpoint_reference
+            }));
+            assert!(
+                loaded
+                    .fixed_relay_peers
+                    .contains(&identities[1].descriptor().unwrap().fingerprint())
+            );
+            // Both ordinary connections and optional header/body lanes use
+            // this exact destination iterator before constructing a dial job.
+            let outbound: std::collections::BTreeSet<_> = loaded
+                .outbound_peers()
+                .map(|peer| peer.expected.fingerprint())
+                .collect();
+            assert_eq!(
+                outbound,
+                [
+                    identities[0].descriptor().unwrap().fingerprint(),
+                    identities[2].descriptor().unwrap().fingerprint()
+                ]
+                .into_iter()
+                .collect()
+            );
+        }
+    }
+    let mut duplicate_dial = miner.clone();
+    duplicate_dial["dial"] = json!(true);
+    assert!(load("validator", vec![old.clone(), duplicate_dial]).is_err());
+    let mut ordinary = miner.clone();
+    ordinary.as_object_mut().unwrap().remove("fixed_relay_role");
+    assert!(load("validator", vec![old.clone(), ordinary.clone()]).is_err());
+    let mut service = ordinary;
+    service["fixed_relay_role"] = json!("service");
+    assert!(load("miner", vec![old.clone(), service]).is_err());
+    let mut duplicate_identity = miner.clone();
+    duplicate_identity["fingerprint"] = old["fingerprint"].clone();
+    duplicate_identity["descriptor"] = old["descriptor"].clone();
+    assert!(load("validator", vec![old.clone(), duplicate_identity]).is_err());
+    let mut mismatched_role = miner.clone();
+    mismatched_role["fixed_relay_role"] = json!("service");
+    assert!(load("validator", vec![old.clone(), mismatched_role]).is_err());
+    let mut mismatched_descriptor = miner;
+    mismatched_descriptor["descriptor"] = active["descriptor"].clone();
+    assert!(load("validator", vec![old, mismatched_descriptor]).is_err());
+    drop(identities);
+    drop(identity);
+    fs::remove_dir_all(directory).unwrap();
+    for path in identity_directories {
+        fs::remove_dir_all(path).unwrap();
+    }
+}
 #[cfg(unix)]
 #[test]
 fn legacy_checkpoint_routing_only_selects_advertisements_without_peer_admission() {

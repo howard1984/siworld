@@ -36,8 +36,11 @@ pub mod state;
 pub(crate) mod storage_budget;
 pub mod storage_policy;
 pub mod store;
+#[cfg(siworld_native_node)]
+pub(crate) mod verification_executor;
 pub mod wire;
 
+#[cfg(not(siworld_native_node))]
 pub(crate) fn transaction_proof_results<T: Sync>(
     values: &[T],
     verify: &(impl Fn(&T) -> Result<(), String> + Sync),

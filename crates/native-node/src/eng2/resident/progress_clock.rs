@@ -3,6 +3,19 @@ use serde_json::Value;
 #[cfg(any(target_os = "linux", test))]
 use serde_json::json;
 
+/// One event timestamp with its kernel boot binding. Unsupported hosts do not
+/// produce a timestamp in the Linux monotonic clock domain.
+pub(super) fn stamp() -> Option<(u64, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        Some((monotonic_ns()?, linux_boot_id_sha256()?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 pub(super) fn snapshot<T>(sample: impl FnOnce() -> T) -> (T, Value) {
     #[cfg(target_os = "linux")]
     {

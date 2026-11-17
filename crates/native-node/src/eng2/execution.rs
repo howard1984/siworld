@@ -235,12 +235,14 @@ impl Engine {
         .legacy_delta(verifier, self.limits)
     }
     #[cfg(feature = "eng2-runtime")]
-    pub(super) fn stage_diagnosed(
+    pub(super) fn stage_diagnosed_with_receipts(
         &self,
         header: &Header,
         body: &body::Body,
         verifier: &NativeVerifier,
+        receipts: Option<&super::native_pipeline::CandidateReceipts>,
     ) -> Result<StagedBlock, super::accept_observation::Failure> {
+        let receipts = receipts.filter(|value| value.matches_engine(self, header));
         if !verifier.authenticates(&self.genesis) {
             return Err(precommit_failure(
                 "native verifier differs from sealed salted genesis".into(),
@@ -261,7 +263,7 @@ impl Engine {
             self.body_policy(),
         )
         .map_err(precommit_failure)?
-        .verify_transactions_diagnosed(verifier)?
+        .verify_transactions_diagnosed_with_receipts(verifier, receipts)?
         .legacy_delta_diagnosed(verifier, self.limits)
     }
     pub(super) fn publish(&mut self, staged: StagedBlock) -> Result<CommittedBlock, String> {
@@ -626,11 +628,14 @@ impl<'a> PreparedBlock<'a> {
         })
     }
     #[cfg(feature = "eng2-runtime")]
-    fn verify_transactions_diagnosed(
+    fn verify_transactions_diagnosed_with_receipts(
         self,
         verifier: &NativeVerifier,
+        receipts: Option<&super::native_pipeline::CandidateReceipts>,
     ) -> Result<NativeTransactions<'a>, super::accept_observation::Failure> {
-        let mut actions = self.actions.verify_native_diagnosed(verifier)?;
+        let mut actions = self
+            .actions
+            .verify_native_diagnosed_with_receipts(verifier, receipts)?;
         for output in &self.ledgers.outputs {
             if output.network() != self.header.network || output.height() != self.header.height {
                 return Err(precommit_failure(
@@ -703,6 +708,8 @@ impl NativeTransactions<'_> {
             .iter()
             .map(|slot| slot.commitment),
         );
+        #[cfg(siworld_native_node)]
+        let verification_permit = crate::verification_executor::acquire();
         verifier.verify_settlement(
             &fees,
             &self.ledgers.settlement.plan,
@@ -711,6 +718,8 @@ impl NativeTransactions<'_> {
             self.actions.rewards(),
             &self.body.settlement_proof,
         )?;
+        #[cfg(siworld_native_node)]
+        drop(verification_permit);
         let identity = match self.header_use {
             HeaderUse::Mined => self
                 .header

@@ -76,19 +76,31 @@ impl Queue {
         json!({"scope":"decoded_body_jobs","completed_retention":self.completed.load(Ordering::Relaxed),"rejected":self.rejected.load(Ordering::Relaxed),"deferred":self.deferred.load(Ordering::Relaxed),"native_acceptance_not_implied":true})
     }
     pub(super) fn submit(&self, ready: Ready) {
-        if self.mailbox.submit(ready).is_err() {
+        if ready.received.ownership.check_active().is_err() || self.mailbox.submit(ready).is_err() {
             self.deferred.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
+#[cfg(test)]
+pub(super) fn test_take(queue: &Queue) -> Ready {
+    queue.mailbox.queue.lock().unwrap().pop_front().unwrap()
+}
+#[cfg(test)]
+pub(super) fn test_admit(shared: &Shared, ready: &Ready) -> Result<bool, String> {
+    admit(shared, ready)
+}
 pub(super) fn run(shared: Arc<Shared>) -> Result<(), String> {
     while let Some(ready) = shared.bodies.mailbox.take(&shared.cancel)? {
-        if ready.download.cancel.is_cancelled() || shared.headers.error().is_some() {
+        if ready.download.cancel.is_cancelled()
+            || ready.received.ownership.check_active().is_err()
+            || shared.headers.error().is_some()
+        {
             continue;
         }
         let result = admit(&shared, &ready);
         match result {
             Ok(true) => {
+                ready.received.ownership.complete();
                 shared.headers.completed(&ready.download.header)?;
                 shared.bodies.completed.fetch_add(1, Ordering::Relaxed);
             }
@@ -114,7 +126,10 @@ fn admit(shared: &Shared, ready: &Ready) -> Result<bool, String> {
         .owner
         .lock()
         .map_err(|_| "resident owner lock poisoned")?;
-    if ready.download.cancel.is_cancelled() || !owner.activities_allowed() {
+    if ready.download.cancel.is_cancelled()
+        || ready.received.ownership.check_active().is_err()
+        || !owner.activities_allowed()
+    {
         return Ok(false);
     }
     owner.retain_fast_headers(&ready.path)?;

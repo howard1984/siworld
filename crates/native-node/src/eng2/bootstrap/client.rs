@@ -40,6 +40,7 @@ pub struct Candidate {
     next_header: u64,
     import_policy: import::Policy,
     body_policy: body::Policy,
+    binding: crate::p2p::Binding,
 }
 
 impl Candidate {
@@ -68,6 +69,7 @@ impl Candidate {
             next_header,
             import_policy,
             body_policy,
+            binding: genesis.peer_binding(),
         })
     }
     pub fn manifest(&self) -> &Manifest {
@@ -180,6 +182,8 @@ pub fn select(candidates: Vec<Prepared>, floor: Work) -> Result<Client, String> 
         plan,
         _history: prepared._history,
         next_object: 0,
+        body_scope: None,
+        current_body: None,
     };
     client.advance()?;
     Ok(client)
@@ -192,6 +196,8 @@ pub struct Client {
     plan: AdmissionPlan,
     _history: HeaderHistory,
     next_object: u64,
+    body_scope: Option<crate::p2p::BodyScope>,
+    current_body: Option<crate::p2p::BodyAuthorization>,
 }
 pub struct Admission {
     pub installation: Installation,
@@ -205,6 +211,36 @@ pub struct Admission {
     pub authenticated_reopen_ms: u128,
 }
 impl Client {
+    /// Bind one explicit acquisition operation after immutable plan selection.
+    /// Reconnects and repeated pull steps retain this original deadline.
+    pub fn bind_body_operation(
+        &mut self,
+        budget: &crate::p2p::Budget,
+        expires: Instant,
+    ) -> Result<(), String> {
+        if self.body_scope.is_some() || self.current_body.is_some() {
+            return Err("bootstrap body operation already bound".into());
+        }
+        self.body_scope = Some(
+            budget
+                .bootstrap_body_scope(expires)
+                .map_err(|_| "bootstrap original body operation unavailable")?,
+        );
+        Ok(())
+    }
+    /// End the original operation without refunding or reopening its accounts.
+    pub fn cancel_body_operation(&mut self) {
+        if let Some(scope) = &self.body_scope {
+            scope.close();
+        }
+        self.current_body = None;
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn operation_body_scope(&self) -> Result<crate::p2p::BodyScope, String> {
+        self.body_scope
+            .clone()
+            .ok_or("bootstrap body operation not bound".into())
+    }
     pub fn manifest(&self) -> &Manifest {
         self.candidate.manifest()
     }
@@ -259,15 +295,27 @@ impl Client {
             }),
             Progress::NativeTail { next, .. } => {
                 let header = self.plan.headers().header(next).ok_or(Error::Protocol)?;
-                let body = pull.body(header)?.ok_or(Error::Unavailable)?;
+                if self.current_body.is_none() {
+                    let scope = self.body_scope.as_ref().ok_or(Error::Protocol)?;
+                    self.current_body =
+                        Some(pull.authorize_body(scope, self.candidate.binding, header)?);
+                }
+                let authorization = self.current_body.as_ref().ok_or(Error::Protocol)?;
+                let body = pull
+                    .body_authorized(header, authorization)?
+                    .ok_or(Error::Unavailable)?;
                 let encoded = body
                     .body
                     .encode(self.candidate.body_policy)
                     .map_err(Error::Owner)?;
+                body.ownership.check_active()?;
                 self.candidate
                     .cache
                     .put_body(header, &encoded)
                     .map_err(Error::Owner)?;
+                body.ownership.complete();
+                drop(body);
+                self.current_body = None;
                 None
             }
             Progress::Downloaded => None,
@@ -439,6 +487,16 @@ mod tests {
         tag: u8,
         claimed: Work,
     ) -> (Genesis, Candidate) {
+        fixture_content(directory, count, tag, claimed, 1024 * 1024, false)
+    }
+    fn fixture_content(
+        directory: &Directory,
+        count: u64,
+        tag: u8,
+        claimed: Work,
+        cache_body_limit: usize,
+        framed_tail: bool,
+    ) -> (Genesis, Candidate) {
         let (genesis, limits, mut manifest) = super::super::tests::framing_fixture();
         let config = genesis.config();
         let mut parent = genesis.id();
@@ -451,7 +509,13 @@ mod tests {
                     timestamp: config.genesis_timestamp + 300 * height,
                     target: [255; 32],
                     execution_commitment: [tag; 32],
-                    body_commitment: [tag; 32],
+                    body_commitment: if framed_tail && height > 72 {
+                        tail_body(&genesis, height)
+                            .commitment(tail_policy())
+                            .unwrap()
+                    } else {
+                        [tag; 32]
+                    },
                     nonce: 0,
                 };
                 parent = header.id().unwrap();
@@ -468,9 +532,18 @@ mod tests {
             &directory.0,
             manifest,
             cache::Policy {
-                max_bytes: 4 * 1024 * 1024,
+                max_bytes: if framed_tail {
+                    // Include the complete synthetic tail in this fixture's
+                    // quarantine byte budget without changing production limits.
+                    (count - 72)
+                        * tail_body(&genesis, 73).encoded_len(tail_policy()).unwrap() as u64
+                        + count * crate::eng2::header::HEADER_BYTES as u64
+                        + 1024 * 1024
+                } else {
+                    4 * 1024 * 1024
+                },
                 max_chunks_per_object: 16,
-                max_body_bytes: 1024 * 1024,
+                max_body_bytes: cache_body_limit,
             },
             p2p::Budget::new(64 * 1024 * 1024),
         )
@@ -494,6 +567,25 @@ mod tests {
         )
         .unwrap();
         (genesis, candidate)
+    }
+
+    fn tail_policy() -> body::Policy {
+        body::Policy {
+            profile: crate::proofs::protocol_profile_fingerprint(),
+            max_body_bytes: 1024 * 1024,
+            max_settlement_proof_bytes: 4096,
+        }
+    }
+    fn tail_body(genesis: &Genesis, height: u64) -> body::Body {
+        let mut body = body::tests::body();
+        body.network = genesis.config().network;
+        body.height = height;
+        body.profile = tail_policy().profile;
+        body.governance.clear();
+        body.fund_claims.clear();
+        body.transactions
+            .sort_by_key(|tx| tx.record.statement_id(&body.network));
+        body
     }
     #[test]
     fn cold_client_recomputes_work_selects_greatest_and_rejects_equal_forks() {
@@ -590,5 +682,9 @@ mod tests {
         );
         assert!(!destination.0.exists());
         assert!(directory.0.join("bootstrap-quarantine.redb").exists());
+    }
+    #[cfg(unix)]
+    mod tail_tests {
+        include!("client/tail_tests.rs");
     }
 }

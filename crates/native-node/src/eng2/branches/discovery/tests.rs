@@ -385,3 +385,21 @@ fn only_fixed_window_expiry_resets_counts_and_invalidates_old_tickets() {
     );
     assert_eq!(ledger.usage().requests, 0);
 }
+
+#[test]
+fn body_window_capability_requires_original_expiry_and_clock_failure_is_permanent() {
+    let mut ledger = Ledger::new([1; 32], [2; 32], limits(), 100).unwrap();
+    let (original, expiry, _) = ledger.body_window();
+    assert!(ledger.renew_body_window(expiry - 1).unwrap().is_none());
+    assert_eq!(ledger.body_window().0, original);
+    let advance = ledger.renew_body_window(expiry).unwrap().unwrap();
+    assert_eq!(advance.identities().0, original);
+    assert_ne!(advance.identities().1, original);
+    assert!(advance.remaining() > 0);
+    assert!(ledger.renew_body_window(expiry - 1).is_err());
+    assert!(
+        ledger
+            .renew_body_window(expiry + advance.remaining())
+            .is_err()
+    );
+}

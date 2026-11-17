@@ -190,3 +190,15 @@ fn retained_offer_canonical_prefix_and_signer_epoch_invalidate_lookup_and_pins()
             .is_err()
     );
 }
+
+/// Framing-only manifest; its synthetic signatures never authorize native admission.
+pub(crate) fn framing_tail_manifest(headers: &[crate::eng2::header::Header]) -> Manifest {
+    let (_, _, mut manifest) = framing_fixture();
+    manifest.tip_height = headers.len() as u64;
+    manifest.tip_id = headers.last().unwrap().id().unwrap();
+    manifest.cumulative_work = Work::from(manifest.tip_height);
+    manifest.certificate.statement.checkpoint_block = headers[71].id().unwrap();
+    manifest.certificate.statement.authorization_block = headers[95].id().unwrap();
+    manifest.bundle = *blake3::hash(&manifest.prefix().unwrap()).as_bytes();
+    manifest
+}

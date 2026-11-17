@@ -12,6 +12,7 @@ use crate::{p2p, wire::Hash};
 use std::io::{self, Read, Write};
 mod bootstrap;
 pub mod lanes;
+pub mod propagation;
 pub use bootstrap::{ChunkRequest, ReceivedChunk, ReceivedManifest};
 
 const TIP: u8 = 1;
@@ -38,6 +39,7 @@ pub fn binding(genesis: &Genesis) -> p2p::Binding {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
+    Propagation(propagation::PropagationRequest),
     GetTip,
     RoundDone,
     Tip { height: u64, id: Hash },
@@ -51,6 +53,9 @@ pub enum Request {
 /// The allocation charge lives as long as the decoded body. Moving the body
 /// out requires retaining this guard until admission and all consumers finish.
 pub struct ReceivedBody {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) receipts: Option<super::native_pipeline::CandidateReceipts>,
+    pub(crate) ownership: p2p::BodyClaim,
     pub body: Body,
     pub reservation: p2p::Reservation,
     #[cfg(feature = "eng2-runtime")]
@@ -66,6 +71,8 @@ struct CompetingHead {
 /// No public plaintext or unauthenticated constructor is provided. Discard
 /// the peer after an exchange error: a partial stream must not be reused.
 pub struct Peer<S> {
+    propagation_session: u64,
+    propagation_supported: Option<bool>,
     session: p2p::Session<S>,
     policy: Policy,
     exact_blocks: Option<bool>,
@@ -95,6 +102,8 @@ impl<S: Read + Write> Peer<S> {
             return Err(p2p::Error::InvalidProtocol);
         }
         Ok(Self {
+            propagation_session: propagation::next_session()?,
+            propagation_supported: None,
             session,
             policy,
             exact_blocks: None,
@@ -110,6 +119,25 @@ impl<S: Read + Write> Peer<S> {
             #[cfg(feature = "eng2-runtime")]
             fetch_overwritten: 0,
         })
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn with_wire_fence<T>(
+        &mut self,
+        fence: std::sync::Arc<dyn p2p::WireFence>,
+        operation: impl FnOnce(&mut Self) -> Result<T, p2p::Error>,
+    ) -> Result<T, p2p::Error> {
+        self.session.set_wire_fence(Some(fence))?;
+        let result = operation(self);
+        self.session.set_wire_fence(None)?;
+        result
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn propagation_known(&self) -> bool {
+        self.propagation_supported.is_some()
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn application_totals(&self) -> p2p::IoTotals {
+        self.session.io_totals()
     }
     pub fn genesis_id(&self) -> Hash {
         self.session.binding().genesis
@@ -174,7 +202,13 @@ impl<S: Read + Write> Peer<S> {
         if let Some(request) = self.initial_request.take() {
             return Ok(request);
         }
+        let before = self.session.io_totals().received;
         let (request, bytes, _charge) = self.receive()?;
+        if let Some(message) =
+            self.propagation_request(request, &bytes, self.session.io_totals().received - before)
+        {
+            return Ok((request, Request::Propagation(message?)));
+        }
         let message = match bytes.first().copied() {
             Some(GET_TIP) if bytes.len() == 1 => Request::GetTip,
             Some(ROUND_DONE) if bytes.len() == 1 => Request::RoundDone,
@@ -381,12 +415,13 @@ impl<S: Read + Write> Peer<S> {
         }
         Ok(())
     }
+    #[cfg(test)]
     pub fn fetch_body(
         &mut self,
         request: u64,
         header: &Header,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
-        self.fetch_body_internal(request, header, None, None)
+        self.fetch_body_internal(request, header, None, None, None)
     }
     #[cfg(test)]
     pub(crate) fn fetch_body_before(
@@ -395,9 +430,9 @@ impl<S: Read + Write> Peer<S> {
         header: &Header,
         deadline: &p2p::Deadline,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
-        self.fetch_body_internal(request, header, Some(deadline), None)
+        self.fetch_body_internal(request, header, Some(deadline), None, None)
     }
-    #[cfg(feature = "eng2-runtime")]
+    #[cfg(all(test, feature = "eng2-runtime"))]
     pub(crate) fn fetch_body_before_observed(
         &mut self,
         request: u64,
@@ -405,7 +440,75 @@ impl<S: Read + Write> Peer<S> {
         deadline: &p2p::Deadline,
         progress: &dyn Fn(usize, usize),
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
-        self.fetch_body_internal(request, header, Some(deadline), Some(progress))
+        self.fetch_body_internal(request, header, Some(deadline), Some(progress), None)
+    }
+    pub(crate) fn body_budget(&self) -> p2p::Budget {
+        self.session.shared_budget()
+    }
+    pub(crate) fn body_binding(&self) -> p2p::Binding {
+        self.session.binding()
+    }
+    pub(crate) fn claim_body_authorized(
+        &self,
+        header: &Header,
+        authorization: &p2p::BodyAuthorization,
+        mode: p2p::BodyMode,
+    ) -> Result<p2p::BodyClaim, p2p::BodyClaimError> {
+        let budget = self.session.shared_budget();
+        let id = header.id().map_err(|_| p2p::BodyClaimError::Unavailable)?;
+        if !budget.authorization_matches(authorization, self.session.binding(), header.height, id) {
+            return Err(p2p::BodyClaimError::Unavailable);
+        }
+        budget.claim_body_authorized(authorization, self.peer(), mode)
+    }
+    #[cfg(test)]
+    pub(crate) fn claim_body(
+        &self,
+        header: &Header,
+        mode: p2p::BodyMode,
+        deadline: &p2p::Deadline,
+    ) -> Result<p2p::BodyClaim, p2p::BodyClaimError> {
+        if header.network != self.session.binding().network || header.height == 0 {
+            return Err(p2p::BodyClaimError::Unavailable);
+        }
+        let id = header.id().map_err(|_| p2p::BodyClaimError::Unavailable)?;
+        self.session.shared_budget().claim_body(
+            self.session.binding(),
+            header.height,
+            id,
+            self.peer(),
+            mode,
+            deadline,
+        )
+    }
+    pub(crate) fn fetch_body_owned(
+        &mut self,
+        request: u64,
+        header: &Header,
+        ownership: p2p::BodyClaim,
+        progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<Option<ReceivedBody>, p2p::Error> {
+        let deadline = ownership.deadline().clone();
+        self.fetch_body_internal(request, header, Some(&deadline), progress, Some(ownership))
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn record_body_protocol_rejection(&mut self, header: &Header) {
+        let now = std::time::Instant::now();
+        let timing = super::accept_observation::FetchTiming {
+            connection: self.observation_connection,
+            attempt: self.fetch_sequence.checked_add(1).unwrap_or(0),
+            height: header.height,
+            start: Some(now),
+            end: Some(now),
+            outcome: 3,
+            transport_error: 1,
+            ..Default::default()
+        };
+        self.fetch_sequence = self.fetch_sequence.saturating_add(1);
+        if self.fetch_observation.is_some() {
+            self.fetch_overwritten = self.fetch_overwritten.saturating_add(1);
+        }
+        self.fetch_observation = Some(timing);
     }
     fn fetch_body_internal(
         &mut self,
@@ -413,10 +516,56 @@ impl<S: Read + Write> Peer<S> {
         header: &Header,
         limit: Option<&p2p::Deadline>,
         progress: Option<&dyn Fn(usize, usize)>,
+        ownership: Option<p2p::BodyClaim>,
     ) -> Result<Option<ReceivedBody>, p2p::Error> {
+        if header.network != self.session.binding().network || header.height == 0 {
+            #[cfg(feature = "eng2-runtime")]
+            self.record_body_protocol_rejection(header);
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        let id = match header.id() {
+            Ok(id) => id,
+            Err(_) => {
+                #[cfg(feature = "eng2-runtime")]
+                self.record_body_protocol_rejection(header);
+                return Err(p2p::Error::InvalidProtocol);
+            }
+        };
+        let budget = self.session.shared_budget();
+        let ownership = match ownership {
+            Some(claim) => claim,
+            #[cfg(not(test))]
+            None => return Err(p2p::Error::InvalidProtocol),
+            #[cfg(test)]
+            None => budget
+                .claim_body(
+                    self.session.binding(),
+                    header.height,
+                    id,
+                    self.peer(),
+                    p2p::BodyMode::Legacy,
+                    &limit
+                        .cloned()
+                        .unwrap_or_else(|| p2p::Deadline::new(BODY_FETCH_TIMEOUT)),
+                )
+                .map_err(|error| match error {
+                    p2p::BodyClaimError::Busy | p2p::BodyClaimError::Capacity => {
+                        p2p::Error::ResourceExhausted
+                    }
+                    _ => p2p::Error::Unavailable,
+                })?,
+        };
+        if !ownership.matches(&budget, self.session.binding(), header.height, id) {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        let body_deadline = limit
+            .cloned()
+            .unwrap_or_else(|| ownership.deadline().clone())
+            .for_body_claim(&ownership);
         let start_deadline = limit
             .cloned()
-            .unwrap_or_else(|| p2p::Deadline::new(std::time::Duration::from_secs(10)));
+            .unwrap_or_else(|| p2p::Deadline::new(std::time::Duration::from_secs(10)))
+            .for_body_claim(&ownership);
         #[cfg(feature = "eng2-runtime")]
         let mut timing = super::accept_observation::FetchTiming {
             connection: self.observation_connection,
@@ -442,6 +591,7 @@ impl<S: Read + Write> Peer<S> {
             query[0] = GET_BODY;
             query[1..9].copy_from_slice(&header.height.to_le_bytes());
             query[9..].copy_from_slice(&id);
+            ownership.begin_query(self.peer())?;
             self.send_application_before(request, &query, &start_deadline)?;
             let (received, start, start_charge) = self.receive_before(&start_deadline)?;
             if received != request {
@@ -479,12 +629,8 @@ impl<S: Read + Write> Peer<S> {
             encoded
                 .try_reserve_exact(length)
                 .map_err(|_| p2p::Error::ResourceExhausted)?;
-            // Legacy chunks receive their original full budget only after the
-            // initial response and allocation. Optional lanes retain the same
-            // absolute deadline across the query, response and every chunk.
-            let body_deadline = limit
-                .cloned()
-                .unwrap_or_else(|| p2p::Deadline::new(BODY_FETCH_TIMEOUT));
+            // Response, allocation, mode fallback and every chunk retain the
+            // claim's first absolute deadline; none creates a renewed budget.
             while encoded.len() < length {
                 // Chunk payloads share the body's absolute deadline; ordinary
                 // control frames otherwise reset their payload limit to ten seconds.
@@ -499,6 +645,7 @@ impl<S: Read + Write> Peer<S> {
                     return Err(p2p::Error::InvalidProtocol);
                 }
                 encoded.extend_from_slice(&chunk[9..]);
+                ownership.received(encoded.len(), length)?;
                 if let Some(progress) = progress {
                     progress(encoded.len(), length);
                 }
@@ -516,6 +663,7 @@ impl<S: Read + Write> Peer<S> {
                 .map_err(|_| p2p::Error::InvalidProtocol)?;
             let body = Body::decode(&encoded, header.network, header.height, self.policy)
                 .map_err(|_| p2p::Error::InvalidProtocol)?;
+            body_deadline.check().map_err(|_| p2p::Error::Unavailable)?;
             #[cfg(feature = "eng2-runtime")]
             {
                 timing.decoded = Some(std::time::Instant::now());
@@ -527,7 +675,11 @@ impl<S: Read + Write> Peer<S> {
                 &encoded,
                 self.policy.max_body_bytes,
             );
+            ownership.decoded()?;
             Ok(Some(ReceivedBody {
+                #[cfg(feature = "eng2-runtime")]
+                receipts: None,
+                ownership,
                 body,
                 reservation,
                 #[cfg(feature = "eng2-runtime")]
@@ -964,6 +1116,103 @@ mod tests {
         }
     }
     #[test]
+    fn closed_original_bootstrap_operation_rejects_an_inflight_body_before_decoded_publication() {
+        struct ClosingStream {
+            input: std::io::Cursor<Vec<u8>>,
+            scope: p2p::BodyScope,
+            closed: bool,
+        }
+        impl std::io::Read for ClosingStream {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.input.read(bytes)?;
+                if self.input.position() >= 512 && !self.closed {
+                    self.scope.close();
+                    self.closed = true;
+                }
+                Ok(read)
+            }
+        }
+        impl std::io::Write for ClosingStream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let binding = binding(&g);
+        let mut sender = Peer::new(
+            session(vec![], binding, p2p::Budget::default()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        sender.send_body(5, &header, &body).unwrap();
+        let budget = p2p::Budget::new(20 * 1024 * 1024);
+        let scope = budget
+            .bootstrap_body_scope(std::time::Instant::now() + BODY_FETCH_TIMEOUT)
+            .unwrap();
+        let auth = budget
+            .authorize_body(
+                &scope,
+                binding,
+                header.height,
+                header.id().unwrap(),
+                &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+            )
+            .unwrap();
+        let input = sender.session.test_channel().output.clone();
+        let stream = ClosingStream {
+            input: std::io::Cursor::new(input),
+            scope,
+            closed: false,
+        };
+        let mut receiver = Peer::new(
+            p2p::Session::from_test_channel(stream, binding, budget.clone()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        let claim = receiver
+            .claim_body_authorized(&header, &auth, p2p::BodyMode::Legacy)
+            .unwrap();
+        assert!(matches!(
+            receiver.fetch_body_owned(5, &header, claim, None),
+            Err(p2p::Error::Unavailable)
+        ));
+        assert!(receiver.session.test_channel().closed);
+        let resident = budget
+            .resident_body_scope(
+                1,
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        let next = budget
+            .authorize_body(
+                &resident,
+                binding,
+                header.height,
+                header.id().unwrap(),
+                &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+            )
+            .unwrap();
+        // The failed stream released physical ownership without completing or refunding the account.
+        let next = budget
+            .claim_body_authorized(&next, [8; 32], p2p::BodyMode::Pieces)
+            .unwrap();
+        assert_eq!(next.source_ordinal(), Some(2));
+        drop(next);
+    }
+    fn assert_payload_released_with_one_retained_account(budget: &p2p::Budget, before: usize) {
+        let (accounts, metadata) = budget.retained_body_accounting();
+        assert_eq!(accounts, 1);
+        assert!(metadata > 0);
+        // Release wire/decoded ownership without refunding the exact candidate account.
+        assert_eq!(budget.available().unwrap() + metadata, before);
+    }
+    #[test]
     fn canonical_multichunk_roundtrip_retains_one_node_budget_until_body_drop() {
         let g = genesis();
         let (body, header) = body_header(&g);
@@ -995,8 +1244,42 @@ mod tests {
         }
         assert!(budget.available().unwrap() < before);
         drop(received);
-        assert_eq!(budget.available().unwrap(), before);
+        assert_payload_released_with_one_retained_account(&budget, before);
     }
+    #[test]
+    fn body_claim_survives_decode_until_admission_owner_drops() {
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let binding = binding(&g);
+        let mut sender = Peer::new(
+            session(vec![], binding, p2p::Budget::default()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        sender.send_body(5, &header, &body).unwrap();
+        let wire = sender.session.test_channel().output.clone();
+        let budget = p2p::Budget::new(20 * 1024 * 1024);
+        let before = budget.available().unwrap();
+        let mut first = Peer::new(session(wire, binding, budget.clone()), &g, policy()).unwrap();
+        let accepted_pending = first.fetch_body(5, &header).unwrap().unwrap();
+        let mut second = Peer::new(session(vec![], binding, budget.clone()), &g, policy()).unwrap();
+        let duplicate = second.fetch_body(6, &header);
+        assert!(matches!(duplicate, Err(p2p::Error::ResourceExhausted)));
+        assert!(second.session.test_channel().output.is_empty());
+        drop(accepted_pending);
+        assert_payload_released_with_one_retained_account(&budget, before);
+        // Releasing the pending native admission permits a new source request.
+        // This authenticated test peer is synthetic and has the same fingerprint.
+        // Reconnection cannot renew its already consumed source attempt.
+        assert!(matches!(
+            second.fetch_body(6, &header),
+            Err(p2p::Error::Unavailable)
+        ));
+        assert!(second.session.test_channel().output.is_empty());
+        assert_payload_released_with_one_retained_account(&budget, before);
+    }
+
     #[test]
     fn body_send_start_chunks_and_flush_share_one_deadline() {
         use std::sync::{
@@ -1165,7 +1448,7 @@ mod tests {
                 assert_eq!(received.as_ref().unwrap().as_ref().unwrap().body, body);
             }
             drop(received);
-            assert_eq!(budget.available().unwrap(), before);
+            assert_payload_released_with_one_retained_account(&budget, before);
         }
     }
     #[cfg(feature = "eng2-runtime")]
@@ -1305,7 +1588,7 @@ mod tests {
                 assert_eq!(received.as_ref().err(), Some(&p2p::Error::Unavailable));
             }
             drop(received);
-            assert_eq!(budget.available().unwrap(), before);
+            assert_payload_released_with_one_retained_account(&budget, before);
         }
     }
     #[test]
@@ -1338,7 +1621,7 @@ mod tests {
                 receiver.session.test_channel().input.position(),
                 (initial.len() + 51) as u64
             );
-            assert_eq!(budget.available().unwrap(), before);
+            assert_payload_released_with_one_retained_account(&budget, before);
         }
     }
     #[test]
@@ -1346,22 +1629,34 @@ mod tests {
         let g = genesis();
         let (_, header) = body_header(&g);
         let b = binding(&g);
-        let budget = p2p::Budget::new(1024);
-        let before = budget.available().unwrap();
-        let wire = frame(5, &start(&header, 2000), b);
-        let mut peer = Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
-        assert!(matches!(
-            peer.fetch_body(5, &header),
-            Err(p2p::Error::ResourceExhausted)
-        ));
-        assert_eq!(budget.available().unwrap(), before);
-        let wire = frame(5, &start(&header, policy().max_body_bytes + 1), b);
-        let mut peer = Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
-        assert!(matches!(
-            peer.fetch_body(5, &header),
-            Err(p2p::Error::ResourceExhausted)
-        ));
-        assert_eq!(budget.available().unwrap(), before);
+        for advertised in [2000, policy().max_body_bytes + 1] {
+            // Each resource-limit case has its own node budget so retained
+            // failed-source accounting cannot obscure the other boundary.
+            let budget = p2p::Budget::new(64 * 1024);
+            let before = budget.available().unwrap();
+            let wire = frame(5, &start(&header, advertised), b);
+            let mut peer = Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
+            assert!(matches!(
+                peer.fetch_body(5, &header),
+                Err(p2p::Error::ResourceExhausted)
+            ));
+            assert_payload_released_with_one_retained_account(&budget, before);
+
+            // Reconnecting the same source cannot renew that candidate's
+            // attempt or cause another request or response read.
+            let wire = frame(5, &start(&header, advertised), b);
+            let mut reconnected =
+                Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
+            assert!(matches!(
+                reconnected.fetch_body(5, &header),
+                Err(p2p::Error::Unavailable)
+            ));
+            assert!(reconnected.session.test_channel().output.is_empty());
+            assert_eq!(reconnected.session.test_channel().input.position(), 0);
+            assert_eq!(reconnected.session.io_totals().sent, 0);
+            assert_eq!(reconnected.session.io_totals().received, 0);
+            assert_payload_released_with_one_retained_account(&budget, before);
+        }
     }
     #[cfg(feature = "eng2-runtime")]
     #[test]
@@ -1470,7 +1765,7 @@ mod tests {
             receiver.fetch_body(5, &header),
             Err(p2p::Error::InvalidProtocol)
         ));
-        assert_eq!(budget.available().unwrap(), before);
+        assert_payload_released_with_one_retained_account(&budget, before);
     }
     #[cfg(feature = "native-p2p")]
     #[test]
@@ -1575,7 +1870,7 @@ mod tests {
         drop(received);
         drop(peer);
         worker.join().unwrap();
-        assert_eq!(budget.available().unwrap(), before);
+        assert_payload_released_with_one_retained_account(&budget, before);
     }
     #[test]
     fn optional_lane_probe_preserves_legacy_response_and_binds_the_live_request() {

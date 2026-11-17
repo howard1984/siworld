@@ -40,6 +40,7 @@ impl NativeVerifier {
         &self,
         record: &crate::issuance::IssuanceRecord,
     ) -> Result<(), Failure> {
+        let _permit = crate::verification_executor::acquire();
         self.verify_issuance_typed(record)
             .map_err(NativeVerificationFailure::into_observation)
     }
@@ -64,6 +65,7 @@ impl NativeVerifier {
         rewards: &[Digest],
         proof: &[u8],
     ) -> Result<(), Failure> {
+        let _permit = crate::verification_executor::acquire();
         self.verify_settlement_typed(fees, plan, network, list_hash, rewards, proof)
             .map_err(NativeVerificationFailure::into_observation)
     }

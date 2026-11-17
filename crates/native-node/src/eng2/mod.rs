@@ -33,12 +33,15 @@ pub mod historical;
 pub mod import;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
 pub mod isolated_production;
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod native_pipeline;
 pub mod network;
 pub mod nullifiers;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
 pub(crate) mod owner_fault;
 pub mod producer;
 pub mod proof_window;
+pub mod propagation;
 #[cfg(feature = "eng2-rehearsal")]
 pub mod rehearsal;
 #[cfg(feature = "eng2-runtime")]

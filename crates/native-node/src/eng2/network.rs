@@ -19,6 +19,7 @@ use std::{
 
 /// The resident owner authenticates every accepted block with its native engine
 /// and commits only through `Store::append`. No socket I/O occurs under this lock.
+pub type BodyProgress = Box<dyn Fn(usize, usize) + Send + Sync>;
 pub trait Owner: Send {
     fn head(&self) -> Result<(u64, Hash), String>;
     fn header(&self, height: u64) -> Result<Option<Header>, String>;
@@ -26,6 +27,53 @@ pub trait Owner: Send {
     fn block_size(&self, height: u64) -> Result<Option<usize>, String>;
     fn block(&self, height: u64) -> Result<(Header, Body), String>;
     fn accept(&mut self, header: &Header, body: &Body) -> Result<(), String>;
+    fn authorize_body(
+        &mut self,
+        header: &Header,
+        budget: &p2p::Budget,
+        binding: p2p::Binding,
+        expires: std::time::Instant,
+    ) -> Result<Option<p2p::BodyAuthorization>, String> {
+        let now = std::time::Instant::now();
+        let deadline = &crate::p2p::Deadline::from_started(
+            now,
+            expires.saturating_duration_since(now),
+            crate::p2p::Cancellation::default(),
+        );
+        #[cfg(test)]
+        {
+            let scope = budget
+                .resident_body_scope(
+                    1,
+                    std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                )
+                .map_err(|_| "test body scope unavailable")?;
+            budget
+                .authorize_body(
+                    &scope,
+                    binding,
+                    header.height,
+                    header.id().map_err(|_| "test header invalid")?,
+                    deadline,
+                )
+                .map(Some)
+                .map_err(|_| "test body authorization unavailable".into())
+        }
+        #[cfg(not(test))]
+        {
+            let _ = (header, budget, binding, deadline);
+            Err("body lifecycle owner unavailable".into())
+        }
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn body_progress(
+        &self,
+        _header: &Header,
+        _peer: Hash,
+        _claim: &p2p::BodyClaim,
+    ) -> Result<Option<BodyProgress>, String> {
+        Ok(None)
+    }
     #[cfg(feature = "eng2-runtime")]
     fn accept_received(
         &mut self,
@@ -113,6 +161,7 @@ pub enum DiscoveryAction {
     Body {
         request: super::branches::discovery::HeaderRequest,
         header: Header,
+        ownership: Box<p2p::BodyClaim>,
     },
     Ready,
     Deferred,
@@ -410,23 +459,51 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
         if used_requests >= usize::from(limits.blocks) * 2 {
             break;
         }
-        let received = peer
-            .fetch_body(sequence.next()?, &header)?
-            .ok_or(Error::Unavailable)?;
+        let deadline = p2p::Deadline::new(super::transport::BODY_FETCH_TIMEOUT);
+        let authorization = with_owner(owner, |o| {
+            o.authorize_body(
+                &header,
+                &peer.body_budget(),
+                peer.body_binding(),
+                deadline.expires_at(),
+            )
+        })?;
+        let Some(authorization) = authorization else {
+            continue;
+        };
+        let ownership =
+            match peer.claim_body_authorized(&header, &authorization, p2p::BodyMode::Legacy) {
+                Ok(claim) => claim,
+                Err(
+                    p2p::BodyClaimError::Busy
+                    | p2p::BodyClaimError::Capacity
+                    | p2p::BodyClaimError::Expired
+                    | p2p::BodyClaimError::SourceUsed
+                    | p2p::BodyClaimError::QueryLimit,
+                ) => {
+                    return Ok(Pulled {
+                        accepted,
+                        checked_head: None,
+                    });
+                }
+                Err(_) => return Err(Error::Unavailable),
+            };
+        #[cfg(feature = "eng2-runtime")]
+        let progress = with_owner(owner, |o| o.body_progress(&header, peer.peer(), &ownership))?;
+        #[cfg(not(feature = "eng2-runtime"))]
+        let progress: Option<Box<dyn Fn(usize, usize) + Send + Sync>> = None;
+        let result = peer.fetch_body_owned(
+            sequence.next()?,
+            &header,
+            ownership,
+            progress.as_deref().map(|p| p as &dyn Fn(usize, usize)),
+        );
+        drop(progress);
+        let received = result?.ok_or(Error::Unavailable)?;
         used_requests += 1;
         // The transport reservation stays live during full native admission.
-        let newly_accepted = with_owner(owner, |o| {
-            // Keep the canonical recheck and native admission in the same
-            // critical section when another download wins during body I/O.
-            if canonical_contains(o, &header)? {
-                return Ok(false);
-            }
-            #[cfg(feature = "eng2-runtime")]
-            o.accept_received(&header, &received)?;
-            #[cfg(not(feature = "eng2-runtime"))]
-            o.accept(&header, &received.body)?;
-            Ok(true)
-        })?;
+        let newly_accepted = accept_pulled(owner, &header, &received)?;
+        received.ownership.complete();
         drop(received);
         accepted += u16::from(newly_accepted);
     }
@@ -481,10 +558,14 @@ fn discover_fork_kind<S: Read + Write, O: Owner>(
                 o.branch_discovery_next(remote, peer.peer(), discovery_now_ms())
             }
         })?;
-        let (ticket, body_header) = match action {
+        let (ticket, body_header, ownership) = match action {
             DiscoveryAction::Ready | DiscoveryAction::Deferred => return Ok(()),
-            DiscoveryAction::Header(ticket) => (ticket, None),
-            DiscoveryAction::Body { request, header } => (request, Some(header)),
+            DiscoveryAction::Header(ticket) => (ticket, None, None),
+            DiscoveryAction::Body {
+                request,
+                header,
+                ownership,
+            } => (request, Some(header), Some(*ownership)),
         };
         if ticket.peer() != peer.peer() || ticket.is_body() != body_header.is_some() {
             return Err(Error::Protocol);
@@ -521,11 +602,29 @@ fn discover_fork_kind<S: Read + Write, O: Owner>(
             if ticket.query() != (header.height, header.id().map_err(|_| Error::Protocol)?) {
                 return Err(Error::Protocol);
             }
-            match peer.fetch_body(sequence.next()?, &header) {
+            let ownership = ownership.ok_or(Error::Protocol)?;
+            #[cfg(feature = "eng2-runtime")]
+            let progress =
+                with_owner(owner, |o| o.body_progress(&header, peer.peer(), &ownership))?;
+            #[cfg(not(feature = "eng2-runtime"))]
+            let progress: Option<Box<dyn Fn(usize, usize) + Send + Sync>> = None;
+            let result = peer.fetch_body_owned(
+                sequence.next()?,
+                &header,
+                ownership,
+                progress.as_deref().map(|p| p as &dyn Fn(usize, usize)),
+            );
+            drop(progress);
+            match result {
                 Ok(Some(received)) => {
                     with_owner(owner, |o| {
+                        received
+                            .ownership
+                            .check_active()
+                            .map_err(|_| "body ownership expired before retention".to_string())?;
                         o.branch_discovery_body(ticket, &header, &received.body, discovery_now_ms())
                     })?;
+                    received.ownership.complete();
                     drop(received);
                 }
                 Ok(None) => with_owner(owner, |o| {
@@ -563,6 +662,7 @@ pub(crate) fn serve<S: Read + Write, O: Owner>(
     message: Request,
 ) -> Result<u16, Error> {
     match message {
+        Request::Propagation(_) => return Err(Error::Protocol),
         Request::BootstrapManifest { bundle } => {
             let _charge = peer.reserve_bootstrap(super::bootstrap::MAX_MANIFEST_BYTES + 1)?;
             let authenticated_peer = peer.peer();
@@ -589,6 +689,11 @@ pub(crate) fn serve<S: Read + Write, O: Owner>(
             height: super::transport::lanes::CAPABILITY_HEIGHT,
         } => {
             peer.send_lane_capabilities(request)?;
+        }
+        Request::Header {
+            height: super::transport::propagation::CAPABILITY_HEIGHT,
+        } => {
+            peer.send_unavailable(request, super::transport::propagation::CAPABILITY_HEIGHT)?;
         }
         Request::Header { height: 0 } => {
             let available = with_owner(owner, |o| Ok(o.exact_exchange_enabled()))?;
@@ -775,6 +880,44 @@ impl<S: Read + Write> BootstrapPull<'_, S> {
         };
         DiscoveryResponse { request, result }
     }
+    pub(crate) fn authorize_body(
+        &self,
+        scope: &p2p::BodyScope,
+        binding: p2p::Binding,
+        header: &Header,
+    ) -> Result<p2p::BodyAuthorization, Error> {
+        if binding != self.peer.body_binding() {
+            return Err(Error::Protocol);
+        }
+        let deadline = p2p::Deadline::new(super::transport::BODY_FETCH_TIMEOUT);
+        self.peer
+            .body_budget()
+            .authorize_body(
+                scope,
+                binding,
+                header.height,
+                header.id().map_err(|_| Error::Protocol)?,
+                &deadline,
+            )
+            .map_err(|_| Error::Unavailable)
+    }
+    pub(crate) fn body_authorized(
+        &mut self,
+        header: &Header,
+        authorization: &p2p::BodyAuthorization,
+    ) -> Result<Option<super::transport::ReceivedBody>, Error> {
+        let request = self.request()?;
+        let ownership = self
+            .peer
+            .claim_body_authorized(header, authorization, p2p::BodyMode::Legacy)
+            .map_err(|_| Error::Unavailable)?;
+        let result = self
+            .peer
+            .fetch_body_owned(request, header, ownership, None)?;
+        self.deadline.check().map_err(|_| p2p::Error::Unavailable)?;
+        Ok(result)
+    }
+    #[cfg(test)]
     pub fn body(
         &mut self,
         header: &Header,
@@ -827,6 +970,28 @@ pub fn initiate_bootstrap<S: Read + Write, O: Owner, T>(
         served += serve(peer, owner, request, message)?;
     }
     Err(Error::RequestLimit)
+}
+fn accept_pulled<O: Owner>(
+    owner: &Arc<Mutex<O>>,
+    header: &Header,
+    received: &super::transport::ReceivedBody,
+) -> Result<bool, Error> {
+    with_owner(owner, |owner| {
+        // An independently committed exact duplicate publishes nothing new.
+        // Check it under the same lock before enforcing the download lifetime.
+        if canonical_contains(owner, header)? {
+            return Ok(false);
+        }
+        received
+            .ownership
+            .check_active()
+            .map_err(|_| "body ownership expired before admission".to_string())?;
+        #[cfg(feature = "eng2-runtime")]
+        owner.accept_received(header, received)?;
+        #[cfg(not(feature = "eng2-runtime"))]
+        owner.accept(header, &received.body)?;
+        Ok(true)
+    })
 }
 fn with_owner<O: Owner, T>(
     owner: &Arc<Mutex<O>>,
@@ -965,6 +1130,27 @@ mod tests {
             budget,
         )
     }
+    #[test]
+    fn ordinary_channel_declines_piece_capability_and_keeps_the_following_turn_usable() {
+        let (mut client, mut server, _) = peers();
+        let owner = Arc::new(Mutex::new(fixture(1)));
+        let expected = owner.lock().unwrap().head().unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (request, message) = server.receive_request().unwrap();
+                serve(&mut server, &owner, request, message).unwrap();
+            }
+            let (request, message) = server.receive_request().unwrap();
+            assert!(matches!(message, Request::RoundDone));
+            server.finish_round(request).unwrap();
+        });
+        assert!(!client.probe_propagation(1).unwrap());
+        assert!(!client.propagation_supported());
+        assert_eq!(client.fetch_tip(2).unwrap(), expected);
+        client.finish_round(3).unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn concurrent_canonical_acceptance_before_header_response_avoids_body_download() {
         let (mut client_peer, mut server_peer, _) = peers();
@@ -1110,7 +1296,12 @@ mod tests {
             client.lock().unwrap().head().unwrap(),
             server.lock().unwrap().head().unwrap()
         );
-        assert_eq!(budget.available().unwrap(), before);
+        // Payload/frame ownership is released; exact-account records remain charged
+        // until the original owner lawfully advances its fixed lifecycle window.
+        let (accounts, metadata) = budget.retained_body_accounting();
+        assert_eq!(accounts, 2);
+        assert!(metadata > 0);
+        assert_eq!(budget.available().unwrap() + metadata, before);
         (result, remote)
     }
     #[cfg(feature = "eng2-runtime")]
@@ -1475,6 +1666,291 @@ mod tests {
         assert!(!client.competing_head_matches(local, (remote.0 + 1, remote.1)));
     }
 
+    fn selected_bootstrap_body_fixture(
+        count: u64,
+        maximum_cache_bytes: u64,
+    ) -> (
+        Genesis,
+        crate::eng2::bootstrap::client::Client,
+        Vec<(Header, Body)>,
+        p2p::Budget,
+        std::path::PathBuf,
+    ) {
+        use crate::eng2::bootstrap::{
+            self, Chunk, Descriptor, Object,
+            cache::{Policy as CachePolicy, Quarantine},
+            client::Candidate,
+        };
+        use siworld_core::pow::Work;
+        let (genesis, imports, _) = bootstrap::tests::framing_fixture();
+        let mut records = fixture(count).blocks;
+        let mut parent = genesis.id();
+        for (header, _) in &mut records {
+            header.parent = parent;
+            header.timestamp = genesis.config().genesis_timestamp + header.height * 300;
+            parent = header.id().unwrap();
+        }
+        let headers: Vec<_> = records.iter().map(|(header, _)| header.clone()).collect();
+        let manifest = bootstrap::tests::framing_tail_manifest(&headers);
+        let mut entropy = [0; 16];
+        getrandom::fill(&mut entropy).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "bootstrap-body-authority-{}",
+            crate::local::hex(&entropy)
+        ));
+        let budget = p2p::Budget::new(256 * 1024 * 1024);
+        let mut cache = Quarantine::create(
+            &directory,
+            manifest,
+            CachePolicy {
+                max_bytes: maximum_cache_bytes,
+                max_chunks_per_object: 16,
+                max_body_bytes: policy().max_body_bytes,
+            },
+            budget.clone(),
+        )
+        .unwrap();
+        for (header, _) in &records {
+            cache.put_header(header).unwrap();
+        }
+        cache
+            .push(
+                Object::Snapshot,
+                0,
+                &Chunk {
+                    descriptor: cache.manifest().snapshot,
+                    bytes: b"fixture".to_vec(),
+                },
+            )
+            .unwrap();
+        for (header, _) in records.iter().take(72) {
+            let bytes = b"synthetic receipt";
+            cache
+                .push(
+                    Object::Receipt {
+                        height: header.height,
+                        id: header.id().unwrap(),
+                    },
+                    0,
+                    &Chunk {
+                        descriptor: Descriptor {
+                            length: bytes.len() as u64,
+                            digest: *blake3::hash(bytes).as_bytes(),
+                        },
+                        bytes: bytes.to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+        let candidate = Candidate::new(
+            cache,
+            &genesis,
+            crate::eng2::import::Policy {
+                state: imports,
+                max_headers: 1000,
+                max_verification_bytes: 512 * 1024 * 1024,
+            },
+            policy(),
+        )
+        .unwrap();
+        let prepared = candidate.prepare(&genesis, Work::one()).unwrap();
+        let client = bootstrap::client::select(vec![prepared], Work::one()).unwrap();
+        (genesis, client, records, budget, directory)
+    }
+    #[test]
+    fn selected_bootstrap_client_downloads_240_tail_bodies_with_one_original_operation() {
+        use crate::eng2::bootstrap::client::Progress;
+        let (genesis, mut client, records, budget, directory) =
+            selected_bootstrap_body_fixture(312, 256 * 1024 * 1024);
+        client
+            .bind_body_operation(
+                &budget,
+                std::time::Instant::now() + std::time::Duration::from_secs(180),
+            )
+            .unwrap();
+        assert_eq!(
+            client.progress().unwrap(),
+            Progress::NativeTail {
+                next: 73,
+                total: 312
+            }
+        );
+        for (header, body) in records.into_iter().skip(72) {
+            let (a, b) = UnixStream::pair().unwrap();
+            for socket in [&a, &b] {
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+            }
+            let mut receiver = Peer::new(
+                p2p::Session::from_test_channel(a, genesis.peer_binding(), budget.clone()),
+                &genesis,
+                policy(),
+            )
+            .unwrap();
+            let mut sender = Peer::new(
+                p2p::Session::from_test_channel(b, genesis.peer_binding(), budget.clone()),
+                &genesis,
+                policy(),
+            )
+            .unwrap();
+            let height = header.height;
+            let server = std::thread::spawn(move || {
+                let (request, message) = sender.receive_request().unwrap();
+                assert!(
+                    matches!(message, Request::Body { height: requested, .. } if requested == height)
+                );
+                sender.send_body(request, &header, &body).unwrap();
+            });
+            let mut sequence = Sequence::default();
+            let mut pull = BootstrapPull {
+                peer: &mut receiver,
+                sequence: &mut sequence,
+                remaining: 1,
+                deadline: p2p::Deadline::new(std::time::Duration::from_secs(180)),
+            };
+            client.pull_step(&mut pull).unwrap();
+            server.join().unwrap();
+            assert!(
+                client
+                    .bind_body_operation(
+                        &budget,
+                        std::time::Instant::now() + std::time::Duration::from_secs(180)
+                    )
+                    .is_err()
+            );
+        }
+        assert_eq!(client.progress().unwrap(), Progress::Downloaded);
+        assert_eq!(budget.retained_body_accounting().0, 240);
+        // Framing and immutable-plan acquisition do not admit synthetic proofs or certificates.
+        drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn selected_bootstrap_cache_failure_preserves_candidate_and_never_completes_its_account() {
+        use crate::eng2::bootstrap::client::Progress;
+        let maximum = 96 * crate::eng2::header::HEADER_BYTES as u64
+            + 7
+            + 72 * b"synthetic receipt".len() as u64
+            + 1;
+        let (genesis, mut client, records, budget, directory) =
+            selected_bootstrap_body_fixture(96, maximum);
+        client
+            .bind_body_operation(
+                &budget,
+                std::time::Instant::now() + super::super::transport::BODY_FETCH_TIMEOUT,
+            )
+            .unwrap();
+        let (header, body) = records[72].clone();
+        for source in [8u8, 9] {
+            let (a, b) = UnixStream::pair().unwrap();
+            a.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            b.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut receiver = Peer::new(
+                p2p::Session::from_test_peer_channel(
+                    a,
+                    genesis.peer_binding(),
+                    budget.clone(),
+                    [source; 32],
+                    p2p::Role::Validator,
+                ),
+                &genesis,
+                policy(),
+            )
+            .unwrap();
+            let mut sender = Peer::new(
+                p2p::Session::from_test_channel(b, genesis.peer_binding(), budget.clone()),
+                &genesis,
+                policy(),
+            )
+            .unwrap();
+            let header = header.clone();
+            let body = body.clone();
+            let server = std::thread::spawn(move || {
+                let (request, message) = sender.receive_request().unwrap();
+                assert!(matches!(message, Request::Body { height: 73, .. }));
+                sender.send_body(request, &header, &body).unwrap();
+            });
+            let mut sequence = Sequence::default();
+            let mut pull = BootstrapPull {
+                peer: &mut receiver,
+                sequence: &mut sequence,
+                remaining: 1,
+                deadline: p2p::Deadline::new(super::super::transport::BODY_FETCH_TIMEOUT),
+            };
+            assert!(
+                matches!(client.pull_step(&mut pull), Err(Error::Owner(reason)) if reason.contains("byte budget exceeded"))
+            );
+            server.join().unwrap();
+            assert_eq!(
+                client.progress().unwrap(),
+                Progress::NativeTail {
+                    next: 73,
+                    total: 96
+                }
+            );
+            assert_eq!(budget.retained_body_accounting().0, 1);
+        }
+        client.cancel_body_operation();
+        drop(client);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn independently_accepted_registry_terminal_body_is_discarded_without_failing_the_round() {
+        let genesis = genesis();
+        let (mut receiver, mut sender, budget) = peers();
+        let remote = fixture(1);
+        let (header, body) = remote.blocks[0].clone();
+        let discovery = crate::eng2::branches::discovery::runtime::Discovery::new(
+            genesis.config().network,
+            genesis.id(),
+            crate::eng2::branches::discovery::runtime::resident_limits(),
+            discovery_now_ms(),
+            budget.clone(),
+        )
+        .unwrap();
+        let auth = budget
+            .authorize_body(
+                &discovery.body_scope(),
+                genesis.peer_binding(),
+                header.height,
+                header.id().unwrap(),
+                &p2p::Deadline::new(super::super::transport::BODY_FETCH_TIMEOUT),
+            )
+            .unwrap();
+        let sent_header = header.clone();
+        let worker = std::thread::spawn(move || {
+            let (request, message) = sender.receive_request().unwrap();
+            assert!(matches!(message, Request::Body { height: 1, .. }));
+            sender.send_body(request, &sent_header, &body).unwrap();
+        });
+        let lease = receiver
+            .claim_body_authorized(&header, &auth, p2p::BodyMode::Legacy)
+            .unwrap();
+        let received = receiver
+            .fetch_body_owned(1, &header, lease, None)
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        // Interleave the real terminal transition between decoded transport and
+        // acquisition of the ordinary owner's publication lock.
+        assert!(
+            budget
+                .accepted_body(genesis.peer_binding(), header.height, header.id().unwrap())
+                .unwrap()
+        );
+        assert!(received.ownership.check_active().is_err());
+        let owner = Arc::new(Mutex::new(fixture(0)));
+        assert!(accept_pulled(&owner, &header, &received).is_err());
+        assert_eq!(owner.lock().unwrap().head().unwrap().0, 0);
+        *owner.lock().unwrap() = remote;
+        assert!(!accept_pulled(&owner, &header, &received).unwrap());
+        assert_eq!(owner.lock().unwrap().head().unwrap().0, 1);
+        drop(received);
+    }
     #[test]
     fn probe_and_exact_requests_share_the_same_round_budget() {
         let (mut peer, _, _) = peers();
@@ -1574,7 +2050,10 @@ mod tests {
             1
         );
         drop(body);
-        assert_eq!(budget.available().unwrap(), available);
+        let (accounts, metadata) = budget.retained_body_accounting();
+        assert_eq!(accounts, 1);
+        assert!(metadata > 0);
+        assert_eq!(budget.available().unwrap() + metadata, available);
     }
     #[test]
     fn discovery_response_returns_linear_request_to_the_same_node_ledger() {
@@ -1776,6 +2255,7 @@ mod tests {
                     window_ms: 4000,
                 },
                 discovery_now_ms(),
+                crate::p2p::Budget::default(),
             )
             .unwrap();
             HeaderOwner {
@@ -1997,6 +2477,7 @@ mod tests {
                 window_ms: 120_000,
             },
             discovery_now_ms(),
+            crate::p2p::Budget::default(),
         )
         .unwrap();
         let owner = Arc::new(Mutex::new(DiscoveryOwner {

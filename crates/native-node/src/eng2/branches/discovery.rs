@@ -111,6 +111,20 @@ pub struct Usage {
     pub body_bytes: u64,
 }
 
+/// Nonconstructible outside the original Ledger renewal implementation.
+pub(crate) struct BodyWindowAdvance {
+    old: u64,
+    new: u64,
+    remaining_ms: u64,
+}
+impl BodyWindowAdvance {
+    pub(crate) fn identities(&self) -> (u64, u64) {
+        (self.old, self.new)
+    }
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining_ms
+    }
+}
 /// A fixed, nonrenewing accounting window. Candidate expiry, retries and tip
 /// changes never remove counts or release slots inside this window. The owner
 /// may explicitly replace an expired window after its local policy cooldown;
@@ -192,6 +206,23 @@ impl Ledger {
         }
         *self = Self::new(self.network, self.genesis, self.limits, now_ms)?;
         Ok(true)
+    }
+    pub(crate) fn renew_body_window(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Option<BodyWindowAdvance>, Error> {
+        let old = self.identity;
+        if !self.renew_expired_window(now_ms)? {
+            return Ok(None);
+        }
+        Ok(Some(BodyWindowAdvance {
+            old,
+            new: self.identity,
+            remaining_ms: self.expires_ms - now_ms,
+        }))
+    }
+    pub(crate) fn body_window(&self) -> (u64, u64, u64) {
+        (self.identity, self.expires_ms, self.last_ms)
     }
     pub fn usage(&self) -> Usage {
         Usage {

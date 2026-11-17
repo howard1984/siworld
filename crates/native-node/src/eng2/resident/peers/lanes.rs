@@ -1,7 +1,8 @@
 //! Independent authenticated optional sockets, each retained by one peer worker.
 use super::super::header_lane::Hub;
 use super::*;
-use crate::eng2::transport::Request;
+use crate::eng2::transport::{Request, propagation::PropagationRequest};
+mod pieces;
 struct ConnectedLane {
     status: Arc<NetworkStatus>,
     headers: Arc<Hub>,
@@ -143,13 +144,53 @@ fn pull_one(
     *sequence = sequence
         .checked_add(1)
         .ok_or("body lane sequence exhausted")?;
-    if let Some(download) = shared.headers.download(peer.peer())? {
+    if !peer.propagation_known() {
+        peer.probe_propagation(*sequence)
+            .map_err(|_| "body propagation negotiation failed")?;
+        return Ok(());
+    }
+    shared.transfers.reap(shared)?;
+    if peer.propagation_supported() {
+        if pieces::pull_batch(peer, shared, *sequence)? {
+            return Ok(());
+        }
+        if pieces::offer(peer, shared, *sequence)? {
+            return Ok(());
+        }
+        if let Some(download) = shared
+            .headers
+            .download_mode(peer.peer(), p2p::BodyMode::Pieces)?
+        {
+            let mut ledger = shared.transfers.ledger(
+                &download.header,
+                &download.deadline,
+                shared.headers.body_policy().max_body_bytes,
+            )?;
+            let validation = shared.transfers.capture(shared, &download);
+            let metadata = peer.fetch_propagation_metadata_at(
+                *sequence,
+                &download.header,
+                &mut ledger,
+                download.ownership()?,
+            );
+            shared
+                .transfers
+                .metadata_observed(shared, &download, &ledger, metadata.is_ok());
+            let metadata = metadata.map_err(|_| "piece metadata interrupted or rejected")?;
+            shared
+                .transfers
+                .insert(download, metadata, ledger, validation, shared)?;
+            return Ok(());
+        }
+    }
+    if let Some(mut download) = shared.headers.download(peer.peer())? {
         let path = shared.headers.path(&download.header)?;
-        let received = peer.fetch_body_before_observed(
+        let ownership = download.take_ownership()?;
+        let received = peer.fetch_body_owned(
             *sequence,
             &download.header,
-            &download.deadline,
-            &|bytes, total| download.received(bytes, total),
+            ownership,
+            Some(&|bytes, total| download.received(bytes, total)),
         );
         // Preserve every actual attempt, including partial reads and failures,
         // before an error can close this independently authenticated lane.
@@ -175,13 +216,27 @@ fn pull_one(
     }
     Ok(())
 }
-fn serve_turn(
-    peer: &mut Peer<p2p::NativeTlsChannel>,
+fn serve_turn<S: std::io::Read + std::io::Write>(
+    peer: &mut Peer<S>,
     shared: &Shared,
     sequence: &mut u64,
 ) -> Result<(), String> {
+    let before = peer.application_totals();
     receive_turn(peer, sequence, |peer, request, message| {
         match message {
+            Request::Header {
+                height: crate::eng2::transport::propagation::CAPABILITY_HEIGHT,
+            } => {
+                peer.send_propagation_capabilities(request)
+                    .map_err(|_| "body propagation negotiation failed")?;
+            }
+            Request::Propagation(message) if peer.propagation_supported() => pieces::serve(
+                peer,
+                shared,
+                request,
+                message,
+                peer.application_totals().received - before.received,
+            )?,
             Request::GetTip => {
                 let (height, id) = shared.headers.tip()?;
                 peer.advertise_tip(request, height, id)

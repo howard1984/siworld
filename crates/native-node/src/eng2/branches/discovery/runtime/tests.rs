@@ -93,6 +93,7 @@ fn owner_state_machine_discovers_all_raw_materials_without_canonical_adoption() 
             window_ms: 4000,
         },
         10,
+        crate::p2p::Budget::default(),
     )
     .unwrap();
     let remote = (3, parent);
@@ -139,6 +140,7 @@ fn owner_state_machine_discovers_all_raw_materials_without_canonical_adoption() 
         let DiscoveryAction::Body {
             request,
             header: requested,
+            ..
         } = action
         else {
             panic!("exact raw body expected")
@@ -169,7 +171,7 @@ fn owner_state_machine_discovers_all_raw_materials_without_canonical_adoption() 
 }
 
 #[test]
-fn delayed_body_alternative_completes_raw_path_while_primary_is_pending() {
+fn body_handoff_waits_for_primary_release_without_consuming_a_source_ticket() {
     let fixture = super::super::super::tests::Fixture::new();
     let bootstrap = crate::eng2::snapshot::tests::bootstrap();
     let genesis = Genesis::seal(
@@ -239,6 +241,7 @@ fn delayed_body_alternative_completes_raw_path_while_primary_is_pending() {
             window_ms: 240_000,
         },
         10,
+        crate::p2p::Budget::default(),
     )
     .unwrap();
     let remote = (1, header.id().unwrap());
@@ -251,17 +254,36 @@ fn delayed_body_alternative_completes_raw_path_while_primary_is_pending() {
     discovery
         .received(request, Some(header.clone()), 12)
         .unwrap();
-    let DiscoveryAction::Body { request: slow, .. } = discovery
+    let DiscoveryAction::Body {
+        request: slow,
+        ownership: slow_owner,
+        ..
+    } = discovery
         .next(&mut branches, &canonical, remote, [9; 32], 14)
         .unwrap()
     else {
         panic!("primary raw-body request expected")
     };
-    let DiscoveryAction::Body { request: fast, .. } = discovery
+    let before = discovery.usage().requests;
+    assert!(matches!(
+        discovery
+            .next(&mut branches, &canonical, remote, [8; 32], 30_013)
+            .unwrap(),
+        DiscoveryAction::Deferred
+    ));
+    assert_eq!(discovery.usage().requests, before);
+    let original_deadline = slow_owner.deadline().clone();
+    discovery.deferred(slow, 30_013).unwrap();
+    drop(slow_owner);
+    let DiscoveryAction::Body {
+        request: fast,
+        ownership: fast_owner,
+        ..
+    } = discovery
         .next(&mut branches, &canonical, remote, [8; 32], 30_014)
         .unwrap()
     else {
-        panic!("delayed alternative must not wait for the primary deadline")
+        panic!("released primary permits the alternate source")
     };
     discovery
         .body(&mut branches, fast, &header, &body, policy, 30_015)
@@ -272,9 +294,12 @@ fn delayed_body_alternative_completes_raw_path_while_primary_is_pending() {
             .unwrap(),
         DiscoveryAction::Ready
     ));
-    discovery
-        .body(&mut branches, slow, &header, &body, policy, 30_017)
-        .unwrap();
+    assert_eq!(
+        fast_owner.deadline().expires_at(),
+        original_deadline.expires_at()
+    );
+    fast_owner.complete();
+    drop(fast_owner);
     assert_eq!(canonical.engine().state().height(), 0);
     assert_eq!(
         branches.body_size(header.id().unwrap()).unwrap(),
@@ -282,7 +307,54 @@ fn delayed_body_alternative_completes_raw_path_while_primary_is_pending() {
     );
     assert_eq!(
         discovery.usage().body_bytes,
-        2 * body.encoded_len(policy).unwrap() as u64
+        body.encoded_len(policy).unwrap() as u64
     );
     assert_eq!(discovery.usage().requests, 3);
+}
+
+#[test]
+fn original_discovery_limits_bound_shared_actual_body_queries() {
+    let budget = crate::p2p::Budget::new(1024 * 1024);
+    let mut limits = resident_limits();
+    limits.maximum_headers = 2;
+    limits.maximum_headers_per_candidate = 2;
+    limits.maximum_requests = 2;
+    let discovery = Discovery::new([1; 32], [2; 32], limits, 0, budget.clone()).unwrap();
+    let binding = crate::p2p::Binding {
+        network: [1; 32],
+        genesis: [2; 32],
+        verifier: [3; 32],
+    };
+    for tag in 1u8..=2 {
+        let auth = budget
+            .authorize_body(
+                &discovery.body_scope(),
+                binding,
+                1,
+                [tag; 32],
+                &crate::p2p::Deadline::new(crate::eng2::transport::BODY_FETCH_TIMEOUT),
+            )
+            .unwrap();
+        let lease = budget
+            .claim_body_authorized(&auth, [4; 32], crate::p2p::BodyMode::Legacy)
+            .unwrap();
+        lease.begin_query([4; 32]).unwrap();
+        if tag == 2 {
+            assert!(lease.begin_query([4; 32]).is_err());
+        }
+        drop(lease);
+    }
+    assert_eq!(
+        budget
+            .authorize_body(
+                &discovery.body_scope(),
+                binding,
+                1,
+                [3; 32],
+                &crate::p2p::Deadline::new(crate::eng2::transport::BODY_FETCH_TIMEOUT)
+            )
+            .unwrap_err(),
+        crate::p2p::BodyClaimError::Capacity
+    );
+    assert_eq!(budget.retained_body_accounting().0, 2);
 }

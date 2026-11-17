@@ -54,6 +54,8 @@ struct RetainedObservation {
 }
 #[derive(Default)]
 pub(crate) struct Observer {
+    #[cfg(feature = "eng2-runtime")]
+    progress_hub: Option<std::sync::Weak<super::resident::header_lane::Hub>>,
     last_now: Option<u64>,
     observed_height: Option<u64>,
     hard: Option<Error>,
@@ -96,6 +98,24 @@ impl View for Accepted<'_> {
     }
 }
 impl Observer {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn observe_progress(
+        &mut self,
+        hub: &std::sync::Arc<super::resident::header_lane::Hub>,
+    ) {
+        self.progress_hub = Some(std::sync::Arc::downgrade(hub));
+    }
+    fn restrict_progress(&self) {
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(hub) = self
+            .progress_hub
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            hub.invalidate_progress_context();
+        }
+    }
+
     pub fn new(budget: &crate::p2p::Budget) -> Result<Self, String> {
         let charge = budget
             .reserve(MAX_PENDING_AUTHORIZATIONS * std::mem::size_of::<RetainedObservation>())
@@ -194,6 +214,7 @@ impl Observer {
             return Err(error);
         }
         if store.ensure_exportable().is_err() {
+            self.restrict_progress();
             self.error = Some(Error::Unavailable);
             return Err(Error::Unavailable);
         }
@@ -228,8 +249,10 @@ impl Observer {
             {
                 let certificate = saved.certificate.clone();
                 if let Err(error) = self.watch_retired(view, &certificate) {
+                    self.restrict_progress();
                     self.error = Some(error);
                     if matches!(error, Error::Conflict | Error::EvidenceUnavailable) {
+                        self.restrict_progress();
                         self.hard = Some(error);
                     }
                     return;
@@ -244,6 +267,7 @@ impl Observer {
         self.retired_anchor_unavailable = false;
         if let Some((height, anchor)) = self.retired_anchor {
             if height > view.height() {
+                self.restrict_progress();
                 self.retired_anchor_unavailable = true;
             } else {
                 match view
@@ -251,11 +275,15 @@ impl Observer {
                     .and_then(|header| header.id().map_err(|_| Error::Rejected))
                 {
                     Ok(id) if id != anchor => {
+                        self.restrict_progress();
                         self.hard = Some(Error::Conflict);
                         self.error = self.hard;
                         return;
                     }
-                    Err(_) => self.retired_anchor_unavailable = true,
+                    Err(_) => {
+                        self.restrict_progress();
+                        self.retired_anchor_unavailable = true;
+                    }
                     Ok(_) => (),
                 }
             }
@@ -265,6 +293,7 @@ impl Observer {
             if let Ok((_, selected)) = headers(view, &certificate.statement)
                 && selected != certificate.statement.checkpoint_block
             {
+                self.restrict_progress();
                 self.hard = Some(Error::Conflict);
                 self.error = self.hard;
                 break;
@@ -394,6 +423,7 @@ impl Observer {
                     return result;
                 }
                 if result == Err(Error::PendingAuthorization) {
+                    self.restrict_progress();
                     let Incoming::Certified {
                         certificate,
                         witness,
@@ -467,8 +497,10 @@ impl Observer {
                 self.error = self.gate_reason();
             }
             Err(error) => {
+                self.restrict_progress();
                 self.error = Some(error);
                 if matches!(error, Error::Conflict | Error::EvidenceUnavailable) {
+                    self.restrict_progress();
                     self.hard = Some(error);
                 }
             }
