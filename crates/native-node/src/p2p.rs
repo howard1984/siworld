@@ -356,6 +356,11 @@ impl BodyClaim {
         self.deadline.check().ok()?;
         self.lease.source_ordinal()
     }
+    /// A conservative planning read, never an allocation or query grant.
+    pub(crate) fn can_query(&self, source: Hash, reserve: u8) -> bool {
+        self.deadline.check().is_ok() && self.lease.can_query(source, reserve, Instant::now())
+    }
+
     pub(crate) fn begin_query(&self, source: Hash) -> Result<(), Error> {
         self.deadline.check().map_err(io_error)?;
         self.lease

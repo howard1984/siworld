@@ -467,6 +467,9 @@ impl<S: Read + Write> Peer<S> {
         ledger
             .bind_claim(self.session.binding(), ownership)
             .map_err(resource)?;
+        if !ownership.can_query(self.peer(), 2) {
+            return Err(p2p::Error::ResourceExhausted);
+        }
         let _reservation =
             self.reserve_application(metadata_allocation(self.policy.max_body_bytes)?)?;
         let attempt = ledger
@@ -479,21 +482,8 @@ impl<S: Read + Write> Peer<S> {
         let request = external_request.unwrap_or(attempt.sequence());
         let deadline = ledger.io_deadline();
         let before = self.session.io_totals();
-        let result = (|| {
-            let mut query = vec![GET_METADATA, VERSION];
-            query.extend_from_slice(&header.height.to_le_bytes());
-            query.extend_from_slice(&block);
-            ownership.begin_query(self.peer())?;
-            self.send_application_before(request, &query, &deadline)?;
-            self.receive_propagation_metadata_before(
-                request,
-                header,
-                None,
-                ownership,
-                _reservation,
-                &deadline,
-            )
-        })();
+        let result =
+            self.fetch_metadata_exchange(request, header, ownership, _reservation, &deadline);
         let after = self.session.io_totals();
         ledger
             .sent(attempt, after.sent - before.sent)
@@ -507,6 +497,73 @@ impl<S: Read + Write> Peer<S> {
             )
             .map_err(resource)?;
         result
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn fetch_propagation_confirmation_at(
+        &mut self,
+        request: u64,
+        header: &Header,
+        transfer: &Mutex<Transfer>,
+        ownership: &p2p::BodyClaim,
+    ) -> Result<bool, p2p::Error> {
+        if request == 0 {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        if !lock(transfer)?.confirmation_available(self.peer(), ownership) {
+            return Ok(false);
+        }
+        // Reserve memory before consuming the one confirmation slot. A local
+        // reservation rejection leaves the first source free to proceed.
+        let reservation =
+            self.reserve_application(metadata_allocation(self.policy.max_body_bytes)?)?;
+        let Some((attempt, deadline)) = lock(transfer)?
+            .begin_confirmation(
+                self.peer(),
+                maximum_wire(self.policy.max_body_bytes)?,
+                ownership,
+            )
+            .map_err(resource)?
+        else {
+            return Ok(false);
+        };
+        let before = self.session.io_totals();
+        let result =
+            self.fetch_metadata_exchange(request, header, ownership, reservation, &deadline);
+        let after = self.session.io_totals();
+        lock(transfer)?
+            .complete_confirmation(
+                attempt,
+                after.sent - before.sent,
+                after.received - before.received,
+                result.as_ref().ok().map(|metadata| &metadata.authenticated),
+            )
+            .map_err(resource)?;
+        result.map(|_| true)
+    }
+
+    fn fetch_metadata_exchange(
+        &mut self,
+        request: u64,
+        header: &Header,
+        ownership: &p2p::BodyClaim,
+        reservation: p2p::Reservation,
+        deadline: &p2p::Deadline,
+    ) -> Result<Metadata, p2p::Error> {
+        let block = header.id().map_err(invalid)?;
+        let mut query = vec![GET_METADATA, VERSION];
+        query.extend_from_slice(&header.height.to_le_bytes());
+        query.extend_from_slice(&block);
+        ownership.begin_query(self.peer())?;
+        self.send_application_before(request, &query, deadline)?;
+        self.receive_propagation_metadata_before(
+            request,
+            header,
+            None,
+            ownership,
+            reservation,
+            deadline,
+        )
     }
 
     fn receive_propagation_metadata_before(
@@ -1510,5 +1567,286 @@ mod tests {
         assert_eq!(budget.available().unwrap(), remaining);
         drop(blocker);
         assert_eq!(budget.available().unwrap(), before);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    fn source_confirmation_two_lanes(second_has_body: bool) {
+        use std::sync::{Arc, Condvar};
+        let (genesis, policy, body, header) = fixture();
+        let budget = p2p::Budget::new(64 * 1024 * 1024);
+        let mut clients = Vec::new();
+        let mut workers = Vec::new();
+        let concurrent = Arc::new((Mutex::new(0usize), Condvar::new()));
+        for index in 1..=2u8 {
+            let (a, b) = UnixStream::pair().unwrap();
+            a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let client = Peer::new(
+                p2p::Session::from_test_peer_channel(
+                    a,
+                    binding(&genesis),
+                    budget.clone(),
+                    [index; 32],
+                    p2p::Role::Miner,
+                ),
+                &genesis,
+                policy,
+            )
+            .unwrap();
+            let mut server = peer(b, &genesis, policy, p2p::Budget::new(64 * 1024 * 1024));
+            clients.push(client);
+            let body = body.clone();
+            let header = header.clone();
+            let concurrent = concurrent.clone();
+            workers.push(thread::spawn(move || {
+                let start = Instant::now(); let cancel = p2p::Cancellation::default();
+                let (request,message) = server.receive_propagation_request(start, Duration::from_secs(3), cancel.clone()).unwrap();
+                assert_eq!(request, 90 + u64::from(index));
+                assert!(matches!(message, PropagationRequest::Metadata {height,id} if height==header.height && id==header.id().unwrap()));
+                if index == 2 && !second_has_body {
+                    server.send_unavailable(request, header.height).unwrap();
+                    return server.session.io_totals();
+                }
+                server.send_propagation_metadata(request, &header, &body, start, Duration::from_secs(3), cancel.clone()).unwrap();
+                let (request,message) = server.receive_propagation_request(start, Duration::from_secs(3), cancel.clone()).unwrap();
+                let PropagationRequest::Pieces(query) = message else { panic!("expected body continuation"); };
+                if second_has_body {
+                    let (count, changed) = &*concurrent;
+                    let mut count = count.lock().unwrap();
+                    *count += 1;
+                    changed.notify_all();
+                    let (count, _) = changed.wait_timeout_while(count, Duration::from_secs(1), |n| *n < 2).unwrap();
+                    assert_eq!(*count, 2, "both body requests must be in flight");
+                }
+                server.send_propagation_pieces(request, &query, &header, &body, start, Duration::from_secs(3), cancel).unwrap();
+                server.session.io_totals()
+            }));
+        }
+        let mut second = clients.pop().unwrap();
+        let mut first = clients.pop().unwrap();
+        let deadline = p2p::Deadline::new(Duration::from_secs(3));
+        let owner = first
+            .claim_body(&header, p2p::BodyMode::Pieces, &deadline)
+            .unwrap();
+        let expiry = owner.deadline().expires_at();
+        let generation = owner.progress_attempt();
+        let mut ledger = DescriptorLedger::new(
+            header.id().unwrap(),
+            &[[1; 32], [2; 32]],
+            Limits {
+                requests: 4,
+                wire_bytes: 64 * 1024 * 1024,
+                peer_requests: 1,
+                peer_wire_bytes: 64 * 1024 * 1024,
+                parallel: 3,
+                lifetime: Duration::from_secs(3),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let metadata = first
+            .fetch_propagation_metadata_at(91, &header, &mut ledger, &owner)
+            .unwrap();
+        let transfer = Mutex::new(metadata.into_transfer(ledger, &budget).unwrap());
+        let confirmed = second.fetch_propagation_confirmation_at(92, &header, &transfer, &owner);
+        if second_has_body {
+            assert!(confirmed.unwrap());
+        } else {
+            assert!(confirmed.is_err());
+        }
+        assert_eq!(owner.deadline().expires_at(), expiry);
+        assert_eq!(owner.progress_attempt(), generation);
+        let connected = std::collections::BTreeSet::from([[1; 32], [2; 32]]);
+        let mut locked = transfer.lock().unwrap();
+        let maximum = locked.batch_capacity(&connected);
+        let first_batch = locked
+            .next_batch([1; 32], None, maximum, Instant::now())
+            .unwrap();
+        let second_batch = if second_has_body {
+            let maximum = locked.batch_capacity(&connected);
+            locked
+                .next_batch([2; 32], None, maximum, Instant::now())
+                .unwrap()
+        } else {
+            vec![]
+        };
+        assert!(!first_batch.is_empty());
+        if second_has_body {
+            assert!(!second_batch.is_empty());
+        }
+        drop(locked);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                first
+                    .fetch_propagation_batch_observed_at(
+                        91,
+                        &first_batch,
+                        &transfer,
+                        &owner,
+                        &|_| Ok(()),
+                    )
+                    .unwrap()
+            });
+            if second_has_body {
+                scope.spawn(|| {
+                    second
+                        .fetch_propagation_batch_observed_at(
+                            92,
+                            &second_batch,
+                            &transfer,
+                            &owner,
+                            &|_| Ok(()),
+                        )
+                        .unwrap()
+                });
+            }
+        });
+        let first_remote = workers.remove(0).join().unwrap();
+        let second_remote = workers.remove(0).join().unwrap();
+        let finished = transfer.into_inner().unwrap();
+        let sources = finished.sources();
+        for (source, local, remote) in [
+            (sources[0], first.session.io_totals(), first_remote),
+            (sources[1], second.session.io_totals(), second_remote),
+        ] {
+            assert_eq!((source.sent, source.received), (local.sent, local.received));
+            assert_eq!((local.sent, local.received), (remote.received, remote.sent));
+            assert_eq!(source.requested, 1);
+        }
+        assert_eq!(
+            sources.iter().map(|s| s.queries).sum::<u64>(),
+            if second_has_body { 4 } else { 3 }
+        );
+        assert_eq!(
+            finished
+                .finish(&header, policy, Instant::now(), owner)
+                .unwrap()
+                .body
+                .encode(policy)
+                .unwrap(),
+            body.encode(policy).unwrap()
+        );
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_real_two_lanes_transfer_concurrently_under_one_owner() {
+        source_confirmation_two_lanes(true);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_real_negative_metadata_leaves_the_first_holder_complete() {
+        source_confirmation_two_lanes(false);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_slow_real_lane_cannot_renew_the_original_deadline() {
+        let (genesis, policy, body, header) = fixture();
+        let budget = p2p::Budget::new(64 * 1024 * 1024);
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut first = peer(a, &genesis, policy, budget.clone());
+        let mut first_server = peer(b, &genesis, policy, p2p::Budget::new(64 * 1024 * 1024));
+        let server_body = body.clone();
+        let server_header = header.clone();
+        let initial = thread::spawn(move || {
+            let start = Instant::now();
+            let cancel = p2p::Cancellation::default();
+            let (request, _) = first_server
+                .receive_propagation_request(start, Duration::from_secs(3), cancel.clone())
+                .unwrap();
+            first_server
+                .send_propagation_metadata(
+                    request,
+                    &server_header,
+                    &server_body,
+                    start,
+                    Duration::from_secs(3),
+                    cancel,
+                )
+                .unwrap();
+            first_server
+        });
+        let deadline = p2p::Deadline::new(Duration::from_millis(400));
+        let owner = first
+            .claim_body(&header, p2p::BodyMode::Pieces, &deadline)
+            .unwrap();
+        let mut ledger = DescriptorLedger::new(
+            header.id().unwrap(),
+            &[[9; 32], [2; 32]],
+            Limits {
+                requests: 4,
+                wire_bytes: 64 * 1024 * 1024,
+                peer_requests: 1,
+                peer_wire_bytes: 64 * 1024 * 1024,
+                parallel: 3,
+                lifetime: Duration::from_secs(3),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let metadata = first
+            .fetch_propagation_metadata_at(91, &header, &mut ledger, &owner)
+            .unwrap();
+        let _live_first_server = initial.join().unwrap();
+        let transfer = Mutex::new(metadata.into_transfer(ledger, &budget).unwrap());
+        let expiry = owner.deadline().expires_at();
+        let generation = owner.progress_attempt();
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        a.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut second = Peer::new(
+            p2p::Session::from_test_peer_channel(
+                a,
+                binding(&genesis),
+                budget.clone(),
+                [2; 32],
+                p2p::Role::Miner,
+            ),
+            &genesis,
+            policy,
+        )
+        .unwrap();
+        let mut second_server = peer(b, &genesis, policy, p2p::Budget::new(64 * 1024 * 1024));
+        let (seen_send, seen) = std::sync::mpsc::sync_channel(1);
+        let delayed_header = header.clone();
+        let delayed = thread::spawn(move || {
+            let start = Instant::now();
+            let cancel = p2p::Cancellation::default();
+            let (request, _) = second_server
+                .receive_propagation_request(start, Duration::from_secs(3), cancel.clone())
+                .unwrap();
+            seen_send.send(()).unwrap();
+            std::thread::sleep(
+                expiry.saturating_duration_since(Instant::now()) + Duration::from_millis(20),
+            );
+            let _ = second_server.send_propagation_metadata(
+                request,
+                &delayed_header,
+                &body,
+                start,
+                Duration::from_secs(3),
+                cancel,
+            );
+        });
+        thread::scope(|scope| {
+            let pending = scope
+                .spawn(|| second.fetch_propagation_confirmation_at(92, &header, &transfer, &owner));
+            seen.recv_timeout(Duration::from_secs(1)).unwrap();
+            let connected = std::collections::BTreeSet::from([[9; 32], [2; 32]]);
+            assert_eq!(transfer.lock().unwrap().batch_capacity(&connected), 0);
+            assert!(pending.join().unwrap().is_err());
+        });
+        delayed.join().unwrap();
+        assert_eq!(owner.deadline().expires_at(), expiry);
+        assert_eq!(owner.progress_attempt(), generation);
+        assert!(owner.check_active().is_err());
+        let mut transfer = transfer.into_inner().unwrap();
+        assert!(matches!(
+            transfer.next_batch([9; 32], None, usize::MAX, Instant::now()),
+            Err(crate::eng2::propagation::pipeline::Error::Expired)
+        ));
+        assert_eq!(transfer.sources().iter().map(|s| s.queries).sum::<u64>(), 2);
     }
 }

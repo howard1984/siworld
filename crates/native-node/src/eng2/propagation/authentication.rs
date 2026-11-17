@@ -152,6 +152,15 @@ impl Descriptor {
 }
 
 impl Authenticated {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn same_descriptor(&self, other: &Self) -> bool {
+        self.block == other.block
+            && self.context == other.context
+            && self.height == other.height
+            && self.descriptor.body_bytes == other.descriptor.body_bytes
+            && self.descriptor.subtrees == other.descriptor.subtrees
+    }
+
     pub fn body_bytes(&self) -> usize {
         // Construction checked the platform-width conversion and bound.
         self.descriptor.body_bytes as usize

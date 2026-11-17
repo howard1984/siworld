@@ -580,6 +580,38 @@ impl Lease {
             .position(Option::is_none)
             .map(|i| i + 1)
     }
+    /// Scheduling information only; begin_query remains the query authority.
+    pub(super) fn can_query(&self, peer: [u8; 32], reserve: u8, now: Instant) -> bool {
+        if reserve == 0 || self.check_active(now).is_err() {
+            return false;
+        }
+        let Ok(inner) = self.registry.0.lock() else {
+            return false;
+        };
+        let Some(entry) = inner
+            .entries
+            .get(&self.key)
+            .filter(|e| e.account == self.account)
+        else {
+            return false;
+        };
+        let (used, maximum) = inner
+            .resident
+            .as_ref()
+            .map_or((inner.unwindowed_queries, WINDOW_QUERIES), |window| {
+                (window.queries, window.maximum_queries)
+            });
+        entry.queries.checked_add(reserve).is_some_and(|n| n <= 4)
+            && used
+                .checked_add(u64::from(reserve))
+                .is_some_and(|n| n <= maximum)
+            && !entry
+                .sources
+                .iter()
+                .flatten()
+                .any(|s| s.peer == peer && s.generation != self.generation)
+    }
+
     pub(super) fn begin_query(&self, peer: [u8; 32], now: Instant) -> Result<(), ClaimError> {
         let mut inner = self
             .registry
@@ -1651,5 +1683,28 @@ mod tests {
         assert_eq!(budget.0.usage.lock().unwrap().bytes, 0);
         drop(budget);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn source_confirmation_planning_retains_prior_generation_sources_and_queries() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let end = n + Duration::from_secs(3);
+        let prior = claim(&r, key(1), 1, n, end).unwrap();
+        prior.begin_query([1; 32], n).unwrap();
+        drop(prior);
+        let owner = r.claim(key(1), [2; 32], Mode::Pieces, n, end).unwrap();
+        assert!(!owner.can_query([1; 32], 1, n));
+        assert!(owner.can_query([3; 32], 3, n));
+        owner.begin_query([2; 32], n).unwrap();
+        assert!(!owner.can_query([3; 32], 3, n));
+        assert!(owner.can_query([2; 32], 1, n));
+        assert_eq!(owner.begin_query([1; 32], n), Err(ClaimError::SourceUsed));
+        owner.begin_query([2; 32], n).unwrap();
+        owner.begin_query([3; 32], n).unwrap();
+        assert!(!owner.can_query([4; 32], 1, n));
+        assert_eq!(owner.begin_query([4; 32], n), Err(ClaimError::QueryLimit));
+        assert_eq!(owner.expires, end);
+        assert!(!owner.can_query([2; 32], 1, end));
     }
 }

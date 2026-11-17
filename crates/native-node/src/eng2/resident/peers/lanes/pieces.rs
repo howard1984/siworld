@@ -7,6 +7,35 @@ pub(super) fn pull_batch<S: std::io::Read + std::io::Write>(
     shared: &Shared,
     request: u64,
 ) -> Result<bool, String> {
+    if let Some(job) = shared.transfers.confirmation(peer.peer())? {
+        let usage = shared.relay.take(
+            peer.peer(),
+            peer.propagation_session_id(),
+            job.download
+                .header
+                .id()
+                .map_err(|_| "piece header identity rejected")?,
+        )?;
+        let operation = |peer: &mut Peer<S>| {
+            peer.fetch_propagation_confirmation_at(
+                request,
+                &job.download.header,
+                &job.transfer,
+                &job.ownership,
+            )
+        };
+        let result = if let Some(usage) = &usage {
+            peer.with_wire_fence(usage.clone(), operation)
+        } else {
+            operation(peer)
+        };
+        if let Some(usage) = usage {
+            let _ = shared.relay.close(usage);
+        }
+        if result.map_err(|_| "piece source confirmation interrupted or rejected")? {
+            return Ok(true);
+        }
+    }
     let Some((job, requests)) = shared
         .transfers
         .batch(peer.peer(), &shared.network.body_sources()?)?

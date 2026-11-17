@@ -64,6 +64,7 @@ struct Source {
     bytes: SourceBytes,
     connected: bool,
     descriptor_attempt: Option<u64>,
+    metadata_confirmed: bool,
     continuation_wire: u64,
     body_batch_used: bool,
     batch_transmitted: bool,
@@ -127,6 +128,7 @@ impl DescriptorLedger {
                         },
                         connected: true,
                         descriptor_attempt: None,
+                        metadata_confirmed: false,
                         continuation_wire: 0,
                         body_batch_used: false,
                         batch_transmitted: false,
@@ -327,6 +329,7 @@ impl DescriptorLedger {
         } else {
             source.continuation_wire = attempt.maximum_wire - received_wire - REQUEST_WIRE_BYTES;
         }
+        source.metadata_confirmed = authenticated;
         self.successful = authenticated;
         Ok(())
     }
@@ -356,6 +359,7 @@ pub struct Transfer {
     pieces: Vec<Piece>,
     sources: BTreeMap<Hash, Source>,
     pending: BTreeMap<(u64, usize), Request>,
+    confirmation_pending: Option<DescriptorAttempt>,
     limits: Limits,
     started: Instant,
     next: u64,
@@ -398,7 +402,7 @@ impl Transfer {
         let descriptor_peer = ledger
             .sources
             .values()
-            .find(|source| source.connected && source.descriptor_attempt.is_some())
+            .find(|source| source.connected && source.metadata_confirmed)
             .map(|source| source.bytes.peer)
             .ok_or(Error::Peer)?;
         let DescriptorLedger {
@@ -448,6 +452,7 @@ impl Transfer {
             pieces,
             sources,
             pending: BTreeMap::new(),
+            confirmation_pending: None,
             limits,
             started,
             next: requests,
@@ -503,6 +508,135 @@ impl Transfer {
             )
         })
     }
+    /// Only an actual alternate body-lane turn can start confirmation. No
+    /// first-source wait, new ownership lease or renewed budget is created.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn confirmation_available(&self, peer: Hash, ownership: &p2p::BodyClaim) -> bool {
+        let confirmed = self
+            .sources
+            .values()
+            .filter(|s| s.metadata_confirmed)
+            .count();
+        self.check(Instant::now()).is_ok()
+            && self.confirmation_pending.is_none()
+            && !self.sources.values().any(|s| s.body_batch_used)
+            && confirmed == 1
+            && self.limits.requests.saturating_sub(self.queries) >= 3
+            && self
+                .sources
+                .get(&peer)
+                .is_some_and(|s| s.connected && s.bytes.requested == 0)
+            && ownership.can_query(peer, 3)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn begin_confirmation(
+        &mut self,
+        peer: Hash,
+        maximum_wire: u64,
+        ownership: &p2p::BodyClaim,
+    ) -> Result<Option<(DescriptorAttempt, p2p::Deadline)>, Error> {
+        if !self.confirmation_available(peer, ownership) {
+            return Ok(None);
+        }
+        let binding = self.binding.ok_or(Error::Framing)?;
+        if !ownership.matches(
+            &self.budget,
+            binding,
+            self.authenticated.height(),
+            self.block(),
+        ) {
+            return Err(Error::Framing);
+        }
+        let source = self.sources.get_mut(&peer).ok_or(Error::Peer)?;
+        let wire = self
+            .reserved_wire
+            .checked_add(maximum_wire)
+            .ok_or(Error::Bounds)?;
+        let peer_wire = source
+            .bytes
+            .reserved_wire
+            .checked_add(maximum_wire)
+            .ok_or(Error::Bounds)?;
+        let sequence = self.next.checked_add(1).ok_or(Error::Bounds)?;
+        if maximum_wire == 0
+            || sequence > self.limits.requests
+            || wire > self.limits.wire_bytes
+            || peer_wire > self.limits.peer_wire_bytes
+        {
+            return Err(Error::Bounds);
+        }
+        source.bytes.requested += 1;
+        source.bytes.queries += 1;
+        source.bytes.reserved_wire = peer_wire;
+        source.descriptor_attempt = Some(sequence);
+        self.next = sequence;
+        self.queries += 1;
+        self.reserved_wire = wire;
+        let attempt = DescriptorAttempt {
+            sequence,
+            peer,
+            maximum_wire,
+        };
+        self.confirmation_pending = Some(attempt);
+        Ok(Some((
+            attempt,
+            self.io_deadline().for_body_claim(ownership),
+        )))
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn complete_confirmation(
+        &mut self,
+        attempt: DescriptorAttempt,
+        sent: u64,
+        received: u64,
+        authenticated: Option<&Authenticated>,
+    ) -> Result<(), Error> {
+        if self.confirmation_pending != Some(attempt) {
+            return Err(Error::Request);
+        }
+        self.confirmation_pending = None;
+        let matched = authenticated.is_some_and(|v| self.authenticated.same_descriptor(v));
+        let source = self.sources.get_mut(&attempt.peer).ok_or(Error::Peer)?;
+        source.bytes.sent = source.bytes.sent.checked_add(sent).ok_or(Error::Bounds)?;
+        source.bytes.received = source
+            .bytes
+            .received
+            .checked_add(received)
+            .ok_or(Error::Bounds)?;
+        let charged = received
+            .checked_add(REQUEST_WIRE_BYTES)
+            .ok_or(Error::Bounds)?;
+        if sent > REQUEST_WIRE_BYTES || charged > attempt.maximum_wire {
+            source.connected = false;
+            source.bytes.failures += 1;
+            self.cancel();
+            return Err(Error::Bounds);
+        }
+        if matched {
+            source.metadata_confirmed = true;
+            source.continuation_wire = attempt.maximum_wire - charged;
+        } else {
+            source.connected = false;
+            source.bytes.failures += 1;
+        }
+        self.check(Instant::now())?;
+        if authenticated.is_some() && !matched {
+            return Err(Error::Framing);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn confirmed_source(&self, peer: Hash) -> bool {
+        self.confirmation_pending.is_none()
+            && self
+                .sources
+                .get(&peer)
+                .is_some_and(|s| s.connected && s.metadata_confirmed)
+    }
+
     pub(crate) fn prepare_io(
         &mut self,
         requests: &[Request],
@@ -553,6 +687,9 @@ impl Transfer {
         now: Instant,
     ) -> Result<Vec<Request>, Error> {
         self.check(now)?;
+        if self.confirmation_pending.is_some() {
+            return Ok(vec![]);
+        }
         let source = self.sources.get(&peer).ok_or(Error::Peer)?;
         if !source.connected {
             return Err(Error::Peer);
@@ -838,6 +975,9 @@ impl Transfer {
     /// and the remaining query/source allowance, including the descriptor query.
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn batch_capacity(&self, connected: &std::collections::BTreeSet<Hash>) -> usize {
+        if self.confirmation_pending.is_some() {
+            return 0;
+        }
         let missing = self
             .pieces
             .iter()
@@ -847,7 +987,10 @@ impl Transfer {
             .sources
             .iter()
             .filter(|(peer, source)| {
-                connected.contains(*peer) && source.connected && !source.body_batch_used
+                connected.contains(*peer)
+                    && source.connected
+                    && source.metadata_confirmed
+                    && !source.body_batch_used
             })
             .count();
         let queries = self.limits.requests.saturating_sub(self.queries) as usize;
@@ -1866,5 +2009,304 @@ mod tests {
         );
         let received = finish(transfer, &header, policy, Instant::now()).unwrap();
         assert_eq!(received.body.encode(policy).unwrap(), *body);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    fn source_confirmation_fixture() -> (Transfer, p2p::BodyClaim, Header, Vec<u8>, BodyPolicy) {
+        let (header, policy, body) = fixture();
+        let budget = p2p::Budget::new(8 * body.len());
+        let start = Instant::now();
+        let binding = p2p::Binding {
+            network: header.network,
+            genesis: [7; 32],
+            verifier: [8; 32],
+        };
+        let ownership = budget
+            .claim_body(
+                binding,
+                header.height,
+                header.id().unwrap(),
+                [1; 32],
+                p2p::BodyMode::Pieces,
+                &p2p::Deadline::new(Duration::from_secs(3)),
+            )
+            .unwrap();
+        ownership.begin_query([1; 32]).unwrap();
+        let mut ledger = DescriptorLedger::new(
+            header.id().unwrap(),
+            &[[1; 32], [2; 32], [3; 32]],
+            limits(body.len()),
+            start,
+        )
+        .unwrap();
+        ledger.bind_claim(binding, &ownership).unwrap();
+        let attempt = ledger
+            .begin([1; 32], (2 * body.len()) as u64, start)
+            .unwrap();
+        ledger.sent(attempt, 93).unwrap();
+        ledger.completed(attempt, 8192, true, start).unwrap();
+        let (authenticated, first) = Descriptor::build(&body, body.len())
+            .unwrap()
+            .authenticate(&header, encoded_piece(&body, 0).unwrap(), body.len())
+            .unwrap();
+        (
+            Transfer::new(authenticated, first, ledger, &budget).unwrap(),
+            ownership,
+            header,
+            body,
+            policy,
+        )
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    fn source_confirmation_auth(header: &Header, body: &[u8]) -> Authenticated {
+        Descriptor::build(body, body.len())
+            .unwrap()
+            .authenticate(header, encoded_piece(body, 0).unwrap(), body.len())
+            .unwrap()
+            .0
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    fn source_confirmation_receive(transfer: &mut Transfer, requests: Vec<Request>, body: &[u8]) {
+        for request in requests {
+            let bytes = encoded_piece(body, request.piece).unwrap();
+            let wire = bytes.len() as u64 + RESPONSE_OVERHEAD;
+            transfer
+                .received(request, bytes, wire, Instant::now())
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn only_confirmed_body_holder_completes_with_connected_nonholder() {
+        let (mut transfer, owner, header, body, policy) = source_confirmation_fixture();
+        let connected = std::collections::BTreeSet::from([[1; 32], [2; 32]]);
+        let original_end = transfer.io_deadline().expires_at();
+        assert!(original_end <= owner.deadline().expires_at());
+        let (probe, end) = transfer
+            .begin_confirmation([2; 32], (2 * body.len()) as u64, &owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(end.expires_at(), original_end);
+        owner.begin_query([2; 32]).unwrap();
+        assert_eq!(transfer.batch_capacity(&connected), 0);
+        transfer.complete_confirmation(probe, 93, 60, None).unwrap();
+        assert!(transfer.confirmed_source([1; 32]));
+        assert!(!transfer.confirmed_source([2; 32]));
+        let maximum = transfer.batch_capacity(&connected);
+        let batch = transfer
+            .next_batch([1; 32], None, maximum, Instant::now())
+            .unwrap();
+        assert_eq!(batch.len(), transfer.piece_count() - 1);
+        owner.begin_query([1; 32]).unwrap();
+        source_confirmation_receive(&mut transfer, batch, &body);
+        assert_eq!(transfer.queries, 3);
+        assert!(transfer.sources().iter().all(|s| s.requested <= 1));
+        assert!(!transfer.confirmation_available([3; 32], &owner));
+        assert_eq!(
+            transfer
+                .finish(&header, policy, Instant::now(), owner)
+                .unwrap()
+                .body
+                .encode(policy)
+                .unwrap(),
+            body
+        );
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_two_holders_keep_disjoint_work_pending_concurrently() {
+        let (mut transfer, owner, header, body, policy) = source_confirmation_fixture();
+        let (probe, _) = transfer
+            .begin_confirmation([2; 32], (2 * body.len()) as u64, &owner)
+            .unwrap()
+            .unwrap();
+        owner.begin_query([2; 32]).unwrap();
+        let second = source_confirmation_auth(&header, &body);
+        transfer
+            .complete_confirmation(probe, 93, 8192, Some(&second))
+            .unwrap();
+        let connected = std::collections::BTreeSet::from([[1; 32], [2; 32], [3; 32]]);
+        let maximum = transfer.batch_capacity(&connected);
+        let first = transfer
+            .next_batch([1; 32], None, maximum, Instant::now())
+            .unwrap();
+        let maximum = transfer.batch_capacity(&connected);
+        let other = transfer
+            .next_batch([2; 32], None, maximum, Instant::now())
+            .unwrap();
+        assert!(!first.is_empty() && !other.is_empty());
+        assert!(
+            first
+                .iter()
+                .all(|a| other.iter().all(|b| a.piece != b.piece))
+        );
+        assert_eq!(
+            transfer
+                .pending
+                .values()
+                .map(|v| v.peer)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        owner.begin_query([1; 32]).unwrap();
+        owner.begin_query([2; 32]).unwrap();
+        assert!(!owner.can_query([3; 32], 1));
+        source_confirmation_receive(&mut transfer, first, &body);
+        source_confirmation_receive(&mut transfer, other, &body);
+        assert_eq!(transfer.queries, 4);
+        assert!(transfer.sources().iter().all(|s| s.requested <= 1));
+        assert_eq!(
+            transfer
+                .finish(&header, policy, Instant::now(), owner)
+                .unwrap()
+                .body
+                .encode(policy)
+                .unwrap(),
+            body
+        );
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_absent_worker_never_delays_the_first_holder() {
+        let (mut transfer, owner, header, body, policy) = source_confirmation_fixture();
+        let connected = std::collections::BTreeSet::from([[1; 32], [2; 32]]);
+        let maximum = transfer.batch_capacity(&connected);
+        let batch = transfer
+            .next_batch([1; 32], None, maximum, Instant::now())
+            .unwrap();
+        assert!(
+            transfer
+                .begin_confirmation([2; 32], (2 * body.len()) as u64, &owner)
+                .unwrap()
+                .is_none()
+        );
+        owner.begin_query([1; 32]).unwrap();
+        source_confirmation_receive(&mut transfer, batch, &body);
+        assert_eq!(transfer.queries, 2);
+        assert_eq!(
+            transfer
+                .finish(&header, policy, Instant::now(), owner)
+                .unwrap()
+                .body
+                .encode(policy)
+                .unwrap(),
+            body
+        );
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_bad_descriptor_preserves_the_original_holder() {
+        let (mut transfer, owner, _, body, _) = source_confirmation_fixture();
+        let (probe, _) = transfer
+            .begin_confirmation([2; 32], (2 * body.len()) as u64, &owner)
+            .unwrap()
+            .unwrap();
+        owner.begin_query([2; 32]).unwrap();
+        let (mut wrong, _, _) = fixture();
+        wrong.nonce += 1;
+        let wrong = source_confirmation_auth(&wrong, &body);
+        assert_eq!(
+            transfer.complete_confirmation(probe, 93, 8192, Some(&wrong)),
+            Err(Error::Framing)
+        );
+        assert!(transfer.confirmed_source([1; 32]));
+        assert!(!transfer.confirmed_source([2; 32]));
+        assert_eq!(transfer.queries, 2);
+        assert_eq!(transfer.sources()[1].failures, 1);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_post_assignment_loss_is_bounded_failure() {
+        let (mut transfer, owner, header, body, _) = source_confirmation_fixture();
+        let (probe, _) = transfer
+            .begin_confirmation([2; 32], (2 * body.len()) as u64, &owner)
+            .unwrap()
+            .unwrap();
+        owner.begin_query([2; 32]).unwrap();
+        let second = source_confirmation_auth(&header, &body);
+        transfer
+            .complete_confirmation(probe, 93, 8192, Some(&second))
+            .unwrap();
+        let connected = std::collections::BTreeSet::from([[1; 32], [2; 32]]);
+        let maximum = transfer.batch_capacity(&connected);
+        let first = transfer
+            .next_batch([1; 32], None, maximum, Instant::now())
+            .unwrap();
+        let maximum = transfer.batch_capacity(&connected);
+        let other = transfer
+            .next_batch([2; 32], None, maximum, Instant::now())
+            .unwrap();
+        assert!(!other.is_empty());
+        source_confirmation_receive(&mut transfer, first, &body);
+        transfer.disconnected([2; 32], 60, Instant::now()).unwrap();
+        assert_eq!(
+            transfer.next_batch([1; 32], None, transfer.piece_count(), Instant::now()),
+            Err(Error::Peer)
+        );
+        assert!(transfer.verified_bytes() < transfer.body_bytes());
+        assert_eq!(transfer.queries, 4);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_prior_queries_reduce_capacity_without_refund() {
+        let (mut transfer, owner, header, body, policy) = source_confirmation_fixture();
+        // The authoritative account has prior work absent from this local
+        // scheduling ledger. It must still constrain confirmation planning.
+        owner.begin_query([3; 32]).unwrap();
+        assert!(!transfer.confirmation_available([2; 32], &owner));
+        assert!(
+            transfer
+                .begin_confirmation([2; 32], (2 * body.len()) as u64, &owner)
+                .unwrap()
+                .is_none()
+        );
+        let connected = std::collections::BTreeSet::from([[1; 32], [2; 32]]);
+        let maximum = transfer.batch_capacity(&connected);
+        let batch = transfer
+            .next_batch([1; 32], None, maximum, Instant::now())
+            .unwrap();
+        owner.begin_query([1; 32]).unwrap();
+        assert!(!owner.can_query([2; 32], 2));
+        source_confirmation_receive(&mut transfer, batch, &body);
+        assert_eq!(
+            transfer
+                .finish(&header, policy, Instant::now(), owner)
+                .unwrap()
+                .body
+                .encode(policy)
+                .unwrap(),
+            body
+        );
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn source_confirmation_rejected_wire_and_cancellation_create_no_probe_budget() {
+        let (mut transfer, owner, _, _, _) = source_confirmation_fixture();
+        let before = transfer.queries;
+        assert!(matches!(
+            transfer.begin_confirmation([2; 32], u64::MAX, &owner),
+            Err(Error::Bounds)
+        ));
+        assert_eq!(transfer.queries, before);
+        assert!(transfer.confirmation_pending.is_none());
+        owner.cancellation().cancel();
+        assert!(
+            transfer
+                .begin_confirmation([2; 32], 8192, &owner)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(transfer.queries, before);
+        assert!(transfer.confirmation_pending.is_none());
     }
 }

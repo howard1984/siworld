@@ -178,6 +178,25 @@ impl Transfers {
             }
         }
     }
+    pub(super) fn confirmation(&self, peer: Hash) -> Result<Option<Arc<Job>>, String> {
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "piece job registry lock poisoned")?
+            .clone();
+        for job in jobs {
+            let available = job
+                .transfer
+                .lock()
+                .map_err(|_| "piece transfer lock poisoned")?
+                .confirmation_available(peer, &job.ownership);
+            if available {
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) fn batch(
         &self,
         peer: Hash,
@@ -198,6 +217,9 @@ impl Transfers {
                 .transfer
                 .lock()
                 .map_err(|_| "piece transfer lock poisoned")?;
+            if !transfer.confirmed_source(peer) {
+                continue;
+            }
             let maximum = transfer.batch_capacity(connected);
             if maximum == 0 {
                 continue;
