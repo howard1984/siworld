@@ -109,12 +109,47 @@ pub fn check_work_after(
 
 /// Searches nonces upward from the header's nonce until the work meets its
 /// target. Returns false only if every remaining nonce fails.
+#[cfg(not(any(test, feature = "test-utils")))]
 pub fn mine(header: &mut Header, iterations: u64) -> bool {
     loop {
         if let Some(found) = mine_some(header, iterations, u64::MAX) {
             return found;
         }
     }
+}
+
+/// Finite, seconds-bounded search for unit and integration fixtures.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn mine(header: &mut Header, iterations: u64) -> bool {
+    mine_fixture(
+        header,
+        iterations,
+        65_536,
+        std::time::Duration::from_secs(2),
+    )
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn mine_fixture(
+    header: &mut Header,
+    iterations: u64,
+    max_nonces: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    assert!(
+        iterations <= 1_000,
+        "fixture PoW iterations exceed the test-only limit"
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    for _ in 0..max_nonces {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        if let Some(found) = mine_some(header, iterations, 1) {
+            return found;
+        }
+    }
+    false
 }
 
 /// [`mine`] for at most `tries` nonces, so a miner can stop when its parent
@@ -351,6 +386,24 @@ mod tests {
         impossible.target = [0; 32];
         impossible.nonce = u64::MAX - 3;
         assert!(!mine(&mut impossible, 1));
+
+        // An impossible fixture stops at either independent bound.
+        impossible.nonce = 0;
+        assert!(!mine_fixture(
+            &mut impossible,
+            1,
+            3,
+            std::time::Duration::from_secs(2)
+        ));
+        assert_eq!(impossible.nonce, 3);
+        impossible.nonce = 0;
+        assert!(!mine_fixture(
+            &mut impossible,
+            1,
+            3,
+            std::time::Duration::ZERO
+        ));
+        assert_eq!(impossible.nonce, 0);
 
         // A search in short runs finds the same nonce.
         let mut parts = h;

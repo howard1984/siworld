@@ -175,6 +175,7 @@ fn wait_for(rpc: &str, request: Value, done: impl Fn(&Value) -> bool) -> Value {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn a_follower_syncs_and_receives_a_payment() {
     let genesis = genesis();
     let (pa, pb) = (free_port(), free_port());
@@ -201,6 +202,7 @@ fn a_follower_syncs_and_receives_a_payment() {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn a_miner_with_peers_mines_only_once_synced() {
     // Two days behind schedule: ASERT puts the target at the ceiling, so a
     // node mining alone would bury genesis under its own blocks at once.

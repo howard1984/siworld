@@ -33,7 +33,27 @@ cargo test --release --locked --manifest-path crates/bench-stark/Cargo.toml \
   -p siworld-bench-plonky3 -p siworld-bench-common
 ```
 
-All-features tests intentionally enable development helpers. Release artifacts use default features. The feature check excludes deterministic crypto and state test helpers from the default normal/build graph.
+All-features tests intentionally enable development helpers. Release artifacts use default features. The feature check excludes deterministic crypto, state and consensus test helpers from the default normal/build graph.
+
+Tests that start the continuous miner service are ignored by default with the
+reason `owner-local only: spawns miner`. Run the complete root suite, including
+these tests, only on an owner-controlled machine:
+
+```sh
+cargo test --workspace --all-features --locked -- --include-ignored
+```
+
+Do not run this command on GitHub computing resources. `Miner::spawn` refuses
+startup with a permission error when `GITHUB_ACTIONS=true`; the offline CI
+isolation preserves that flag. The refusal test uses a child process without
+changing the environment shared by concurrent tests.
+
+Single-block fixtures remain eligible for offline CI. The consensus
+`test-utils` feature and native test fixtures limit searches to 65,536 nonces
+and two seconds, with at most 1,000 hash iterations per nonce. Exhausting a
+bound fails the fixture. These limits do not change production block validity
+or the default production search. Continuous node and miner acceptance,
+propagation measurements and endurance runs remain owner-operated tests.
 
 ## Coverage
 

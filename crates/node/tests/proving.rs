@@ -264,6 +264,7 @@ fn wait_info(running: &Running, predicate: impl Fn(&Value) -> bool) -> Value {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn rpc_and_peer_sync_continue_while_container_proving_is_held() {
     let genesis = genesis();
     let (n, barrier, rx) = held(&genesis);
@@ -284,6 +285,7 @@ fn rpc_and_peer_sync_continue_while_container_proving_is_held() {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn same_tip_payment_cancels_old_candidate_and_coalesces_rebuilds() {
     let genesis = genesis();
     let (n, barrier, rx) = held(&genesis);
@@ -314,6 +316,7 @@ fn same_tip_payment_cancels_old_candidate_and_coalesces_rebuilds() {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn peer_tip_change_invalidates_in_flight_proof() {
     let genesis = genesis();
     let (n, barrier, rx) = held(&genesis);
@@ -387,6 +390,7 @@ fn funded_node(
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn same_tip_payout_invalidates_the_candidate_without_clearing_the_queue() {
     let mut genesis = genesis();
     let signer = DevFundSigner::from_seed(&Digest([8; 32]));
@@ -415,6 +419,7 @@ fn same_tip_payout_invalidates_the_candidate_without_clearing_the_queue() {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn failed_background_build_preserves_payment_reservations_and_payouts() {
     let mut genesis = genesis();
     let signer = DevFundSigner::from_seed(&Digest([8; 32]));
@@ -470,6 +475,7 @@ fn observed_with_timeout(rx: &mpsc::Receiver<Observation>, timeout: Duration) ->
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn tick_does_not_cancel_a_proof_taking_longer_than_the_tick() {
     let genesis = genesis();
     let (n, barrier, rx) = held(&genesis);
@@ -488,6 +494,7 @@ fn tick_does_not_cancel_a_proof_taking_longer_than_the_tick() {
 }
 
 #[test]
+#[ignore = "owner-local only: spawns miner"]
 fn shutdown_invalidates_candidate_and_closes_rpc_before_waiting_for_prover() {
     let genesis = genesis();
     let (n, barrier, rx) = held(&genesis);

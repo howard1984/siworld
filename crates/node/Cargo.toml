@@ -67,6 +67,7 @@ diagnostics = ["plonky3"]
 rustix.workspace = true
 
 [dev-dependencies]
+siworld-consensus = { workspace = true, features = ["test-utils"] }
 siworld-state = { workspace = true, features = ["test-utils"] }
 
 [lints]
