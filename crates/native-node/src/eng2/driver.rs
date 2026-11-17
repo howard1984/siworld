@@ -17,6 +17,8 @@ use crate::{
     wire::Hash,
 };
 
+#[cfg(feature = "eng2-runtime")]
+mod history;
 mod reorganization;
 pub use reorganization::SwitchEvent;
 
@@ -95,6 +97,8 @@ fn transaction_identity(packet: &[u8], network: &Hash) -> Result<(Hash, usize), 
 }
 
 pub struct Driver {
+    #[cfg(feature = "eng2-runtime")]
+    historical_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     store: Store,
     verifier: NativeVerifier,
     padding: Pool,
@@ -123,6 +127,8 @@ impl Driver {
             return Err("driver verifier differs from sealed salted genesis".into());
         }
         Ok(Self {
+            #[cfg(feature = "eng2-runtime")]
+            historical_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             padding: Pool::new(store.engine().state().network()),
             pending: pending_pool(store.engine().state().network())?,
             store,

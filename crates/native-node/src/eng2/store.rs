@@ -20,6 +20,8 @@ use std::fs::OpenOptions;
 use std::path::Path;
 #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
 mod commitment_tests;
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod history;
 mod imported;
 mod observation;
 #[cfg(feature = "eng2-rehearsal")]

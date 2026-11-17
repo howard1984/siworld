@@ -9,6 +9,8 @@ use super::{
     store::{BodyAvailability, Store},
 };
 pub mod discovery;
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod history;
 mod refusal;
 
 use crate::wire::Hash;

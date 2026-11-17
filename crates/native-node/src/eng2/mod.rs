@@ -28,6 +28,8 @@ pub mod genesis;
 pub mod genesis_tool;
 pub mod header;
 pub mod header_relay;
+#[cfg(feature = "eng2-runtime")]
+pub mod historical;
 pub mod import;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
 pub mod isolated_production;

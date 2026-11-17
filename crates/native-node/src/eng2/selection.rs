@@ -83,6 +83,18 @@ impl VerifiedHeaders {
             .collect()
     }
     pub fn verify(rules: HeaderRules, headers: Vec<Header>) -> Result<Self, SelectionError> {
+        Self::verify_bounded(rules, headers, || true)
+    }
+    /// The same header checks with an owner-selected finite work deadline.
+    /// Cancellation changes no proof, work or selection rule.
+    pub(crate) fn verify_bounded(
+        rules: HeaderRules,
+        headers: Vec<Header>,
+        available: impl Fn() -> bool,
+    ) -> Result<Self, SelectionError> {
+        if !available() {
+            return Err(SelectionError::Limit);
+        }
         if rules.network == [0; 32]
             || rules.genesis == [0; 32]
             || rules.genesis_timestamp == 0
@@ -103,6 +115,9 @@ impl VerifiedHeaders {
             .map_err(|_| SelectionError::Limit)?;
         let mut cumulative = Work::zero();
         for (index, header) in headers.iter().enumerate() {
+            if !available() {
+                return Err(SelectionError::Limit);
+            }
             if header.network != rules.network
                 || header.height != index as u64 + 1
                 || header.parent != parent
@@ -129,6 +144,9 @@ impl VerifiedHeaders {
                 &header.target,
             ) {
                 return Err(SelectionError::Work);
+            }
+            if !available() {
+                return Err(SelectionError::Limit);
             }
             cumulative = cumulative
                 .checked_add(pow::block_work(&header.target))

@@ -26,9 +26,16 @@ mod config;
 pub(crate) mod header_lane;
 pub use bootstrap::bootstrap_signed;
 #[cfg(unix)]
+pub(crate) mod historical;
+#[cfg(unix)]
 mod mailbox;
 #[cfg(unix)]
 mod operations;
+#[cfg(unix)]
+pub use historical::{
+    exchange_file as exchange_historical_file, result as historical_result,
+    submit as submit_historical, submit_file as submit_historical_file,
+};
 #[cfg(unix)]
 pub use operations::{result as operations_result, submit as submit_operations};
 pub(crate) mod peers;
@@ -737,6 +744,15 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         mailbox: Arc::new(CheckpointMailbox::new(budget.clone())),
     });
     let _cancel_on_return = CancelOnDrop(shared.cancel.clone());
+    #[cfg(unix)]
+    let _historical = historical::start(
+        directory,
+        &shared,
+        &run,
+        &running_binary,
+        event_node.ok_or("historical source identity unavailable")?,
+        &genesis,
+    )?;
     service::write_run_receipt(directory, &run)?;
     let started = Instant::now();
     #[cfg(unix)]
