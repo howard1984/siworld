@@ -91,8 +91,9 @@ pub struct Store {
 }
 /// An immutable database transaction captured without reading snapshot bodies.
 /// All archive/body allocation and decoding belongs to the existing worker.
+#[derive(Clone)]
 pub(crate) struct CheckpointArchiveRead {
-    transaction: redb::ReadTransaction,
+    transaction: std::sync::Arc<redb::ReadTransaction>,
     network: Hash,
     head: u64,
     imported_prefix: u64,
@@ -175,7 +176,7 @@ impl CheckpointRestoreRead {
             table.get(target).unwrap().unwrap().value().len()
         };
         let archive = CheckpointArchiveRead {
-            transaction,
+            transaction: std::sync::Arc::new(transaction),
             network: engine.state().network(),
             head,
             imported_prefix: 0,
@@ -255,11 +256,71 @@ impl CheckpointRestoreRead {
 pub(crate) struct CapturedArchiveBytes {
     pub(crate) base: Header,
     pub(crate) archive: Vec<u8>,
-    pub(crate) suffix: Vec<(Header, Body)>,
+    pub(crate) suffix: CapturedSuffix,
     pub(crate) reservation: crate::p2p::Reservation,
     pub(crate) input_digest: Hash,
 }
+/// A pinned read cursor; no decoded proof body survives its loop iteration.
+/// The immutable transaction is the same one used for the full input digest.
+#[derive(Default)]
+pub(crate) struct CapturedSuffix {
+    read: Option<CheckpointArchiveRead>,
+    next: u64,
+    through: u64,
+}
+impl CapturedSuffix {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.read.is_none() || self.next > self.through
+    }
+}
+impl Iterator for CapturedSuffix {
+    type Item = Result<(Header, Body), String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_empty() {
+            return None;
+        }
+        let height = self.next;
+        self.next += 1;
+        Some(
+            self.read
+                .as_ref()
+                .expect("nonempty captured suffix")
+                .body(height),
+        )
+    }
+}
 impl CheckpointArchiveRead {
+    fn body(&self, height: u64) -> Result<(Header, Body), String> {
+        if height <= self.imported_prefix {
+            return Err("captured checkpoint proof body unavailable before imported prefix".into());
+        }
+        let (expected, length) = self.compact(height)?;
+        let blocks = self
+            .transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "captured checkpoint blocks unavailable")?;
+        let row = blocks
+            .get(height)
+            .map_err(|_| "captured checkpoint block read failed")?
+            .ok_or("captured checkpoint block missing")?;
+        let raw = row.value();
+        if raw.len() != HEADER_BYTES + length
+            || raw.get(..HEADER_BYTES)
+                != Some(
+                    expected
+                        .encode()
+                        .map_err(|_| "captured checkpoint header invalid")?
+                        .as_slice(),
+                )
+        {
+            return Err("captured checkpoint body differs from accepted index".into());
+        }
+        let body = Body::decode(&raw[HEADER_BYTES..], self.network, height, self.policy)?;
+        if body.commitment(self.policy)? != expected.body_commitment {
+            return Err("captured checkpoint body commitment differs".into());
+        }
+        Ok((expected, body))
+    }
     pub(crate) fn compact(&self, height: u64) -> Result<(Header, usize), String> {
         if height == 0 || height > self.head {
             return Err("captured checkpoint header is outside the accepted prefix".into());
@@ -303,16 +364,21 @@ impl CheckpointArchiveRead {
             return Err("captured checkpoint archive exceeds byte bound".into());
         }
         let base = self.compact(base_height)?.0;
-        let suffix_bytes = (base_height + 1..=height).try_fold(0usize, |total, h| {
-            total
-                .checked_add(self.compact(h)?.1)
-                .ok_or_else(|| "captured checkpoint suffix byte bound overflow".to_owned())
+        // Only one decoded body and its transient workspace can be live at a
+        // time. State growth remains charged separately for the complete suffix.
+        let maximum_body = (base_height + 1..=height).try_fold(0usize, |maximum, h| {
+            Ok::<_, String>(maximum.max(self.compact(h)?.1))
         })?;
-        let reservation = super::runtime_export::archive_work::ArchiveWork::reserve(
-            bytes.value().len(),
-            suffix_bytes,
-            budget,
-        )?;
+        let scan_reservation = if maximum_body == 0 {
+            None
+        } else {
+            Some(super::runtime_export::archive_work::ArchiveWork::reserve(
+                0,
+                maximum_body,
+                budget,
+            )?)
+        };
+        let mut state_bytes = 0usize;
         let mut input = blake3::Hasher::new_derive_key(
             "siworld eng2 checkpoint captured reconstruction input v1",
         );
@@ -323,15 +389,10 @@ impl CheckpointArchiveRead {
         );
         input.update(&(bytes.value().len() as u64).to_le_bytes());
         input.update(bytes.value());
-        let archive = bytes.value().to_vec();
         let blocks = self
             .transaction
             .open_table(BLOCKS)
             .map_err(|_| "captured checkpoint blocks unavailable")?;
-        let mut suffix = Vec::new();
-        suffix
-            .try_reserve_exact((height - base_height) as usize)
-            .map_err(|_| "captured checkpoint suffix allocation failed")?;
         for h in base_height + 1..=height {
             if h <= self.imported_prefix {
                 return Err(
@@ -357,12 +418,49 @@ impl CheckpointArchiveRead {
             }
             input.update(&(raw.len() as u64).to_le_bytes());
             input.update(raw);
-            let body = Body::decode(&raw[HEADER_BYTES..], self.network, h, self.policy)?;
-            if body.commitment(self.policy)? != expected.body_commitment {
-                return Err("captured checkpoint body commitment differs".into());
-            }
-            suffix.push((expected, body));
+            let (_, body) = self.body(h)?;
+            // Exclude only transaction and settlement proof buffers, which are
+            // destroyed before reading the next body. All framing, public
+            // records, governance and issuance material remain charged as
+            // potential persistent state at the existing archive factor (16),
+            // in addition to four times the largest complete encoded body.
+            let proof_bytes =
+                body.transactions
+                    .iter()
+                    .try_fold(body.settlement_proof.len(), |total, tx| {
+                        total
+                            .checked_add(tx.proof.len())
+                            .ok_or("captured checkpoint proof byte bound overflow")
+                    })?;
+            let retained = length
+                .checked_sub(proof_bytes)
+                .ok_or("captured checkpoint proof length differs")?;
+            state_bytes = state_bytes
+                .checked_add(retained)
+                .ok_or("captured checkpoint state growth bound overflow")?;
         }
+        // No scan body remains live across this release and final admission.
+        drop(scan_reservation);
+        let state_bound = bytes
+            .value()
+            .len()
+            .checked_add(state_bytes)
+            .ok_or("captured checkpoint state workspace bound overflow")?;
+        let reservation = super::runtime_export::archive_work::ArchiveWork::reserve(
+            state_bound,
+            maximum_body,
+            budget,
+        )?;
+        let archive = bytes.value().to_vec();
+        let suffix = if base_height == height {
+            CapturedSuffix::default()
+        } else {
+            CapturedSuffix {
+                read: Some(self.clone()),
+                next: base_height + 1,
+                through: height,
+            }
+        };
         Ok(CapturedArchiveBytes {
             base,
             archive,
@@ -961,7 +1059,7 @@ impl Store {
             .begin_read()
             .map_err(|_| "checkpoint preparation archive read unavailable")?;
         let read = CheckpointArchiveRead {
-            transaction,
+            transaction: std::sync::Arc::new(transaction),
             network: self.engine.state().network(),
             head: self.engine.state().height(),
             imported_prefix: self.imported_prefix,
@@ -999,7 +1097,7 @@ impl Store {
             .map_err(|_| "checkpoint restore read transaction unavailable")?;
         Ok(CheckpointRestoreRead {
             archive: CheckpointArchiveRead {
-                transaction,
+                transaction: std::sync::Arc::new(transaction),
                 network: self.engine.state().network(),
                 head,
                 imported_prefix: self.imported_prefix,
@@ -1918,7 +2016,7 @@ mod tests {
         };
         let target = crate::eng2::runtime_export::eligible_checkpoint(head).unwrap_or(head);
         let read = CheckpointArchiveRead {
-            transaction,
+            transaction: std::sync::Arc::new(transaction),
             network: engine.state().network(),
             head,
             imported_prefix: 0,

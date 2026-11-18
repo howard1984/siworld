@@ -49,8 +49,9 @@ boundary or length grants no allocation or proof execution authority.
 Use one absolute deadline from the initial transfer admission through every
 request, retry, piece, assembly and admission step. Progress does not renew it.
 Count retries against the same finite request and byte ceilings. Cancelled or
-expired transfers cannot publish a body or restart under a fresh deadline for
-the same retained candidate. Source accounting identifies configured peer
+expired transfers cannot publish a body. Resident retry policy may later open a
+new exact account after every owner and pin releases the expired one; it never
+extends the expired account's deadline. Source accounting identifies configured peer
 identities and byte counts; it excludes endpoints and transaction observations.
 
 One source attempt is a two-phase exchange on one authenticated connection:
@@ -99,8 +100,10 @@ keeps the claim until every actual I/O owner releases it.
 
 The body-ownership key includes network, genesis, verifier, height and header
 identity. Legacy, piece and fallback paths share one query ceiling and the
-original absolute deadline. Failed or reconnected sources do not acquire a new
-attempt. A healthy slow stream is not preempted solely because it exceeds the
+original absolute deadline. Failed or reconnected sources consume another
+attempt and query within the same finite account limits. Failed piece I/O selects
+whole-body fallback for that exact account and its subsequent reopenings.
+A healthy slow stream is not preempted solely because it exceeds the
 handoff interval. Native admission cannot be preempted. Durable canonical
 acceptance marks the exact account terminal; its actual I/O slot remains held
 until the last actual owner releases it.
@@ -110,10 +113,17 @@ The book retains at most the original 2,048 header accounts. The original
 1,024-query ceiling also applies to cold bootstrap before a resident window
 exists. The first resident window inherits those consumed queries; only lawful
 renewal by the original discovery ledger resets the aggregate count. Account
-and pin allocations are charged before insertion. Original discovery-window renewal may
-retire expired accounts only after all candidate pins and actual owners release
-them. Bootstrap acquisition uses its selected operation's original end instead
-of creating a discovery window. Reconnection, mode changes and candidate-cache
+and pin allocations are charged before insertion. An expired nonterminal resident
+account may reopen only after all candidate pins and actual owners release it.
+Successive reopenings wait 15, 30, 60 and then 120 seconds after expiry, with at
+most eight reopenings per exact block in a rolling hour. Each new account has at
+most 180 seconds and fresh source-attempt accounting; the resident window's
+consumed queries and wire bytes remain charged. Reopening history survives a
+discovery-window rollover. Canonical acceptance remains terminal within the
+retained lifecycle. Original discovery-window renewal may retire expired
+accounts only after their owners, pins and recent reopening history are gone.
+Bootstrap acquisition uses its selected operation's original end and cannot use
+this resident retry policy. Reconnection, mode changes and candidate-cache
 eviction cannot reset an existing account. A closed operation cannot publish
 progress, queue a body or write the quarantine cache. Successful quarantine
 storage completes transport ownership but grants no native admission authority.

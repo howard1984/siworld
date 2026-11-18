@@ -32,7 +32,7 @@ pub struct ArchiveWork {
     genesis: Vec<u8>,
     archive: Vec<u8>,
     base: Header,
-    suffix: Vec<(Header, crate::eng2::body::Body)>,
+    suffix: crate::eng2::store::CapturedSuffix,
     limits: ImportLimits,
     reservation: Reservation,
     deferred: Option<(crate::eng2::store::CheckpointArchiveRead, Budget)>,
@@ -131,7 +131,7 @@ impl ArchiveWork {
             genesis,
             archive: Vec::new(),
             base: anchor,
-            suffix: Vec::new(),
+            suffix: crate::eng2::store::CapturedSuffix::default(),
             limits,
             reservation,
             deferred: Some((read, budget.clone())),
@@ -269,10 +269,11 @@ impl ArchiveWork {
                 self.limits.chain,
             )?;
             let verifier = crate::proofs::NativeVerifier::for_genesis(engine.genesis())?;
-            for (header, body) in self.suffix {
+            for item in self.suffix {
                 if cancelled.load(Ordering::Acquire) {
                     return Err("checkpoint archive preparation cancelled".into());
                 }
+                let (header, body) = item?;
                 engine.apply(&header, &body, &verifier)?;
             }
             if engine.state().height() != self.context.anchor.height

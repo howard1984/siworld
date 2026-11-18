@@ -86,7 +86,7 @@ pub(super) fn fixture(budget: &Budget) -> ArchiveWork {
         genesis: genesis.encode().unwrap(),
         archive: bytes,
         base: header,
-        suffix: Vec::new(),
+        suffix: crate::eng2::store::CapturedSuffix::default(),
         limits: limits(),
         reservation,
         deferred: None,
@@ -332,4 +332,84 @@ fn cancellation_never_joins_a_running_result_owner_and_later_poll_discards_it() 
     worker.cancel_and_discard_finished().unwrap();
     assert!(!worker.is_busy());
     assert_eq!(budget.available().unwrap(), maximum);
+}
+
+#[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+#[test]
+#[ignore = "requires an existing owner-local public native Store fixture"]
+fn checkpoint_suffix_streaming_existing_store_stays_within_original_budget() {
+    assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+    let source = std::path::PathBuf::from(std::env::var_os("SIWORLD_ENG2_NATIVE_FIXTURE").unwrap());
+    let limits = crate::eng2::snapshot::ImportLimits {
+        chain: crate::eng2::state_components::Limits {
+            max_leaves: 1_000_000,
+            max_nullifiers: 1_000_000,
+            max_component_bytes: 64 * 1024 * 1024,
+        },
+        max_snapshot_bytes: 512 * 1024 * 1024,
+    };
+    const MAXIMUM: usize = 1024 * 1024 * 1024;
+    let budget = Budget::new(MAXIMUM);
+    let (read, base, _) =
+        crate::eng2::store::CheckpointRestoreRead::existing_public_fixture_for_test(
+            &source, limits, &budget,
+        );
+    let target = base + 11;
+    assert!(target <= read.head());
+    let before = budget.available().unwrap();
+    let start = Instant::now();
+    // Admission cannot borrow another caller's outstanding reservation.
+    let pressure = budget.reserve(before - 1).unwrap();
+    assert!(ArchiveWork::from_restore_read(&read, target, limits, &budget).is_err());
+    assert_eq!(budget.available().unwrap(), 1);
+    drop(pressure);
+    assert_eq!(budget.available().unwrap(), before);
+    let captured = ArchiveWork::from_restore_read(&read, target, limits, &budget)
+        .expect("bounded suffix reconstruction must fit the unchanged one-GiB budget");
+    assert!(
+        captured.base.height < target,
+        "fixture must exercise a real multi-block suffix"
+    );
+    let actual_base = captured.base.height;
+    let workspace_charge = before - budget.available().unwrap();
+    let validated = captured.validate(&AtomicBool::new(false)).unwrap();
+    assert_eq!(validated.state().height(), target);
+    assert_eq!(
+        validated.state().tip(),
+        read.header(target).unwrap().id().unwrap()
+    );
+    let snapshot_bytes = validated.snapshot_bytes().len();
+    let native = validated.identity();
+    let duplicate = ArchiveWork::from_restore_read(&read, target, limits, &budget).unwrap();
+    assert!(
+        native
+            .matches(&duplicate, validated.snapshot_bytes())
+            .unwrap()
+    );
+    let mut changed_snapshot = validated.snapshot_bytes().to_vec();
+    changed_snapshot[10] ^= 1;
+    assert!(!native.matches(&duplicate, &changed_snapshot).unwrap());
+    drop((changed_snapshot, duplicate, native, validated));
+    assert_eq!(budget.available().unwrap(), before);
+    let cancelled = ArchiveWork::from_restore_read(&read, target, limits, &budget).unwrap();
+    assert_eq!(
+        cancelled.validate(&AtomicBool::new(true)).err().unwrap(),
+        "checkpoint archive preparation cancelled"
+    );
+    assert_eq!(budget.available().unwrap(), before);
+    drop(read);
+    assert_eq!(budget.available().unwrap(), MAXIMUM);
+    println!(
+        "{}",
+        serde_json::json!({
+            "result":"REAL_STORE_SUFFIX_RECONSTRUCTION_WITHIN_ORIGINAL_BUDGET",
+            "base": actual_base, "target": target, "workspace_charge_bytes": workspace_charge,
+            "snapshot_bytes": snapshot_bytes, "budget_bytes": MAXIMUM,
+            "elapsed_seconds": start.elapsed().as_secs_f64(),
+            "database_writes": 0, "proof_generation": false
+        })
+    );
+    // Leave the completed process alive briefly for an external owner-local
+    // sampler to read the kernel lifetime physical-footprint peak.
+    std::thread::sleep(Duration::from_millis(250));
 }

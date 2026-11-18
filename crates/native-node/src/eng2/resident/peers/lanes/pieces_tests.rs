@@ -250,6 +250,12 @@ fn cancelled_candidate_keeps_its_claim_until_the_inflight_adapter_worker_release
         .unwrap()
         .unwrap();
     assert!(!requests.is_empty());
+    // The replacement source advertises the exact header before requesting it.
+    receiver
+        .shared
+        .headers
+        .offer(header.clone(), [7; 32])
+        .unwrap();
     receiver.shared.transfers.cancel();
     receiver.shared.transfers.reap(&receiver.shared).unwrap();
     assert_eq!(receiver.shared.transfers.diagnostic()["active"], 1);
@@ -266,10 +272,25 @@ fn cancelled_candidate_keeps_its_claim_until_the_inflight_adapter_worker_release
     receiver.shared.transfers.reap(&receiver.shared).unwrap();
     assert_eq!(receiver.shared.transfers.diagnostic()["active"], 0);
     assert_eq!(receiver.shared.transfers.diagnostic()["failed"], 1);
+    // This failed Pieces attempt must select whole-body fallback. The test
+    // helper download_exact intentionally requests Pieces and remains denied.
+    assert!(
+        receiver
+            .shared
+            .headers
+            .download_exact([7; 32], header.id().unwrap())
+            .unwrap()
+            .is_none()
+    );
     let replacement = receiver
         .shared
         .headers
-        .download_exact([7; 32], header.id().unwrap())
+        .download_preferred(
+            [7; 32],
+            p2p::BodyMode::Legacy,
+            Some(header.id().unwrap()),
+            &Default::default(),
+        )
         .unwrap()
         .unwrap();
     drop(replacement);

@@ -98,6 +98,10 @@ pub(crate) enum ReserveFailure {
 #[derive(Clone, Debug)]
 pub struct Budget(Arc<BudgetInner>);
 impl Budget {
+    #[cfg(all(test, feature = "eng2-runtime"))]
+    pub(crate) fn age_test_body_accounts(&self, age: Duration) {
+        self.0.bodies.age_test_accounts(age);
+    }
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn body_registry_diagnostic(&self) -> serde_json::Value {
         let Some(d) = self.0.bodies.last_decision() else {
@@ -389,6 +393,9 @@ pub struct BodyClaim {
     _charge: Reservation,
 }
 impl BodyClaim {
+    pub(crate) fn account_identity(&self) -> u64 {
+        self.lease.account_identity()
+    }
     pub(crate) fn account_received_offer(&self, bytes: u64) -> Result<(), Error> {
         self.wire
             .reserve(bytes, Instant::now())

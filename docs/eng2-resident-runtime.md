@@ -93,10 +93,19 @@ may overlap a retained certified generation and bootstrap offers. All live
 reservations remain charged during this overlap, and admission still rejects
 requests that exceed the shared maximum. This limit is separate from process
 memory accounting; larger archives can still exceed the available workspace.
+Checkpoint reconstruction pins an immutable read transaction, authenticates the
+captured raw input and streams one suffix body through native validation at a
+time. Its reservation includes the base archive, accumulated public records and
+the largest encoded suffix body. Proof bodies are released between blocks;
+streaming does not raise the shared limit or replace native verification.
 
 At most eight connection workers share the node's byte-admission budget.
 Listening service pairs select one deterministic dialer. Failed connections use
-bounded backoff. A live connection alone does not establish readiness: a fresh
+backoff of 2, 4, 8, 16, 32 and then 60 seconds; a stable session resets the
+next delay to one second. Worker exit diagnostics retain bounded static reason
+codes without peer endpoints. A deferred body authorization ends that pull turn
+without repeatedly querying the same header or consuming the peer's request
+limit. A live connection alone does not establish readiness: a fresh
 completed bidirectional round must also show that the selected peer's available
 extension was exhausted. An exact full batch requires another round. Readiness
 expires after 30 seconds without a completed round and is revoked on disconnect.
@@ -107,9 +116,14 @@ download until that budget expires, even after its ordinary 30-second retention
 period. Expiry cancels the transfer; its slot and byte reservations remain owned
 until the download and its consumers release them. Cache eviction, rejection and
 shutdown still cancel work. The cache remains limited to 128 headers, four
-downloads globally, two simultaneous peers per body and four distinct peer
-attempts per cached header. A failed attempt does not reset that peer limit or
-retain partial body chunks for a replacement connection.
+downloads globally, two simultaneous peers per body and four source attempts
+per exact account. A failed attempt does not reset that peer limit or
+retain partial body chunks for a replacement connection. Only authenticated
+peers that advertised the exact header may supply its optional body. Expired
+authorization pins are released so the bounded resident retry policy can reopen
+the exact account; aggregate request and wire limits remain charged. New
+discovery tickets cannot replace pending tickets from an earlier account, and
+candidate retention limits remain unchanged.
 
 ## Checkpoint signing readiness
 

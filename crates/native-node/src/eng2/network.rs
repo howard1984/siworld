@@ -469,7 +469,13 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
             )
         })?;
         let Some(authorization) = authorization else {
-            continue;
+            // The owner deferred this exact body. Finish this bounded turn;
+            // repeating its header cannot create new authorization and can
+            // consume the responder's first-round negotiation allowance.
+            return Ok(Pulled {
+                accepted,
+                checked_head: None,
+            });
         };
         let ownership =
             match peer.claim_body_authorized(&header, &authorization, p2p::BodyMode::Legacy) {
@@ -1130,6 +1136,61 @@ mod tests {
             budget,
         )
     }
+    #[test]
+    fn deferred_body_authorization_keeps_first_negotiated_round_connected() {
+        struct Deferred(Fixture);
+        impl Owner for Deferred {
+            fn head(&self) -> Result<(u64, Hash), String> {
+                self.0.head()
+            }
+            fn header(&self, height: u64) -> Result<Option<Header>, String> {
+                self.0.header(height)
+            }
+            fn block_size(&self, height: u64) -> Result<Option<usize>, String> {
+                self.0.block_size(height)
+            }
+            fn block(&self, height: u64) -> Result<(Header, Body), String> {
+                self.0.block(height)
+            }
+            fn accept(&mut self, h: &Header, b: &Body) -> Result<(), String> {
+                self.0.accept(h, b)
+            }
+            fn authorize_body(
+                &mut self,
+                _: &Header,
+                _: &p2p::Budget,
+                _: p2p::Binding,
+                _: std::time::Instant,
+            ) -> Result<Option<p2p::BodyAuthorization>, String> {
+                Ok(None)
+            }
+        }
+        let (mut client, mut server, _) = peers();
+        let local = Arc::new(Mutex::new(Deferred(fixture(0))));
+        let remote = Arc::new(Mutex::new(fixture(1)));
+        let worker = std::thread::spawn(move || {
+            respond(
+                &mut server,
+                &remote,
+                &mut Sequence::default(),
+                Limits::default(),
+            )
+        });
+        let mut sequence = Sequence::default();
+        assert!(client.probe_lanes(sequence.next().unwrap()).unwrap());
+        let result = initiate(&mut client, &local, &mut sequence, Limits::default());
+        let served = worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "deferred body must preserve the authenticated round: {result:?}"
+        );
+        assert!(
+            served.is_ok(),
+            "responder must retain its fixed request ceiling: {served:?}"
+        );
+        assert_eq!(result.unwrap().accepted, 0);
+    }
+
     #[test]
     fn ordinary_channel_declines_piece_capability_and_keeps_the_following_turn_usable() {
         let (mut client, mut server, _) = peers();

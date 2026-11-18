@@ -419,3 +419,87 @@ fn released_failed_body_requests_retry_same_peer_without_refunding_attempts() {
         Error::Capacity
     );
 }
+
+#[test]
+fn body_account_reopen_resets_source_attempts_without_refunding_window_caps() {
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    ledger.limits.maximum_attempts_per_header = 2;
+    ledger.limits.maximum_requests = 5;
+    for now in [20, 22] {
+        let request = ledger
+            .request_body_for_account(tip, tip, [10; 32], now, 11)
+            .unwrap();
+        ledger.defer(request, now + 1).unwrap();
+    }
+    assert_eq!(
+        ledger
+            .request_body_for_account(tip, tip, [10; 32], 24, 11)
+            .unwrap_err(),
+        Error::Capacity
+    );
+    for now in [25, 27] {
+        let request = ledger
+            .request_body_for_account(tip, tip, [10; 32], now, 12)
+            .unwrap();
+        ledger.defer(request, now + 1).unwrap();
+    }
+    assert_eq!(ledger.usage().requests, 5);
+    assert_eq!(ledger.usage().peers, 1);
+    assert_eq!(
+        ledger
+            .request_body_for_account(tip, tip, [10; 32], 29, 13)
+            .unwrap_err(),
+        Error::Capacity
+    );
+    assert_eq!(
+        ledger
+            .request_body_for_account(tip, tip, [10; 32], 120_010, 14)
+            .unwrap_err(),
+        Error::Expired
+    );
+    assert_eq!(ledger.usage().requests, 5);
+}
+
+#[test]
+fn body_account_reopen_cannot_replace_live_tickets_or_refund_completed_bytes() {
+    let (mut ledger, headers, tip) = body_hedge_fixture(2);
+    let first_id = headers[0].id().unwrap();
+    let original = ledger
+        .request_body_for_account(tip, first_id, [10; 32], 20, 11)
+        .unwrap();
+    assert_eq!(
+        ledger
+            .request_body_for_account(tip, first_id, [11; 32], 30_020, 12)
+            .unwrap_err(),
+        Error::InFlight
+    );
+    assert_eq!(ledger.usage().requests, 3);
+    // A failed old ticket is consumed before the registry-minted new account
+    // can issue a ticket. It cannot later complete against the replacement.
+    ledger.defer(original, 30_021).unwrap();
+    let replacement = ledger
+        .request_body_for_account(tip, first_id, [10; 32], 30_022, 12)
+        .unwrap();
+    ledger.body_retained(replacement, 100, 30_023).unwrap();
+    assert_eq!(
+        ledger
+            .request_body_for_account(tip, first_id, [11; 32], 30_024, 13)
+            .unwrap_err(),
+        Error::Complete
+    );
+    ledger.limits.maximum_body_bytes = 150;
+    let second = ledger
+        .request_body_for_account(tip, tip, [10; 32], 30_025, 14)
+        .unwrap();
+    assert_eq!(
+        ledger.body_retained(second, 51, 30_026).unwrap_err(),
+        Error::Capacity
+    );
+    assert_eq!(ledger.usage().body_bytes, 100);
+    let second = ledger
+        .request_body_for_account(tip, tip, [10; 32], 30_027, 15)
+        .unwrap();
+    ledger.body_retained(second, 50, 30_028).unwrap();
+    assert_eq!(ledger.usage().body_bytes, 150);
+    assert_eq!(ledger.usage().requests, 6);
+}

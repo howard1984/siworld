@@ -871,6 +871,7 @@ impl Hub {
             .filter(|(_, e)| {
                 target.is_none_or(|id| id == e.context.id)
                     && !e.complete
+                    && e.offered_sources.contains(&Some(peer))
                     && needed.contains(&e.context.id)
             })
             .map(|(index, e)| (e.header.height, e.sequence, index))
@@ -920,10 +921,15 @@ impl Hub {
                     selected = Some((index, claim.cancellation(), claim));
                     break;
                 }
+                Err(p2p::BodyClaimError::Expired) => {
+                    // Release the cached pin only after the old lease is no
+                    // longer useful. The shared registry owns retry timing.
+                    entry.authorization = None;
+                    continue;
+                }
                 Err(
                     p2p::BodyClaimError::Busy
                     | p2p::BodyClaimError::Capacity
-                    | p2p::BodyClaimError::Expired
                     | p2p::BodyClaimError::SourceUsed
                     | p2p::BodyClaimError::PreferUnused
                     | p2p::BodyClaimError::QueryLimit,
@@ -1057,6 +1063,36 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    impl Hub {
+        pub(super) fn advertise_test_source(&self, peer: Hash) {
+            let headers: Vec<_> = self
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .iter()
+                .map(|entry| entry.header.clone())
+                .collect();
+            for header in headers {
+                self.offer(header, peer).unwrap();
+            }
+        }
+        pub(super) fn advertised_download(
+            self: &Arc<Self>,
+            peer: Hash,
+        ) -> Result<Option<Download>, String> {
+            self.advertise_test_source(peer);
+            self.download(peer)
+        }
+        pub(super) fn advertised_download_mode(
+            self: &Arc<Self>,
+            peer: Hash,
+            mode: p2p::BodyMode,
+        ) -> Result<Option<Download>, String> {
+            self.advertise_test_source(peer);
+            self.download_mode(peer, mode)
+        }
+    }
     pub(super) fn hub() -> Arc<Hub> {
         let rules = HeaderRules {
             network: [1; 32],
@@ -1194,7 +1230,7 @@ mod tests {
         drop(discovery);
         drop(observation);
         drop(claim);
-        let download = hub.download([6; 32]).unwrap().unwrap();
+        let download = hub.advertised_download([6; 32]).unwrap().unwrap();
         assert_eq!(download.candidate.attempt_index, 2);
         download.ownership().unwrap().begin_query([6; 32]).unwrap();
         assert_eq!(download.ownership().unwrap().source_ordinal(), Some(2));
@@ -1213,7 +1249,7 @@ mod tests {
         assert_eq!(before["lag_blocks"], 1);
         assert_eq!(before["downloads"].as_array().unwrap().len(), 0);
 
-        let download = hub.download([7; 32]).unwrap().unwrap();
+        let download = hub.advertised_download([7; 32]).unwrap().unwrap();
         let pending = hub.sync_progress();
         assert_eq!(pending["downloads"][0]["phase"], "waiting_for_body");
         assert_eq!(pending["downloads"][0]["attempt_index"], 1);
@@ -1240,7 +1276,7 @@ mod tests {
         let hub = hub();
         let first = header([2; 32], 1, 3);
         hub.offer(first, [8; 32]).unwrap();
-        let download = hub.download([7; 32]).unwrap().unwrap();
+        let download = hub.advertised_download([7; 32]).unwrap().unwrap();
         download.ownership().unwrap().begin_query([7; 32]).unwrap();
         download.received(1024, 2048);
         let old = Instant::now() - Duration::from_secs(60);
@@ -1261,7 +1297,7 @@ mod tests {
         download.cancel.cancel();
         assert_eq!(hub.sync_progress()["downloads"][0]["active"], false);
         drop(download);
-        let replacement = hub.download([6; 32]).unwrap().unwrap();
+        let replacement = hub.advertised_download([6; 32]).unwrap().unwrap();
         let value = hub.sync_progress();
         assert_eq!(value["downloads"][0]["attempt_index"], 2);
         assert_eq!(value["downloads"][0]["received_bytes"], 0);
@@ -1279,15 +1315,15 @@ mod tests {
             parent = next.id().unwrap();
             hub.offer(next, [8; 32]).unwrap();
         }
-        let one = hub.download([1; 32]).unwrap().unwrap();
-        let two = hub.download([2; 32]).unwrap().unwrap();
+        let one = hub.advertised_download([1; 32]).unwrap().unwrap();
+        let two = hub.advertised_download([2; 32]).unwrap().unwrap();
         assert_eq!(one.header, first);
         assert_eq!(two.header.height, 2);
-        let three = hub.download([3; 32]).unwrap().unwrap();
-        let four = hub.download([4; 32]).unwrap().unwrap();
+        let three = hub.advertised_download([3; 32]).unwrap().unwrap();
+        let four = hub.advertised_download([4; 32]).unwrap().unwrap();
         assert_eq!(three.header.height, 3);
         assert_eq!(four.header.height, 4);
-        assert!(hub.download([5; 32]).unwrap().is_none());
+        assert!(hub.advertised_download([5; 32]).unwrap().is_none());
         assert!(
             hub.inner
                 .lock()
@@ -1355,7 +1391,14 @@ mod tests {
                 .iter()
                 .all(|header| header.height >= 20)
         );
-        assert_eq!(hub.download([5; 32]).unwrap().unwrap().header.height, 18);
+        assert_eq!(
+            hub.advertised_download([5; 32])
+                .unwrap()
+                .unwrap()
+                .header
+                .height,
+            18
+        );
     }
     #[test]
     fn local_publication_serves_one_immutable_body_without_advancing_state_and_keeps_its_charge_until_last_reader()
@@ -1377,7 +1420,7 @@ mod tests {
         hub.produced(header.clone(), body.clone()).unwrap();
         assert!(!hub.waiting());
         assert_eq!(hub.tip().unwrap(), (0, [2; 32]));
-        assert!(hub.download([5; 32]).unwrap().is_none());
+        assert!(hub.advertised_download([5; 32]).unwrap().is_none());
         let cached = hub.local_body(1, id).unwrap().unwrap();
         assert!(Arc::ptr_eq(&cached.body, &body));
         assert!(hub.local_body(2, id).unwrap().is_none());
@@ -1395,7 +1438,7 @@ mod tests {
         let hub = hub();
         let first = header([2; 32], 1, 3);
         hub.offer(first, [8; 32]).unwrap();
-        let download = hub.download([1; 32]).unwrap().unwrap();
+        let download = hub.advertised_download([1; 32]).unwrap().unwrap();
         let now = Instant::now();
         {
             let mut inner = hub.inner.lock().unwrap();
@@ -1420,26 +1463,26 @@ mod tests {
         let first = header([2; 32], 1, 3);
         hub.offer(first.clone(), [8; 32]).unwrap();
         let pieces = hub
-            .download_mode([5; 32], p2p::BodyMode::Pieces)
+            .advertised_download_mode([5; 32], p2p::BodyMode::Pieces)
             .unwrap()
             .unwrap();
         let first_deadline = pieces.deadline.expires_at();
         pieces.ownership().unwrap().begin_query([5; 32]).unwrap();
         assert!(
-            hub.download_mode([6; 32], p2p::BodyMode::Legacy)
+            hub.advertised_download_mode([6; 32], p2p::BodyMode::Legacy)
                 .unwrap()
                 .is_none()
         );
         drop(pieces);
         let retry = hub
-            .download_mode([5; 32], p2p::BodyMode::Legacy)
+            .advertised_download_mode([5; 32], p2p::BodyMode::Legacy)
             .unwrap()
             .unwrap();
         assert_eq!(retry.deadline.expires_at(), first_deadline);
         assert_eq!(retry.ownership().unwrap().source_ordinal(), Some(2));
         drop(retry);
         let legacy = hub
-            .download_mode([6; 32], p2p::BodyMode::Legacy)
+            .advertised_download_mode([6; 32], p2p::BodyMode::Legacy)
             .unwrap()
             .unwrap();
         assert_eq!(legacy.deadline.expires_at(), first_deadline);
@@ -1449,7 +1492,7 @@ mod tests {
         assert!(legacy.ownership().unwrap().begin_query([6; 32]).is_err());
         drop(legacy);
         assert!(
-            hub.download_mode([7; 32], p2p::BodyMode::Pieces)
+            hub.advertised_download_mode([7; 32], p2p::BodyMode::Pieces)
                 .unwrap()
                 .is_none()
         );
@@ -1462,7 +1505,7 @@ mod tests {
         let first = header([2; 32], 1, 3);
         hub.offer(first, [8; 32]).unwrap();
         for peer in 1..=MAX_ATTEMPTS {
-            let download = hub.download([peer as u8; 32]).unwrap().unwrap();
+            let download = hub.advertised_download([peer as u8; 32]).unwrap().unwrap();
             download
                 .ownership()
                 .unwrap()
@@ -1471,9 +1514,9 @@ mod tests {
             drop(download);
         }
         assert_eq!(hub.active_downloads(), 0);
-        assert!(hub.download([9; 32]).unwrap().is_none());
+        assert!(hub.advertised_download([9; 32]).unwrap().is_none());
         let mut inner = hub.inner.lock().unwrap();
-        assert_eq!(inner.entries[0].offered_sources.iter().flatten().count(), 1);
+        assert_eq!(inner.entries[0].offered_sources.iter().flatten().count(), 6);
         let expires = inner.entries[0].first + RETENTION;
         hub.reconcile(&mut inner, expires - Duration::from_nanos(1));
         assert_eq!(inner.entries.len(), 1);
@@ -1493,7 +1536,7 @@ mod tests {
         }
         let mut leases = Vec::new();
         for peer in 1..=4 {
-            leases.push(hub.download([peer; 32]).unwrap().unwrap());
+            leases.push(hub.advertised_download([peer; 32]).unwrap().unwrap());
         }
         {
             let mut inner = hub.inner.lock().unwrap();
@@ -1506,22 +1549,22 @@ mod tests {
         assert!(hub.inner.lock().unwrap().entries.is_empty());
         let replacement = header([2; 32], 1, 4);
         hub.offer(replacement.clone(), [9; 32]).unwrap();
-        assert!(hub.download([5; 32]).unwrap().is_none());
+        assert!(hub.advertised_download([5; 32]).unwrap().is_none());
         drop(leases.pop());
-        let next = hub.download([5; 32]).unwrap().unwrap();
+        let next = hub.advertised_download([5; 32]).unwrap().unwrap();
         assert_eq!(next.header, replacement);
-        assert!(hub.download([6; 32]).unwrap().is_none());
+        assert!(hub.advertised_download([6; 32]).unwrap().is_none());
         drop(next);
         drop(leases);
         assert_eq!(hub.active_downloads.load(Ordering::Acquire), 0);
-        assert!(hub.download([6; 32]).unwrap().is_some());
+        assert!(hub.advertised_download([6; 32]).unwrap().is_some());
     }
     #[test]
     fn postcommit_cache_failure_disables_optional_paths_and_preserves_owned_downloads() {
         let hub = hub();
         let header = header([2; 32], 1, 3);
         hub.offer(header.clone(), [8; 32]).unwrap();
-        let download = hub.download([5; 32]).unwrap().unwrap();
+        let download = hub.advertised_download([5; 32]).unwrap().unwrap();
         let mut calls = 0;
         // This update has no error-return channel to reverse a prior native
         // commitment. Its distinct diagnostic pauses only optional work/mining.
@@ -1560,11 +1603,33 @@ mod tests {
 mod retry_cache_regressions {
     use super::*;
     #[test]
+    fn cached_expired_authorization_releases_pin_and_reopens_the_same_body() {
+        let hub = super::tests::hub();
+        let header = super::tests::header([2; 32], 1, 3);
+        hub.offer(header, [5; 32]).unwrap();
+        let first = hub.advertised_download([5; 32]).unwrap().unwrap();
+        first.ownership().unwrap().begin_query([5; 32]).unwrap();
+        drop(first);
+        // Age the registry, leaving the real cache pin and request path intact.
+        hub.budget.age_test_body_accounts(Duration::from_secs(196));
+        assert!(hub.advertised_download([5; 32]).unwrap().is_none());
+        let next = hub.advertised_download([5; 32]).unwrap();
+        assert!(
+            next.is_some(),
+            "the cache must release its expired authorization pin"
+        );
+        let next = next.unwrap();
+        next.ownership().unwrap().begin_query([5; 32]).unwrap();
+        assert_eq!(hub.budget.retained_body_accounting().0, 1);
+        assert_eq!(next.ownership().unwrap().source_ordinal(), Some(1));
+    }
+
+    #[test]
     fn cached_failed_source_retries_after_unused_connected_offerer() {
         let hub = super::tests::hub();
         let h = super::tests::header([2; 32], 1, 3);
         hub.offer(h.clone(), [5; 32]).unwrap();
-        let one = hub.download([5; 32]).unwrap().unwrap();
+        let one = hub.advertised_download([5; 32]).unwrap().unwrap();
         let deadline = one.deadline.expires_at();
         one.ownership().unwrap().begin_query([5; 32]).unwrap();
         drop(one);
@@ -1594,12 +1659,35 @@ mod retry_cache_regressions {
         hub.inner.lock().unwrap().entries.front_mut().unwrap().first -=
             RETENTION + Duration::from_secs(1);
         hub.offer(h, [5; 32]).unwrap();
-        let four = hub.download([5; 32]).unwrap().unwrap();
+        let four = hub.advertised_download([5; 32]).unwrap().unwrap();
         assert_eq!(four.deadline.expires_at(), deadline);
         assert_eq!(four.ownership().unwrap().source_ordinal(), Some(4));
         four.ownership().unwrap().begin_query([5; 32]).unwrap();
         drop(four);
-        assert!(hub.download([6; 32]).unwrap().is_none());
+        assert!(hub.advertised_download([6; 32]).unwrap().is_none());
         assert_eq!(hub.budget.retained_body_accounting().0, 1);
+    }
+}
+
+#[cfg(test)]
+mod source_selection_regressions {
+    use super::*;
+    #[test]
+    fn body_download_requires_an_authenticated_advertiser_for_the_exact_header() {
+        let hub = super::tests::hub();
+        let header = super::tests::header([2; 32], 1, 3);
+        hub.offer(header, [5; 32]).unwrap();
+        let connected = std::collections::BTreeSet::from([[5; 32], [6; 32]]);
+        assert!(
+            hub.download_preferred([6; 32], p2p::BodyMode::Legacy, None, &connected)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(hub.budget.retained_body_accounting().0, 0);
+        assert!(
+            hub.download_preferred([5; 32], p2p::BodyMode::Legacy, None, &connected)
+                .unwrap()
+                .is_some()
+        );
     }
 }

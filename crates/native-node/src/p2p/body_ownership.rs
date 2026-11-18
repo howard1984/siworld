@@ -10,6 +10,8 @@ use std::{
 pub(super) const CAPACITY: usize = 32;
 const BOOK_CAPACITY: usize = 2048;
 const WINDOW_QUERIES: u64 = 1024;
+const MAX_REOPENS_PER_HOUR: usize = 8;
+const REOPEN_HISTORY: Duration = Duration::from_secs(3600);
 const WINDOW_WIRE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const HANDOFF_DELAY: Duration = Duration::from_secs(30);
 pub(super) fn record_charge() -> usize {
@@ -90,11 +92,26 @@ struct Entry {
     owner: Option<Owner>,
     terminal: bool,
     ever_issued: bool,
+    pieces_failed: bool,
     sources: [Option<Source>; 4],
     queries: u8,
+    reopens: [Option<Instant>; MAX_REOPENS_PER_HOUR],
+    reopen_count: u32,
     #[cfg(feature = "eng2-runtime")]
     decision: Option<Decision>,
     _charge: Option<super::BodyBookCharge>,
+}
+impl Entry {
+    fn retains_retry_history(&self, now: Instant) -> bool {
+        (!self.origin_bootstrap
+            && !self.terminal
+            && now.saturating_duration_since(self.expires) < REOPEN_HISTORY)
+            || self
+                .reopens
+                .iter()
+                .flatten()
+                .any(|at| now.saturating_duration_since(*at) < REOPEN_HISTORY)
+    }
 }
 #[derive(Debug)]
 struct Window {
@@ -219,6 +236,14 @@ impl Authorization {
     }
 }
 impl Registry {
+    #[cfg(all(test, feature = "eng2-runtime"))]
+    pub(super) fn age_test_accounts(&self, age: Duration) {
+        let mut inner = self.0.lock().unwrap();
+        for entry in inner.entries.values_mut() {
+            entry.first -= age;
+            entry.expires -= age;
+        }
+    }
     pub(super) fn restrict_wire(&self, scope: &Scope, maximum: u64) -> Result<(), ClaimError> {
         if !scope.matches(&scope.0.registry) || maximum == 0 {
             return Err(ClaimError::Unavailable);
@@ -431,9 +456,12 @@ impl Registry {
         inner.unwindowed_queries = 0;
         inner.unwindowed_wire_bytes = wire_reserved;
         inner.unwindowed_wire_reserved = wire_reserved;
-        inner
-            .entries
-            .retain(|_, entry| entry.owner.is_some() || entry.pins != 0 || now < entry.expires);
+        inner.entries.retain(|_, entry| {
+            entry.owner.is_some()
+                || entry.pins != 0
+                || now < entry.expires
+                || entry.retains_retry_history(now)
+        });
         Ok(())
     }
     pub(super) fn authorize(
@@ -483,9 +511,61 @@ impl Registry {
         if now >= end {
             return Err(ClaimError::Expired);
         }
+        // A new exact account never refunds the resident window's queries or
+        // wire bytes. Retained history prevents reconnects and window rollover
+        // from bypassing the per-block rolling retry bound.
+        let reopen = inner.entries.get(&key).is_some_and(|entry| {
+            !scope.0.bootstrap
+                && !entry.origin_bootstrap
+                && !entry.terminal
+                && entry.owner.is_none()
+                && entry.pins == 0
+                && now >= entry.expires
+                && now.saturating_duration_since(entry.expires)
+                    >= Duration::from_secs((15u64 << entry.reopen_count.min(3)).min(120))
+                && entry
+                    .reopens
+                    .iter()
+                    .flatten()
+                    .filter(|at| now.saturating_duration_since(**at) < REOPEN_HISTORY)
+                    .count()
+                    < MAX_REOPENS_PER_HOUR
+        });
+        if reopen {
+            if expires.saturating_duration_since(now) > crate::eng2::transport::BODY_FETCH_TIMEOUT {
+                return Err(ClaimError::Expired);
+            }
+            inner.account = inner
+                .account
+                .checked_add(1)
+                .ok_or(ClaimError::Unavailable)?;
+            let account = inner.account;
+            let entry = inner.entries.get_mut(&key).ok_or(ClaimError::Unavailable)?;
+            let slot = entry
+                .reopens
+                .iter_mut()
+                .find(|at| at.is_none_or(|at| now.saturating_duration_since(at) >= REOPEN_HISTORY))
+                .ok_or(ClaimError::Unavailable)?;
+            *slot = Some(now);
+            entry.reopen_count = entry.reopen_count.saturating_add(1);
+            entry.account = account;
+            entry.epoch = epoch;
+            entry.origin = Arc::downgrade(&scope.0);
+            entry.origin_scope = scope.0.id;
+            entry.first = now;
+            entry.expires = end;
+            entry.ever_issued = false;
+            entry.sources = std::array::from_fn(|_| None);
+            entry.queries = 0;
+            #[cfg(feature = "eng2-runtime")]
+            {
+                entry.decision = None;
+            }
+        }
         let replace = inner.entries.get(&key).is_some_and(|e| {
             e.owner.is_none()
                 && e.pins == 0
+                && !e.retains_retry_history(now)
                 && now >= e.expires
                 && (e.epoch != epoch
                     || (scope.0.bootstrap
@@ -527,8 +607,11 @@ impl Registry {
                     owner: None,
                     terminal: false,
                     ever_issued: false,
+                    pieces_failed: false,
                     sources: std::array::from_fn(|_| None),
                     queries: 0,
+                    reopens: [None; MAX_REOPENS_PER_HOUR],
+                    reopen_count: 0,
                     #[cfg(feature = "eng2-runtime")]
                     decision: None,
                     _charge: record_charge,
@@ -604,6 +687,9 @@ impl Registry {
                 owner.cancel.store(true, Ordering::Release);
             }
             return Err(ClaimError::Expired);
+        }
+        if mode == Mode::Pieces && entry.pieces_failed {
+            return Err(ClaimError::SourceUsed);
         }
         if entry.sources.iter().flatten().any(|s| s.peer == source)
             && now.saturating_duration_since(entry.first)
@@ -862,6 +948,9 @@ pub(super) struct Lease {
     _authorization: Authorization,
 }
 impl Lease {
+    pub(super) fn account_identity(&self) -> u64 {
+        self.account
+    }
     pub(super) fn wire_account(&self, charge: Option<super::BodyBookCharge>) -> WireAccount {
         WireAccount {
             registry: self.registry.clone(),
@@ -1170,6 +1259,19 @@ impl Drop for Lease {
         }) {
             let retryable = !self.complete.load(Ordering::Acquire)
                 && entry.owner.as_ref().is_some_and(|owner| !owner.decoded);
+            if retryable
+                && entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.mode == Mode::Pieces)
+                && entry
+                    .sources
+                    .iter()
+                    .flatten()
+                    .any(|source| source.generation == self.generation)
+            {
+                entry.pieces_failed = true;
+            }
             for source in entry
                 .sources
                 .iter_mut()
@@ -1188,6 +1290,196 @@ impl Drop for Lease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expired_resident_account_reopens_with_bounded_backoff_and_rolling_limit() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let scope = r
+            .resident_scope(1, n, n + Duration::from_secs(7200))
+            .unwrap();
+        let mut at = n;
+        let mut last_account = 0;
+        for attempt in 0..=8u32 {
+            let end = at + Duration::from_secs(1);
+            let auth = r.authorize(&scope, key(91), at, end, None).unwrap();
+            assert!(auth.pin.account > last_account);
+            last_account = auth.pin.account;
+            let lease = r
+                .claim_authorized(&auth, [1; 32], Mode::Legacy, at)
+                .unwrap();
+            lease.begin_query([1; 32], at).unwrap();
+            drop(lease);
+            drop(auth);
+            let delay = Duration::from_secs((15u64 << attempt.min(3)).min(120));
+            let early = end + delay - Duration::from_nanos(1);
+            assert_eq!(
+                r.authorize(&scope, key(91), early, early + Duration::from_secs(1), None)
+                    .unwrap_err(),
+                ClaimError::Expired
+            );
+            at = end + delay;
+        }
+        assert_eq!(
+            r.authorize(&scope, key(91), at, at + Duration::from_secs(1), None)
+                .unwrap_err(),
+            ClaimError::Expired
+        );
+        let usage = r.0.lock().unwrap();
+        assert_eq!(usage.resident.as_ref().unwrap().queries, 9);
+        assert_eq!(usage.active, 0);
+        assert_eq!(usage.entries.len(), 1);
+        drop(usage);
+        // A resident accounting-window change does not refund this block's
+        // rolling hour. This also exercises the old epoch-based replace path.
+        let rollover = at + Duration::from_secs(1);
+        r.advance_window(1, 2, rollover, n + Duration::from_secs(7200))
+            .unwrap();
+        let renewed = r
+            .resident_scope(2, rollover, n + Duration::from_secs(7200))
+            .unwrap();
+        assert_eq!(
+            r.authorize(
+                &renewed,
+                key(91),
+                rollover,
+                rollover + Duration::from_secs(1),
+                None
+            )
+            .unwrap_err(),
+            ClaimError::Expired
+        );
+        let later = n + Duration::from_secs(4000);
+        assert!(
+            r.authorize(
+                &renewed,
+                key(91),
+                later,
+                later + Duration::from_secs(1),
+                None
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn first_resident_reopen_after_window_rollover_keeps_backoff_and_history() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let scope = r.resident_scope(1, n, n + Duration::from_secs(2)).unwrap();
+        let auth = r
+            .authorize(&scope, key(94), n, n + Duration::from_secs(1), None)
+            .unwrap();
+        let original = auth.pin.account;
+        let lease = r.claim_authorized(&auth, [1; 32], Mode::Legacy, n).unwrap();
+        lease.begin_query([1; 32], n).unwrap();
+        drop(lease);
+        drop(auth);
+        let rollover = n + Duration::from_secs(2);
+        r.advance_window(1, 2, rollover, n + Duration::from_secs(7200))
+            .unwrap();
+        let scope = r
+            .resident_scope(2, rollover, n + Duration::from_secs(7200))
+            .unwrap();
+        assert_eq!(
+            r.authorize(
+                &scope,
+                key(94),
+                rollover,
+                rollover + Duration::from_secs(180),
+                None
+            )
+            .unwrap_err(),
+            ClaimError::Expired
+        );
+        let at = n + Duration::from_secs(16);
+        assert_eq!(
+            r.authorize(&scope, key(94), at, at + Duration::from_secs(181), None)
+                .unwrap_err(),
+            ClaimError::Expired
+        );
+        assert_eq!(r.0.lock().unwrap().entries[&key(94)].reopen_count, 0);
+        let reopened = r
+            .authorize(&scope, key(94), at, at + Duration::from_secs(180), None)
+            .unwrap();
+        assert!(reopened.pin.account > original);
+        let inner = r.0.lock().unwrap();
+        let entry = &inner.entries[&key(94)];
+        assert_eq!(entry.reopen_count, 1);
+        assert_eq!(
+            entry.reopens.iter().flatten().copied().collect::<Vec<_>>(),
+            vec![at]
+        );
+        assert_eq!(entry.epoch, 2);
+    }
+
+    #[test]
+    fn resident_reopen_preserves_pins_terminal_and_shared_wire_limits() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let scope = r
+            .resident_scope(1, n, n + Duration::from_secs(7200))
+            .unwrap();
+        let end = n + Duration::from_secs(1);
+        let auth = r.authorize(&scope, key(92), n, end, None).unwrap();
+        let lease = r.claim_authorized(&auth, [1; 32], Mode::Legacy, n).unwrap();
+        lease.begin_query([1; 32], n).unwrap();
+        let account = lease.wire_account(None);
+        let wire = account.reserve(1024, n).unwrap();
+        wire.finish(512).unwrap();
+        drop(account);
+        let at = end + Duration::from_secs(15);
+        assert_eq!(
+            r.authorize(&scope, key(92), at, at + Duration::from_secs(1), None)
+                .unwrap_err(),
+            ClaimError::Expired
+        );
+        drop(lease);
+        assert_eq!(
+            r.authorize(&scope, key(92), at, at + Duration::from_secs(1), None)
+                .unwrap_err(),
+            ClaimError::Expired
+        );
+        drop(auth);
+        let next = r
+            .authorize(&scope, key(92), at, at + Duration::from_secs(1), None)
+            .unwrap();
+        let inner = r.0.lock().unwrap();
+        let window = inner.resident.as_ref().unwrap();
+        assert_eq!(
+            (window.queries, window.wire_bytes, window.wire_reserved),
+            (1, 512, 0)
+        );
+        drop(inner);
+        assert!(r.accepted(key(92)).unwrap());
+        drop(next);
+        let later = at + Duration::from_secs(121);
+        assert_eq!(
+            r.authorize(&scope, key(92), later, later + Duration::from_secs(1), None)
+                .unwrap_err(),
+            ClaimError::Expired
+        );
+    }
+
+    #[test]
+    fn failed_piece_io_selects_whole_body_fallback_without_refunding_attempts() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let end = n + Duration::from_secs(180);
+        let pieces = r.claim(key(93), [1; 32], Mode::Pieces, n, end).unwrap();
+        let account = pieces.account;
+        pieces.begin_query([1; 32], n).unwrap();
+        drop(pieces);
+        assert_eq!(
+            r.claim(key(93), [1; 32], Mode::Pieces, n, end).unwrap_err(),
+            ClaimError::SourceUsed
+        );
+        let whole = r.claim(key(93), [1; 32], Mode::Legacy, n, end).unwrap();
+        assert_eq!(whole.account, account);
+        assert_eq!(whole.expires, end);
+        whole.begin_query([1; 32], n).unwrap();
+        assert_eq!(r.0.lock().unwrap().resident.as_ref().unwrap().queries, 2);
+    }
+
     fn key(n: u8) -> Key {
         Key {
             context: [[1; 32], [2; 32], [3; 32]],
@@ -1642,24 +1934,28 @@ mod tests {
             ClaimError::Expired
         );
         drop(retained);
-        let fresh = r
-            .authorize(
+        // Releasing the bootstrap pin does not bypass the resident account's
+        // expiry backoff or count the first reopen as a fresh lifecycle.
+        assert_eq!(
+            r.authorize(
                 &resident,
                 key(1),
                 original + Duration::from_secs(1),
                 original + Duration::from_secs(180),
                 None,
             )
+            .unwrap_err(),
+            ClaimError::Expired
+        );
+        let at = original + Duration::from_secs(15);
+        let fresh = r
+            .authorize(&resident, key(1), at, at + Duration::from_secs(180), None)
             .unwrap();
         assert!(
-            r.claim_authorized(
-                &fresh,
-                [1; 32],
-                Mode::Legacy,
-                original + Duration::from_secs(1)
-            )
-            .is_ok()
+            r.claim_authorized(&fresh, [1; 32], Mode::Legacy, at)
+                .is_ok()
         );
+        assert_eq!(r.0.lock().unwrap().entries[&key(1)].reopen_count, 1);
     }
     #[test]
     fn stale_authorization_cannot_release_or_query_a_new_account_after_owner_rollover() {
@@ -2045,8 +2341,20 @@ mod tests {
             .claim_body_authorized(&authorization, [5; 32], Mode::Legacy)
             .unwrap();
         lease.begin_query([5; 32]).unwrap();
+        lease.complete();
         drop(lease);
         drop(authorization);
+        assert!(
+            budget
+                .0
+                .bodies
+                .0
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .all(|e| e.terminal)
+        );
         assert_eq!(
             budget.0.usage.lock().unwrap().bytes,
             scope_charge() + record_charge()
@@ -2116,11 +2424,18 @@ mod lifecycle_regressions {
         let (r, _scope, auth, n) = setup();
         for ordinal in 1..=4 {
             let at = n + Duration::from_secs(ordinal as u64 * 31);
+            if ordinal > 2 {
+                assert_eq!(
+                    r.claim_authorized(&auth, [5; 32], Mode::Pieces, at)
+                        .unwrap_err(),
+                    ClaimError::SourceUsed
+                );
+            }
             let lease = r
                 .claim_authorized(
                     &auth,
                     [5; 32],
-                    if ordinal % 2 == 0 {
+                    if ordinal == 2 {
                         Mode::Pieces
                     } else {
                         Mode::Legacy

@@ -85,11 +85,21 @@ struct ConnectionObservation {
     completed_head: Option<(u64, Hash)>,
     checkpoint_head: Option<(u64, Hash)>,
 }
+#[derive(Clone, Copy)]
+struct WorkerExitDiagnostic {
+    code: &'static str,
+    outbound: bool,
+    lane: u8,
+    retry_until: Option<Instant>,
+    failures: u32,
+}
 pub(super) struct NetworkObservation {
     at: Instant,
     invalidations: u64,
     disconnections: u64,
     last_disconnect: Option<ConnectionDiagnostic>,
+    worker_exits: u64,
+    last_worker_exit: Option<WorkerExitDiagnostic>,
     connections: [Option<ConnectionObservation>; MAX_WORKERS],
 }
 fn head_json(head: Option<(u64, Hash)>) -> Value {
@@ -115,6 +125,9 @@ impl NetworkObservation {
             "observed_monotonic_ns":monotonic_ns(Some(self.at),origin),"freshness_ns":"30000000000",
             "invalidations":self.invalidations,"disconnections":self.disconnections,
             "closed_history_complete":false,"connections":connections,"rounds":rounds,
+            "worker_exits":self.worker_exits,"last_worker_exit":self.last_worker_exit.map(|exit|json!({
+                "code":exit.code,"outbound":exit.outbound,"lane":exit.lane,"failures":exit.failures,
+                "retry_until_monotonic_ns":monotonic_ns(exit.retry_until,origin)})),
             "last_disconnect":self.last_disconnect.map(|d|json!({"ordinal":d.ordinal,
                 "last_round":d.rounds[(d.cursor+ROUND_RECORDS-1)%ROUND_RECORDS].map(|r|r.json(d.ordinal,origin)),
                 "latest_fetch":d.latest_fetch.map(|fetch|fetch.json(origin))}))})
@@ -124,7 +137,8 @@ const _: () = assert!(std::mem::size_of::<RoundRecord>() <= 256);
 pub(super) const fn diagnostic_storage_bytes() -> usize {
     MAX_WORKERS * (std::mem::size_of::<ConnectionDiagnostic>() + std::mem::size_of::<u64>())
         + std::mem::size_of::<Option<ConnectionDiagnostic>>()
-        + 3 * std::mem::size_of::<u64>()
+        + 4 * std::mem::size_of::<u64>()
+        + std::mem::size_of::<Option<WorkerExitDiagnostic>>()
 }
 
 struct Connection {
@@ -144,6 +158,8 @@ struct StatusInner {
     invalidations: u64,
     disconnections: u64,
     last_disconnect: Option<ConnectionDiagnostic>,
+    worker_exits: u64,
+    last_worker_exit: Option<WorkerExitDiagnostic>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PeerReadiness {
@@ -425,6 +441,8 @@ impl NetworkStatus {
                 invalidations: status.invalidations,
                 disconnections: status.disconnections,
                 last_disconnect: status.last_disconnect,
+                worker_exits: status.worker_exits,
+                last_worker_exit: status.last_worker_exit,
                 connections,
             },
         ))
@@ -581,6 +599,22 @@ struct Backoff {
     failures: u32,
     until: Instant,
 }
+impl Backoff {
+    fn after_exit(previous: Option<&Self>, stable: bool, now: Instant) -> Self {
+        let failures = if stable {
+            0
+        } else {
+            previous.map_or(1, |b| b.failures.saturating_add(1))
+        };
+        Self {
+            failures,
+            until: now + Duration::from_secs((1u64 << failures.min(6)).min(60)),
+        }
+    }
+    fn ready(&self, now: Instant) -> bool {
+        now >= self.until
+    }
+}
 fn session(
     mut peer: Peer<p2p::NativeTlsChannel>,
     initiator: bool,
@@ -668,7 +702,17 @@ fn session(
                 .map(|round| (round.accepted, round.checked_head)),
             Some(peer.take_fetch_observation()),
         );
-        let round = round.map_err(|_| "peer round failed")?;
+        let round = round.map_err(|error| match error {
+            network::Error::RequestLimit => "peer_round_request_limit",
+            network::Error::Protocol => "peer_round_protocol_rejected",
+            network::Error::Transport(p2p::Error::ResourceExhausted) => {
+                "peer_round_transport_capacity"
+            }
+            network::Error::Transport(_) => "peer_round_transport_unavailable",
+            network::Error::Owner(_) => "peer_round_owner_unavailable",
+            network::Error::Discovery(_) => "peer_round_discovery_unavailable",
+            _ => "peer_round_unavailable",
+        })?;
         let checkpoint = checkpoint_phase(&mut peer, initiator, shared);
         shared
             .network
@@ -949,24 +993,45 @@ pub(super) fn run(
                 if workers[index].handle.is_finished() {
                     let worker = workers.swap_remove(index);
                     let stable = worker.started.elapsed() >= Duration::from_secs(60);
-                    let _ = worker.handle.join();
+                    let result = worker.handle.join();
+                    let code = match &result {
+                        Ok(Ok(())) => "peer_worker_completed",
+                        Err(_) => "peer_worker_panicked",
+                        Ok(Err(error)) => match error.as_str() {
+                            "peer_round_request_limit" => "peer_round_request_limit",
+                            "peer_round_protocol_rejected" => "peer_round_protocol_rejected",
+                            "peer_round_transport_capacity" => "peer_round_transport_capacity",
+                            "peer_round_transport_unavailable" => {
+                                "peer_round_transport_unavailable"
+                            }
+                            "peer_round_owner_unavailable" => "peer_round_owner_unavailable",
+                            "peer_round_discovery_unavailable" => {
+                                "peer_round_discovery_unavailable"
+                            }
+                            "peer authentication unavailable" => "peer_authentication_unavailable",
+                            _ => "peer_worker_other_failure",
+                        },
+                    };
+                    let mut diagnostic = WorkerExitDiagnostic {
+                        code,
+                        outbound: worker.outbound.is_some(),
+                        lane: worker.outbound.map_or(0, |p| p.1),
+                        retry_until: None,
+                        failures: 0,
+                    };
                     if let Some(peer) = worker.outbound {
-                        let failures = if stable {
-                            0
-                        } else {
-                            backoff
-                                .get(&peer)
-                                .map_or(1, |b| b.failures.saturating_add(1))
-                        };
-                        backoff.insert(
-                            peer,
-                            Backoff {
-                                failures,
-                                until: Instant::now()
-                                    + Duration::from_secs((1u64 << failures.min(6)).min(60)),
-                            },
-                        );
+                        let next = Backoff::after_exit(backoff.get(&peer), stable, Instant::now());
+                        diagnostic.retry_until = Some(next.until);
+                        diagnostic.failures = next.failures;
+                        backoff.insert(peer, next);
                     }
+                    let mut status = shared
+                        .network
+                        .inner
+                        .lock()
+                        .map_err(|_| "connection registry lock poisoned")?;
+                    status.worker_exits = status.worker_exits.saturating_add(1);
+                    status.last_worker_exit = Some(diagnostic);
                 } else {
                     index += 1;
                 }
@@ -983,7 +1048,7 @@ pub(super) fn run(
                     || workers.iter().any(|w| w.outbound == Some((peer, 0)))
                     || backoff
                         .get(&(peer, 0))
-                        .is_some_and(|b| Instant::now() < b.until)
+                        .is_some_and(|b| !b.ready(Instant::now()))
                 {
                     continue;
                 }
@@ -1028,7 +1093,7 @@ pub(super) fn run(
                         break;
                     }
                     if workers.iter().any(|w| w.outbound == Some(key))
-                        || backoff.get(&key).is_some_and(|b| Instant::now() < b.until)
+                        || backoff.get(&key).is_some_and(|b| !b.ready(Instant::now()))
                     {
                         continue;
                     }
@@ -1087,6 +1152,24 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outbound_reconnection_backoff_is_bounded_and_stable_sessions_reset_it() {
+        let mut at = Instant::now();
+        let mut previous = None;
+        for attempt in 1..=100u32 {
+            let next = Backoff::after_exit(previous.as_ref(), false, at);
+            let expected = Duration::from_secs((1u64 << attempt.min(6)).min(60));
+            assert_eq!(next.until.duration_since(at), expected);
+            assert!(!next.ready(next.until - Duration::from_nanos(1)));
+            assert!(next.ready(next.until));
+            at = next.until;
+            previous = Some(next);
+        }
+        let stable = Backoff::after_exit(previous.as_ref(), true, at);
+        assert_eq!(stable.failures, 0);
+        assert_eq!(stable.until.duration_since(at), Duration::from_secs(1));
+    }
+
     #[test]
     fn diagnostic_round_retention_does_not_refresh_readiness() {
         let status = Arc::new(NetworkStatus::default());

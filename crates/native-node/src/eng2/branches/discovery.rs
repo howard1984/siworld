@@ -93,6 +93,7 @@ struct Candidate {
     pending: Option<u64>,
     pending_bodies: BTreeMap<u64, PendingBody>,
     body_attempts: BTreeMap<Hash, Vec<Hash>>,
+    body_accounts: BTreeMap<Hash, u64>,
     received_bodies: BTreeSet<Hash>,
 }
 #[derive(Debug)]
@@ -274,6 +275,7 @@ impl Ledger {
                 pending: None,
                 pending_bodies: BTreeMap::new(),
                 body_attempts: BTreeMap::new(),
+                body_accounts: BTreeMap::new(),
                 received_bodies: BTreeSet::new(),
             },
         );
@@ -368,6 +370,17 @@ impl Ledger {
         peer: Hash,
         now_ms: u64,
     ) -> Result<HeaderRequest, Error> {
+        self.request_body_for_account(candidate, id, peer, now_ms, 0)
+    }
+    /// The ID is minted by the node-wide exact-body owner, not a socket or peer.
+    pub(crate) fn request_body_for_account(
+        &mut self,
+        candidate: Hash,
+        id: Hash,
+        peer: Hash,
+        now_ms: u64,
+        account: u64,
+    ) -> Result<HeaderRequest, Error> {
         let cursor = self.cursor(candidate, now_ms)?;
         if !cursor.ancestor_confirmed {
             return Err(Error::AncestorMismatch);
@@ -396,7 +409,21 @@ impl Ledger {
             .find(|h| h.id().ok() == Some(id))
             .ok_or(Error::InvalidHeader)?;
         let height = header.height;
-        let tried = entry.body_attempts.get(&id);
+        let new_account = entry
+            .body_accounts
+            .get(&id)
+            .is_some_and(|old| *old != account);
+        if new_account
+            && entry
+                .pending_bodies
+                .values()
+                .any(|pending| pending.id == id)
+        {
+            return Err(Error::InFlight);
+        }
+        let tried = (!new_account)
+            .then(|| entry.body_attempts.get(&id))
+            .flatten();
         // A released failed request may use the same peer again. Its previous
         // ticket remains charged, and the same peer cannot overlap itself.
         if entry
@@ -416,6 +443,10 @@ impl Ledger {
         self.requests += 1;
         self.peers.insert(peer);
         let entry = self.candidates.get_mut(&candidate).unwrap();
+        if new_account {
+            entry.body_attempts.remove(&id);
+        }
+        entry.body_accounts.insert(id, account);
         entry.body_attempts.entry(id).or_default().push(peer);
         entry.pending_bodies.insert(
             self.requests,

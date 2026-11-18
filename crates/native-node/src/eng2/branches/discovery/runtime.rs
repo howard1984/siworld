@@ -236,7 +236,13 @@ impl Discovery {
                     ) => return Ok(DiscoveryAction::Deferred),
                     Err(_) => return Ok(DiscoveryAction::Deferred),
                 };
-                return match self.ledger.request_body(remote.1, id, peer, now_ms) {
+                return match self.ledger.request_body_for_account(
+                    remote.1,
+                    id,
+                    peer,
+                    now_ms,
+                    ownership.account_identity(),
+                ) {
                     Ok(request) => Ok(DiscoveryAction::Body {
                         request,
                         header,
