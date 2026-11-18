@@ -890,3 +890,121 @@ fn queued_body_cannot_publish_after_its_original_scope_closes_while_waiting_for_
     std::fs::remove_dir_all(source.directory).unwrap();
     std::fs::remove_dir_all(receiver.directory).unwrap();
 }
+
+#[test]
+fn header_only_unused_source_consumes_its_opportunity_then_failed_source_can_retry() {
+    let source = fixture(p2p::Role::Miner, p2p::Role::Validator, 2);
+    let receiver = fixture(p2p::Role::Validator, p2p::Role::Miner, 1);
+    let header = produced(&source, 7);
+    let old = [5; 32];
+    let unused = [6; 32];
+    let connected = std::collections::BTreeSet::from([old, unused]);
+    receiver.shared.headers.offer(header.clone(), old).unwrap();
+    let mut original_deadline = None;
+    let mut expected_wire = 0;
+    for (index, fingerprint) in [old, unused, old].into_iter().enumerate() {
+        if index == 1 {
+            receiver
+                .shared
+                .headers
+                .offer(header.clone(), unused)
+                .unwrap();
+            assert!(
+                receiver
+                    .shared
+                    .headers
+                    .download_preferred(old, p2p::BodyMode::Legacy, None, &connected)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut download = receiver
+            .shared
+            .headers
+            .download_preferred(fingerprint, p2p::BodyMode::Legacy, None, &connected)
+            .unwrap()
+            .unwrap();
+        let ownership = download.take_ownership().unwrap();
+        let end = ownership.deadline().expires_at();
+        if let Some(original) = original_deadline {
+            assert_eq!(end, original);
+        } else {
+            original_deadline = Some(end);
+        }
+        assert_eq!(ownership.source_ordinal(), Some(index + 1));
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut remote = Peer::new(
+            p2p::Session::from_test_peer_channel(
+                a,
+                source.genesis.peer_binding(),
+                source.shared.budget.clone(),
+                fingerprint,
+                p2p::Role::Validator,
+            ),
+            &source.genesis,
+            source.shared.headers.body_policy(),
+        )
+        .unwrap();
+        let mut local = Peer::new(
+            p2p::Session::from_test_peer_channel(
+                b,
+                receiver.genesis.peer_binding(),
+                receiver.shared.budget.clone(),
+                fingerprint,
+                p2p::Role::Miner,
+            ),
+            &receiver.genesis,
+            receiver.shared.headers.body_policy(),
+        )
+        .unwrap();
+        let h = header.clone();
+        let body = source
+            .shared
+            .headers
+            .local_body(h.height, h.id().unwrap())
+            .unwrap()
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let (request, kind) = remote.receive_request().unwrap();
+            assert!(matches!(kind, crate::eng2::transport::Request::Body { .. }));
+            if index < 2 {
+                remote.send_unavailable(request, h.height).unwrap();
+            } else {
+                remote.send_body(request, &h, body.body()).unwrap();
+            }
+        });
+        let result = local
+            .fetch_body_owned(11, &header, ownership, None)
+            .unwrap();
+        if index < 2 {
+            assert!(result.is_none());
+        } else {
+            assert!(result.is_some());
+        }
+        let io = local.application_totals();
+        expected_wire += io.sent + io.received;
+        drop(result);
+        drop(local);
+        drop(download);
+        worker.join().unwrap();
+    }
+    assert_eq!(receiver.shared.budget.body_wire_usage().0, expected_wire);
+    assert_eq!(receiver.shared.headers.active_downloads(), 0);
+    assert_eq!(
+        receiver
+            .shared
+            .owner
+            .lock()
+            .unwrap()
+            .engine()
+            .state()
+            .height(),
+        0
+    );
+    drop(source.shared);
+    drop(receiver.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(receiver.directory).unwrap();
+}

@@ -1,6 +1,7 @@
 //! Resident restoration lifecycle on the existing owned archive worker.
 use super::super::retained::Restored;
 use super::super::retained_work::{PreparedResult, RetainedWork, ValidatedRetained};
+use super::retained_diagnostic::{Cause, Failure, Stage};
 use super::*;
 
 impl Host {
@@ -28,6 +29,7 @@ impl Host {
             last_exported: None,
             last_status: None,
             tick_failure: None,
+            retained_failure: None,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -54,12 +56,30 @@ impl Host {
         store: &Store,
         headers: impl FnOnce() -> Result<Option<crate::eng2::branches::CheckpointHeaders>, String>,
     ) -> Result<bool, String> {
-        let result = self.reconcile_retained_step(store, headers);
-        if result.is_err() {
+        let mut stage = Stage::WorkerState;
+        let mut generation_mismatches = 0;
+        let result =
+            self.reconcile_retained_step(store, headers, &mut stage, &mut generation_mismatches);
+        if let Err(error) = &result {
+            let sequence = self
+                .retained_failure
+                .map_or(1, |old| old.sequence.saturating_add(1));
+            self.retained_failure = Some(Failure {
+                sequence,
+                stage,
+                cause: Cause::classify(error),
+                generation_mismatches,
+                withdrawal: None,
+            });
             // A real authentication/context failure is different from pending
             // inspection: pause current publication and invalidate every earlier
             // task, even if the canonical head is unchanged. History stays readable.
-            self.pause_reorganization_exports()?;
+            if let Err(error) = self.pause_reorganization_exports() {
+                if let Some(failure) = &mut self.retained_failure {
+                    failure.withdrawal = Some(Cause::classify(&error));
+                }
+                return Err(error);
+            }
         }
         result
     }
@@ -68,6 +88,8 @@ impl Host {
         &mut self,
         store: &Store,
         headers: impl FnOnce() -> Result<Option<crate::eng2::branches::CheckpointHeaders>, String>,
+        stage: &mut Stage,
+        generation_mismatches: &mut u8,
     ) -> Result<bool, String> {
         self.retained_ready = false;
         let restoring = self
@@ -79,6 +101,7 @@ impl Host {
                 .preparation
                 .as_mut()
                 .ok_or("checkpoint worker unavailable")?;
+            *stage = Stage::Complete;
             let result = preparation.worker.try_complete_retained();
             if preparation.worker.is_busy() {
                 return Ok(false);
@@ -89,9 +112,20 @@ impl Host {
                     // Authentication errors remain errors. Only a successful
                     // result captured before a canonical advance is discarded
                     // as pending; it cannot restore signing or wallet readiness.
+                    *stage = Stage::Revision;
                     if !result.revision.is_current_revision(store)? {
+                        *stage = Stage::StaleWithdrawal;
                         self.pause_reorganization_exports()?;
                         return Ok(false);
+                    }
+                    *stage = Stage::Install;
+                    if let Some(preparation) = &self.preparation {
+                        *generation_mismatches =
+                            u8::from(result.generation != preparation.generation)
+                                | (u8::from(
+                                    result.material_generation != self.export.material_generation(),
+                                ) << 1)
+                                | (u8::from(result.retired_through != self.retired_through) << 2);
                     }
                     self.install_retained(store, result)?;
                     self.retained_ready = true;
@@ -103,7 +137,9 @@ impl Host {
         }
         // Drain a prior archive result without a signing/readiness permit. A
         // completed candidate may coexist with the next restoration task.
+        *stage = Stage::Drain;
         self.advance_preparation(store, None)?;
+        *stage = Stage::WorkerState;
         let preparation = self
             .preparation
             .as_mut()
@@ -111,9 +147,12 @@ impl Host {
         if preparation.worker.is_busy() {
             return Ok(false);
         }
+        *stage = Stage::Headers;
+        let headers = headers()?;
+        *stage = Stage::Capture;
         let mut work = RetainedWork::capture(
             store,
-            headers()?,
+            headers,
             &self.export,
             self.limits,
             &preparation.budget,
@@ -122,7 +161,9 @@ impl Host {
             self.latest.as_ref(),
             self.pending.as_ref(),
         )?;
+        *stage = Stage::Votes;
         work.bind_pending_votes(&self.votes, self.journaled_vote.as_ref())?;
+        *stage = Stage::Start;
         preparation.worker.start_retained(work)?;
         preparation.retained_request = true;
         Ok(false)

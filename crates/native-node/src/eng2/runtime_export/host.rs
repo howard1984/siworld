@@ -295,6 +295,8 @@ pub struct Host {
     last_exported: Option<(u64, Hash, Option<u64>)>,
     last_status: Option<Status>,
     tick_failure: Option<TickFailureReason>,
+    #[cfg(feature = "eng2-runtime")]
+    retained_failure: Option<retained_diagnostic::Failure>,
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
@@ -355,6 +357,11 @@ fn wallet_failure_code(error: &str) -> &'static str {
     }
 }
 impl Host {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn retained_failure_diagnostic(&self) -> Option<serde_json::Value> {
+        self.retained_failure
+            .map(retained_diagnostic::Failure::json)
+    }
     /// The failed operation's bounded origin; the original Result is unchanged.
     pub fn tick_failure_reason(&self) -> Option<TickFailureReason> {
         self.tick_failure
@@ -400,6 +407,8 @@ impl Host {
             last_exported: None,
             last_status: None,
             tick_failure: None,
+            #[cfg(feature = "eng2-runtime")]
+            retained_failure: None,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -440,6 +449,8 @@ impl Host {
             last_exported: None,
             last_status: None,
             tick_failure: None,
+            #[cfg(feature = "eng2-runtime")]
+            retained_failure: None,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -1361,3 +1372,6 @@ mod codec;
 
 #[cfg(feature = "eng2-runtime")]
 mod restoration;
+
+#[cfg(feature = "eng2-runtime")]
+mod retained_diagnostic;

@@ -98,6 +98,26 @@ pub(crate) enum ReserveFailure {
 #[derive(Clone, Debug)]
 pub struct Budget(Arc<BudgetInner>);
 impl Budget {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn body_registry_diagnostic(&self) -> serde_json::Value {
+        let Some(d) = self.0.bodies.last_decision() else {
+            return serde_json::Value::Null;
+        };
+        let code = match d.error {
+            None => "granted",
+            Some(BodyClaimError::Busy) => "busy",
+            Some(BodyClaimError::Expired) => "expired",
+            Some(BodyClaimError::Capacity) => "capacity",
+            Some(BodyClaimError::SourceUsed) => "source_used",
+            Some(BodyClaimError::PreferUnused) => "unused_source_preferred",
+            Some(BodyClaimError::QueryLimit) => "query_limit",
+            Some(BodyClaimError::Unavailable) => "unavailable",
+        };
+        let wire = self.0.bodies.wire_usage();
+        serde_json::json!({"wire_charged_bytes":wire.map(|w|w.0),"wire_reserved_bytes":wire.map(|w|w.1),"wire_maximum_bytes":wire.map(|w|w.2),"scope":"last_exact_body_decision","sequence":d.sequence,"phase":d.phase,"code":code,
+            "height":d.height,"account":d.account,"generation":d.generation,"queries":d.queries,
+            "window_queries":d.window_queries,"age_ms":d.age_ms,"remaining_ms":d.remaining_ms,"terminal":d.terminal})
+    }
     pub fn new(maximum: usize) -> Self {
         Self(Arc::new(BudgetInner {
             bodies: Arc::new(body_ownership::Registry::default()),
@@ -137,6 +157,17 @@ impl Budget {
             expires,
             Some(self.body_book_charge(body_ownership::scope_charge())?),
         )
+    }
+    pub(crate) fn restrict_body_wire_limit(
+        &self,
+        scope: &BodyScope,
+        maximum: u64,
+    ) -> Result<(), BodyClaimError> {
+        self.0.bodies.restrict_wire(scope, maximum)
+    }
+    #[cfg(test)]
+    pub(crate) fn body_wire_usage(&self) -> (u64, u64, u64) {
+        self.0.bodies.wire_usage().unwrap()
     }
     pub(crate) fn restrict_body_limits(
         &self,
@@ -218,17 +249,31 @@ impl Budget {
         source: Hash,
         mode: BodyMode,
     ) -> Result<BodyClaim, BodyClaimError> {
+        self.claim_body_preferred(authorization, source, mode, std::iter::empty())
+    }
+    pub(crate) fn claim_body_preferred(
+        &self,
+        authorization: &BodyAuthorization,
+        source: Hash,
+        mode: BodyMode,
+        alternatives: impl IntoIterator<Item = Hash>,
+    ) -> Result<BodyClaim, BodyClaimError> {
         let charge = self
             .reserve(std::mem::size_of::<BodyClaim>() + std::mem::size_of::<body_ownership::Key>())
             .map_err(|_| BodyClaimError::Capacity)?;
-        let lease = self.0.bodies.claim_authorized(
+        let lease = self.0.bodies.claim_preferred(
             authorization,
             source,
             mode,
             std::time::Instant::now(),
+            alternatives,
         )?;
         let deadline = Deadline::new(std::time::Duration::from_secs(180)).for_body_lease(&lease);
+        let wire = Arc::new(lease.wire_account(Some(
+            self.body_book_charge(std::mem::size_of::<body_ownership::WireAccount>() + 64)?,
+        )));
         Ok(BodyClaim {
+            wire,
             lease,
             deadline,
             _charge: charge,
@@ -338,11 +383,18 @@ impl Default for Budget {
 /// One exact candidate owner across Legacy and Pieces. Piece requests borrow it.
 #[derive(Debug)]
 pub struct BodyClaim {
+    wire: Arc<body_ownership::WireAccount>,
     lease: body_ownership::Lease,
     deadline: Deadline,
     _charge: Reservation,
 }
 impl BodyClaim {
+    pub(crate) fn account_received_offer(&self, bytes: u64) -> Result<(), Error> {
+        self.wire
+            .reserve(bytes, Instant::now())
+            .and_then(|ticket| ticket.finish(bytes))
+            .map_err(|_| Error::ResourceExhausted)
+    }
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn cancellation(&self) -> Cancellation {
         Cancellation(self.lease.cancel.clone())
@@ -368,6 +420,7 @@ impl BodyClaim {
             .map_err(|error| match error {
                 BodyClaimError::Capacity
                 | BodyClaimError::SourceUsed
+                | BodyClaimError::PreferUnused
                 | BodyClaimError::QueryLimit => Error::ResourceExhausted,
                 _ => Error::Unavailable,
             })
@@ -750,6 +803,7 @@ pub(crate) trait WireFence: Send + Sync {
 }
 struct Timed<'a, S> {
     fence: Option<&'a dyn WireFence>,
+    body_wire: Option<&'a body_ownership::WireAccount>,
     channel: &'a mut S,
     deadline: Deadline,
     totals: Option<&'a mut IoTotals>,
@@ -760,16 +814,30 @@ impl<S: Read> Read for Timed<'_, S> {
         if let Some(fence) = self.fence {
             fence.check_wire(bytes.len() as u64)?;
         }
-        let read = self.channel.read(bytes)?;
-        if let Some(totals) = self.totals.as_mut() {
-            totals.received = totals
+        let ticket = self
+            .body_wire
+            .map(|wire| wire.reserve(bytes.len() as u64, Instant::now()))
+            .transpose()
+            .map_err(|_| io::Error::other("body wire budget unavailable"))?;
+        let result = self.channel.read(bytes);
+        let actual = result.as_ref().copied().unwrap_or(0);
+        let counted = self.totals.as_mut().map_or(Ok(()), |totals| {
+            totals
                 .received
-                .checked_add(read as u64)
-                .ok_or_else(|| io::Error::other("application byte counter exhausted"))?;
-        }
-        if let Some(fence) = self.fence {
-            fence.account_wire(read as u64)?;
-        }
+                .checked_add(actual as u64)
+                .map(|next| totals.received = next)
+                .ok_or_else(|| io::Error::other("application byte counter exhausted"))
+        });
+        let charged = ticket.map(|t| t.finish(actual as u64)).transpose();
+        let outer = self
+            .fence
+            .map(|f| f.account_wire(actual as u64))
+            .transpose();
+        // Settle both accounts before returning any counter or meter error.
+        counted?;
+        charged.map_err(|_| io::Error::other("body wire accounting unavailable"))?;
+        outer?;
+        let read = result?;
         self.deadline.check()?;
         Ok(read)
     }
@@ -780,16 +848,30 @@ impl<S: Write> Write for Timed<'_, S> {
         if let Some(fence) = self.fence {
             fence.check_wire(bytes.len() as u64)?;
         }
-        let written = self.channel.write(bytes)?;
-        if let Some(totals) = self.totals.as_mut() {
-            totals.sent = totals
+        let ticket = self
+            .body_wire
+            .map(|wire| wire.reserve(bytes.len() as u64, Instant::now()))
+            .transpose()
+            .map_err(|_| io::Error::other("body wire budget unavailable"))?;
+        let result = self.channel.write(bytes);
+        let actual = result.as_ref().copied().unwrap_or(0);
+        let counted = self.totals.as_mut().map_or(Ok(()), |totals| {
+            totals
                 .sent
-                .checked_add(written as u64)
-                .ok_or_else(|| io::Error::other("application byte counter exhausted"))?;
-        }
-        if let Some(fence) = self.fence {
-            fence.account_wire(written as u64)?;
-        }
+                .checked_add(actual as u64)
+                .map(|next| totals.sent = next)
+                .ok_or_else(|| io::Error::other("application byte counter exhausted"))
+        });
+        let charged = ticket.map(|t| t.finish(actual as u64)).transpose();
+        let outer = self
+            .fence
+            .map(|f| f.account_wire(actual as u64))
+            .transpose();
+        // Settle both accounts before returning any counter or meter error.
+        counted?;
+        charged.map_err(|_| io::Error::other("body wire accounting unavailable"))?;
+        outer?;
+        let written = result?;
         self.deadline.check()?;
         Ok(written)
     }
@@ -959,6 +1041,7 @@ pub struct IoTotals {
 }
 
 pub struct Session<S> {
+    body_wire: Option<Arc<body_ownership::WireAccount>>,
     wire_fence: Option<Arc<dyn WireFence>>,
     channel: S,
     binding: Binding,
@@ -1012,6 +1095,7 @@ impl<S: Read + Write> Session<S> {
             channel: &mut channel,
             deadline: admission.deadline.clone(),
             fence: None,
+            body_wire: None,
             totals: None,
         };
         timed
@@ -1030,6 +1114,7 @@ impl<S: Read + Write> Session<S> {
             budget,
             totals: IoTotals::default(),
             wire_fence: None,
+            body_wire: None,
             _transport: Some(permit.established()),
             #[cfg(feature = "native-p2p")]
             checkpoints,
@@ -1049,7 +1134,18 @@ impl<S: Read + Write> Session<S> {
         self.wire_fence = fence;
         Ok(())
     }
+    pub(crate) fn set_body_accounting(&mut self, claim: Option<&BodyClaim>) -> Result<(), Error> {
+        if self.body_wire.is_some() && claim.is_some() {
+            return Err(Error::InvalidProtocol);
+        }
+        self.body_wire = claim.map(|c| c.wire.clone());
+        Ok(())
+    }
     fn check_wire(&self, bytes: usize) -> Result<(), Error> {
+        if let Some(wire) = &self.body_wire {
+            wire.check(bytes as u64, Instant::now())
+                .map_err(|_| Error::ResourceExhausted)?;
+        }
         if let Some(fence) = &self.wire_fence {
             fence.check_wire(bytes as u64).map_err(io_error)?;
         }
@@ -1104,6 +1200,7 @@ impl<S: Read + Write> Session<S> {
             deadline: deadline.clone(),
             totals: Some(&mut self.totals),
             fence: self.wire_fence.as_deref(),
+            body_wire: self.body_wire.as_deref(),
         };
         timed.write_all(&header).map_err(io_error)?;
         timed.write_all(body).map_err(io_error)?;
@@ -1148,6 +1245,7 @@ impl<S: Read + Write> Session<S> {
             deadline: Deadline::new(BLOCK_TIMEOUT),
             totals: Some(&mut self.totals),
             fence: self.wire_fence.as_deref(),
+            body_wire: self.body_wire.as_deref(),
         };
         timed.write_all(&header).map_err(io_error)?;
         block.write_to(&mut timed).map_err(io_error)?;
@@ -1232,6 +1330,7 @@ impl<S: Read + Write> Session<S> {
             deadline: deadline.clone(),
             totals: Some(&mut self.totals),
             fence: self.wire_fence.as_deref(),
+            body_wire: self.body_wire.as_deref(),
         }
         .read_exact(&mut header)
         .map_err(io_error)?;
@@ -1272,6 +1371,7 @@ impl<S: Read + Write> Session<S> {
                 deadline,
                 totals: Some(&mut self.totals),
                 fence: self.wire_fence.as_deref(),
+                body_wire: self.body_wire.as_deref(),
             };
             let block =
                 Block::read_from(&mut timed, length, &self.binding.network).map_err(io_error)?;
@@ -1291,6 +1391,7 @@ impl<S: Read + Write> Session<S> {
                 deadline,
                 totals: Some(&mut self.totals),
                 fence: self.wire_fence.as_deref(),
+                body_wire: self.body_wire.as_deref(),
             };
             timed.read_exact(&mut body).map_err(io_error)?;
             timed.deadline.check().map_err(io_error)?;
@@ -1329,6 +1430,7 @@ impl<S: Read + Write> Session<S> {
             budget,
             totals: IoTotals::default(),
             wire_fence: None,
+            body_wire: None,
             _transport: None,
             #[cfg(feature = "native-p2p")]
             checkpoints: false,

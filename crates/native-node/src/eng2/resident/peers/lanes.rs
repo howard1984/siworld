@@ -157,10 +157,12 @@ fn pull_one(
         if pieces::offer(peer, shared, *sequence)? {
             return Ok(());
         }
-        if let Some(download) = shared
-            .headers
-            .download_mode(peer.peer(), p2p::BodyMode::Pieces)?
-        {
+        if let Some(download) = shared.headers.download_preferred(
+            peer.peer(),
+            p2p::BodyMode::Pieces,
+            None,
+            &shared.network.body_sources()?,
+        )? {
             let mut ledger = shared.transfers.ledger(
                 &download.header,
                 &download.deadline,
@@ -183,7 +185,12 @@ fn pull_one(
             return Ok(());
         }
     }
-    if let Some(mut download) = shared.headers.download(peer.peer())? {
+    if let Some(mut download) = shared.headers.download_preferred(
+        peer.peer(),
+        p2p::BodyMode::Legacy,
+        None,
+        &shared.network.body_sources()?,
+    )? {
         let path = shared.headers.path(&download.header)?;
         let ownership = download.take_ownership()?;
         let received = peer.fetch_body_owned(

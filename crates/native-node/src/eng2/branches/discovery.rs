@@ -92,7 +92,7 @@ struct Candidate {
     attempted_peers: BTreeSet<Hash>,
     pending: Option<u64>,
     pending_bodies: BTreeMap<u64, PendingBody>,
-    body_attempts: BTreeMap<Hash, BTreeSet<Hash>>,
+    body_attempts: BTreeMap<Hash, Vec<Hash>>,
     received_bodies: BTreeSet<Hash>,
 }
 #[derive(Debug)]
@@ -397,8 +397,14 @@ impl Ledger {
             .ok_or(Error::InvalidHeader)?;
         let height = header.height;
         let tried = entry.body_attempts.get(&id);
-        if tried.is_some_and(|tried| tried.contains(&peer)) {
-            return Err(Error::DuplicatePeer);
+        // A released failed request may use the same peer again. Its previous
+        // ticket remains charged, and the same peer cannot overlap itself.
+        if entry
+            .pending_bodies
+            .values()
+            .any(|pending| pending.id == id && pending.peer == peer)
+        {
+            return Err(Error::InFlight);
         }
         if self.requests >= self.limits.maximum_requests
             || tried.is_some_and(|tried| tried.len() >= self.limits.maximum_attempts_per_header)
@@ -410,7 +416,7 @@ impl Ledger {
         self.requests += 1;
         self.peers.insert(peer);
         let entry = self.candidates.get_mut(&candidate).unwrap();
-        entry.body_attempts.entry(id).or_default().insert(peer);
+        entry.body_attempts.entry(id).or_default().push(peer);
         entry.pending_bodies.insert(
             self.requests,
             PendingBody {

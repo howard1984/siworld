@@ -163,6 +163,9 @@ fn initial_and_failed_authentication_preserve_history_without_restoring_authorit
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if host.reconcile_retained_async(&store, || Ok(None)).is_err() {
+            let diagnostic = host.retained_failure_diagnostic().unwrap();
+            assert_eq!(diagnostic["stage"], "worker_completion");
+            assert_eq!(diagnostic["code"], "cursor_malformed");
             break;
         }
         assert!(Instant::now() < deadline);
@@ -376,4 +379,77 @@ fn obsolete_retained_success_stays_pending_and_authentication_errors_remain_hard
     );
     host.stop_preparation().unwrap();
     assert_eq!(budget.available().unwrap(), 64 * 1024 * 1024);
+}
+
+#[test]
+fn header_capture_error_is_observed_without_granting_authority_or_exporting_text() {
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("header-error-diagnostic");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
+    let text = "synthetic-private/path synthetic-secret";
+    assert_eq!(
+        host.reconcile_retained_async(&store, || Err(text.into()))
+            .unwrap_err(),
+        text
+    );
+    let d = host.retained_failure_diagnostic().unwrap();
+    assert_eq!(d["stage"], "header_capture");
+    assert_eq!(d["code"], "unknown");
+    assert!(!d.to_string().contains(text));
+    assert!(!host.retained_ready);
+    assert!(host.latest_checkpoint().is_none());
+    assert!(host.tick(&store, 1, &[]).is_err());
+    host.stop_preparation().unwrap();
+}
+#[test]
+fn actual_successful_worker_with_wrong_generation_stays_hard_and_records_installation() {
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("generation-error-diagnostic");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
+    let generation = host.preparation.as_ref().unwrap().generation;
+    let work = RetainedWork::capture(
+        &store,
+        None,
+        &host.export,
+        limits(),
+        &budget,
+        generation + 1,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    host.preparation
+        .as_mut()
+        .unwrap()
+        .worker
+        .start_retained(work)
+        .unwrap();
+    host.preparation.as_mut().unwrap().retained_request = true;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match host.reconcile_retained_async(&store, || Ok(None)) {
+            Err(error) => {
+                assert_eq!(error, "checkpoint retained restoration generation changed");
+                break;
+            }
+            Ok(ready) => assert!(!ready),
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let d = host.retained_failure_diagnostic().unwrap();
+    assert_eq!(d["stage"], "installation");
+    assert_eq!(d["code"], "generation_changed");
+    assert_eq!(d["worker_generation_changed"], true);
+    assert_eq!(d["material_generation_changed"], false);
+    assert_eq!(d["retirement_changed"], false);
+    assert!(!host.retained_ready);
+    assert!(host.latest_checkpoint().is_none());
+    assert!(host.tick(&store, 1, &[]).is_err());
+    host.stop_preparation().unwrap();
 }

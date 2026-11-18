@@ -10,6 +10,7 @@ use std::{
 pub(super) const CAPACITY: usize = 32;
 const BOOK_CAPACITY: usize = 2048;
 const WINDOW_QUERIES: u64 = 1024;
+const WINDOW_WIRE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) const HANDOFF_DELAY: Duration = Duration::from_secs(30);
 pub(super) fn record_charge() -> usize {
     16 * std::mem::size_of::<(Key, Entry)>() + 512
@@ -37,8 +38,24 @@ pub enum ClaimError {
     Expired,
     Capacity,
     SourceUsed,
+    PreferUnused,
     QueryLimit,
     Unavailable,
+}
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Decision {
+    pub sequence: u64,
+    pub phase: &'static str,
+    pub error: Option<ClaimError>,
+    pub height: u64,
+    pub account: u64,
+    pub generation: Option<u64>,
+    pub queries: u8,
+    pub window_queries: u64,
+    pub age_ms: u128,
+    pub remaining_ms: u128,
+    pub terminal: bool,
 }
 #[derive(Debug)]
 struct Owner {
@@ -46,6 +63,7 @@ struct Owner {
     generation: u64,
     source: [u8; 32],
     mode: Mode,
+    ordinal: usize,
     started: Instant,
     decoded: bool,
     bytes: u64,
@@ -57,6 +75,7 @@ struct Owner {
 struct Source {
     peer: [u8; 32],
     generation: u64,
+    retryable: bool,
 }
 #[derive(Debug)]
 struct Entry {
@@ -73,6 +92,8 @@ struct Entry {
     ever_issued: bool,
     sources: [Option<Source>; 4],
     queries: u8,
+    #[cfg(feature = "eng2-runtime")]
+    decision: Option<Decision>,
     _charge: Option<super::BodyBookCharge>,
 }
 #[derive(Debug)]
@@ -81,15 +102,23 @@ struct Window {
     expires: Instant,
     queries: u64,
     maximum_queries: u64,
+    wire_bytes: u64,
+    wire_reserved: u64,
+    maximum_wire: u64,
 }
 #[derive(Debug)]
 struct Inner {
     entries: BTreeMap<Key, Entry>,
     generation: u64,
+    #[cfg(feature = "eng2-runtime")]
+    decision_sequence: u64,
     account: u64,
     scope: u64,
     active: usize,
     unwindowed_queries: u64,
+    unwindowed_wire_bytes: u64,
+    unwindowed_wire_reserved: u64,
+    maximum_unwindowed_wire: u64,
     maximum_entries: usize,
     resident: Option<Window>,
 }
@@ -100,10 +129,15 @@ impl Default for Registry {
         Self(Mutex::new(Inner {
             entries: BTreeMap::new(),
             generation: 0,
+            #[cfg(feature = "eng2-runtime")]
+            decision_sequence: 0,
             account: 0,
             scope: 0,
             active: 0,
             unwindowed_queries: 0,
+            unwindowed_wire_bytes: 0,
+            unwindowed_wire_reserved: 0,
+            maximum_unwindowed_wire: WINDOW_WIRE_BYTES,
             maximum_entries: BOOK_CAPACITY,
             resident: None,
         }))
@@ -185,6 +219,86 @@ impl Authorization {
     }
 }
 impl Registry {
+    pub(super) fn restrict_wire(&self, scope: &Scope, maximum: u64) -> Result<(), ClaimError> {
+        if !scope.matches(&scope.0.registry) || maximum == 0 {
+            return Err(ClaimError::Unavailable);
+        }
+        let mut inner = self.0.lock().map_err(|_| ClaimError::Unavailable)?;
+        if !std::ptr::eq(self, Arc::as_ptr(&scope.0.registry))
+            || scope.0.closed.load(Ordering::Acquire)
+        {
+            return Err(ClaimError::Unavailable);
+        }
+        inner.maximum_unwindowed_wire = inner.maximum_unwindowed_wire.min(maximum);
+        if let Some(w) = &mut inner.resident {
+            w.maximum_wire = w.maximum_wire.min(maximum);
+        }
+        Ok(())
+    }
+    #[cfg(any(feature = "eng2-runtime", test))]
+    pub(super) fn wire_usage(&self) -> Option<(u64, u64, u64)> {
+        let inner = self.0.lock().ok()?;
+        Some(inner.resident.as_ref().map_or(
+            (
+                inner.unwindowed_wire_bytes,
+                inner.unwindowed_wire_reserved,
+                inner.maximum_unwindowed_wire,
+            ),
+            |w| (w.wire_bytes, w.wire_reserved, w.maximum_wire),
+        ))
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn record_decision(
+        &self,
+        key: Key,
+        phase: &'static str,
+        error: Option<ClaimError>,
+        now: Instant,
+    ) {
+        let Ok(mut inner) = self.0.lock() else {
+            return;
+        };
+        inner.decision_sequence = inner.decision_sequence.saturating_add(1);
+        let sequence = inner.decision_sequence;
+        let window_queries = inner
+            .resident
+            .as_ref()
+            .map_or(inner.unwindowed_queries, |w| w.queries);
+        if let Some(entry) = inner.entries.get_mut(&key) {
+            entry.decision = Some(Decision {
+                sequence,
+                phase,
+                error,
+                height: key.height,
+                account: entry.account,
+                generation: entry.owner.as_ref().map(|o| o.generation),
+                queries: entry.queries,
+                window_queries,
+                age_ms: now.saturating_duration_since(entry.first).as_millis(),
+                remaining_ms: entry.expires.saturating_duration_since(now).as_millis(),
+                terminal: entry.terminal,
+            });
+        }
+    }
+    #[cfg(not(feature = "eng2-runtime"))]
+    fn record_decision(
+        &self,
+        _key: Key,
+        _phase: &'static str,
+        _error: Option<ClaimError>,
+        _now: Instant,
+    ) {
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn last_decision(&self) -> Option<Decision> {
+        self.0
+            .lock()
+            .ok()?
+            .entries
+            .values()
+            .filter_map(|e| e.decision)
+            .max_by_key(|d| d.sequence)
+    }
     #[cfg(test)]
     pub(super) fn retained_accounting(&self) -> (usize, usize) {
         let inner = self.0.lock().unwrap();
@@ -229,6 +343,9 @@ impl Registry {
                     expires,
                     queries: inner.unwindowed_queries,
                     maximum_queries: WINDOW_QUERIES,
+                    wire_bytes: inner.unwindowed_wire_bytes,
+                    wire_reserved: inner.unwindowed_wire_reserved,
+                    maximum_wire: inner.maximum_unwindowed_wire,
                 })
             }
         }
@@ -300,19 +417,38 @@ impl Registry {
             return Err(ClaimError::Unavailable);
         }
         let maximum_queries = window.maximum_queries;
+        let maximum_wire = window.maximum_wire;
+        let wire_reserved = window.wire_reserved;
         *window = Window {
             identity: new,
             expires,
             queries: 0,
             maximum_queries,
+            maximum_wire,
+            wire_bytes: wire_reserved,
+            wire_reserved,
         };
         inner.unwindowed_queries = 0;
+        inner.unwindowed_wire_bytes = wire_reserved;
+        inner.unwindowed_wire_reserved = wire_reserved;
         inner
             .entries
             .retain(|_, entry| entry.owner.is_some() || entry.pins != 0 || now < entry.expires);
         Ok(())
     }
     pub(super) fn authorize(
+        self: &Arc<Self>,
+        scope: &Scope,
+        key: Key,
+        now: Instant,
+        expires: Instant,
+        charges: Option<(super::BodyBookCharge, super::BodyBookCharge)>,
+    ) -> Result<Authorization, ClaimError> {
+        let result = self.authorize_inner(scope, key, now, expires, charges);
+        self.record_decision(key, "authorize", result.as_ref().err().copied(), now);
+        result
+    }
+    fn authorize_inner(
         self: &Arc<Self>,
         scope: &Scope,
         key: Key,
@@ -393,6 +529,8 @@ impl Registry {
                     ever_issued: false,
                     sources: std::array::from_fn(|_| None),
                     queries: 0,
+                    #[cfg(feature = "eng2-runtime")]
+                    decision: None,
                     _charge: record_charge,
                 },
             );
@@ -413,12 +551,40 @@ impl Registry {
             }),
         })
     }
+    #[cfg(test)]
     pub(super) fn claim_authorized(
         self: &Arc<Self>,
         authorization: &Authorization,
         source: [u8; 32],
         mode: Mode,
         now: Instant,
+    ) -> Result<Lease, ClaimError> {
+        self.claim_preferred(authorization, source, mode, now, std::iter::empty())
+    }
+    pub(super) fn claim_preferred(
+        self: &Arc<Self>,
+        authorization: &Authorization,
+        source: [u8; 32],
+        mode: Mode,
+        now: Instant,
+        alternatives: impl IntoIterator<Item = [u8; 32]>,
+    ) -> Result<Lease, ClaimError> {
+        let result = self.claim_preferred_inner(authorization, source, mode, now, alternatives);
+        self.record_decision(
+            authorization.pin.key,
+            "claim",
+            result.as_ref().err().copied(),
+            now,
+        );
+        result
+    }
+    fn claim_preferred_inner(
+        self: &Arc<Self>,
+        authorization: &Authorization,
+        source: [u8; 32],
+        mode: Mode,
+        now: Instant,
+        alternatives: impl IntoIterator<Item = [u8; 32]>,
     ) -> Result<Lease, ClaimError> {
         let pin = &authorization.pin;
         if !Arc::ptr_eq(self, &pin.registry) || pin.scope.0.closed.load(Ordering::Acquire) {
@@ -439,8 +605,31 @@ impl Registry {
             }
             return Err(ClaimError::Expired);
         }
-        if entry.owner.is_none() && entry.sources.iter().flatten().any(|s| s.peer == source) {
+        if entry.sources.iter().flatten().any(|s| s.peer == source)
+            && now.saturating_duration_since(entry.first)
+                >= crate::eng2::transport::BODY_FETCH_TIMEOUT
+        {
             return Err(ClaimError::SourceUsed);
+        }
+        if entry.owner.is_none()
+            && entry
+                .sources
+                .iter()
+                .flatten()
+                .rfind(|s| s.peer == source)
+                .is_some_and(|s| !s.retryable)
+        {
+            return Err(ClaimError::SourceUsed);
+        }
+        // A released failed lease may retry inside this same account. Known
+        // eligible unused sources get the next opportunity before a retry.
+        if entry.owner.is_none()
+            && entry.sources.iter().flatten().any(|s| s.peer == source)
+            && alternatives.into_iter().any(|peer| {
+                peer != source && !entry.sources.iter().flatten().any(|s| s.peer == peer)
+            })
+        {
+            return Err(ClaimError::PreferUnused);
         }
         if entry.queries >= 4 {
             return Err(ClaimError::QueryLimit);
@@ -464,6 +653,12 @@ impl Registry {
             }
             return Err(ClaimError::Busy);
         }
+        let ordinal = entry
+            .sources
+            .iter()
+            .position(Option::is_none)
+            .ok_or(ClaimError::Capacity)?
+            + 1;
         if inner.active >= CAPACITY {
             return Err(ClaimError::Capacity);
         }
@@ -484,6 +679,7 @@ impl Registry {
             generation,
             source,
             mode,
+            ordinal,
             started: now,
             decoded: false,
             bytes: 0,
@@ -529,6 +725,130 @@ impl Registry {
         self.claim_authorized(&auth, source, mode, now)
     }
 }
+/// Every I/O reservation belongs to the shared original window, not a socket.
+#[derive(Debug)]
+pub(super) struct WireAccount {
+    registry: Arc<Registry>,
+    key: Key,
+    account: u64,
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    authorization: Authorization,
+    _charge: Option<super::BodyBookCharge>,
+}
+impl WireAccount {
+    fn checked(&self, inner: &Inner, bytes: u64, now: Instant) -> Result<(), ClaimError> {
+        let entry = inner
+            .entries
+            .get(&self.key)
+            .filter(|e| e.account == self.account)
+            .ok_or(ClaimError::Unavailable)?;
+        if entry.terminal
+            || now >= entry.expires
+            || self.cancel.load(Ordering::Acquire)
+            || self
+                .authorization
+                .pin
+                .scope
+                .0
+                .closed
+                .load(Ordering::Acquire)
+            || entry
+                .owner
+                .as_ref()
+                .is_none_or(|o| o.generation != self.generation || o.decoded)
+        {
+            return Err(ClaimError::Expired);
+        }
+        let (used, maximum) = inner.resident.as_ref().map_or(
+            (inner.unwindowed_wire_bytes, inner.maximum_unwindowed_wire),
+            |w| (w.wire_bytes, w.maximum_wire),
+        );
+        if used.checked_add(bytes).is_none_or(|next| next > maximum) {
+            return Err(ClaimError::Capacity);
+        }
+        Ok(())
+    }
+    pub(super) fn check(&self, bytes: u64, now: Instant) -> Result<(), ClaimError> {
+        let inner = self
+            .registry
+            .0
+            .lock()
+            .map_err(|_| ClaimError::Unavailable)?;
+        self.checked(&inner, bytes, now)
+    }
+    pub(super) fn reserve(&self, bytes: u64, now: Instant) -> Result<WireTicket, ClaimError> {
+        let mut inner = self
+            .registry
+            .0
+            .lock()
+            .map_err(|_| ClaimError::Unavailable)?;
+        self.checked(&inner, bytes, now)?;
+        if let Some(w) = &mut inner.resident {
+            w.wire_bytes += bytes;
+            w.wire_reserved += bytes;
+        } else {
+            inner.unwindowed_wire_bytes += bytes;
+            inner.unwindowed_wire_reserved += bytes;
+        }
+        Ok(WireTicket {
+            registry: self.registry.clone(),
+            reserved: bytes,
+            finished: false,
+        })
+    }
+}
+/// Unused reserved bytes are released; actual or uncertain bytes are never refunded.
+pub(super) struct WireTicket {
+    registry: Arc<Registry>,
+    reserved: u64,
+    finished: bool,
+}
+impl WireTicket {
+    pub(super) fn finish(mut self, actual: u64) -> Result<(), ClaimError> {
+        if actual > self.reserved {
+            return Err(ClaimError::Unavailable);
+        }
+        self.release(actual)?;
+        self.finished = true;
+        Ok(())
+    }
+    fn release(&self, actual: u64) -> Result<(), ClaimError> {
+        let mut inner = self
+            .registry
+            .0
+            .lock()
+            .map_err(|_| ClaimError::Unavailable)?;
+        let unused = self.reserved - actual;
+        if let Some(w) = &mut inner.resident {
+            w.wire_reserved = w
+                .wire_reserved
+                .checked_sub(self.reserved)
+                .ok_or(ClaimError::Unavailable)?;
+            w.wire_bytes = w
+                .wire_bytes
+                .checked_sub(unused)
+                .ok_or(ClaimError::Unavailable)?;
+        } else {
+            inner.unwindowed_wire_reserved = inner
+                .unwindowed_wire_reserved
+                .checked_sub(self.reserved)
+                .ok_or(ClaimError::Unavailable)?;
+            inner.unwindowed_wire_bytes = inner
+                .unwindowed_wire_bytes
+                .checked_sub(unused)
+                .ok_or(ClaimError::Unavailable)?;
+        }
+        Ok(())
+    }
+}
+impl Drop for WireTicket {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.release(self.reserved);
+        }
+    }
+}
 #[derive(Debug)]
 pub(super) struct Lease {
     registry: Arc<Registry>,
@@ -542,6 +862,17 @@ pub(super) struct Lease {
     _authorization: Authorization,
 }
 impl Lease {
+    pub(super) fn wire_account(&self, charge: Option<super::BodyBookCharge>) -> WireAccount {
+        WireAccount {
+            registry: self.registry.clone(),
+            key: self.key,
+            account: self.account,
+            generation: self.generation,
+            cancel: self.cancel.clone(),
+            authorization: self._authorization.clone(),
+            _charge: charge,
+        }
+    }
     #[cfg(any(feature = "eng2-runtime", test))]
     pub(super) fn generation(&self) -> u64 {
         self.generation
@@ -568,17 +899,7 @@ impl Lease {
         {
             return None;
         }
-        if let Some(index) = entry.sources.iter().position(|s| {
-            s.as_ref()
-                .is_some_and(|s| s.peer == owner.source && s.generation == self.generation)
-        }) {
-            return Some(index + 1);
-        }
-        entry
-            .sources
-            .iter()
-            .position(Option::is_none)
-            .map(|i| i + 1)
+        Some(owner.ordinal)
     }
     /// Scheduling information only; begin_query remains the query authority.
     pub(super) fn can_query(&self, peer: [u8; 32], reserve: u8, now: Instant) -> bool {
@@ -601,18 +922,56 @@ impl Lease {
             .map_or((inner.unwindowed_queries, WINDOW_QUERIES), |window| {
                 (window.queries, window.maximum_queries)
             });
-        entry.queries.checked_add(reserve).is_some_and(|n| n <= 4)
+        let Some(owner) = entry.owner.as_ref() else {
+            return false;
+        };
+        if entry.terminal
+            || now >= entry.expires
+            || owner.generation != self.generation
+            || owner.decoded
+            || self.cancel.load(Ordering::Acquire)
+            || self
+                ._authorization
+                .pin
+                .scope
+                .0
+                .closed
+                .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let source_slot = entry
+            .sources
+            .iter()
+            .flatten()
+            .any(|s| s.peer == peer && s.generation == self.generation)
+            || entry
+                .sources
+                .iter()
+                .enumerate()
+                .any(|(i, s)| s.is_none() && (peer == owner.source || i + 1 != owner.ordinal));
+        source_slot
+            && entry.queries.checked_add(reserve).is_some_and(|n| n <= 4)
             && used
                 .checked_add(u64::from(reserve))
                 .is_some_and(|n| n <= maximum)
-            && !entry
-                .sources
-                .iter()
-                .flatten()
-                .any(|s| s.peer == peer && s.generation != self.generation)
+            && !entry.sources.iter().flatten().any(|s| {
+                s.peer == peer
+                    && s.generation != self.generation
+                    && entry
+                        .owner
+                        .as_ref()
+                        .is_none_or(|owner| owner.source != peer)
+            })
     }
 
     pub(super) fn begin_query(&self, peer: [u8; 32], now: Instant) -> Result<(), ClaimError> {
+        let result = self.begin_query_inner(peer, now);
+        self.registry
+            .record_decision(self.key, "query", result.as_ref().err().copied(), now);
+        result
+    }
+    fn begin_query_inner(&self, peer: [u8; 32], now: Instant) -> Result<(), ClaimError> {
         let mut inner = self
             .registry
             .0
@@ -652,18 +1011,30 @@ impl Lease {
         if entry.queries >= 4 {
             return Err(ClaimError::QueryLimit);
         }
-        if let Some(source) = entry.sources.iter().flatten().find(|s| s.peer == peer) {
-            if source.generation != self.generation {
-                return Err(ClaimError::SourceUsed);
-            }
-        } else {
+        if entry
+            .sources
+            .iter()
+            .flatten()
+            .any(|s| s.peer == peer && s.generation != self.generation && owner.source != peer)
+        {
+            return Err(ClaimError::SourceUsed);
+        }
+        if !entry
+            .sources
+            .iter()
+            .flatten()
+            .any(|s| s.peer == peer && s.generation == self.generation)
+        {
             *entry
                 .sources
                 .iter_mut()
-                .find(|s| s.is_none())
+                .enumerate()
+                .find(|(i, s)| s.is_none() && (peer == owner.source || *i + 1 != owner.ordinal))
+                .map(|(_, slot)| slot)
                 .ok_or(ClaimError::Capacity)? = Some(Source {
                 peer,
                 generation: self.generation,
+                retryable: false,
             });
         }
         entry.queries += 1;
@@ -797,6 +1168,16 @@ impl Drop for Lease {
                     .as_ref()
                     .is_some_and(|o| o.generation == self.generation)
         }) {
+            let retryable = !self.complete.load(Ordering::Acquire)
+                && entry.owner.as_ref().is_some_and(|owner| !owner.decoded);
+            for source in entry
+                .sources
+                .iter_mut()
+                .flatten()
+                .filter(|source| source.generation == self.generation)
+            {
+                source.retryable = retryable;
+            }
             entry.terminal |= self.complete.load(Ordering::Acquire);
             entry.owner = None;
             inner.active = inner.active.saturating_sub(1);
@@ -830,10 +1211,12 @@ mod tests {
         let end = n + Duration::from_secs(180);
         let first = claim(&r, key(1), 1, n, end).unwrap();
         first.begin_query([1; 32], n).unwrap();
+        let first_authorization = first._authorization.clone();
         drop(first);
         assert_eq!(
-            r.claim(key(1), [1; 32], Mode::Pieces, n, end).unwrap_err(),
-            ClaimError::SourceUsed
+            r.claim_preferred(&first_authorization, [1; 32], Mode::Pieces, n, [[2; 32]])
+                .unwrap_err(),
+            ClaimError::PreferUnused
         );
         let pieces = r.claim(key(1), [2; 32], Mode::Pieces, n, end).unwrap();
         pieces.begin_query([2; 32], n).unwrap();
@@ -1168,10 +1551,10 @@ mod tests {
         }
         assert_eq!(r.0.lock().unwrap().active, 0);
         assert_eq!(r.0.lock().unwrap().entries.len(), 100);
-        assert_eq!(
-            claim(&r, key(0), 1, now, end).unwrap_err(),
-            ClaimError::SourceUsed
-        );
+        let retry = claim(&r, key(0), 1, now, end).unwrap();
+        assert_eq!(retry.source_ordinal(), Some(2));
+        assert_eq!(r.0.lock().unwrap().entries.get(&key(0)).unwrap().queries, 1);
+        drop(retry);
         assert!(claim(&r, key(200), 1, now, end).is_ok());
     }
     #[test]
@@ -1706,5 +2089,346 @@ mod tests {
         assert_eq!(owner.begin_query([4; 32], n), Err(ClaimError::QueryLimit));
         assert_eq!(owner.expires, end);
         assert!(!owner.can_query([2; 32], 1, end));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_regressions {
+    use super::*;
+    fn setup() -> (Arc<Registry>, Scope, Authorization, Instant) {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let scope = r
+            .resident_scope(1, n, n + Duration::from_secs(3600))
+            .unwrap();
+        let k = Key {
+            context: [[1; 32], [2; 32], [3; 32]],
+            height: 336,
+            id: [4; 32],
+        };
+        let auth = r
+            .authorize(&scope, k, n, n + Duration::from_secs(180), None)
+            .unwrap();
+        (r, scope, auth, n)
+    }
+    #[test]
+    fn released_partial_source_retries_without_deadline_query_or_ordinal_reset() {
+        let (r, _scope, auth, n) = setup();
+        for ordinal in 1..=4 {
+            let at = n + Duration::from_secs(ordinal as u64 * 31);
+            let lease = r
+                .claim_authorized(
+                    &auth,
+                    [5; 32],
+                    if ordinal % 2 == 0 {
+                        Mode::Pieces
+                    } else {
+                        Mode::Legacy
+                    },
+                    at,
+                )
+                .unwrap();
+            assert_eq!(lease.first, n);
+            assert_eq!(lease.expires, n + Duration::from_secs(180));
+            assert_eq!(lease.source_ordinal(), Some(ordinal));
+            assert!(lease.can_query([5; 32], 1, at));
+            lease.begin_query([5; 32], at).unwrap();
+            assert_eq!(lease.source_ordinal(), Some(ordinal));
+            lease.received(2097134, 39916719, at).unwrap();
+            drop(lease);
+        }
+        assert_eq!(
+            r.claim_authorized(&auth, [6; 32], Mode::Legacy, n + Duration::from_secs(179))
+                .unwrap_err(),
+            ClaimError::QueryLimit
+        );
+        let inner = r.0.lock().unwrap();
+        let e = inner.entries.get(&auth.pin.key).unwrap();
+        assert_eq!(
+            (
+                e.queries,
+                e.sources.iter().flatten().count(),
+                inner.active,
+                inner.resident.as_ref().unwrap().queries
+            ),
+            (4, 4, 0, 4)
+        );
+    }
+    #[test]
+    fn retry_never_overlaps_owner_or_reuses_stale_callbacks() {
+        let (r, _scope, auth, n) = setup();
+        let old = r.claim_authorized(&auth, [5; 32], Mode::Legacy, n).unwrap();
+        old.begin_query([5; 32], n).unwrap();
+        assert_eq!(
+            r.claim_authorized(&auth, [5; 32], Mode::Pieces, n + Duration::from_secs(31))
+                .unwrap_err(),
+            ClaimError::Busy
+        );
+        let stale = Lease {
+            registry: r.clone(),
+            key: old.key,
+            account: old.account,
+            generation: old.generation,
+            first: old.first,
+            expires: old.expires,
+            cancel: old.cancel.clone(),
+            complete: AtomicBool::new(false),
+            _authorization: auth.clone(),
+        };
+        drop(old);
+        let next = r
+            .claim_authorized(&auth, [5; 32], Mode::Pieces, n + Duration::from_secs(32))
+            .unwrap();
+        assert_ne!(stale.generation, next.generation);
+        assert!(stale.received(1, 2, n + Duration::from_secs(32)).is_err());
+        assert!(
+            stale
+                .begin_query([5; 32], n + Duration::from_secs(32))
+                .is_err()
+        );
+        drop(stale);
+        assert!(next.check_active(n + Duration::from_secs(32)).is_ok());
+    }
+    #[test]
+    fn expired_retry_and_fresh_scope_cannot_renew_original_account() {
+        let (r, scope, auth, n) = setup();
+        let old = r.claim_authorized(&auth, [5; 32], Mode::Legacy, n).unwrap();
+        old.begin_query([5; 32], n).unwrap();
+        drop(old);
+        for seconds in [180, 181] {
+            let at = n + Duration::from_secs(seconds);
+            assert_eq!(
+                r.claim_authorized(&auth, [5; 32], Mode::Pieces, at)
+                    .unwrap_err(),
+                ClaimError::Expired
+            );
+            assert_eq!(
+                r.authorize(
+                    &scope,
+                    auth.pin.key,
+                    at,
+                    at + Duration::from_secs(180),
+                    None
+                )
+                .unwrap_err(),
+                ClaimError::Expired
+            );
+            let fresh = r
+                .resident_scope(1, at, at + Duration::from_secs(3600))
+                .unwrap();
+            assert_eq!(
+                r.authorize(
+                    &fresh,
+                    auth.pin.key,
+                    at,
+                    at + Duration::from_secs(180),
+                    None
+                )
+                .unwrap_err(),
+                ClaimError::Expired
+            );
+        }
+    }
+    #[test]
+    fn terminal_and_scope_cancel_do_not_gain_retry_authority() {
+        let (r, scope, auth, n) = setup();
+        let old = r.claim_authorized(&auth, [5; 32], Mode::Legacy, n).unwrap();
+        old.begin_query([5; 32], n).unwrap();
+        old.complete();
+        drop(old);
+        assert_eq!(
+            r.claim_authorized(&auth, [5; 32], Mode::Pieces, n)
+                .unwrap_err(),
+            ClaimError::Expired
+        );
+        scope.close();
+        assert_eq!(
+            r.claim_authorized(&auth, [5; 32], Mode::Pieces, n)
+                .unwrap_err(),
+            ClaimError::Unavailable
+        );
+    }
+    #[test]
+    fn repeated_sources_do_not_refund_the_original_window() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let end = n + Duration::from_secs(180);
+        let scope = r
+            .resident_scope(1, n, n + Duration::from_secs(3600))
+            .unwrap();
+        for height in 0..256 {
+            let k = Key {
+                context: [[1; 32], [2; 32], [3; 32]],
+                height,
+                id: [4; 32],
+            };
+            let auth = r.authorize(&scope, k, n, end, None).unwrap();
+            for _ in 0..4 {
+                let l = r.claim_authorized(&auth, [5; 32], Mode::Legacy, n).unwrap();
+                l.begin_query([5; 32], n).unwrap();
+                drop(l);
+            }
+        }
+        let k = Key {
+            context: [[1; 32], [2; 32], [3; 32]],
+            height: 257,
+            id: [4; 32],
+        };
+        let auth = r.authorize(&scope, k, n, end, None).unwrap();
+        let l = r.claim_authorized(&auth, [6; 32], Mode::Pieces, n).unwrap();
+        assert!(!l.can_query([6; 32], 1, n));
+        assert_eq!(l.begin_query([6; 32], n), Err(ClaimError::QueryLimit));
+        assert_eq!(r.0.lock().unwrap().resident.as_ref().unwrap().queries, 1024);
+    }
+}
+
+#[cfg(test)]
+mod preferred_source_regressions {
+    use super::*;
+    #[test]
+    fn unused_eligible_source_precedes_failed_source_retry() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let k = Key {
+            context: [[1; 32], [2; 32], [3; 32]],
+            height: 1,
+            id: [4; 32],
+        };
+        let old = r
+            .claim(k, [5; 32], Mode::Legacy, n, n + Duration::from_secs(180))
+            .unwrap();
+        let auth = old._authorization.clone();
+        old.begin_query([5; 32], n).unwrap();
+        drop(old);
+        assert_eq!(
+            r.claim_preferred(&auth, [5; 32], Mode::Pieces, n, [[6; 32]])
+                .unwrap_err(),
+            ClaimError::PreferUnused
+        );
+        let alternate = r
+            .claim_preferred(&auth, [6; 32], Mode::Pieces, n, [[5; 32]])
+            .unwrap();
+        alternate.begin_query([6; 32], n).unwrap();
+        drop(alternate);
+        let retry = r
+            .claim_preferred(&auth, [5; 32], Mode::Legacy, n, [[6; 32]])
+            .unwrap();
+        assert_eq!(retry.source_ordinal(), Some(3));
+        retry.begin_query([5; 32], n).unwrap();
+        assert!(!retry.can_query([6; 32], 1, n));
+        assert_eq!(retry.begin_query([6; 32], n), Err(ClaimError::SourceUsed));
+    }
+}
+
+#[cfg(test)]
+mod wire_budget_regressions {
+    use super::*;
+    #[test]
+    fn reservations_bound_concurrent_sockets_and_partial_bytes_survive_retry() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let end = n + Duration::from_secs(180);
+        let scope = r
+            .resident_scope(1, n, n + Duration::from_secs(3600))
+            .unwrap();
+        r.restrict_wire(&scope, 100).unwrap();
+        let k = Key {
+            context: [[1; 32], [2; 32], [3; 32]],
+            height: 1,
+            id: [4; 32],
+        };
+        let a = r.authorize(&scope, k, n, end, None).unwrap();
+        let l = r.claim_authorized(&a, [5; 32], Mode::Pieces, n).unwrap();
+        l.begin_query([5; 32], n).unwrap();
+        let wire = l.wire_account(None);
+        let first = wire.reserve(80, n).unwrap();
+        assert!(matches!(wire.reserve(21, n), Err(ClaimError::Capacity)));
+        assert_eq!(r.wire_usage(), Some((80, 80, 100)));
+        first.finish(17).unwrap();
+        assert_eq!(r.wire_usage(), Some((17, 0, 100)));
+        drop(l);
+        let l = r.claim_authorized(&a, [5; 32], Mode::Legacy, n).unwrap();
+        let wire = l.wire_account(None);
+        let retry = wire.reserve(83, n).unwrap();
+        retry.finish(83).unwrap();
+        assert_eq!(r.wire_usage(), Some((100, 0, 100)));
+        assert!(wire.reserve(1, n).is_err());
+        drop(l);
+        assert_eq!(r.wire_usage(), Some((100, 0, 100)));
+    }
+    #[test]
+    fn unknown_io_consumes_reservation_and_renewal_carries_outstanding_tickets() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let scope = r
+            .resident_scope(1, n, n + Duration::from_secs(3600))
+            .unwrap();
+        r.restrict_wire(&scope, 100).unwrap();
+        let k = Key {
+            context: [[1; 32], [2; 32], [3; 32]],
+            height: 1,
+            id: [4; 32],
+        };
+        let a = r
+            .authorize(&scope, k, n, n + Duration::from_secs(180), None)
+            .unwrap();
+        let l = r.claim_authorized(&a, [5; 32], Mode::Legacy, n).unwrap();
+        let wire = l.wire_account(None);
+        drop(wire.reserve(20, n).unwrap());
+        assert_eq!(r.wire_usage(), Some((20, 0, 100)));
+        let pending = wire.reserve(50, n).unwrap();
+        r.advance_window(
+            1,
+            2,
+            n + Duration::from_secs(3600),
+            n + Duration::from_secs(7200),
+        )
+        .unwrap();
+        assert_eq!(r.wire_usage(), Some((50, 50, 100)));
+        pending.finish(7).unwrap();
+        assert_eq!(r.wire_usage(), Some((7, 0, 100)));
+        assert!(wire.reserve(1, n + Duration::from_secs(3601)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod decoded_and_ordinal_regressions {
+    use super::*;
+    #[test]
+    fn decoded_release_keeps_source_rejected_and_foreign_queries_do_not_move_ordinal() {
+        let r = Arc::new(Registry::default());
+        let n = Instant::now();
+        let end = n + Duration::from_secs(180);
+        let key = Key {
+            context: [[1; 32], [2; 32], [3; 32]],
+            height: 1,
+            id: [4; 32],
+        };
+        let l = r.claim(key, [5; 32], Mode::Pieces, n, end).unwrap();
+        let auth = l._authorization.clone();
+        for _ in 0..20 {
+            assert_eq!(l.source_ordinal(), Some(1));
+            assert!(l.can_query([5; 32], 1, n));
+        }
+        assert_eq!(r.0.lock().unwrap().entries.get(&key).unwrap().queries, 0);
+        l.begin_query([6; 32], n).unwrap();
+        assert_eq!(l.source_ordinal(), Some(1));
+        l.begin_query([5; 32], n).unwrap();
+        assert_eq!(l.source_ordinal(), Some(1));
+        l.decoded(n).unwrap();
+        assert!(!l.can_query([5; 32], 1, n));
+        assert!(!l.can_query([7; 32], 1, n));
+        assert_eq!(l.begin_query([5; 32], n), Err(ClaimError::Unavailable));
+        drop(l);
+        assert_eq!(
+            r.claim_authorized(&auth, [5; 32], Mode::Legacy, n)
+                .unwrap_err(),
+            ClaimError::SourceUsed
+        );
+        assert_eq!(
+            r.claim_authorized(&auth, [6; 32], Mode::Legacy, n)
+                .unwrap_err(),
+            ClaimError::SourceUsed
+        );
     }
 }

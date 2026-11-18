@@ -365,11 +365,12 @@ impl<S: Read + Write> Peer<S> {
             .begin(self.peer(), maximum_wire(offer.body_bytes)?, Instant::now())
             .map_err(resource)?;
         let deadline = ledger.io_deadline();
+        ownership.account_received_offer(offer.received_wire)?;
         let before = self.session.io_totals();
-        let result = (|| {
-            ownership.begin_query(self.peer())?;
-            self.send_credit(&offer, maximum_wire(offer.body_bytes)?, &deadline)?;
-            self.receive_propagation_metadata_before(
+        let result = self.with_body_accounting(ownership, |peer| {
+            ownership.begin_query(peer.peer())?;
+            peer.send_credit(&offer, maximum_wire(offer.body_bytes)?, &deadline)?;
+            peer.receive_propagation_metadata_before(
                 offer.request,
                 &offer.header,
                 Some(offer.body_bytes),
@@ -377,7 +378,7 @@ impl<S: Read + Write> Peer<S> {
                 reservation,
                 &deadline,
             )
-        })();
+        });
         let after = self.session.io_totals();
         ledger
             .sent(attempt, after.sent - before.sent)
@@ -550,20 +551,22 @@ impl<S: Read + Write> Peer<S> {
         reservation: p2p::Reservation,
         deadline: &p2p::Deadline,
     ) -> Result<Metadata, p2p::Error> {
-        let block = header.id().map_err(invalid)?;
-        let mut query = vec![GET_METADATA, VERSION];
-        query.extend_from_slice(&header.height.to_le_bytes());
-        query.extend_from_slice(&block);
-        ownership.begin_query(self.peer())?;
-        self.send_application_before(request, &query, deadline)?;
-        self.receive_propagation_metadata_before(
-            request,
-            header,
-            None,
-            ownership,
-            reservation,
-            deadline,
-        )
+        self.with_body_accounting(ownership, |peer| {
+            let block = header.id().map_err(invalid)?;
+            let mut query = vec![GET_METADATA, VERSION];
+            query.extend_from_slice(&header.height.to_le_bytes());
+            query.extend_from_slice(&block);
+            ownership.begin_query(peer.peer())?;
+            peer.send_application_before(request, &query, deadline)?;
+            peer.receive_propagation_metadata_before(
+                request,
+                header,
+                None,
+                ownership,
+                reservation,
+                deadline,
+            )
+        })
     }
 
     fn receive_propagation_metadata_before(
@@ -705,70 +708,72 @@ impl<S: Read + Write> Peer<S> {
         ownership: &p2p::BodyClaim,
         observe: &dyn Fn(&Transfer) -> Result<(), p2p::Error>,
     ) -> Result<(), p2p::Error> {
-        if requests
-            .first()
-            .is_none_or(|request| request.peer != self.peer())
-        {
-            return Err(p2p::Error::Unconfigured);
-        }
-        let (deadline, count, height) = lock(transfer)?
-            .prepare_io(requests, ownership)
-            .map_err(resource)?;
-        // indices (4 each), a geometrically grown run vector (at most 16
-        // each), and final run encoding (at most 8 each) coexist briefly.
-        // Keep their original global-budget charge through the whole I/O.
-        let query_charge = requests
-            .len()
-            .checked_mul(32)
-            .and_then(|bytes| bytes.checked_add(128))
-            .ok_or(p2p::Error::ResourceExhausted)?;
-        let _query_reservation = self.session.shared_budget().reserve(query_charge)?;
-        let query = codec::encode_query(height, requests, count).map_err(invalid)?;
-        let sequence = external_request.unwrap_or(requests[0].sequence);
-        let before = self.session.io_totals();
-        let sent = ownership
-            .begin_query(self.peer())
-            .and_then(|()| self.send_application_before(sequence, &query, &deadline));
-        lock(transfer)?
-            .sent(
-                self.peer(),
-                self.session.io_totals().sent - before.sent,
-                Instant::now(),
-            )
-            .map_err(resource)?;
-        let mut accounted = 0;
-        let result = (|| {
-            sent?;
-            for _ in 0..requests.len() {
-                let frame_before = self.session.io_totals().received;
-                let (response, frame, _charge) =
-                    self.receive_application_before(&deadline, PIECE_BYTES + 38)?;
-                let piece = codec::decode_piece(&frame, count).map_err(invalid)?;
-                let assigned = requests
-                    .iter()
-                    .find(|request| request.piece == piece.index)
-                    .ok_or(p2p::Error::InvalidProtocol)?;
-                if response != sequence || piece.block != assigned.block {
-                    return Err(p2p::Error::InvalidProtocol);
-                }
-                let received = self.session.io_totals().received - frame_before;
-                // The source's bytes are charged even when authentication or a
-                // stale/duplicate assignment fails. Do not charge them twice.
-                accounted += received;
-                lock(transfer)?
-                    .received(*assigned, piece.bytes.to_vec(), received, Instant::now())
-                    .map_err(resource)?;
-                let progress = lock(transfer)?;
-                ownership.received(progress.verified_bytes(), progress.body_bytes())?;
-                observe(&progress)?;
+        self.with_body_accounting(ownership, |peer| {
+            if requests
+                .first()
+                .is_none_or(|request| request.peer != peer.peer())
+            {
+                return Err(p2p::Error::Unconfigured);
             }
-            Ok(())
-        })();
-        if result.is_err() {
-            let partial = self.session.io_totals().received - before.received - accounted;
-            let _ = lock(transfer)?.disconnected(self.peer(), partial, Instant::now());
-        }
-        result
+            let (deadline, count, height) = lock(transfer)?
+                .prepare_io(requests, ownership)
+                .map_err(resource)?;
+            // indices (4 each), a geometrically grown run vector (at most 16
+            // each), and final run encoding (at most 8 each) coexist briefly.
+            // Keep their original global-budget charge through the whole I/O.
+            let query_charge = requests
+                .len()
+                .checked_mul(32)
+                .and_then(|bytes| bytes.checked_add(128))
+                .ok_or(p2p::Error::ResourceExhausted)?;
+            let _query_reservation = peer.session.shared_budget().reserve(query_charge)?;
+            let query = codec::encode_query(height, requests, count).map_err(invalid)?;
+            let sequence = external_request.unwrap_or(requests[0].sequence);
+            let before = peer.session.io_totals();
+            let sent = ownership
+                .begin_query(peer.peer())
+                .and_then(|()| peer.send_application_before(sequence, &query, &deadline));
+            lock(transfer)?
+                .sent(
+                    peer.peer(),
+                    peer.session.io_totals().sent - before.sent,
+                    Instant::now(),
+                )
+                .map_err(resource)?;
+            let mut accounted = 0;
+            let result = (|| {
+                sent?;
+                for _ in 0..requests.len() {
+                    let frame_before = peer.session.io_totals().received;
+                    let (response, frame, _charge) =
+                        peer.receive_application_before(&deadline, PIECE_BYTES + 38)?;
+                    let piece = codec::decode_piece(&frame, count).map_err(invalid)?;
+                    let assigned = requests
+                        .iter()
+                        .find(|request| request.piece == piece.index)
+                        .ok_or(p2p::Error::InvalidProtocol)?;
+                    if response != sequence || piece.block != assigned.block {
+                        return Err(p2p::Error::InvalidProtocol);
+                    }
+                    let received = peer.session.io_totals().received - frame_before;
+                    // The source's bytes are charged even when authentication or a
+                    // stale/duplicate assignment fails. Do not charge them twice.
+                    accounted += received;
+                    lock(transfer)?
+                        .received(*assigned, piece.bytes.to_vec(), received, Instant::now())
+                        .map_err(resource)?;
+                    let progress = lock(transfer)?;
+                    ownership.received(progress.verified_bytes(), progress.body_bytes())?;
+                    observe(&progress)?;
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                let partial = peer.session.io_totals().received - before.received - accounted;
+                let _ = lock(transfer)?.disconnected(peer.peer(), partial, Instant::now());
+            }
+            result
+        })
     }
 
     pub fn receive_propagation_request(
@@ -1192,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_metadata_counts_partial_application_bytes_and_never_retries_a_source() {
+    fn failed_metadata_keeps_partial_bytes_and_allows_bounded_failed_source_retry() {
         let (genesis, policy, _body, header) = fixture();
         let (client, server) = UnixStream::pair().unwrap();
         let budget = p2p::Budget::new(64 * 1024 * 1024);
@@ -1239,10 +1244,12 @@ mod tests {
         assert_eq!(accounts, 1);
         assert!(metadata > 0);
         assert_eq!(budget.available().unwrap() + metadata, 64 * 1024 * 1024);
-        assert!(matches!(
-            client.claim_body(&header, p2p::BodyMode::Legacy, &deadline),
-            Err(p2p::BodyClaimError::SourceUsed)
-        ));
+        let retry = client
+            .claim_body(&header, p2p::BodyMode::Legacy, &deadline)
+            .unwrap();
+        assert_eq!(retry.deadline().expires_at(), deadline.expires_at());
+        assert_eq!(retry.source_ordinal(), Some(2));
+        drop(retry);
         assert!(
             budget
                 .claim_body(

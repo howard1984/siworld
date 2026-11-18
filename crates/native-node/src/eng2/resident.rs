@@ -321,6 +321,7 @@ struct ExportState<'a> {
     wallet_export: Option<bool>,
     checkpoint_tick_reason: Option<&'a str>,
     wallet_diagnostic: Option<(&'a str, Option<&'a str>)>,
+    retained_diagnostic: Option<Value>,
 }
 fn export_status(
     directory: &Path,
@@ -336,6 +337,7 @@ fn export_status(
         wallet_export,
         checkpoint_tick_reason,
         wallet_diagnostic,
+        retained_diagnostic,
     } = export_state;
     let (mining, listening) = mode;
     let owner = shared
@@ -404,6 +406,8 @@ fn export_status(
         "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
         "historical_proof_replay":false
     });
+    status["body_registry_decision"] = shared.budget.body_registry_diagnostic();
+    status["retained_restoration_failure"] = json!(retained_diagnostic);
     status["checkpoint_error"] = json!(checkpoint_error);
     status["checkpoint_tick_reason"] = json!(checkpoint_tick_reason);
     status["checkpoint_archive_error"] = json!(owner.last_archive_error());
@@ -1046,6 +1050,16 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     (mining, listening),
                     ExportState {
                         checkpoint_error,
+                        retained_diagnostic: {
+                            #[cfg(unix)]
+                            {
+                                checkpoint_host.retained_failure_diagnostic()
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                None
+                            }
+                        },
                         wallet_export: {
                             #[cfg(unix)]
                             {
@@ -1101,6 +1115,16 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         (mining, false),
         ExportState {
             checkpoint_error,
+            retained_diagnostic: {
+                #[cfg(unix)]
+                {
+                    checkpoint_host.retained_failure_diagnostic()
+                }
+                #[cfg(not(unix))]
+                {
+                    None
+                }
+            },
             wallet_export: {
                 #[cfg(unix)]
                 {

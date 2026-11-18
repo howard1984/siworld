@@ -100,10 +100,6 @@ fn body_hedge_keeps_concurrency_attempt_and_expiry_bounds() {
     );
     assert_eq!(ledger.usage().requests, 3);
     ledger.defer(second, 30_022).unwrap();
-    assert_eq!(
-        ledger.request_body(tip, tip, [11; 32], 30_023).unwrap_err(),
-        Error::DuplicatePeer
-    );
     let third = ledger.request_body(tip, tip, [12; 32], 30_024).unwrap();
     ledger.defer(third, 30_025).unwrap();
     let fourth = ledger.request_body(tip, tip, [13; 32], 30_026).unwrap();
@@ -354,11 +350,11 @@ fn body_requests_share_global_attempt_caps_and_retain_no_duplicate_bytes() {
     ledger.receive(request, h, 12).unwrap();
     let request = ledger.request_body(tip, tip, [10; 32], 13).unwrap();
     ledger.defer(request, 14).unwrap();
+    let request = ledger.request_body(tip, tip, [10; 32], 15).unwrap();
     assert_eq!(
-        ledger.request_body(tip, tip, [10; 32], 15).unwrap_err(),
-        Error::DuplicatePeer
+        ledger.request_body(tip, tip, [11; 32], 15).unwrap_err(),
+        Error::InFlight
     );
-    let request = ledger.request_body(tip, tip, [11; 32], 16).unwrap();
     assert!(request.is_body());
     ledger.body_retained(request, 100, 17).unwrap();
     assert_eq!(
@@ -401,5 +397,25 @@ fn body_window_capability_requires_original_expiry_and_clock_failure_is_permanen
         ledger
             .renew_body_window(expiry + advance.remaining())
             .is_err()
+    );
+}
+
+#[test]
+fn released_failed_body_requests_retry_same_peer_without_refunding_attempts() {
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    let initial = ledger.usage().requests;
+    for index in 0..4 {
+        let now = 20 + index * 2;
+        let request = ledger.request_body(tip, tip, [10; 32], now).unwrap();
+        assert_eq!(
+            ledger.request_body(tip, tip, [10; 32], now).unwrap_err(),
+            Error::InFlight
+        );
+        ledger.defer(request, now + 1).unwrap();
+    }
+    assert_eq!(ledger.usage().requests, initial + 4);
+    assert_eq!(
+        ledger.request_body(tip, tip, [11; 32], 30).unwrap_err(),
+        Error::Capacity
     );
 }

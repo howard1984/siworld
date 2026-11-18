@@ -51,6 +51,9 @@ impl Discovery {
         body_budget
             .restrict_body_limits(&body_scope, limits.maximum_headers, limits.maximum_requests)
             .map_err(|_| Error::Configuration)?;
+        body_budget
+            .restrict_body_wire_limit(&body_scope, limits.maximum_body_bytes)
+            .map_err(|_| Error::Configuration)?;
         Ok(Self {
             ledger,
             qualified: BTreeSet::new(),
@@ -228,6 +231,7 @@ impl Discovery {
                         crate::p2p::BodyClaimError::Busy
                         | crate::p2p::BodyClaimError::Capacity
                         | crate::p2p::BodyClaimError::SourceUsed
+                        | crate::p2p::BodyClaimError::PreferUnused
                         | crate::p2p::BodyClaimError::QueryLimit,
                     ) => return Ok(DiscoveryAction::Deferred),
                     Err(_) => return Ok(DiscoveryAction::Deferred),

@@ -1086,18 +1086,47 @@ mod tests {
             let lease = peer
                 .claim_body_authorized(&header, &auth, crate::p2p::BodyMode::Legacy)
                 .unwrap();
+            let original_expiry = lease.deadline().expires_at();
+            #[cfg(feature = "eng2-runtime")]
+            let original_account = budget.body_registry_diagnostic()["account"].clone();
             // The actual ordinary transport writes a request and observes a disconnected
             // response, releasing physical ownership without completing its account.
             assert!(
                 peer.fetch_body_owned(u64::from(tag), &header, lease, None)
                     .is_err()
             );
+            let retry = budget
+                .claim_body_authorized(&auth, [9; 32], crate::p2p::BodyMode::Pieces)
+                .unwrap();
+            assert_eq!(retry.deadline().expires_at(), original_expiry);
+            assert_eq!(retry.source_ordinal(), Some(2));
+            #[cfg(feature = "eng2-runtime")]
+            {
+                let decision = budget.body_registry_diagnostic();
+                assert_eq!(decision["account"], original_account);
+                assert_eq!(decision["queries"], 1);
+            }
+            retry.begin_query([9; 32]).unwrap();
             assert_eq!(
                 budget
-                    .claim_body_authorized(&auth, [9; 32], crate::p2p::BodyMode::Pieces)
+                    .claim_body_authorized(&auth, [9; 32], crate::p2p::BodyMode::Legacy)
                     .unwrap_err(),
-                crate::p2p::BodyClaimError::SourceUsed
+                crate::p2p::BodyClaimError::Busy
             );
+            #[cfg(feature = "eng2-runtime")]
+            {
+                let decision = budget.body_registry_diagnostic();
+                assert_eq!(decision["account"], original_account);
+                assert_eq!(decision["queries"], 2);
+                assert_eq!(decision["window_queries"], u64::from(tag) * 2);
+            }
+            drop(retry);
+            let available = budget
+                .claim_body_authorized(&auth, [10; 32], crate::p2p::BodyMode::Legacy)
+                .unwrap();
+            assert_eq!(available.deadline().expires_at(), original_expiry);
+            assert_eq!(available.source_ordinal(), Some(3));
+            drop(available);
         }
         #[cfg(unix)]
         {

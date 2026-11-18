@@ -120,6 +120,16 @@ impl<S: Read + Write> Peer<S> {
             fetch_overwritten: 0,
         })
     }
+    pub(crate) fn with_body_accounting<T>(
+        &mut self,
+        ownership: &p2p::BodyClaim,
+        operation: impl FnOnce(&mut Self) -> Result<T, p2p::Error>,
+    ) -> Result<T, p2p::Error> {
+        self.session.set_body_accounting(Some(ownership))?;
+        let result = operation(self);
+        self.session.set_body_accounting(None)?;
+        result
+    }
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn with_wire_fence<T>(
         &mut self,
@@ -578,6 +588,7 @@ impl<S: Read + Write> Peer<S> {
         {
             self.fetch_sequence = self.fetch_sequence.saturating_add(1);
         }
+        self.session.set_body_accounting(Some(&ownership))?;
         let result = (|| {
             if header.network != self.session.binding().network || header.height == 0 {
                 return Err(p2p::Error::InvalidProtocol);
@@ -686,6 +697,7 @@ impl<S: Read + Write> Peer<S> {
                 observation,
             }))
         })();
+        self.session.set_body_accounting(None)?;
         #[cfg(feature = "eng2-runtime")]
         {
             let mut result = result;
@@ -1636,26 +1648,54 @@ mod tests {
             let before = budget.available().unwrap();
             let wire = frame(5, &start(&header, advertised), b);
             let mut peer = Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
+            let initial = peer
+                .claim_body(
+                    &header,
+                    p2p::BodyMode::Legacy,
+                    &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+                )
+                .unwrap();
+            let original_deadline = initial.deadline().expires_at();
             assert!(matches!(
-                peer.fetch_body(5, &header),
+                peer.fetch_body_owned(5, &header, initial, None),
                 Err(p2p::Error::ResourceExhausted)
             ));
             assert_payload_released_with_one_retained_account(&budget, before);
-
-            // Reconnecting the same source cannot renew that candidate's
-            // attempt or cause another request or response read.
-            let wire = frame(5, &start(&header, advertised), b);
-            let mut reconnected =
-                Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
-            assert!(matches!(
-                reconnected.fetch_body(5, &header),
-                Err(p2p::Error::Unavailable)
-            ));
-            assert!(reconnected.session.test_channel().output.is_empty());
-            assert_eq!(reconnected.session.test_channel().input.position(), 0);
-            assert_eq!(reconnected.session.io_totals().sent, 0);
-            assert_eq!(reconnected.session.io_totals().received, 0);
-            assert_payload_released_with_one_retained_account(&budget, before);
+            let first = peer.session.io_totals();
+            let mut charged = first.sent + first.received;
+            for ordinal in 2..=4 {
+                let wire = frame(5, &start(&header, advertised), b);
+                let mut reconnected =
+                    Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
+                let claim = reconnected
+                    .claim_body(
+                        &header,
+                        p2p::BodyMode::Legacy,
+                        &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+                    )
+                    .unwrap();
+                assert_eq!(claim.deadline().expires_at(), original_deadline);
+                assert_eq!(claim.source_ordinal(), Some(ordinal));
+                assert!(matches!(
+                    reconnected.fetch_body_owned(5, &header, claim, None),
+                    Err(p2p::Error::ResourceExhausted)
+                ));
+                let io = reconnected.session.io_totals();
+                assert!(io.sent > 0);
+                assert!(io.received > 0);
+                charged += io.sent + io.received;
+            }
+            let mut fifth = Peer::new(
+                session(frame(5, &start(&header, advertised), b), b, budget.clone()),
+                &g,
+                policy(),
+            )
+            .unwrap();
+            assert!(fifth.fetch_body(5, &header).is_err());
+            assert!(fifth.session.test_channel().output.is_empty());
+            assert_eq!(fifth.session.test_channel().input.position(), 0);
+            assert_eq!(budget.body_wire_usage().0, charged);
+            assert_eq!(budget.body_wire_usage().1, 0);
         }
     }
     #[cfg(feature = "eng2-runtime")]
@@ -1952,5 +1992,71 @@ mod tests {
         let deadline = p2p::Deadline::cancellable(std::time::Duration::from_secs(1), cancel);
         assert!(peer.fetch_body_before(1, &header, &deadline).is_err());
         assert!(peer.session.test_channel().output.is_empty());
+    }
+    #[test]
+    fn failed_partial_legacy_then_same_source_retry_keeps_actual_shared_wire_charge() {
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let b = binding(&g);
+        let mut sender =
+            Peer::new(session(vec![], b, p2p::Budget::default()), &g, policy()).unwrap();
+        sender.send_body(5, &header, &body).unwrap();
+        let wire = sender.session.test_channel().output.clone();
+        let budget = p2p::Budget::new(20 * 1024 * 1024);
+        let scope = budget
+            .resident_body_scope(
+                1,
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        let limit = wire.len() as u64 * 3;
+        budget.restrict_body_wire_limit(&scope, limit).unwrap();
+        let auth = budget
+            .authorize_body(
+                &scope,
+                b,
+                header.height,
+                header.id().unwrap(),
+                &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+            )
+            .unwrap();
+        let mut partial = Peer::new(
+            session(wire[..wire.len() / 2].to_vec(), b, budget.clone()),
+            &g,
+            policy(),
+        )
+        .unwrap();
+        let claim = partial
+            .claim_body_authorized(&header, &auth, p2p::BodyMode::Legacy)
+            .unwrap();
+        let deadline = claim.deadline().expires_at();
+        assert!(partial.fetch_body_owned(5, &header, claim, None).is_err());
+        let first = partial.session.io_totals();
+        let first_bytes = first.sent + first.received;
+        assert!(first.received > 0);
+        assert_eq!(budget.body_wire_usage(), (first_bytes, 0, limit));
+        drop(partial);
+        let mut retry = Peer::new(session(wire, b, budget.clone()), &g, policy()).unwrap();
+        let claim = retry
+            .claim_body_authorized(&header, &auth, p2p::BodyMode::Legacy)
+            .unwrap();
+        assert_eq!(claim.deadline().expires_at(), deadline);
+        assert_eq!(claim.source_ordinal(), Some(2));
+        let received = retry
+            .fetch_body_owned(5, &header, claim, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.body, body);
+        let second = retry.session.io_totals();
+        assert_eq!(
+            budget.body_wire_usage(),
+            (first_bytes + second.sent + second.received, 0, limit)
+        );
+        drop(received);
+        drop(retry);
+        assert_eq!(
+            budget.body_wire_usage().0,
+            first_bytes + second.sent + second.received
+        );
     }
 }
