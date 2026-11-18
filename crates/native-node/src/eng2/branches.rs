@@ -12,6 +12,7 @@ pub mod discovery;
 #[cfg(feature = "eng2-runtime")]
 pub(crate) mod history;
 mod refusal;
+mod retention;
 
 use crate::wire::Hash;
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};

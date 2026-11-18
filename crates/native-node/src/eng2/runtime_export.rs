@@ -373,6 +373,17 @@ impl PreparedCheckpoint {
     }
 }
 impl CertifiedCheckpoint {
+    pub(crate) fn pruning_context(
+        &self,
+        store: &Store,
+    ) -> Result<super::proof_retention::Checkpoint, String> {
+        self.check_current(store)?;
+        Ok(super::proof_retention::Checkpoint {
+            height: self.certificate.statement.checkpoint_height,
+            block: self.certificate.statement.checkpoint_block,
+            published: self.published,
+        })
+    }
     pub fn certificate(&self) -> &Certificate {
         &self.certificate
     }

@@ -986,3 +986,63 @@ fn checkpoint_archive_admission_covers_retained_generation_overlap() {
     drop(retained);
     assert_eq!(budget.available().unwrap(), MEMORY_BYTES);
 }
+
+#[test]
+fn restart_state_digest_binds_every_complete_component_and_context() {
+    let components: [Vec<u8>; 11] = std::array::from_fn(|index| vec![index as u8; index + 1]);
+    let original = hash_restart_components([1; 32], 347, [2; 32], &components);
+    for index in 0..components.len() {
+        let mut changed = components.clone();
+        changed[index][0] ^= 1;
+        assert_ne!(
+            original,
+            hash_restart_components([1; 32], 347, [2; 32], &changed)
+        );
+    }
+    assert_ne!(
+        original,
+        hash_restart_components([3; 32], 347, [2; 32], &components)
+    );
+    assert_ne!(
+        original,
+        hash_restart_components([1; 32], 348, [2; 32], &components)
+    );
+    assert_ne!(
+        original,
+        hash_restart_components([1; 32], 347, [3; 32], &components)
+    );
+    let mut left = components.clone();
+    left[0] = vec![1];
+    left[1] = vec![2, 3];
+    let mut right = left.clone();
+    right[0] = vec![1, 2];
+    right[1] = vec![3];
+    assert_ne!(
+        hash_restart_components([1; 32], 347, [2; 32], &left),
+        hash_restart_components([1; 32], 347, [2; 32], &right)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_restart_preserves_complete_state_digest_and_existing_identity() {
+    let directory = directory();
+    let genesis = genesis();
+    let expected = crate::local::hex(&genesis.id());
+    write(&directory.join("genesis.bin"), &genesis.encode().unwrap());
+    drop(NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap());
+    initialize_store(&directory, &expected).unwrap();
+    let identity = public_identity(&directory, &expected).unwrap();
+    let first = restart_check(&directory, &expected).unwrap();
+    let second = restart_check(&directory, &expected).unwrap();
+    assert_eq!(first["state_sha256"], second["state_sha256"]);
+    assert_eq!(first["state_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(first["authenticated_restart"], "passed");
+    assert_eq!(second["historical_proof_replay"], false);
+    assert_eq!(first["pruned_through"], 0);
+    assert_eq!(
+        identity["fingerprint"],
+        public_identity(&directory, &expected).unwrap()["fingerprint"]
+    );
+    fs::remove_dir_all(directory).unwrap();
+}

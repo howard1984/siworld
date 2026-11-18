@@ -32,6 +32,8 @@ mod observation;
 #[cfg(feature = "eng2-rehearsal")]
 pub use observation::Observation;
 mod receipts;
+mod retention;
+pub use retention::{Maintenance as ProofMaintenance, Report as ProofRetentionReport};
 mod replacement;
 pub use replacement::{
     PrevalidatedReplacement, ReplacementBudget, ReplacementFailure, ReplacementReplay,

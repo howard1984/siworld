@@ -49,13 +49,21 @@ pub(super) fn verify(
     {
         return Err("rollback ancestor head differs from retained point".into());
     }
+    let body_floor = imported_prefix.max(retention::restored_floor(
+        transaction,
+        genesis.id(),
+        identity,
+    )?);
+    if body_floor > point.height {
+        return Err("rollback proof floor exceeds retained point".into());
+    }
     let blocks = transaction
         .open_table(BLOCKS)
         .map_err(|_| "rollback ancestor blocks unavailable")?;
     if blocks
         .len()
         .map_err(|_| "rollback ancestor block count unavailable")?
-        != point.height - imported_prefix
+        != point.height - body_floor
     {
         return Err("rollback ancestor retained history count differs".into());
     }

@@ -40,6 +40,7 @@ pub mod nullifiers;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
 pub(crate) mod owner_fault;
 pub mod producer;
+pub mod proof_retention;
 pub mod proof_window;
 pub mod propagation;
 #[cfg(feature = "eng2-rehearsal")]

@@ -228,6 +228,34 @@ impl Driver {
         }
         Ok(())
     }
+    /// The existing exclusive owner authorizes bounded local storage maintenance.
+    /// Peer bootstrap promises and canonical switching remain protected.
+    pub fn maintain_proofs(
+        &mut self,
+        maintenance: &mut super::store::ProofMaintenance,
+        checkpoint: Option<&super::runtime_export::CertifiedCheckpoint>,
+        now: u64,
+        monotonic: u64,
+        budget: &crate::p2p::Budget,
+    ) -> Result<super::store::ProofRetentionReport, String> {
+        self.ensure_activities_allowed()?;
+        let pins = self.bootstrap_body_pins();
+        let mut report =
+            maintenance.tick(&mut self.store, checkpoint, now, monotonic, budget, &pins)?;
+        if report.paused.is_none()
+            && let Some(reorganization) = self.reorganization.as_mut()
+        {
+            let (blocks, bytes) = maintenance.prune_branch_proofs(
+                &mut reorganization.branches,
+                &self.store,
+                &pins,
+                budget,
+            )?;
+            report.removed_branch_blocks = blocks;
+            report.removed_branch_encoded_bytes = bytes;
+        }
+        Ok(report)
+    }
     pub fn bootstrap_available(&self) -> bool {
         self.activities_allowed()
             && self

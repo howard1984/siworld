@@ -15,6 +15,7 @@ pub(super) struct Destination {
 }
 pub(super) struct Configuration {
     pub role: p2p::Role,
+    pub proof_retention: Option<super::super::proof_retention::Policy>,
     pub listen: Option<SocketAddr>,
     pub mining: bool,
     pub peers: Vec<Destination>,
@@ -75,7 +76,9 @@ impl Configuration {
         let object = value
             .as_object()
             .ok_or("resident configuration requires an object")?;
-        if object.len() != 7 + usize::from(object.contains_key("legacy_checkpoint_peers"))
+        if object.len()
+            != 7 + usize::from(object.contains_key("legacy_checkpoint_peers"))
+                + usize::from(object.contains_key("proof_retention"))
             || value["version"] != 2
             || value["engineering"] != true
         {
@@ -216,8 +219,11 @@ impl Configuration {
                 }
             }
         }
+        let proof_retention =
+            super::super::proof_retention::configured(object.get("proof_retention"), role)?;
         Ok(Self {
             role,
+            proof_retention,
             listen,
             mining,
             peers,

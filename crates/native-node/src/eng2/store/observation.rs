@@ -63,13 +63,33 @@ fn authenticate_inner(
     let blocks = txn
         .open_table(BLOCKS)
         .map_err(|_| "restart canonical table missing")?;
-    let (imported_prefix, import_seed) = imported::resume_context(txn, height)?;
+    let retained_floor = retention::read_floor(txn, genesis.id(), identity)?;
+    let (imported_prefix, import_seed) =
+        imported::resume_context_with_floor(txn, height, retained_floor)?;
+    let body_floor = imported_prefix.max(retained_floor);
+    if body_floor > height.saturating_sub(24) {
+        return Err("retained proof floor exceeds rollback protection".into());
+    }
     if blocks
         .len()
         .map_err(|_| "restart block count unavailable")?
-        != height - imported_prefix
+        != height - body_floor
     {
         return Err("restart canonical count differs".into());
+    }
+    if body_floor > 0
+        && (blocks
+            .first()
+            .map_err(|_| "retained body range unavailable")?
+            .map(|r| r.0.value())
+            != Some(body_floor + 1)
+            || blocks
+                .last()
+                .map_err(|_| "retained body range unavailable")?
+                .map(|r| r.0.value())
+                != Some(height))
+    {
+        return Err("retained proof tail is not contiguous".into());
     }
     let index = txn
         .open_table(INDEX)

@@ -143,9 +143,56 @@ pub fn restart_check(directory: &Path, expected: &str) -> Result<Value, String> 
         load_genesis(directory, expected)?,
         limits().chain,
     )?;
+    let state_sha256 = restart_state_sha256(&store)?;
+    let pruned_through = store.proof_retention_floor()?;
     Ok(
-        json!({"version":2,"genesis":expected,"height":store.engine().state().height(),"tip":crate::local::hex(&store.engine().state().tip()),"elapsed_ms":started.elapsed().as_millis().to_string(),"historical_proof_replay":false,"authenticated_restart":"passed"}),
+        json!({"version":2,"genesis":expected,"height":store.engine().state().height(),"tip":crate::local::hex(&store.engine().state().tip()),"state_sha256":crate::local::hex(&state_sha256),"pruned_through":pruned_through,"elapsed_ms":started.elapsed().as_millis().to_string(),"historical_proof_replay":false,"authenticated_restart":"passed"}),
     )
+}
+
+fn restart_state_sha256(store: &Store) -> Result<Hash, String> {
+    let engine = store.engine();
+    let state = engine.state();
+    let height = state.height();
+    let genesis = engine.genesis().id();
+    let parent = if height == 0 {
+        [0; 32]
+    } else {
+        store.header(height)?.parent
+    };
+    let components = state.canonical_components(
+        super::state_components::Binding {
+            genesis,
+            rules_commitment: engine.genesis().rules_commitment(),
+            parent,
+        },
+        limits().chain,
+    )?;
+    Ok(hash_restart_components(
+        genesis,
+        height,
+        state.tip(),
+        &components,
+    ))
+}
+
+fn hash_restart_components(
+    genesis: Hash,
+    height: u64,
+    tip: Hash,
+    components: &[Vec<u8>; 11],
+) -> Hash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"SIWORLD-ENG2-RESTART-STATE-V1\0");
+    hasher.update(genesis);
+    hasher.update(height.to_le_bytes());
+    hasher.update(tip);
+    for (index, component) in components.iter().enumerate() {
+        hasher.update((index as u64).to_le_bytes());
+        hasher.update((component.len() as u64).to_le_bytes());
+        hasher.update(component);
+    }
+    hasher.finalize().into()
 }
 pub fn public_identity(directory: &Path, expected: &str) -> Result<Value, String> {
     let genesis = load_genesis(directory, expected)?;
@@ -322,6 +369,7 @@ struct ExportState<'a> {
     checkpoint_tick_reason: Option<&'a str>,
     wallet_diagnostic: Option<(&'a str, Option<&'a str>)>,
     retained_diagnostic: Option<Value>,
+    proof_retention: Option<Value>,
 }
 fn export_status(
     directory: &Path,
@@ -338,6 +386,7 @@ fn export_status(
         checkpoint_tick_reason,
         wallet_diagnostic,
         retained_diagnostic,
+        proof_retention,
     } = export_state;
     let (mining, listening) = mode;
     let owner = shared
@@ -408,6 +457,7 @@ fn export_status(
     });
     status["body_registry_decision"] = shared.budget.body_registry_diagnostic();
     status["retained_restoration_failure"] = json!(retained_diagnostic);
+    status["proof_retention"] = json!(proof_retention);
     status["checkpoint_error"] = json!(checkpoint_error);
     status["checkpoint_tick_reason"] = json!(checkpoint_tick_reason);
     status["checkpoint_archive_error"] = json!(owner.last_archive_error());
@@ -632,6 +682,19 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         config.listen.is_some(),
         config.checkpoint_key.is_some(),
     )?;
+    #[cfg(unix)]
+    let mut proof_maintenance = config
+        .proof_retention
+        .map(super::store::ProofMaintenance::new)
+        .transpose()?;
+    #[cfg(unix)]
+    let mut proof_retention_status = None;
+    #[cfg(not(unix))]
+    let proof_retention_status: Option<Value> = None;
+    #[cfg(not(unix))]
+    if config.proof_retention.is_some() {
+        return Err("proof retention maintenance is unavailable on this platform".into());
+    }
     let mining = config.mining;
     let listening = config.listen.is_some();
     #[cfg(unix)]
@@ -886,6 +949,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let mut last_export = Instant::now() - Duration::from_secs(5);
     let mut last_checkpoint = Instant::now() - Duration::from_secs(1);
     #[cfg(unix)]
+    let mut last_proof_maintenance = Instant::now() - Duration::from_secs(60);
+    #[cfg(unix)]
     let mut checkpoint_error = None;
     #[cfg(not(unix))]
     let checkpoint_error = None;
@@ -1037,6 +1102,36 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                 }
                 last_checkpoint = Instant::now();
             }
+            #[cfg(unix)]
+            if last_proof_maintenance.elapsed() >= Duration::from_secs(60) {
+                if let Some(maintenance) = proof_maintenance.as_mut() {
+                    let mut owner = shared
+                        .owner
+                        .lock()
+                        .map_err(|_| "resident owner lock poisoned")?;
+                    if owner.activities_allowed() {
+                        // Storage failure pauses maintenance only. Signing and
+                        // readiness continue to use their existing independent gates.
+                        proof_retention_status = Some(
+                            match owner.maintain_proofs(
+                                maintenance,
+                                checkpoint_host.latest_checkpoint(),
+                                unix_ms()? / 1000,
+                                started.elapsed().as_secs(),
+                                &shared.budget,
+                            ) {
+                                Ok(report) => {
+                                    json!({"enabled":true,"alarm":report.paused.map(super::proof_retention::Pause::code),"pruned_through":report.pruned_through,"removed_blocks":report.removed_blocks,"removed_encoded_bytes":report.removed_encoded_bytes,"removed_branch_blocks":report.removed_branch_blocks,"removed_branch_encoded_bytes":report.removed_branch_encoded_bytes,"more_eligible":report.more_eligible})
+                                }
+                                Err(_) => {
+                                    json!({"enabled":true,"alarm":"proof_pruning_maintenance_failed"})
+                                }
+                            },
+                        );
+                    }
+                }
+                last_proof_maintenance = Instant::now();
+            }
             if last_export.elapsed() >= Duration::from_secs(5) {
                 sequence = sequence
                     .checked_add(1)
@@ -1050,6 +1145,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     (mining, listening),
                     ExportState {
                         checkpoint_error,
+                        proof_retention: proof_retention_status.clone(),
                         retained_diagnostic: {
                             #[cfg(unix)]
                             {
@@ -1115,6 +1211,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         (mining, false),
         ExportState {
             checkpoint_error,
+            proof_retention: proof_retention_status.clone(),
             retained_diagnostic: {
                 #[cfg(unix)]
                 {

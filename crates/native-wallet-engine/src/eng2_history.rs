@@ -408,8 +408,10 @@ impl ReceiptBlock {
         sparse.require_exact_ranges(&ranges)?;
         Ok(block)
     }
-    /// Construction remains internal: externally publishable input must come
-    /// from the accepted Store adapter, never an admitted or pending block.
+    /// Construction authenticates public ranges against the supplied header,
+    /// without proving native execution or chain selection. Canonical wallet
+    /// publication requires the accepted Store adapter. Expired branch records
+    /// stay in their separate local namespace and grant no admission authority.
     #[allow(dead_code)] // Native export uses this constructor; portable wallet builds decode.
     pub(crate) fn export(
         context: &Context,

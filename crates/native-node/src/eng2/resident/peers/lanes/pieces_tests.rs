@@ -57,6 +57,7 @@ fn fixture(role: p2p::Role, remote_role: p2p::Role, seed: u8) -> Fixture {
         .unwrap();
     let config = config::Configuration {
         role,
+        proof_retention: None,
         listen: None,
         mining: false,
         peers: vec![config::Destination {
