@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from urllib.parse import urlsplit
 
 CSP = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; script-src-attr 'none'; style-src 'self'; style-src-attr 'none'; connect-src 'self'; worker-src 'self'; img-src 'self'; font-src 'self'; media-src 'self'; manifest-src 'none'; frame-src 'none'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
 HEADERS = {
@@ -24,6 +25,64 @@ HEADERS = {
 }
 
 
+def connection_origins(values):
+    if not isinstance(values, list) or len(values) > 4:
+        raise ValueError('Invalid pinned connection origins.')
+    origins = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError('Invalid pinned connection origin.')
+        url = urlsplit(value)
+        port = url.port
+        if (not url.hostname or url.username or url.password or url.query or url.fragment or url.path
+                or not re.fullmatch(r'[A-Za-z0-9.:[\]\-]+', url.netloc)
+                or not (url.scheme == 'https' or url.scheme == 'http'
+                        and url.hostname in ('localhost', '127.0.0.1', '::1'))):
+            raise ValueError('Invalid pinned connection origin.')
+        host = url.hostname.lower()
+        if ':' in host:
+            host = '[' + host + ']'
+        suffix = ':' + str(port) if port is not None and port != (443 if url.scheme == 'https' else 80) else ''
+        if value != url.scheme + '://' + host + suffix or value in origins:
+            raise ValueError('Connection origins must be canonical and unique.')
+        origins.append(value)
+    return origins
+
+
+def response_headers(origins):
+    origins = connection_origins(origins)
+    policy = CSP.replace("connect-src 'self';", "connect-src 'self'" + ''.join(' ' + value for value in origins) + ';')
+    return {**HEADERS, 'Content-Security-Policy': policy}
+
+
+def wallet_connection_origins(source):
+    text = (source / 'sdk/network.js').read_text()
+    prefix = 'export const ENGINEERING = '
+    if len(text.encode()) > 16384 or not text.startswith(prefix) or not text.rstrip().endswith(';'):
+        raise ValueError('Pinned runtime configuration differs.')
+    try:
+        value = json.loads(text[len(prefix):].rstrip()[:-1])
+    except ValueError:
+        if text.strip() == 'export const ENGINEERING = {name:"Custom native V1",network:"",account:0};':
+            return []
+        raise ValueError('Pinned runtime configuration differs.') from None
+    if not isinstance(value, dict):
+        raise ValueError('Pinned runtime configuration differs.')
+    if value.get('name') != 'siworld-eng-2':
+        return []
+    if (type(value.get('version')) is not int or value['version'] != 2
+            or type(value.get('fee_mode')) is not int or value['fee_mode'] != 0 or value.get('read_only') is not True
+            or any(not isinstance(value.get(key), str) or not re.fullmatch('[0-9a-f]{64}', value[key])
+                   or set(value[key]) == {'0'} for key in ('network', 'genesis', 'rules', 'profile'))):
+        raise ValueError('Pinned engineering-v2 runtime configuration differs.')
+    api = connection_origins([value.get('api')])[0]
+    data = connection_origins(value.get('apis', [api]))
+    submission = connection_origins(value.get('submission_apis', data))
+    if not 1 <= len(data) <= 2 or not 1 <= len(submission) <= 2 or data[0] != api:
+        raise ValueError('Pinned engineering-v2 source lists differ.')
+    return list(dict.fromkeys(data + submission))
+
+
 def integrity(data):
     return 'sha384-' + base64.b64encode(hashlib.sha384(data).digest()).decode()
 
@@ -34,7 +93,7 @@ def replace_once(text, old, new):
     return text.replace(old, new, 1)
 
 
-def verify_release(root, expected_manifest_sha256=None):
+def verify_release(root, expected_manifest_sha256=None, expected_connect_origins=None):
     if root.is_symlink() or not root.is_dir():
         raise ValueError('Release root must be a regular directory.')
     entries = list(root.rglob('*'))
@@ -65,7 +124,12 @@ def verify_release(root, expected_manifest_sha256=None):
     computed = hashlib.sha256(json.dumps(digests, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     if computed != release or integrity((root / (app + '.html')).read_bytes()) != manifest['html_integrity']:
         raise ValueError('Release or HTML integrity mismatch.')
-    if json.loads((root / 'response-headers.json').read_text()) != HEADERS:
+    origins = connection_origins(manifest.get('connect_origins', []))
+    if app != 'wallet' and origins:
+        raise ValueError('Only the explicit wallet profile may bind connection origins.')
+    if expected_connect_origins is not None and origins != connection_origins(expected_connect_origins):
+        raise ValueError('Approved connection origins differ.')
+    if json.loads((root / 'response-headers.json').read_text()) != response_headers(origins):
         raise ValueError('Response policy differs.')
     expected_files = set(manifest['assets']) | {app + '.html', 'release-manifest.json', 'response-headers.json'}
     actual_files = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
@@ -161,6 +225,7 @@ def package(source, destination, esbuild):
         temporary = Path(temporary)
         stage = temporary / 'stage'
         threaded = stage_input(source, stage)
+        wallet_origins = wallet_connection_origins(source)
         prepared = temporary / 'release'
         for app, entry, workers in [
             ('wallet', 'assets/native-wallet.js', {'wallet-worker': 'sdk/worker.js'}),
@@ -170,6 +235,8 @@ def package(source, destination, esbuild):
             assets = app_root / 'assets'
             assets.mkdir(parents=True)
             entries = {app: entry, **workers}
+            if app == 'wallet':
+                entries['wallet-startup'] = 'assets/wallet-startup.js'
             if threaded:
                 entries['rayon-worker'] = 'rayon-entry.js'
             meta = temporary / (app + '-meta.json')
@@ -202,14 +269,19 @@ def package(source, destination, esbuild):
             original = 'native-wallet.js' if app == 'wallet' else 'vault-application.js'
             html = replace_once(html, '<script type="module" src="assets/' + original + '"></script>',
                                 '<script type="module" src="/releases/' + release + '/assets/' + app + '.mjs" integrity="' + digests[app + '.mjs'] + '" crossorigin="anonymous"></script>')
+            if app == 'wallet':
+                html = replace_once(html, '<script src="assets/wallet-startup.js"></script>',
+                                    '<script src="/releases/' + release + '/assets/wallet-startup.mjs" integrity="' + digests['wallet-startup.mjs'] + '" crossorigin="anonymous"></script>')
             (app_root / (app + '.html')).write_text(html)
+            origins = wallet_origins if app == 'wallet' else []
             manifest = {'version': 1, 'application': app, 'release': release, 'threaded': threaded,
+                        'connect_origins': origins,
                         'assets': {f'releases/{release}/assets/{name}': digest for name, digest in digests.items()},
                         'html_integrity': integrity(html.encode()),
                         'worker_integrity_boundary': 'Static same-origin HTTPS workers; manifest validation is not browser Worker SRI.'}
             (app_root / 'release-manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
-            (app_root / 'response-headers.json').write_text(json.dumps(HEADERS, sort_keys=True, indent=2) + '\n')
-            verify_release(app_root)
+            (app_root / 'response-headers.json').write_text(json.dumps(response_headers(origins), sort_keys=True, indent=2) + '\n')
+            verify_release(app_root, expected_connect_origins=origins)
         shutil.copytree(prepared, destination)
 
 

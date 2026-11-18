@@ -12,10 +12,10 @@ exec sudo -n unshare --net -- bash -c '
  [[ "$(ip -o link show | wc -l)" -eq 1 && -z "$(ip route show)" && -z "$(ip -6 route show default)" ]]
  target_env=(); if [[ -n "$target" ]]; then target_env+=("CARGO_TARGET_DIR=$target"); fi
  exec setpriv --reuid "$uid" --regid "$gid" --clear-groups --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
- env -i HOME="$task_home" PATH="$root/scripts/ci-bin:$task_path" \
+ env -i HOME="$task_home" PATH="$root/scripts/ci-bin:$task_path" GITHUB_ACTIONS="${10}" \
  CARGO_HOME="$task_home/.cargo" RUSTUP_HOME="$task_home/.rustup" \
  CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=always SIWORLD_REAL_CARGO="$real_cargo" \
  "${target_env[@]}" GITHUB_WORKSPACE="$root" CI=true GITHUB_OUTPUT="$9" \
  RAYON_NUM_THREADS=4 SIWORLD_COMPOSITION_HIDING_WORKERS=2 \
  LANG=C.UTF-8 LC_ALL=C.UTF-8 python3 "$root/scripts/ci-fixtures.py" bash --noprofile --norc -eo pipefail "$script"
-' offline-ci "$(id -u)" "$(id -g)" "$HOME" "$PATH" "$root" "$real_cargo" "$1" "${CARGO_TARGET_DIR:-}" "${GITHUB_OUTPUT:-}"
+' offline-ci "$(id -u)" "$(id -g)" "$HOME" "$PATH" "$root" "$real_cargo" "$1" "${CARGO_TARGET_DIR:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_ACTIONS:-}"

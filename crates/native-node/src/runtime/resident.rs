@@ -1092,14 +1092,8 @@ mod tests {
         transactions.sort_unstable_by_key(|tx| tx.record.statement_id(&config.network));
         block.transactions = transactions;
         block.settlement_proof = vec![1; crate::wire::MAX_SETTLEMENT_PROOF];
-        let seed = block.pow_seed().unwrap();
         block.nonce = 0;
-        while !siworld_core::pow::meets_target(
-            &siworld_core::pow::pow_hash(&seed, block.nonce, config.pow_iterations),
-            &block.target,
-        ) {
-            block.nonce += 1;
-        }
+        crate::fixtures::find_test_nonce(&mut block, config.pow_iterations, true);
         let bytes = block.encoded_len().unwrap();
         assert!(bytes >= MAX_SLOTS * crate::wire::MAX_TX_PROOF + crate::wire::MAX_SETTLEMENT_PROOF);
         assert!(bytes <= MAX_BLOCK_BYTES);

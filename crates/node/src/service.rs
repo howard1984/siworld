@@ -230,7 +230,8 @@ async fn run_inner(
 
     let miner = config
         .mine
-        .then(|| Miner::spawn(node.chain.params.pow_iterations, found_tx));
+        .then(|| Miner::spawn(node.chain.params.pow_iterations, found_tx))
+        .transpose()?;
     let (prepared, mut prepared_rx) = mpsc::channel(1);
     let mut service = Service {
         node,
@@ -1216,7 +1217,13 @@ struct Miner {
 
 impl Miner {
     /// Starts the miner thread; it sends each block it seals to `found`.
-    fn spawn(iterations: u64, found: mpsc::Sender<Job>) -> Self {
+    fn spawn(iterations: u64, found: mpsc::Sender<Job>) -> io::Result<Self> {
+        if std::env::var_os("GITHUB_ACTIONS").as_deref() == Some(std::ffi::OsStr::new("true")) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "miner execution is prohibited on GitHub Actions",
+            ));
+        }
         let job: Arc<Mutex<Option<MiningJob>>> = Arc::default();
         let generation = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1261,12 +1268,12 @@ impl Miner {
                 }
             })
         };
-        Self {
+        Ok(Self {
             job,
             generation,
             stop,
             thread: Some(thread),
-        }
+        })
     }
 
     /// Replaces the template; `None` pauses mining.
@@ -1304,6 +1311,45 @@ mod tests {
     use crate::genesis::{Genesis, GenesisFile, ProofsFile};
     use siworld_circuits::MockProver;
     use siworld_crypto::{SecretSeed, SpendKey};
+
+    #[test]
+    fn github_actions_refuses_miner_startup() {
+        if std::env::var_os("GITHUB_ACTIONS").as_deref() == Some(std::ffi::OsStr::new("true")) {
+            let (send, _receive) = mpsc::channel(1);
+            // Zero iterations would panic before thread creation if the guard
+            // were removed; this negative test cannot execute mining work.
+            let error = match Miner::spawn(0, send) {
+                Err(error) => error,
+                Ok(miner) => {
+                    miner.stop();
+                    panic!("GitHub Actions unexpectedly started a miner");
+                }
+            };
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                error.to_string(),
+                "miner execution is prohibited on GitHub Actions"
+            );
+            return;
+        }
+        // A child process exercises the real environment without mutating the
+        // environment shared by concurrent tests or spawning a miner locally.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service::tests::github_actions_refuses_miner_startup",
+                "--nocapture",
+            ])
+            .env("GITHUB_ACTIONS", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
 
     fn service() -> Service {
         let genesis = Genesis::from_file(&GenesisFile {
@@ -1384,11 +1430,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "owner-local only: spawns miner"]
     async fn pow_can_finish_before_proof_and_survives_timestamp_refresh() {
         let mut service = service();
         let block = service.node.template(now() + 1).unwrap();
         let (send, mut receive) = mpsc::channel(1);
-        service.miner = Some(Miner::spawn(1, send));
+        service.miner = Some(Miner::spawn(1, send).unwrap());
         service.on_prepared(2, block.header);
         let mined = tokio::time::timeout(Duration::from_secs(2), receive.recv())
             .await
@@ -1436,10 +1483,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "owner-local only: spawns miner"]
     async fn candidate_generation_exhaustion_fails_closed() {
         let mut service = service();
         let (send, _receive) = mpsc::channel(1);
-        service.miner = Some(Miner::spawn(1, send));
+        service.miner = Some(Miner::spawn(1, send).unwrap());
         service.generation = u64::MAX;
         service.refresh_template();
         assert!(service.fatal.is_some());
@@ -1449,9 +1497,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "owner-local only: spawns miner"]
     fn dropping_the_miner_also_stops_its_thread() {
         let (send, _receive) = mpsc::channel(1);
-        let miner = Miner::spawn(1, send);
+        let miner = Miner::spawn(1, send).unwrap();
         let stopped = miner.stop.clone();
         drop(miner);
         let was_stopped = stopped.load(Ordering::Relaxed);

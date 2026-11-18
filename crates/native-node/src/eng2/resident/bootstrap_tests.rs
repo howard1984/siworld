@@ -183,6 +183,7 @@ fn hybrid_rollover_reauthenticates_exact_lease_resumes_and_rejects_expired_or_fo
     let destination = config::Destination {
         endpoint: listener.local_addr().unwrap(),
         dial: true,
+        checkpoint_reference: true,
         expected,
     };
     let server_genesis = genesis.clone();

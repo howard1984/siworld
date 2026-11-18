@@ -20,9 +20,17 @@ fn receipt_hash(previous: Hash, height: u64, digest: Hash) -> Hash {
 fn marker_seed(marker: &[u8]) -> Hash {
     blake3::derive_key("siworld eng2 signed import local index seed v1", marker)
 }
+#[cfg(test)]
 pub(super) fn resume_context(
     txn: &redb::ReadTransaction,
     height: u64,
+) -> Result<(u64, Hash), String> {
+    resume_context_with_floor(txn, height, 0)
+}
+pub(super) fn resume_context_with_floor(
+    txn: &redb::ReadTransaction,
+    height: u64,
+    retained_floor: u64,
 ) -> Result<(u64, Hash), String> {
     let meta = txn
         .open_table(META)
@@ -70,6 +78,10 @@ pub(super) fn resume_context(
     if digest.as_slice() != &bytes[144..176] {
         return Err("import receipt prefix digest differs".into());
     }
+    let floor = prefix.max(retained_floor);
+    if floor >= height {
+        return Err("import retained floor is above accepted tail".into());
+    }
     let blocks = txn
         .open_table(BLOCKS)
         .map_err(|_| "import retained body table missing")?;
@@ -77,7 +89,7 @@ pub(super) fn resume_context(
         .first()
         .map_err(|_| "import retained body range unavailable")?
         .map(|row| row.0.value())
-        != Some(prefix + 1)
+        != Some(floor + 1)
         || blocks
             .last()
             .map_err(|_| "import retained body range unavailable")?
@@ -86,7 +98,7 @@ pub(super) fn resume_context(
         || blocks
             .len()
             .map_err(|_| "import retained body count unavailable")?
-            != height - prefix
+            != height - floor
     {
         return Err("import retained body range differs from sealed prefix".into());
     }
@@ -212,10 +224,14 @@ impl VerifiedImport {
         let genesis = Genesis::decode(&encoded)?;
         let limits = self.engine.limits();
         let mut store = Store::create(&candidate, genesis, limits)?;
-        let transaction = store
+        let mut transaction = store
             .database
             .begin_write()
             .map_err(|_| "import candidate transaction unavailable")?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(|_| "import candidate durability unavailable")?;
+        transaction.set_quick_repair(true);
         let mut digest = [0; 32];
         for (i, row) in self.receipts.iter().enumerate() {
             check()?;

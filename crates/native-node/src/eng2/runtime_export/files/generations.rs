@@ -41,6 +41,7 @@ pub struct WalletProgress {
     pub target_height: u64,
     pub published_height: Option<u64>,
     pub published: bool,
+    pub current: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Entry {
@@ -131,45 +132,9 @@ impl Catalog {
         }
         Ok(Self { sequence, entries })
     }
-    fn staged(
-        &self,
-        height: u64,
-        tip: Hash,
-        digest: Hash,
-        now: u64,
-        committed: Option<(u64, Hash)>,
-    ) -> Result<Self, String> {
-        let mut next = self.clone();
-        next.entries
-            .retain(|e| e.expires == 0 || now < e.expires || committed == Some((e.height, e.tip)));
-        // An orphan active generation can exist after catalog/head interruption.
-        // Preserve its complete immutable data as a bounded retained pin.
-        for entry in &mut next.entries {
-            if entry.expires == 0 || committed == Some((entry.height, entry.tip)) {
-                entry.expires = now
-                    .checked_add(RETAIN_SECONDS)
-                    .filter(|v| *v < (1 << 53))
-                    .ok_or("wallet retention clock overflow")?;
-            }
-        }
-        next.entries.retain(|e| (e.height, e.tip) != (height, tip));
-        if next.entries.len() >= RETAINED_HEADS {
-            return Err("wallet retained generation catalog full".into());
-        }
-        next.entries.push(Entry {
-            height,
-            tip,
-            digest,
-            expires: 0,
-        });
-        next.sequence = next
-            .sequence
-            .checked_add(1)
-            .filter(|v| *v < (1 << 53))
-            .ok_or("wallet catalog sequence exhausted")?;
-        Ok(next)
-    }
 }
+include!("generations/retained_index.rs");
+
 struct Acquired {
     native: Option<wallet_history::Export>,
     #[cfg(test)]
@@ -233,10 +198,15 @@ pub struct WalletPublisher {
     full: Vec<Descriptor>,
     tail: Vec<Record>,
     catalog: Catalog,
+    retained: RetainedIndex,
     published: Option<(u64, Hash, u64)>,
+    refresh_required: bool,
     last_now: Option<u64>,
 }
 impl WalletPublisher {
+    pub fn invalidate_advertisement(&mut self) {
+        self.refresh_required = true;
+    }
     pub fn open(
         export: &PublicExport,
         store: &Store,
@@ -269,7 +239,9 @@ impl WalletPublisher {
     ) -> Result<Self, String> {
         let policy = policy.check()?;
         let memory = budget
-            .reserve(4 * (wire::MAX_MANIFEST_BYTES + wire::MAX_CHUNK_BYTES))
+            .reserve(
+                4 * (wire::MAX_MANIFEST_BYTES + wire::MAX_CHUNK_BYTES) + 3 * RETAINED_INDEX_BYTES,
+            )
             .map_err(|_| "wallet publisher retained metadata memory unavailable")?;
         let descriptor = openat(
             &export.root,
@@ -356,6 +328,7 @@ impl WalletPublisher {
             .map(|bytes| Catalog::decode(&binding, &bytes))
             .transpose()?
             .unwrap_or_default();
+        let retained = RetainedIndex::read(export, &binding)?;
         let mut value = Self {
             tip: binding.genesis(),
             binding,
@@ -369,7 +342,9 @@ impl WalletPublisher {
             full: Vec::new(),
             tail: Vec::new(),
             catalog,
+            retained,
             published: None,
+            refresh_required: true,
             last_now: None,
         };
         if let Some(bytes) = export.read_optional("wallet-head.json", 2048)? {
@@ -409,15 +384,7 @@ impl WalletPublisher {
                 return Err("wallet restored generation head differs".into());
             }
             let current = source.head();
-            let canonical = height <= current.0
-                && (height == 0 && tip == value.binding.genesis()
-                    || height > 0
-                        && source
-                            .header(height)?
-                            .id()
-                            .map_err(|_| "wallet restored canonical identity rejected")?
-                            == tip);
-            if canonical {
+            {
                 let mut previous = value.binding.genesis();
                 for descriptor in &manifest.chunks {
                     let chunk = descriptor.decode_chunk(
@@ -443,6 +410,7 @@ impl WalletPublisher {
                 value.height = height;
                 value.tip = tip;
             }
+            value.reconcile_prefix(export, source, current.0)?;
             value.published = Some((height, tip, published));
         }
         value.persist_reservation(export)?;
@@ -559,19 +527,7 @@ impl WalletPublisher {
         if target > wire::MAX_HEIGHT {
             return Err("wallet public header capacity exceeded".into());
         }
-        if self.height > target
-            || self.height > 0
-                && source
-                    .header(self.height)?
-                    .id()
-                    .map_err(|_| "wallet prefix identity rejected")?
-                    != self.tip
-        {
-            self.height = 0;
-            self.tip = self.binding.genesis();
-            self.full.clear();
-            self.tail.clear();
-        }
+        self.reconcile_prefix(export, source, target)?;
         let genesis = source.genesis()?;
         if genesis.len() > MAX_GENESIS {
             return Err("wallet public genesis exceeds bound".into());
@@ -611,9 +567,10 @@ impl WalletPublisher {
         let mut published = false;
         if self.height == target
             && self.tip == tip
-            && self.published.is_none_or(|(h, id, time)| {
-                (h, id) != (target, tip) || now.saturating_sub(time) >= 60
-            })
+            && (self.refresh_required
+                || self.published.is_none_or(|(h, id, time)| {
+                    (h, id) != (target, tip) || now.saturating_sub(time) >= 60
+                }))
         {
             self.publish(export, source, now)?;
             published = true;
@@ -623,7 +580,67 @@ impl WalletPublisher {
             target_height: target,
             published_height: self.published.map(|v| v.0),
             published,
+            current: !self.refresh_required
+                && self
+                    .published
+                    .is_some_and(|(h, id, _)| (h, id) == (target, tip)),
         })
+    }
+    /// Reuse only the immutable prefix that still matches the accepted Store.
+    /// Reconciliation is metadata-only and never regenerates earlier receipts.
+    fn reconcile_prefix(
+        &mut self,
+        export: &PublicExport,
+        source: &impl Source,
+        target: u64,
+    ) -> Result<(), String> {
+        let mut height = self.height;
+        let mut tip = self.tip;
+        let mut full = self.full.clone();
+        let mut tail = self.tail.clone();
+        while height > target
+            || height > 0
+                && source
+                    .header(height)?
+                    .id()
+                    .map_err(|_| "wallet prefix identity rejected")?
+                    != tip
+        {
+            if tail.is_empty() {
+                let descriptor = full.last().ok_or("wallet rewind chunk missing")?;
+                let chunk = descriptor.decode_chunk(
+                    &self.binding,
+                    &export.read(&descriptor.name(), wire::MAX_CHUNK_BYTES)?,
+                )?;
+                if chunk.records.len() != wire::CHUNK_HEADERS
+                    || chunk.from + chunk.records.len() as u64 - 1 != height
+                {
+                    return Err("wallet rewind chunk height differs".into());
+                }
+                tail = chunk.records;
+                full.pop();
+            }
+            let record = tail.pop().ok_or("wallet rewind record missing")?;
+            let header = record.decoded(&self.binding)?;
+            if header.height != height || record.id != tip {
+                return Err("wallet rewind record context differs".into());
+            }
+            height = height
+                .checked_sub(1)
+                .ok_or("wallet rewind height underflow")?;
+            tip = header.parent;
+        }
+        if height == 0 && tip != self.binding.genesis() {
+            return Err("wallet rewind genesis differs".into());
+        }
+        if height != self.height {
+            self.height = height;
+            self.tip = tip;
+            self.full = full;
+            self.tail = tail;
+            self.refresh_required = true;
+        }
+        Ok(())
     }
     fn publish(
         &mut self,
@@ -657,13 +674,21 @@ impl WalletPublisher {
         if FAIL_BEFORE_CATALOG.with(|flag| flag.replace(false)) {
             return Err("injected interruption before wallet catalog".into());
         }
-        let next = self.catalog.staged(
+        let (next, retained) = self.catalog.staged_advertisement(
+            &self.retained,
             self.height,
             self.tip,
             hash,
             now,
             self.published.map(|(height, tip, _)| (height, tip)),
         )?;
+        // Durable retention precedes cache eviction and the final head commit.
+        self.replace_metadata(
+            export,
+            RETAINED_INDEX_NAME,
+            &retained.encode(&self.binding)?,
+        )?;
+        self.retained = retained;
         // These are complete immutable dependencies, even if a later cursor
         // replacement fails. The previous advertised head remains resolvable.
         self.replace_metadata(
@@ -672,6 +697,12 @@ impl WalletPublisher {
             &next.encode(&self.binding)?,
         )?;
         self.catalog = next;
+        #[cfg(test)]
+        AFTER_CATALOG.with(|hook| {
+            if let Some(barrier) = hook.borrow_mut().take() {
+                barrier();
+            }
+        });
         #[cfg(test)]
         if FAIL_BEFORE_HEAD.with(|flag| flag.replace(false)) {
             return Err("injected interruption before wallet head".into());
@@ -691,11 +722,13 @@ impl WalletPublisher {
             &serde_json::to_vec(&head).map_err(|_| "wallet current head encoding failed")?,
         )?;
         self.published = Some((self.height, self.tip, now));
+        self.refresh_required = false;
         Ok(())
     }
 }
 #[cfg(test)]
 thread_local! {
+    static AFTER_CATALOG: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {std::cell::RefCell::new(None)};
     static FAIL_BEFORE_HEAD: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};
     static FAIL_BEFORE_MANIFEST: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};
     static FAIL_BEFORE_CATALOG: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};

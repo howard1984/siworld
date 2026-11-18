@@ -103,7 +103,17 @@ fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating
         status
     );
     assert!(host.tick(&store, 100_000, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
     assert!(host.tick(&store, 1u64 << 53, &[]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
+    assert!(host.tick(&store, 100_002, &[]).is_ok());
+    assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(store.engine().state().tip(), state_before);
     assert!(!fs::read_dir(&root).unwrap().any(|entry| {
         entry
@@ -140,7 +150,15 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         )
         .is_err()
     );
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::InputBounds)
+    );
     assert!(host.tick(&store, 100_001, &[proposal]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::Proposal)
+    );
     let vote = Incoming::Vote {
         statement: candidate.statement.clone(),
         vote: Box::new(Vote {
@@ -149,6 +167,10 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         }),
     };
     assert!(host.tick(&store, 100_002, &[vote]).is_err());
+    assert_eq!(
+        host.tick_failure_reason(),
+        Some(TickFailureReason::VoteWithoutCandidate)
+    );
     let mut witness = candidate.witness;
     witness.governance = vec![0; limits().chain.max_component_bytes + 1];
     assert!(
@@ -164,6 +186,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     );
     assert_eq!(store.engine().state().height(), 0);
     let result = host.tick(&store, 100_004, &[]).unwrap();
+    assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(result.status.signer_slot, None);
     assert!(result.status.pruning_paused);
     assert!(result.vote.is_none());
@@ -209,4 +232,205 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
     assert_eq!(progress.published_height, Some(0));
     assert_eq!(host.wallet_export_state(), Some(false));
     assert!(host.tick(&store, 1001, &[]).is_ok());
+}
+
+#[test]
+fn reorganization_retains_wallet_cursor_and_republishes_same_complete_head() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-pause");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    assert!(
+        host.tick_wallet_export(&store, 1000, &budget)
+            .unwrap()
+            .unwrap()
+            .published
+    );
+    assert!(root.join("wallet-head.json").exists());
+    host.pause_reorganization_exports().unwrap();
+    assert!(root.join("wallet-head.json").is_file());
+    assert_eq!(host.wallet_export_state(), Some(true));
+    host.pause_reorganization_exports().unwrap();
+    assert!(
+        host.tick_wallet_export(&store, 1001, &budget)
+            .unwrap()
+            .unwrap()
+            .published
+    );
+    assert!(root.join("wallet-head.json").exists());
+    assert_eq!(host.wallet_export_state(), Some(false));
+}
+
+#[test]
+fn retained_open_keeps_malformed_records_fail_closed() {
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("retained-open");
+    let mut host = Host::open_retained(&root, &store, limits(), None, |_, _| {
+        panic!("empty actual genesis has no retained checkpoint")
+    })
+    .unwrap();
+    host.reconcile_retained(&store, |_, _| panic!("unchanged head is cached"))
+        .unwrap();
+    assert!(host.latest_checkpoint().is_none());
+    drop(host);
+    let path = root.join("checkpoint-eng2.json");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"{}").unwrap();
+    file.sync_all().unwrap();
+    assert!(Host::open(&root, &store, limits(), None).is_err());
+    assert!(Host::open_retained(&root, &store, limits(), None, |_, _| Ok(None)).is_err());
+    assert_eq!(fs::read(path).unwrap(), b"{}");
+}
+
+#[test]
+fn ancestor_barrier_retires_later_authorizations_and_preserves_earlier_ones() {
+    // Injected trusted synthetic capabilities exercise barrier behavior only.
+    // They are never accepted by Store or offered as native checkpoint evidence.
+    fn checkpoint() -> CertifiedCheckpoint {
+        let prepared = synthetic_candidate();
+        let message = prepared.statement.encode().unwrap();
+        let vote = |slot: u8, seed: u8| Vote {
+            slot,
+            signature: *ml_dsa_65::sign(
+                &ml_dsa_65::generate_key_pair([seed; 32]).signing_key,
+                &message,
+                Statement::signing_context(),
+                [42; 32],
+            )
+            .unwrap()
+            .as_ref(),
+        };
+        let certificate = Certificate {
+            statement: prepared.statement.clone(),
+            votes: [vote(0, 3), vote(1, 4)],
+        };
+        CertifiedCheckpoint {
+            prepared,
+            certificate,
+            published: 100_000,
+        }
+    }
+    let directory = Directory::new();
+    let store = directory.store();
+    let retained_root = directory.private("earlier-authorization");
+    let mut kept = Host::open(&retained_root, &store, limits(), None).unwrap();
+    kept.latest = Some(checkpoint());
+    kept.pending = Some(synthetic_candidate());
+    kept.pause_reorganization_exports_at(96).unwrap();
+    assert_eq!(kept.latest_checkpoint().unwrap().published, 100_000);
+    assert!(kept.pending.is_some());
+    assert_eq!(kept.retired_through, None);
+    let root = directory.private("later-authorization");
+    let mut retired = Host::open(&root, &store, limits(), None).unwrap();
+    retired.latest = Some(checkpoint());
+    retired.pending = Some(synthetic_candidate());
+    retired.pause_reorganization_exports_at(95).unwrap();
+    assert!(retired.latest_checkpoint().is_none());
+    assert!(retired.pending.is_none());
+    assert!(retired.votes.iter().all(Option::is_none));
+    assert!(retired.anchor_retired(72));
+    assert!(!retired.anchor_retired(84));
+    let publication = root.join("checkpoint-publication-00000000000000000072.json");
+    let original = fs::read(&publication).unwrap();
+    let value: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(value["published_unix_seconds"], 100_000);
+    retired.pause_reorganization_exports_at(95).unwrap();
+    assert_eq!(fs::read(publication).unwrap(), original);
+}
+
+#[test]
+fn wallet_open_and_restart_stay_paused_until_a_new_complete_publication() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-initial-pause");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert!(!root.join("wallet-head.json").exists());
+    assert!(
+        host.tick_wallet_export(&store, 1000, &budget)
+            .unwrap()
+            .unwrap()
+            .current
+    );
+    let committed = std::fs::read(root.join("wallet-head.json")).unwrap();
+    assert_eq!(host.wallet_export_state(), Some(false));
+    drop(host);
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    host.enable_wallet_export(&store, WalletPolicy::default(), &budget)
+        .unwrap();
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert_eq!(
+        std::fs::read(root.join("wallet-head.json")).unwrap(),
+        committed
+    );
+    host.restore_required = true;
+    host.retained_ready = false;
+    assert!(host.tick_wallet_export(&store, 1001, &budget).is_err());
+    assert_eq!(host.wallet_export_state(), Some(true));
+    assert_eq!(
+        std::fs::read(root.join("wallet-head.json")).unwrap(),
+        committed
+    );
+    host.retained_ready = true;
+    let progress = host
+        .tick_wallet_export(&store, 1001, &budget)
+        .unwrap()
+        .unwrap();
+    assert!(progress.current && progress.published);
+    assert_eq!(host.wallet_export_state(), Some(false));
+    let head: Value =
+        serde_json::from_slice(&std::fs::read(root.join("wallet-head.json")).unwrap()).unwrap();
+    assert_eq!(head["published_unix_seconds"], 1001);
+}
+
+#[test]
+fn wallet_publication_diagnostic_survives_successful_checkpoint_tick() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("wallet-error-origin");
+    let mut host = Host::open(&root, &store, limits(), None).unwrap();
+    let budget = crate::p2p::Budget::new(2 * 1024 * 1024);
+    assert_eq!(host.wallet_export_diagnostic(), ("disabled", None));
+    assert!(
+        host.enable_wallet_export(
+            &store,
+            WalletPolicy {
+                max_artifact_bytes: 1
+            },
+            &budget
+        )
+        .is_err()
+    );
+    assert_eq!(host.wallet_export_diagnostic().0, "open_error");
+    assert!(host.tick_wallet_export(&store, 1000, &budget).is_err());
+    let before = host.wallet_export_diagnostic().1.unwrap().to_owned();
+    assert_eq!(host.wallet_export_diagnostic().0, "publication_error");
+    host.tick(&store, 1000, &[]).unwrap();
+    assert_eq!(
+        host.wallet_export_diagnostic(),
+        ("publication_error", Some(before.as_str()))
+    );
+}
+
+#[test]
+fn public_wallet_error_codes_never_include_untrusted_runtime_details() {
+    let code: &'static str = wallet_failure_code("untrusted private runtime context");
+    assert_eq!(code, "publication_failed");
+    assert_eq!(
+        wallet_failure_code("wallet retained pin index full"),
+        "retained_pin_capacity_exhausted"
+    );
+    assert!(!code.contains("untrusted"));
 }

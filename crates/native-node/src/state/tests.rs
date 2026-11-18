@@ -71,13 +71,7 @@ fn candidate(state: &State, seed: u32) -> Block {
         issuances: Vec::new(),
         settlement_proof: vec![1],
     };
-    let seed = block.pow_seed().unwrap();
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, block.nonce, state.config.pow_iterations),
-        &block.target,
-    ) {
-        block.nonce += 1;
-    }
+    crate::fixtures::find_test_nonce(&mut block, state.config.pow_iterations, true);
     block
 }
 #[test]
@@ -401,13 +395,7 @@ fn asert_header_failures_precede_proof_checks_and_are_atomic() {
             0 => invalid.timestamp = state.median_time_past(),
             1 => invalid.target[31] ^= 1,
             _ => {
-                let seed = invalid.pow_seed().unwrap();
-                while siworld_core::pow::meets_target(
-                    &siworld_core::pow::pow_hash(&seed, invalid.nonce, state.config.pow_iterations),
-                    &invalid.target,
-                ) {
-                    invalid.nonce += 1;
-                }
+                crate::fixtures::find_test_nonce(&mut invalid, state.config.pow_iterations, false);
             }
         }
         let mut next = state.clone();
@@ -422,13 +410,7 @@ fn early_parent_changes_the_next_asert_target_and_old_target_is_rejected() {
     let mut state = State::new(Config::development([10; 32], 0).unwrap()).unwrap();
     let mut early = candidate(&state, 2000000);
     early.timestamp = state.timestamp() + 1;
-    let seed = early.pow_seed().unwrap();
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, early.nonce, state.config.pow_iterations),
-        &early.target,
-    ) {
-        early.nonce += 1;
-    }
+    crate::fixtures::find_test_nonce(&mut early, state.config.pow_iterations, true);
     state.apply(&early, &TestVerifier).unwrap();
     assert!(state.next_target() < state.config.genesis_target);
     let mut stale = candidate(&state, 2100000);
@@ -452,13 +434,7 @@ fn future_time_is_local_admission_only_not_a_replay_clock_rule() {
         block.timestamp,
         1_700_000_000
     ));
-    let seed = block.pow_seed().unwrap();
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, block.nonce, state.config.pow_iterations),
-        &block.target,
-    ) {
-        block.nonce += 1;
-    }
+    crate::fixtures::find_test_nonce(&mut block, state.config.pow_iterations, true);
     state.apply(&block, &TestVerifier).unwrap();
     assert_eq!(state.timestamp(), u64::MAX);
 }

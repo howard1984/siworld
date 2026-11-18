@@ -64,6 +64,22 @@ zero-height generation uses the pinned genesis identifier and no chunks.
 The source checks its actual accepted head before committing publication.
 HTTP requests cannot refresh the source publication timestamp.
 
+Restoration and authentication failures preserve the last complete wallet head.
+They pause new publication without deleting historical data or refreshing its
+publication time. A separate refresh flag forces publication after successful
+restoration, including an unchanged head. Until that commit succeeds, the old
+committed generation remains pinned even past its nominal retention expiry.
+`wallet_export_paused` remains true during backfill or a pending refresh. An old
+complete wallet head does not assert the current native head or grant signing
+or checkpoint authority. Consumers compare it with the exporting node's native
+status separately from propagation between different nodes.
+
+The head and catalog are separate atomic file replacements, not one filesystem
+transaction. Readers bracket both metadata files around immutable dependency
+reads and retry if either changes, within the original acquisition deadline.
+They resolve the head's exact catalog entry and verify its manifest, chunks and
+receipts. Missing, malformed or inconsistent data grants no verified prefix.
+
 `Store::materialize_permanent_receipt` explicitly materializes one accepted
 height under the same shared budget. It authenticates the immutable context,
 exact canonical header and body length, then durably commits the receipt and its
@@ -96,15 +112,33 @@ and contiguous. The finite export limit is 100,000 headers, 782 chunks and
 `wallet-generations.json` contains exactly `version` (1), the four context
 identifiers, `fee_mode` (0), `sequence` and `entries`. Each entry has `height`,
 `tip`, `manifest_sha256` and `expires_unix_seconds`. The one active entry has
-expiry 0. Replaced heads remain pinned for 900 seconds; the catalog has at
-most four entries and 4,096 bytes. An interrupted catalog-before-head write
+expiry 0. The current advertisement cache has at most four entries and 4,096
+bytes. Replaced heads remain pinned for 900 seconds in a separate bounded
+retention index; advertisement eviction does not expire a retained pin. An interrupted catalog-before-head write
 retains the previously committed head; an orphan active generation is not a
 committed head. Restart reconciles the committed generation against the local
 accepted prefix before continuing incremental backfill.
 
-A full catalog pauses new publication until an entry expires; it never evicts
-an unexpired pin. Expiry removes catalog references only. Artifacts are never
-deleted by this publisher. A reader must resolve an exact retained `(height,
+`wallet-retained-generations.bin` contains `SWE2WRI1`, the exact 129-byte
+binding, a u16 entry count, then 80-byte records: u64 height, 32-byte tip,
+32-byte manifest SHA-256 and u64 expiry. It holds at most 256 distinct retired
+heads and 20,619 bytes. The publisher durably replaces this index before the
+advertisement cache and commits the current head last. All unexpired retired
+pins remain indexed; an unchanged-head refresh does not extend unrelated
+retention deadlines. A full retention index pauses publication with an explicit
+error. Malformed records and digest conflicts remain errors. The existing
+artifact budget covers retained immutable dependencies and mutable metadata;
+three index buffers are reserved from the shared memory budget.
+
+`PublicExport::wallet_generation_manifest` resolves an exact current or
+unexpired retained pin and checks the manifest's context, head and digest.
+`PublicExport::wallet_generation_header_page` consumes that resolver and
+authenticates the selected immutable chunks, preserving the exact requested
+head in the existing `SWE2WHP1` encoding. Its owned bytes retain a finite shared
+memory reservation. Browser synchronization remains an independent integration.
+Callers still authenticate selected receipts and chain work; lookup does not grant
+chain-selection, signing or checkpoint authority. Expiry removes index references
+only. Artifacts are never deleted by this publisher. A reader must resolve an exact retained `(height,
 tip)` and must not substitute the newer head. It can assemble an arbitrary
 page of at most 128 headers from at most two chunks, producing the existing
 `SWE2WHP1` response. A receipt must match the selected record's identity,
@@ -118,8 +152,11 @@ The existing Unix resident enables publication only when
 per one-second checkpoint interval, borrowing its Store and shared memory
 budget. There is no new worker, observer or Store. Wallet failures only pause
 this export; checkpoint coordination, validation and production continue.
-Existing resident status reports `wallet_export_enabled` and the optional
-`wallet_export_paused` state. No engineering-v1 path is changed.
+Existing resident status reports `wallet_export_enabled`, the optional
+`wallet_export_paused` state, and independent `wallet_export_stage` and static
+`wallet_export_error` codes. Unrecognized error details map to a fixed code;
+paths, addresses and private runtime strings are never copied into status. Successful checkpoint ticks do not clear a
+wallet publication failure. No engineering-v1 path is changed.
 
 The default artifact budget is 32 GiB. An explicit `WalletPolicy` accepts a
 finite bound from 128 KiB through 1 TiB. Opening inventories descriptor-confined

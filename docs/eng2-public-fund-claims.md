@@ -61,3 +61,27 @@ height. It creates a second non-clone `DebitedFundOutput` only after the actual
 debit succeeds. Replays and overdrafts cannot create that output. This operation
 must target an isolated candidate ledger: the debit and output must commit
 atomically with the remaining block state.
+
+## Candidate authorization window
+
+`WindowedFundClaim` is an inactive version-two primitive. It retains the same
+public payment fields, interprets the signed height as the first permitted
+inclusion height, and adds an eight-byte last permitted height immediately
+after it. Both endpoints are inclusive. At least 288 heights must be permitted;
+zero starts, shorter intervals and overflowing minimum endpoints are rejected.
+The fixed frame is 6,869 bytes. Every field and both endpoints are signed under
+`siworld eng2 public fund claim v2`. Version-one and version-two signatures and
+decoders are not interchangeable.
+
+Verification checks the actual inclusion height and its frozen governance
+state. The active complete destination and immutable member authority still
+apply; an interval does not preserve an obsolete destination after rotation.
+The authorization capability binds the actual inclusion height, and its debit
+continues to enforce available entitlement and the next unspent counter.
+Rebroadcasting the same signed payload cannot debit the ledger a second time.
+
+The existing body decoder still accepts only version-one exact-height claims.
+Selecting the windowed format requires a new authenticated genesis/rules binding,
+bounded body framing, producer and validator integration, signing-tool support
+and reorganization acceptance. Adding this primitive does not modify the
+retained engineering genesis or establish full-network qualification.

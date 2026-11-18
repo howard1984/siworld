@@ -192,7 +192,10 @@ fn array<const N: usize>(value: &Value) -> Result<[u8; N], String> {
         return Err("Local tree cache byte width.".into());
     }
     let mut bytes = [0; N];
-    for (out, chunk) in bytes.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+    for (out, chunk) in bytes
+        .iter_mut()
+        .zip(text.as_bytes().as_chunks::<2>().0.iter())
+    {
         let d = |b: u8| match b {
             b'0'..=b'9' => Ok(b - b'0'),
             b'a'..=b'f' => Ok(b - b'a' + 10),
