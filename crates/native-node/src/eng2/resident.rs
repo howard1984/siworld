@@ -43,6 +43,7 @@ pub use historical::{
 pub use operations::{result as operations_result, submit as submit_operations};
 pub(crate) mod peers;
 mod production;
+mod progress_checkpoint;
 mod progress_clock;
 mod progress_runs;
 #[cfg(unix)]
@@ -321,6 +322,7 @@ impl Shared {
         &self,
         owner: &Driver,
         checkpoint_error: Option<&str>,
+        checkpoint_progress: &progress_checkpoint::State,
     ) -> Result<(), String> {
         let observer = self
             .checkpoint_observer
@@ -329,11 +331,10 @@ impl Shared {
         let eligible = owner.activities_allowed()
             && owner.last_archive_error().is_none()
             && owner.reorganization_alarm().is_none()
-            && checkpoint_error.is_none()
             && !observer.conflicted()
             && observer.error().is_none()
             && owner.head().is_ok();
-        self.headers.publish_progress_context(eligible);
+        checkpoint_progress.publish(&self.headers, eligible, checkpoint_error);
         Ok(())
     }
 
@@ -945,6 +946,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     if !mining {
         shared.phase("networking")?;
     }
+    #[cfg(unix)]
+    let mut checkpoint_progress = progress_checkpoint::State::default();
+    #[cfg(not(unix))]
+    let checkpoint_progress = progress_checkpoint::State::default();
     let mut sequence = 0u64;
     let mut last_export = Instant::now() - Duration::from_secs(5);
     let mut last_checkpoint = Instant::now() - Duration::from_secs(1);
@@ -1021,7 +1026,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                         shared.mailbox.publish(&[])?;
                     }
                 }
-                shared.publish_progress(&owner, checkpoint_error)?;
+                shared.publish_progress(&owner, checkpoint_error, &checkpoint_progress)?;
             }
             if last_checkpoint.elapsed() >= Duration::from_secs(1) {
                 #[cfg(unix)]
@@ -1039,7 +1044,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             // Restoration failure pauses only advertisements and
                             // signing; canonical validation and peers keep running.
                             shared.mailbox.publish(&[])?;
-                            shared.headers.invalidate_progress_context();
+                            checkpoint_progress.restoration(&shared.headers, restored.is_err());
                             checkpoint_error = Some(if restored.is_err() {
                                 "checkpoint_retained_restoration_failed"
                             } else {
@@ -1075,12 +1080,14 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                                             )
                                             .is_err()
                                     {
-                                        shared.headers.invalidate_progress_context();
+                                        checkpoint_progress.failed(&shared.headers);
                                         checkpoint_error = Some("signed_bootstrap_unavailable");
+                                    } else {
+                                        checkpoint_progress.recovered();
                                     }
                                 }
                                 Err(_) => {
-                                    shared.headers.invalidate_progress_context();
+                                    checkpoint_progress.failed(&shared.headers);
                                     checkpoint_error =
                                         Some("checkpoint_tick_rejected_or_unavailable");
                                     checkpoint_tick_reason = checkpoint_host
@@ -1098,7 +1105,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             }
                         }
                     }
-                    shared.publish_progress(&owner, checkpoint_error)?;
+                    shared.publish_progress(&owner, checkpoint_error, &checkpoint_progress)?;
                 }
                 last_checkpoint = Instant::now();
             }

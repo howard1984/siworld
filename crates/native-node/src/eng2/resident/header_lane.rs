@@ -1062,6 +1062,161 @@ impl Hub {
 
 #[cfg(test)]
 mod tests {
+    fn checkpoint_progress_candidate() -> super::super::progress_runs::Candidate {
+        super::super::progress_runs::Candidate {
+            id: [3; 32],
+            sequence: 1,
+            height: 1,
+            work: siworld_core::pow::block_work(&[255; 32]),
+            attempt_index: 1,
+        }
+    }
+    fn checkpoint_progress_event(hub: &Hub, bytes: usize, now: u64) {
+        let token = hub
+            .progress_runs
+            .token(checkpoint_progress_candidate())
+            .unwrap();
+        hub.progress_runs.received_test_at(token, bytes, now);
+    }
+    #[test]
+    fn checkpoint_progress_pending_preserves_actual_run_without_extending_it() {
+        use super::super::progress_checkpoint::State;
+        let hub = hub();
+        let mut checkpoint = State::default();
+        checkpoint.publish(&hub, true, None);
+        checkpoint_progress_event(&hub, 10, 100);
+        checkpoint_progress_event(&hub, 20, 200);
+        let before = hub.sync_progress_runs();
+        checkpoint.restoration(&hub, false);
+        checkpoint.publish(&hub, true, Some("checkpoint_retained_restoration_pending"));
+        assert_eq!(hub.sync_progress_runs(), before);
+        checkpoint_progress_event(&hub, 30, 300);
+        checkpoint.restoration(&hub, false);
+        checkpoint.publish(&hub, true, Some("checkpoint_retained_restoration_pending"));
+        checkpoint_progress_event(&hub, 40, 400);
+        let after = hub.sync_progress_runs();
+        assert_eq!(after["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(after["runs"][0]["id"], before["runs"][0]["id"]);
+        assert_eq!(
+            after["runs"][0]["state_epoch"],
+            before["runs"][0]["state_epoch"]
+        );
+        assert_eq!(after["runs"][0]["start_ns"], "100");
+        assert_eq!(after["runs"][0]["end_ns"], "400");
+        assert_eq!(hub.sync_progress_runs(), after);
+        // Repeated byte counts and a gap beyond five seconds still cannot extend a run.
+        checkpoint_progress_event(&hub, 40, 500);
+        assert_eq!(hub.sync_progress_runs(), after);
+        checkpoint_progress_event(&hub, 50, 5_000_000_401);
+        assert_eq!(hub.sync_progress_runs(), after);
+        checkpoint_progress_event(&hub, 60, 5_000_000_501);
+        assert_eq!(
+            hub.sync_progress_runs()["runs"].as_array().unwrap().len(),
+            2
+        );
+    }
+    #[test]
+    fn checkpoint_progress_failure_pending_cannot_reopen_until_successful_tick() {
+        use super::super::progress_checkpoint::State;
+        for error in [
+            "checkpoint_retained_restoration_failed",
+            "checkpoint_tick_rejected_or_unavailable",
+            "signed_bootstrap_unavailable",
+        ] {
+            let hub = hub();
+            let mut checkpoint = State::default();
+            checkpoint.publish(&hub, true, None);
+            checkpoint_progress_event(&hub, 10, 100);
+            checkpoint_progress_event(&hub, 20, 200);
+            let stale = hub
+                .progress_runs
+                .token(checkpoint_progress_candidate())
+                .unwrap();
+            if error == "checkpoint_retained_restoration_failed" {
+                checkpoint.restoration(&hub, true);
+            } else {
+                checkpoint.failed(&hub);
+            }
+            checkpoint.publish(&hub, true, Some(error));
+            for _ in 0..2 {
+                checkpoint.restoration(&hub, false);
+                checkpoint.publish(&hub, true, Some("checkpoint_retained_restoration_pending"));
+                assert!(
+                    hub.progress_runs
+                        .token(checkpoint_progress_candidate())
+                        .is_none()
+                );
+            }
+            // Even clearing the presentation string is not a successful tick.
+            checkpoint.publish(&hub, true, None);
+            assert!(
+                hub.progress_runs
+                    .token(checkpoint_progress_candidate())
+                    .is_none()
+            );
+            let stopped = hub.sync_progress_runs();
+            hub.progress_runs.received_test_at(stale, 30, 300);
+            assert_eq!(hub.sync_progress_runs(), stopped);
+            checkpoint.recovered();
+            checkpoint.publish(&hub, true, None);
+            checkpoint_progress_event(&hub, 40, 400);
+            checkpoint_progress_event(&hub, 50, 500);
+            let after = hub.sync_progress_runs();
+            assert_eq!(after["runs"].as_array().unwrap().len(), 2);
+            assert_ne!(
+                after["runs"][0]["state_epoch"],
+                after["runs"][1]["state_epoch"]
+            );
+            assert_eq!(after["runs"][1]["start_ns"], "400");
+        }
+    }
+    #[test]
+    fn checkpoint_progress_pending_cannot_override_owner_guards_or_hard_errors() {
+        use super::super::progress_checkpoint::State;
+        for error in [
+            None,
+            Some("checkpoint_retained_restoration_pending"),
+            Some("checkpoint_current_quorum_conflict"),
+            Some("checkpoint_observer_unavailable"),
+        ] {
+            let hub = hub();
+            let mut checkpoint = State::default();
+            checkpoint.publish(&hub, true, None);
+            checkpoint_progress_event(&hub, 10, 100);
+            checkpoint_progress_event(&hub, 20, 200);
+            let old = hub.sync_progress_runs();
+            let stale = hub
+                .progress_runs
+                .token(checkpoint_progress_candidate())
+                .unwrap();
+            // These publications represent the unchanged owner/archive/reorg/observer gates.
+            checkpoint.publish(&hub, false, error);
+            checkpoint.restoration(&hub, false);
+            checkpoint.publish(&hub, false, Some("checkpoint_retained_restoration_pending"));
+            assert!(
+                hub.progress_runs
+                    .token(checkpoint_progress_candidate())
+                    .is_none()
+            );
+            hub.progress_runs.received_test_at(stale, 30, 300);
+            assert_eq!(hub.sync_progress_runs(), old);
+            // Recovery cannot override an owner/observer/reorganization guard.
+            checkpoint.recovered();
+            checkpoint.publish(&hub, false, None);
+            assert!(
+                hub.progress_runs
+                    .token(checkpoint_progress_candidate())
+                    .is_none()
+            );
+            checkpoint.publish(&hub, true, Some("unrecognized_error"));
+            assert!(
+                hub.progress_runs
+                    .token(checkpoint_progress_candidate())
+                    .is_none()
+            );
+        }
+    }
+
     use super::*;
     impl Hub {
         pub(super) fn advertise_test_source(&self, peer: Hash) {

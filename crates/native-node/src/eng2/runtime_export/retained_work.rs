@@ -200,22 +200,30 @@ impl RetainedWork {
                 .check_signatures(roster.keys())
                 .map_err(|_| "checkpoint publication signatures invalid")?;
         }
-        // Reading this input also binds the complete exact base archive and
-        // every ordered raw suffix body/header. A prefix hash is insufficient.
-        let work = ArchiveWork::from_restore_read(
-            &self.read,
-            statement.checkpoint_height,
-            self.limits,
-            &self.budget,
-        )?;
+        // Check all actual pinned input bytes before reserving a duplicate
+        // reconstruction workspace. Reuse still requires the live validated
+        // owner, exact context, snapshot, votes and certificate checks above.
         let reusable = reuse
             .filter(|live| live.statement == statement)
-            .map(|live| live.native.matches(&work, &snapshot))
+            .map(|live| {
+                live.native.matches_restore_read(
+                    &self.read,
+                    statement.checkpoint_height,
+                    self.limits,
+                    &snapshot,
+                )
+            })
             .transpose()?
             .unwrap_or(false);
         let archive: Option<ValidatedArchive> = if reusable {
             None
         } else {
+            let work = ArchiveWork::from_restore_read(
+                &self.read,
+                statement.checkpoint_height,
+                self.limits,
+                &self.budget,
+            )?;
             let validated = work.validate(cancelled)?;
             if validated.snapshot_bytes() != snapshot {
                 return Err(

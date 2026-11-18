@@ -65,6 +65,28 @@ impl NativeArchiveIdentity {
             && self.snapshot == other.snapshot
             && self.snapshot_bytes == other.snapshot_bytes
     }
+    pub(super) fn matches_restore_read(
+        &self,
+        read: &crate::eng2::store::CheckpointRestoreRead,
+        height: u64,
+        limits: ImportLimits,
+        snapshot: &[u8],
+    ) -> Result<bool, String> {
+        let anchor = read.header(height)?;
+        if self.anchor != anchor
+            || self.network != read.network()
+            || self.genesis != read.genesis_id()
+            || self.rules != read.rules()
+            || self.snapshot_bytes != snapshot.len()
+            || self.snapshot != *blake3::hash(snapshot).as_bytes()
+        {
+            return Ok(false);
+        }
+        let digest = read.archive_input_digest(height, limits)?;
+        Ok(self.input
+            == ArchiveWork::bound_input_identity(read.genesis_bytes(), &anchor, limits, digest)?)
+    }
+    #[cfg(test)]
     pub(super) fn matches(&self, work: &ArchiveWork, snapshot: &[u8]) -> Result<bool, String> {
         Ok(self.anchor == work.context.anchor
             && self.network == work.context.network
@@ -169,7 +191,40 @@ impl ArchiveWork {
             input_digest: captured.input_digest,
         })
     }
+    fn bound_input_identity(
+        genesis: &[u8],
+        anchor: &Header,
+        limits: ImportLimits,
+        input_digest: Hash,
+    ) -> Result<Hash, String> {
+        let mut hash =
+            blake3::Hasher::new_derive_key("siworld eng2 checkpoint native input identity v1");
+        hash.update(blake3::hash(genesis).as_bytes());
+        hash.update(
+            &anchor
+                .encode()
+                .map_err(|_| "checkpoint input anchor invalid")?,
+        );
+        for bound in [
+            limits.max_snapshot_bytes,
+            limits.chain.max_component_bytes,
+            limits.chain.max_leaves,
+            limits.chain.max_nullifiers,
+        ] {
+            hash.update(&(bound as u64).to_le_bytes());
+        }
+        hash.update(&input_digest);
+        Ok(*hash.finalize().as_bytes())
+    }
     fn native_input_identity(&self) -> Result<Hash, String> {
+        if self.input_digest != [0; 32] {
+            return Self::bound_input_identity(
+                &self.genesis,
+                &self.context.anchor,
+                self.limits,
+                self.input_digest,
+            );
+        }
         let mut hash =
             blake3::Hasher::new_derive_key("siworld eng2 checkpoint native input identity v1");
         hash.update(blake3::hash(&self.genesis).as_bytes());

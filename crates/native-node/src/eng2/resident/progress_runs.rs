@@ -116,6 +116,11 @@ impl Recorder {
         self.received_at(token, bytes, total, now, boot);
     }
 
+    #[cfg(test)]
+    pub(super) fn received_test_at(&self, token: Token, bytes: usize, now: u64) {
+        self.received_at(token, bytes, 10_000, now, "11".repeat(32));
+    }
+
     fn received_at(&self, token: Token, bytes: usize, total: usize, now: u64, boot: String) {
         if bytes == 0 || bytes > total {
             return;
