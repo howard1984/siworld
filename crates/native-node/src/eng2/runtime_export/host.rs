@@ -680,12 +680,12 @@ impl Host {
         &mut self,
         store: &Store,
         readiness: Option<&dyn SigningReadiness>,
-    ) -> Result<(), String> {
+    ) -> Result<(), super::budget_diagnostic::Error> {
         let retired_through = self.retired_through;
         let Some(preparation) = &mut self.preparation else {
             return Ok(());
         };
-        let result = preparation.worker.try_complete();
+        let result = preparation.worker.try_complete_observed();
         if preparation.request_generation != preparation.generation {
             // A cancelled obsolete task may return either cancellation or a
             // complete result. Neither can regain authority after the barrier.

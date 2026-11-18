@@ -19,6 +19,7 @@ use libcrux_ml_dsa::ml_dsa_65::{self, MLDSA65Signature, MLDSA65VerificationKey};
 use serde_json::{Value, json};
 
 pub mod archive_work;
+pub(crate) mod budget_diagnostic;
 #[cfg(unix)]
 mod preparation;
 #[cfg(test)]

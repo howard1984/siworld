@@ -109,6 +109,7 @@ pub(super) struct Failure {
     pub sequence: u64,
     pub stage: Stage,
     pub cause: Cause,
+    pub budget: Option<super::super::budget_diagnostic::Failure>,
     pub generation_mismatches: u8,
     pub withdrawal: Option<Cause>,
 }
@@ -118,7 +119,12 @@ impl Failure {
             "worker_generation_changed":self.generation_mismatches&1!=0,
             "material_generation_changed":self.generation_mismatches&2!=0,
             "retirement_changed":self.generation_mismatches&4!=0,
-            "withdrawal_error":self.withdrawal.map(Cause::code)})
+            "withdrawal_error":self.withdrawal.map(Cause::code),
+            "budget_operation":self.budget.map(|value| value.operation.code()),
+            "budget_failure":self.budget.and_then(|value| value.reason()),
+            "budget_requested":self.budget.and_then(|value| value.requested),
+            "budget_used":self.budget.and_then(|value| value.usage()).map(|usage| usage.used),
+            "budget_maximum":self.budget.and_then(|value| value.usage()).map(|usage| usage.maximum)})
     }
 }
 #[cfg(test)]
@@ -131,6 +137,7 @@ mod tests {
             sequence: 1,
             stage: Stage::Complete,
             cause: Cause::classify(error),
+            budget: None,
             generation_mismatches: 0,
             withdrawal: None,
         }

@@ -1,4 +1,6 @@
 //! Descriptor-confined public artifacts and write-once public signature journals.
+#[cfg(any(test, feature = "eng2-runtime"))]
+use super::budget_diagnostic::{self, Error as BudgetError, Operation};
 use super::*;
 use rustix::fs::{AtFlags, Mode, OFlags, fsync, openat, renameat, unlinkat};
 #[cfg(any(test, feature = "eng2-runtime"))]
@@ -280,11 +282,14 @@ impl PublicExport {
     pub(super) fn retained_reader(
         &self,
         budget: &crate::p2p::Budget,
-    ) -> Result<RetainedReader, String> {
+    ) -> Result<RetainedReader, BudgetError> {
         self.check_root()?;
-        let memory = budget
-            .reserve(64 * 1024)
-            .map_err(|_| "checkpoint retained reader metadata budget unavailable")?;
+        let memory = budget_diagnostic::reserve(
+            budget,
+            64 * 1024,
+            Operation::ReaderMetadata,
+            "checkpoint retained reader metadata budget unavailable",
+        )?;
         let mut material =
             blake3::Hasher::new_derive_key("siworld eng2 checkpoint retained material v1");
         material.update(&self.network);
@@ -462,12 +467,12 @@ impl PublicExport {
     ) -> Result<SavedPublication, String> {
         self.read_publication_using(bytes, limits, |name, bound| self.read(name, bound))
     }
-    fn read_publication_using(
+    fn read_publication_using<E: From<String> + From<&'static str>>(
         &self,
         bytes: &[u8],
         limits: ImportLimits,
-        mut read: impl FnMut(&str, usize) -> Result<Vec<u8>, String>,
-    ) -> Result<SavedPublication, String> {
+        mut read: impl FnMut(&str, usize) -> Result<Vec<u8>, E>,
+    ) -> Result<SavedPublication, E> {
         let cursor: Value =
             serde_json::from_slice(bytes).map_err(|_| "checkpoint publication cursor malformed")?;
         const FIELDS: [&str; 14] = [
@@ -550,11 +555,11 @@ impl PublicExport {
     fn retained_votes(&self, statement: &Statement) -> Result<Vec<Vote>, String> {
         self.retained_votes_using(statement, |name, bound| self.read_optional(name, bound))
     }
-    fn retained_votes_using(
+    fn retained_votes_using<E: From<String> + From<&'static str>>(
         &self,
         statement: &Statement,
-        mut read: impl FnMut(&str, usize) -> Result<Option<Vec<u8>>, String>,
-    ) -> Result<Vec<Vote>, String> {
+        mut read: impl FnMut(&str, usize) -> Result<Option<Vec<u8>>, E>,
+    ) -> Result<Vec<Vote>, E> {
         let encoded = statement
             .encode()
             .map_err(|_| "checkpoint journal statement invalid")?;
@@ -1110,7 +1115,7 @@ impl RetainedReader {
         &self,
         name: &str,
         limit: usize,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, BudgetError> {
         self.export.check_root()?;
         let descriptor = match openat(
             &self.export.root,
@@ -1167,14 +1172,16 @@ impl RetainedReader {
             file.seek(SeekFrom::Start(0))
                 .map_err(|_| "checkpoint retained candidate rewind failed")?;
         }
-        let reservation = self
-            .budget
-            .reserve(charge)
-            .map_err(|_| "checkpoint retained artifact budget unavailable")?;
+        let reservation = budget_diagnostic::reserve(
+            &self.budget,
+            charge,
+            Operation::RetainedArtifact,
+            "checkpoint retained artifact budget unavailable",
+        )?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(length)
-            .map_err(|_| "checkpoint retained allocation failed")?;
+            .map_err(|_| BudgetError::allocation(length))?;
         bytes.resize(length, 0);
         file.read_exact(&mut bytes)
             .map_err(|_| "checkpoint retained artifact read failed")?;
@@ -1214,7 +1221,7 @@ impl RetainedReader {
         &self,
         bytes: &[u8],
         limits: ImportLimits,
-    ) -> Result<SavedPublication, String> {
+    ) -> Result<SavedPublication, BudgetError> {
         self.export
             .read_publication_using(bytes, limits, |name, bound| {
                 self.read_optional(name, bound)?
@@ -1222,7 +1229,7 @@ impl RetainedReader {
             })
     }
     #[cfg(feature = "eng2-runtime")]
-    pub(super) fn votes(&self, statement: &Statement) -> Result<Vec<Vote>, String> {
+    pub(super) fn votes(&self, statement: &Statement) -> Result<Vec<Vote>, BudgetError> {
         self.export
             .retained_votes_using(statement, |name, bound| self.read_optional(name, bound))
     }
@@ -1232,13 +1239,14 @@ impl RetainedReader {
         epoch: u64,
         height: u64,
         limits: ImportLimits,
-    ) -> Result<Option<(Statement, AuthorizationWitness, Vec<u8>)>, String> {
+    ) -> Result<Option<(Statement, AuthorizationWitness, Vec<u8>)>, BudgetError> {
         self.read_optional(&candidate_name(epoch, height), candidate_bound(limits)?)?
             .map(|bytes| decode_candidate_parts(&bytes, self.export.network, limits))
             .transpose()
+            .map_err(Into::into)
     }
     #[cfg(feature = "eng2-runtime")]
-    pub(super) fn withdrawn(&self, height: u64) -> Result<Option<Vec<u8>>, String> {
+    pub(super) fn withdrawn(&self, height: u64) -> Result<Option<Vec<u8>>, BudgetError> {
         self.read_optional(&publication_name(height), 8192)
     }
 }

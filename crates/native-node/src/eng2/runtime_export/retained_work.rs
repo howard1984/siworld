@@ -1,6 +1,7 @@
 //! Retained artifact authentication on the existing single archive worker.
 //! Captures and results carry no signing readiness or filesystem write access.
 use super::archive_work::{ArchiveWork, NativeArchiveIdentity, ValidatedArchive};
+use super::budget_diagnostic::Error as BudgetError;
 use super::retained::Restored;
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,7 +83,7 @@ impl RetainedWork {
         retired_through: Option<u64>,
         latest: Option<&CertifiedCheckpoint>,
         pending: Option<&PreparedCheckpoint>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BudgetError> {
         let mut live_latest = latest
             .map(|value| {
                 LiveArchive::capture(&value.prepared)
@@ -121,7 +122,7 @@ impl RetainedWork {
         &mut self,
         collected: &[Option<Vote>; 3],
         local: Option<&(Statement, Vote)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), BudgetError> {
         // Preserve the single known local durable source even across a pause
         // that removed live pending. A matching cold candidate must retain it.
         self.local_vote_provenance = local.cloned();
@@ -139,7 +140,7 @@ impl RetainedWork {
         self.collected_votes = (*collected).clone();
         Ok(())
     }
-    fn cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    fn cancelled(cancelled: &AtomicBool) -> Result<(), BudgetError> {
         if cancelled.load(Ordering::Acquire) {
             Err("checkpoint retained restoration cancelled".into())
         } else {
@@ -153,7 +154,7 @@ impl RetainedWork {
         certificate: Option<&Certificate>,
         reuse: Option<&LiveArchive>,
         cancelled: &AtomicBool,
-    ) -> Result<Restored<PreparedResult>, String> {
+    ) -> Result<Restored<PreparedResult>, BudgetError> {
         let SavedPreparedInput {
             statement,
             witness,
@@ -270,7 +271,7 @@ impl RetainedWork {
         saved: files::SavedPublication,
         reuse: Option<&LiveArchive>,
         cancelled: &AtomicBool,
-    ) -> Result<Restored<PublicationResult>, String> {
+    ) -> Result<Restored<PublicationResult>, BudgetError> {
         if saved.published >= 1u64 << 53 {
             return Err("checkpoint publication time invalid".into());
         }
@@ -316,7 +317,7 @@ impl RetainedWork {
         height: u64,
         required: Option<&LiveArchive>,
         cancelled: &AtomicBool,
-    ) -> Result<Restored<PreparedResult>, String> {
+    ) -> Result<Restored<PreparedResult>, BudgetError> {
         let mut candidate = match self.reader.candidate(epoch, height, self.limits)? {
             Some((statement, witness, snapshot)) => {
                 if statement.checkpoint_height != height || statement.roster_sequence != epoch {
@@ -375,7 +376,7 @@ impl RetainedWork {
         }
         Ok(candidate)
     }
-    pub(super) fn validate(self, cancelled: &AtomicBool) -> Result<ValidatedRetained, String> {
+    pub(super) fn validate(self, cancelled: &AtomicBool) -> Result<ValidatedRetained, BudgetError> {
         Self::cancelled(cancelled)?;
         let cursor = self.reader.read_optional("checkpoint-eng2.json", 8192)?;
         let latest = match &cursor {

@@ -1,4 +1,5 @@
 //! Resident restoration lifecycle on the existing owned archive worker.
+use super::super::budget_diagnostic::Error as BudgetError;
 use super::super::retained::Restored;
 use super::super::retained_work::{PreparedResult, RetainedWork, ValidatedRetained};
 use super::retained_diagnostic::{Cause, Failure, Stage};
@@ -68,6 +69,7 @@ impl Host {
                 sequence,
                 stage,
                 cause: Cause::classify(error),
+                budget: error.budget,
                 generation_mismatches,
                 withdrawal: None,
             });
@@ -81,7 +83,7 @@ impl Host {
                 return Err(error);
             }
         }
-        result
+        result.map_err(Into::into)
     }
     #[cfg(feature = "eng2-runtime")]
     fn reconcile_retained_step(
@@ -90,7 +92,7 @@ impl Host {
         headers: impl FnOnce() -> Result<Option<crate::eng2::branches::CheckpointHeaders>, String>,
         stage: &mut Stage,
         generation_mismatches: &mut u8,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, BudgetError> {
         self.retained_ready = false;
         let restoring = self
             .preparation

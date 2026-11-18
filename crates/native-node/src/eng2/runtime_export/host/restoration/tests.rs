@@ -453,3 +453,102 @@ fn actual_successful_worker_with_wrong_generation_stays_hard_and_records_install
     assert!(host.tick(&store, 1, &[]).is_err());
     host.stop_preparation().unwrap();
 }
+
+fn assert_budget_pressure(
+    free: usize,
+    operation: &str,
+    requested: usize,
+    stage: &str,
+    artifact: bool,
+    code: &str,
+) {
+    use std::{fs, io::Write, os::unix::fs::OpenOptionsExt};
+    const MAXIMUM: usize = 1024 * 1024 * 1024;
+    let directory = Directory::new();
+    let store = directory.store();
+    let root = directory.private("budget-pressure");
+    let budget = crate::p2p::Budget::new(MAXIMUM);
+    let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
+    if artifact {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("checkpoint-eng2.json"))
+            .unwrap()
+            .write_all(&[b'x'; 32])
+            .unwrap();
+    }
+    let external = budget.reserve(MAXIMUM - free).unwrap();
+    let before_generation = host.preparation.as_ref().unwrap().generation;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let error = loop {
+        if let Err(error) = host.reconcile_retained_async(&store, || Ok(None)) {
+            break error;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let diagnostic = host.retained_failure_diagnostic().unwrap();
+    assert_eq!(diagnostic["stage"], stage);
+    assert_eq!(diagnostic["code"], code);
+    assert!(!host.retained_ready);
+    assert!(host.latest_checkpoint().is_none());
+    assert!(host.preparation.as_ref().unwrap().generation > before_generation);
+    assert!(!error.contains("budget_requested"));
+    assert_eq!(budget.available().unwrap(), free);
+    // A concurrent account can change after the failing admission. The
+    // diagnostic must retain the counters observed at that admission.
+    drop(external);
+    let context = 1024 * 1024 + std::mem::size_of::<crate::eng2::store::CheckpointRestoreRead>();
+    let used = match operation {
+        "restore_context" => MAXIMUM - free,
+        "retained_reader_metadata" => MAXIMUM - free + context,
+        "retained_artifact" => MAXIMUM - free + context + 64 * 1024,
+        _ => unreachable!(),
+    };
+    assert_eq!(diagnostic["budget_operation"], operation);
+    assert_eq!(diagnostic["budget_failure"], "exhausted");
+    assert_eq!(diagnostic["budget_requested"], requested);
+    assert_eq!(diagnostic["budget_used"], used);
+    assert_eq!(diagnostic["budget_maximum"], MAXIMUM);
+    host.stop_preparation().unwrap();
+    assert_eq!(budget.available().unwrap(), MAXIMUM);
+}
+
+#[test]
+fn retained_budget_diagnostic_distinguishes_restore_context_pressure() {
+    let requested = 1024 * 1024 + std::mem::size_of::<crate::eng2::store::CheckpointRestoreRead>();
+    assert_budget_pressure(
+        1,
+        "restore_context",
+        requested,
+        "material_capture",
+        false,
+        "unknown",
+    );
+}
+#[test]
+fn retained_budget_diagnostic_distinguishes_reader_metadata_pressure() {
+    let context = 1024 * 1024 + std::mem::size_of::<crate::eng2::store::CheckpointRestoreRead>();
+    assert_budget_pressure(
+        context + 64 * 1024 - 1,
+        "retained_reader_metadata",
+        64 * 1024,
+        "material_capture",
+        false,
+        "budget_unavailable",
+    );
+}
+#[test]
+fn retained_budget_diagnostic_distinguishes_artifact_pressure_on_worker() {
+    let context = 1024 * 1024 + std::mem::size_of::<crate::eng2::store::CheckpointRestoreRead>();
+    assert_budget_pressure(
+        context + 64 * 1024 + 63,
+        "retained_artifact",
+        64,
+        "worker_completion",
+        true,
+        "budget_unavailable",
+    );
+}

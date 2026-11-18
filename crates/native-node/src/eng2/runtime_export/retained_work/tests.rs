@@ -141,3 +141,67 @@ fn pinned_reader_types_move_without_transferring_a_store_or_signer() {
     requires_send::<RetainedWork>();
     requires_send::<ValidatedRetained>();
 }
+
+#[cfg(feature = "eng2-rehearsal")]
+#[test]
+#[ignore = "requires an existing owner-local public native Store fixture"]
+fn retained_budget_diagnostic_existing_live_identity_requires_duplicate_workspace() {
+    use super::super::budget_diagnostic::Operation;
+    let source = std::path::PathBuf::from(std::env::var_os("SIWORLD_ENG2_NATIVE_FIXTURE").unwrap());
+    assert!(source.is_absolute());
+    const MAXIMUM: usize = 1024 * 1024 * 1024;
+    let budget = crate::p2p::Budget::new(MAXIMUM);
+    let limits = crate::eng2::snapshot::ImportLimits {
+        chain: crate::eng2::state_components::Limits {
+            max_leaves: 1_000_000,
+            max_nullifiers: 1_000_000,
+            max_component_bytes: 64 * 1024 * 1024,
+        },
+        max_snapshot_bytes: 512 * 1024 * 1024,
+    };
+    let (read, height, archive_bytes) =
+        crate::eng2::store::CheckpointRestoreRead::existing_public_fixture_for_test(
+            &source, limits, &budget,
+        );
+    let validated = ArchiveWork::from_restore_read(&read, height, limits, &budget)
+        .unwrap()
+        .validate(&AtomicBool::new(false))
+        .unwrap();
+    let native = validated.identity();
+    let (snapshot, live_guard) = validated
+        .into_snapshot(std::mem::size_of::<CertifiedCheckpoint>())
+        .unwrap();
+    let charge = archive_bytes * 16 + 8 * 1024 * 1024;
+    let available = budget.available().unwrap();
+    assert!(available > charge);
+    let pressure = budget.reserve(available - charge + 1).unwrap();
+    let used = MAXIMUM - budget.available().unwrap();
+    // This is the unchanged eager read invoked before NativeArchiveIdentity::matches.
+    // The original fully validated snapshot and its guard are still alive.
+    let failure = ArchiveWork::from_restore_read(&read, height, limits, &budget)
+        .err()
+        .unwrap();
+    assert_eq!(failure, "checkpoint archive preparation budget unavailable");
+    let observed = failure.budget.unwrap();
+    assert_eq!(observed.operation, Operation::ArchivePreparation);
+    assert_eq!(observed.requested, Some(charge));
+    assert_eq!(
+        observed.usage().unwrap(),
+        crate::p2p::ByteUsage {
+            maximum: MAXIMUM,
+            used
+        }
+    );
+    drop(pressure);
+    let duplicate = ArchiveWork::from_restore_read(&read, height, limits, &budget).unwrap();
+    assert!(native.matches(&duplicate, &snapshot).unwrap());
+    let mut changed = snapshot.clone();
+    changed[10] ^= 1;
+    assert!(!native.matches(&duplicate, &changed).unwrap());
+    drop((duplicate, changed, native, snapshot, live_guard, read));
+    assert_eq!(budget.available().unwrap(), MAXIMUM);
+    println!(
+        "{}",
+        serde_json::json!({"result":"LOCAL_REAL_ARCHIVE_LIVE_IDENTITY_DUPLICATE_WORKSPACE_REPRODUCED","checkpoint_height":height,"base_archive_bytes":archive_bytes,"suffix_body_bytes":0,"requested":charge,"used":used,"maximum":MAXIMUM,"native_validation_performed":true,"same_identity_matches_after_pressure_released":true,"changed_snapshot_rejected":true,"production_cause_established":false,"proof_generation":false,"database_writes":0})
+    );
+}

@@ -2,6 +2,7 @@
 //!
 //! A validated archive is not a signing or publication capability. Resident
 //! integration must separately acquire its existing readiness and owner guards.
+use super::budget_diagnostic::{self, Error as BudgetError, Operation};
 use super::{Header, ImportLimits, SnapshotState, Store};
 use crate::eng2::genesis::Genesis;
 use crate::{
@@ -143,7 +144,7 @@ impl ArchiveWork {
         height: u64,
         limits: ImportLimits,
         budget: &Budget,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, BudgetError> {
         let anchor = read.header(height)?;
         let captured = read.archive(height, limits, budget)?;
         Ok(Self {
@@ -215,7 +216,7 @@ impl ArchiveWork {
         bytes: usize,
         suffix_bytes: usize,
         budget: &Budget,
-    ) -> Result<Reservation, String> {
+    ) -> Result<Reservation, BudgetError> {
         let charge = Self::charge(bytes)?
             .checked_add(
                 suffix_bytes
@@ -223,9 +224,12 @@ impl ArchiveWork {
                     .ok_or("checkpoint suffix workspace bound overflow")?,
             )
             .ok_or("checkpoint preparation workspace bound overflow")?;
-        budget
-            .reserve(charge)
-            .map_err(|_| "checkpoint archive preparation budget unavailable".into())
+        budget_diagnostic::reserve(
+            budget,
+            charge,
+            Operation::ArchivePreparation,
+            "checkpoint archive preparation budget unavailable",
+        )
     }
     pub(super) fn validate(mut self, cancelled: &AtomicBool) -> Result<ValidatedArchive, String> {
         if cancelled.load(Ordering::Acquire) {
@@ -392,7 +396,7 @@ enum WorkerResult {
 #[derive(Default)]
 pub struct ArchiveWorker {
     cancelled: Arc<AtomicBool>,
-    worker: Option<JoinHandle<Result<WorkerResult, String>>>,
+    worker: Option<JoinHandle<Result<WorkerResult, BudgetError>>>,
     completed: Option<WorkerResult>,
 }
 impl ArchiveWorker {
@@ -419,11 +423,12 @@ impl ArchiveWorker {
             before(cancelled);
             work.validate(cancelled)
                 .map(|value| WorkerResult::Archive(Box::new(value)))
+                .map_err(Into::into)
         })
     }
     fn spawn(
         &mut self,
-        job: impl FnOnce(&AtomicBool) -> Result<WorkerResult, String> + Send + 'static,
+        job: impl FnOnce(&AtomicBool) -> Result<WorkerResult, BudgetError> + Send + 'static,
     ) -> Result<(), String> {
         if self.is_busy() {
             return Err("checkpoint worker already owns a task or result".into());
@@ -460,7 +465,7 @@ impl ArchiveWorker {
                 .map(|value| WorkerResult::Retained(Box::new(value)))
         })
     }
-    fn poll(&mut self) -> Result<(), String> {
+    fn poll(&mut self) -> Result<(), BudgetError> {
         if self.completed.is_some() || !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
             return Ok(());
         }
@@ -474,6 +479,11 @@ impl ArchiveWorker {
         Ok(())
     }
     pub fn try_complete(&mut self) -> Result<Option<ValidatedArchive>, String> {
+        self.try_complete_observed().map_err(Into::into)
+    }
+    pub(super) fn try_complete_observed(
+        &mut self,
+    ) -> Result<Option<ValidatedArchive>, BudgetError> {
         self.poll()?;
         match self.completed.take() {
             Some(WorkerResult::Archive(value)) => Ok(Some(*value)),
@@ -488,7 +498,7 @@ impl ArchiveWorker {
     #[cfg(all(unix, feature = "eng2-runtime"))]
     pub(super) fn try_complete_retained(
         &mut self,
-    ) -> Result<Option<super::retained_work::ValidatedRetained>, String> {
+    ) -> Result<Option<super::retained_work::ValidatedRetained>, BudgetError> {
         self.poll()?;
         match self.completed.take() {
             Some(WorkerResult::Retained(value)) => Ok(Some(*value)),

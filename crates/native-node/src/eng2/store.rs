@@ -4,6 +4,11 @@
 //! that history; ordinary recovery requires the same atomic accepted-state seal
 //! and existing local identity, without treating imported state as accepted.
 
+#[cfg(feature = "eng2-runtime")]
+use super::runtime_export::budget_diagnostic;
+use super::runtime_export::budget_diagnostic::Error as BudgetError;
+#[cfg(any(test, feature = "eng2-runtime"))]
+use super::runtime_export::budget_diagnostic::Operation;
 use super::{
     body::Body,
     execution::{CommittedBlock, Engine},
@@ -148,6 +153,65 @@ pub(crate) struct CheckpointRestoreRead {
 }
 #[cfg(feature = "eng2-runtime")]
 impl CheckpointRestoreRead {
+    #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
+    pub(crate) fn existing_public_fixture_for_test(
+        source: &Path,
+        limits: super::snapshot::ImportLimits,
+        budget: &crate::p2p::Budget,
+    ) -> (Self, u64, usize) {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+        let genesis = std::fs::read(source.join("genesis.bin")).unwrap();
+        let engine = Engine::new(Genesis::decode(&genesis).unwrap(), limits.chain).unwrap();
+        let database = redb::ReadOnlyDatabase::open(source.join("chain.redb")).unwrap();
+        let transaction = database.begin_read().unwrap();
+        let head = {
+            let table = transaction.open_table(META).unwrap();
+            let row = table.get("head").unwrap().unwrap();
+            u64::from_le_bytes(row.value()[..8].try_into().unwrap())
+        };
+        let target = super::runtime_export::eligible_checkpoint(head).unwrap();
+        let archive_bytes = {
+            let table = transaction.open_table(ANCHORS).unwrap();
+            table.get(target).unwrap().unwrap().value().len()
+        };
+        let archive = CheckpointArchiveRead {
+            transaction,
+            network: engine.state().network(),
+            head,
+            imported_prefix: 0,
+            policy: engine.body_policy(),
+        };
+        let authorization = archive.compact(head).unwrap().0;
+        let revision = CheckpointRevision {
+            instance: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            revision: 0,
+            height: head,
+            tip: authorization.id().unwrap(),
+        };
+        let memory = budget
+            .reserve(1024 * 1024 + std::mem::size_of::<Self>())
+            .unwrap();
+        (
+            Self {
+                archive,
+                genesis,
+                genesis_id: engine.genesis().id(),
+                rules: engine.genesis().rules_commitment(),
+                authorization: Some(authorization),
+                roster: engine
+                    .state()
+                    .governance()
+                    .active_roster()
+                    .digest(engine.state().network()),
+                epoch: engine.state().governance().active_roster().epoch_sequence,
+                revision,
+                _context_memory: memory,
+            },
+            target,
+            archive_bytes,
+        )
+    }
+
     pub(crate) fn network(&self) -> Hash {
         self.archive.network
     }
@@ -183,7 +247,7 @@ impl CheckpointRestoreRead {
         height: u64,
         limits: super::snapshot::ImportLimits,
         budget: &crate::p2p::Budget,
-    ) -> Result<CapturedArchiveBytes, String> {
+    ) -> Result<CapturedArchiveBytes, BudgetError> {
         self.archive.read(height, limits, budget)
     }
 }
@@ -219,7 +283,7 @@ impl CheckpointArchiveRead {
         height: u64,
         limits: super::snapshot::ImportLimits,
         budget: &crate::p2p::Budget,
-    ) -> Result<CapturedArchiveBytes, String> {
+    ) -> Result<CapturedArchiveBytes, BudgetError> {
         let table = self
             .transaction
             .open_table(ANCHORS)
@@ -911,11 +975,14 @@ impl Store {
     pub(crate) fn capture_checkpoint_restore(
         &self,
         budget: &crate::p2p::Budget,
-    ) -> Result<CheckpointRestoreRead, String> {
+    ) -> Result<CheckpointRestoreRead, BudgetError> {
         self.ensure_exportable()?;
-        let memory = budget
-            .reserve(1024 * 1024 + std::mem::size_of::<CheckpointRestoreRead>())
-            .map_err(|_| "checkpoint restore context budget unavailable")?;
+        let memory = budget_diagnostic::reserve(
+            budget,
+            1024 * 1024 + std::mem::size_of::<CheckpointRestoreRead>(),
+            Operation::RestoreContext,
+            "checkpoint restore context budget unavailable",
+        )?;
         let genesis = self.engine.genesis().encode()?;
         if genesis.len() > 1024 * 1024 {
             return Err("checkpoint restore genesis exceeds byte bound".into());
@@ -1823,6 +1890,77 @@ mod tests {
     }
     fn fs_remove_fixture(directory: std::path::PathBuf) {
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an existing owner-local public native Store fixture"]
+    fn retained_budget_diagnostic_existing_store_workspace_pressure() {
+        assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+        let source =
+            std::path::PathBuf::from(std::env::var_os("SIWORLD_ENG2_NATIVE_FIXTURE").unwrap());
+        assert!(source.is_absolute());
+        let genesis = Genesis::decode(&std::fs::read(source.join("genesis.bin")).unwrap()).unwrap();
+        let limits = super::super::snapshot::ImportLimits {
+            chain: Limits {
+                max_leaves: 1_000_000,
+                max_nullifiers: 1_000_000,
+                max_component_bytes: 64 * 1024 * 1024,
+            },
+            max_snapshot_bytes: 512 * 1024 * 1024,
+        };
+        let engine = Engine::new(genesis, limits.chain).unwrap();
+        let database = redb::ReadOnlyDatabase::open(source.join("chain.redb")).unwrap();
+        let transaction = database.begin_read().unwrap();
+        let head = {
+            let meta = transaction.open_table(META).unwrap();
+            let row = meta.get("head").unwrap().unwrap();
+            u64::from_le_bytes(row.value()[..8].try_into().unwrap())
+        };
+        let target = crate::eng2::runtime_export::eligible_checkpoint(head).unwrap_or(head);
+        let read = CheckpointArchiveRead {
+            transaction,
+            network: engine.state().network(),
+            head,
+            imported_prefix: 0,
+            policy: engine.body_policy(),
+        };
+        let (base_height, archive_bytes) = {
+            let table = read.transaction.open_table(ANCHORS).unwrap();
+            let lower = target
+                .saturating_sub(crate::eng2::runtime_export::LEGACY_CHECKPOINT_INTERVAL - 1)
+                .max(1);
+            let mut rows = table.range(lower..=target).unwrap();
+            let (height, bytes) = rows.next_back().unwrap().unwrap();
+            (height.value(), bytes.value().len())
+        };
+        let lengths = (base_height + 1..=target)
+            .map(|height| (height, read.compact(height).unwrap().1))
+            .collect::<Vec<_>>();
+        let suffix_bytes = lengths.iter().map(|(_, bytes)| *bytes).sum::<usize>();
+        let requested = archive_bytes * 16 + 8 * 1024 * 1024 + suffix_bytes * 4;
+        const MAXIMUM: usize = 1024 * 1024 * 1024;
+        let budget = crate::p2p::Budget::new(MAXIMUM);
+        let free = requested.saturating_sub(1).min(MAXIMUM);
+        let held = budget.reserve(MAXIMUM - free).unwrap();
+        let error = read.read(target, limits, &budget).err().unwrap();
+        assert_eq!(error, "checkpoint archive preparation budget unavailable");
+        let diagnostic = error.budget.unwrap();
+        assert_eq!(diagnostic.operation, Operation::ArchivePreparation);
+        assert_eq!(diagnostic.requested, Some(requested));
+        assert_eq!(
+            diagnostic.usage(),
+            Some(crate::p2p::ByteUsage {
+                maximum: MAXIMUM,
+                used: MAXIMUM - free
+            })
+        );
+        assert_eq!(budget.available().unwrap(), free);
+        drop(held);
+        assert_eq!(budget.available().unwrap(), MAXIMUM);
+        println!(
+            "{}",
+            serde_json::json!({"result":"LOCAL_EXISTING_STORE_BUDGET_PRESSURE_REPRODUCED","head":head,"target":target,"base_height":base_height,"base_archive_bytes":archive_bytes,"suffix_body_lengths":lengths,"suffix_body_bytes":suffix_bytes,"requested":requested,"used":MAXIMUM-free,"maximum":MAXIMUM,"proof_generation":false,"body_reads":0,"database_writes":0,"production_cause_established":false})
+        );
     }
     #[test]
     #[ignore = "requires a disposable copy of at least 24 accepted native blocks"]
