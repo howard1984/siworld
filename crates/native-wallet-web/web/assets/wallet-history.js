@@ -1,5 +1,6 @@
 const sip = '0'.repeat(64);
-const phases = {prepared: 'Proof incomplete', finalized: 'Ready to send', pending: 'Pending', unknown: 'Status uncertain', confirmed: 'Confirmed'};
+const count=value=>Number.isSafeInteger(value)&&value>=0?value:null;
+const phases = {prepared: 'Proof incomplete', finalized: 'Ready to send', pending: 'Pending', unknown: 'Status uncertain', confirmed: 'Confirmed', reserved: 'Proof incomplete', uncertain: 'Status uncertain', accepted: 'Pending', included: 'Included in authenticated receipt', cancelled: 'Cancelled'};
 export function transactionRows(result) {
   const grouped = new Map();
   for (const note of result.received_records || []) {
@@ -8,9 +9,11 @@ export function transactionRows(result) {
     if (!row) {
       row = {id, direction: 'received', title: note.kind === 'mining' ? 'Mining reward' : note.kind === 'allocation' ? 'Allocation received' : 'Payment received',
         asset: note.asset, amount_atoms: '0', height: note.height, timestamp: note.timestamp,
-        status: 'Confirmed', notes: [], block_id: note.block_id};
+        status: 'Confirmed', confirmations:count(note.confirmations), notes: [], block_id: note.block_id};
       grouped.set(id, row);
     }
+    const confirmations=count(note.confirmations);
+    if(confirmations!==null)row.confirmations=row.confirmations===null?confirmations:Math.min(row.confirmations,confirmations);
     row.amount_atoms = (BigInt(row.amount_atoms) + BigInt(note.amount_atoms)).toString();
     row.notes.push(note);
     if (!note.spent && note.unlock_height > result.height) {
@@ -18,11 +21,13 @@ export function transactionRows(result) {
       else if (row.status !== 'Locked') row.status = 'Awaiting maturity';
     }
   }
-  const rows = [...grouped.values()];
+  const rows = [...grouped.values()].map(row=>({...row,status:row.confirmations!==null&&row.confirmations<24
+    ? 'Pending confirmation'+(row.status==='Confirmed'?'':` · ${row.status}`):row.status}));
   for (const payment of result.payments || []) rows.push({
     ...payment, id: `payment:${payment.id}`, direction: 'sent', title: 'Payment sent', asset: sip,
     timestamp: payment.confirmed_timestamp ?? payment.created_at ?? null,
-    height: payment.confirmed_height ?? null, status: phases[payment.phase] || 'Status unavailable', notes: [],
+    height: payment.confirmed_height ?? null, confirmations:count(payment.confirmations),
+    status:payment.phase==='included'&&count(payment.confirmations)!==null&&payment.confirmations<24?'Pending confirmation':phases[payment.phase] || 'Status unavailable', notes: [],
   });
   return rows.sort((a, b) => (b.height === null) - (a.height === null) || (b.height ?? 0) - (a.height ?? 0) || (b.timestamp ?? 0) - (a.timestamp ?? 0) || a.id.localeCompare(b.id));
 }
@@ -54,10 +59,11 @@ export class WalletHistory {
     for (const row of rows.slice(this.page * 20, (this.page + 1) * 20)) {
       const detail = document.createElement('details'); detail.className = 'transaction-entry';
       const summary = document.createElement('summary');
-      for (const [text, css] of [[row.title, 'transaction-title'], [(row.direction === 'sent' ? '−' : '+') + formatted(row.amount_atoms, row.asset), 'transaction-amount'], [row.status, 'transaction-status'], [date(row.timestamp), 'transaction-date']]) {
+      for (const [text, css] of [[row.title, 'transaction-title'], [(row.direction === 'sent' ? '−' : '+') + formatted(row.amount_atoms, row.asset), 'transaction-amount'], [row.confirmations===null?row.status:`${row.status} · ${row.confirmations} confirmation${row.confirmations===1?'':'s'}`, 'transaction-status'], [date(row.timestamp), 'transaction-date']]) {
         const span = document.createElement('span'); span.className = css; span.textContent = text; summary.append(span);
       }
       const fields = [row.height === null ? 'Not included in an accepted block' : `Block ${row.height}`];
+      if (row.confirmations!==null) fields.push(`Confirmations: ${row.confirmations}`);
       if (row.recipient) fields.push(`Recipient: ${row.recipient}`);
       if (row.fee_atoms !== undefined) fields.push(`Fee: ${formatted(row.fee_atoms, sip)}`);
       if (row.statement_id) fields.push(`Statement: ${row.statement_id}`);

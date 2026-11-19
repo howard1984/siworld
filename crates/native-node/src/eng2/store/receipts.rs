@@ -195,6 +195,7 @@ impl Store {
         transaction
             .set_durability(Durability::Immediate)
             .map_err(|_| "permanent receipt durability unavailable")?;
+        transaction.set_quick_repair(true);
         checked.write(&transaction)?;
         transaction
             .commit()

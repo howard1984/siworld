@@ -316,13 +316,7 @@ fn staged_shorter_fork_wins_only_with_greater_verified_work() {
         let mut block = candidate(target.state(), 1 + index * 100_000);
         block.timestamp = target.state().timestamp() + 14_400;
         block.nonce = 0;
-        let seed = block.pow_seed().unwrap();
-        while !siworld_core::pow::meets_target(
-            &siworld_core::pow::pow_hash(&seed, block.nonce, target.state().config.pow_iterations),
-            &block.target,
-        ) {
-            block.nonce += 1;
-        }
+        crate::fixtures::find_test_nonce(&mut block, target.state().config.pow_iterations, true);
         target.append(&block, &TestVerifier).unwrap();
     }
     let mut source = Store::open(source_dir.db(), config, &TestVerifier).unwrap();

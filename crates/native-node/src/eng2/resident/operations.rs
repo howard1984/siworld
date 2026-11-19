@@ -3,7 +3,7 @@ use super::*;
 use crate::{
     eng2::execution::CommittedBlock, eng2_operations::PendingOperations, issuance::IssuanceRecord,
 };
-mod io;
+pub(super) mod io;
 #[cfg(test)]
 mod tests;
 

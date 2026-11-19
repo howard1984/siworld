@@ -47,3 +47,6 @@ pub mod ranges;
 mod wallet_eng2_header;
 
 pub mod paths;
+
+/// Complete immutable engineering receipt scans with explicit trust boundaries.
+pub mod receipt_scan;

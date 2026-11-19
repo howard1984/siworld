@@ -17,6 +17,8 @@ use zeroize::Zeroizing;
 
 mod journal;
 mod opening;
+#[cfg(all(unix, feature = "eng2-rehearsal"))]
+pub mod rehearsal;
 mod storage;
 pub use journal::{PaymentPacket, PaymentStatus, ReservedPayment};
 pub use opening::StoredPaymentOpening;

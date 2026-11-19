@@ -244,14 +244,8 @@ fn payment_fixture(
     (config, block, sidecar)
 }
 fn remine(block: &mut crate::wire::Block, config: &crate::state::Config) {
-    let seed = block.pow_seed().unwrap();
     block.nonce = 0;
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, block.nonce, config.pow_iterations),
-        &block.target,
-    ) {
-        block.nonce += 1;
-    }
+    crate::fixtures::find_test_nonce(block, config.pow_iterations, true);
 }
 
 #[test]

@@ -30,6 +30,28 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const INITIAL_NOTES: usize = 3;
 pub const CIPHERTEXT_BYTES: usize = 1313;
 pub const MAX_PROOF_BYTES: usize = 524_288;
+
+/// Opaque evidence produced only by the actual issuance verifier rejection.
+#[derive(Debug)]
+pub(crate) struct NativeIssuanceRejection {
+    _private: (),
+}
+
+#[derive(Debug)]
+pub(crate) enum IssuanceVerificationFailure {
+    Preparation(String),
+    Rejected(NativeIssuanceRejection),
+}
+
+impl IssuanceVerificationFailure {
+    fn into_original(self) -> String {
+        match self {
+            Self::Preparation(original) => original,
+            Self::Rejected(_) => "native issuance proof verification failed".into(),
+        }
+    }
+}
+
 pub const TESTNET_ISSUANCE_FEE_ATOMS: u64 = 5_000_000_000;
 /// Implementation codec bounds. Activated limits must be explicit in Config.
 pub const METADATA_CODEC_LIMIT: usize = 256;
@@ -261,6 +283,7 @@ impl IssuanceRecord {
             + self.signed.declaration.metadata.name.len()
             + self.proof.len())
     }
+    #[cfg(siworld_native_node)]
     pub(crate) fn owned_bytes(&self) -> Option<usize> {
         self.proof
             .capacity()
@@ -454,6 +477,7 @@ impl AssetRegistry {
         self.fees.insert(record.fee_commitment);
         Ok(())
     }
+    #[cfg(siworld_native_node)]
     pub(crate) fn logical_memory_bytes(&self) -> Option<usize> {
         // Logical conservative charge for sparse BTree nodes. This includes
         // doubled payload plus room for a full root node in every collection;
@@ -652,11 +676,21 @@ impl IssuanceVerifier {
         })
     }
     pub fn verify(&self, record: &IssuanceRecord) -> Result<(), String> {
-        record.validate_shape()?;
+        self.verify_typed(record)
+            .map_err(IssuanceVerificationFailure::into_original)
+    }
+
+    pub(crate) fn verify_typed(
+        &self,
+        record: &IssuanceRecord,
+    ) -> Result<(), IssuanceVerificationFailure> {
+        record
+            .validate_shape()
+            .map_err(IssuanceVerificationFailure::Preparation)?;
         let proof = self
             .shape
             .decode(&record.proof)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| IssuanceVerificationFailure::Preparation(e.to_string()))?;
         verify_with_preprocessed(
             &self.cfg,
             &self.air,
@@ -664,8 +698,11 @@ impl IssuanceVerifier {
             &record.signed.declaration.public_inputs(),
             Some(&self.vk),
         )
-        .map_err(|_| "native issuance proof verification failed".into())
+        .map_err(|_| {
+            IssuanceVerificationFailure::Rejected(NativeIssuanceRejection { _private: () })
+        })
     }
 }
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
+#[path = "issuance/tests.rs"]
 mod tests;

@@ -35,5 +35,39 @@ class ToolchainSetupTests(unittest.TestCase):
                              os.environ['HOME'] + '/.local/siworld-wasm-bindgen/bin')
 
 
+class OfflineIsolationTests(unittest.TestCase):
+    def test_hosted_identity_survives_the_clean_environment(self):
+        # Replace only host-isolation commands; execute the actual shell wrapper
+        # without privileges, network changes, project code or fixture writes.
+        programs = {
+            'uname': 'printf "Linux\\n"',
+            'id': 'printf "1000\\n"',
+            'sudo': 'shift; exec "$@"',
+            'unshare': 'shift; shift; exec "$@"',
+            'setpriv': 'while [ "$1" != -- ]; do shift; done; shift; exec "$@"',
+            'ip': 'if [ "$1" = -o ]; then printf "1: lo\\n"; fi',
+            'python3': 'printf "%s" "$GITHUB_ACTIONS"',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            for name, body in programs.items():
+                command = temporary / name
+                command.write_text('#!/bin/sh\nset -eu\n' + body + '\n')
+                command.chmod(0o700)
+            for flag in ('true', 'false', None):
+                with self.subTest(flag=flag):
+                    env = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
+                               GITHUB_WORKSPACE=str(ROOT), CARGO_TARGET_DIR=str(temporary / 'unused-target'))
+                    env.pop('GITHUB_ACTIONS', None)
+                    if flag is not None:
+                        env['GITHUB_ACTIONS'] = flag
+                    output = subprocess.run(
+                        ['bash', str(ROOT / 'scripts/ci-offline.sh'), str(temporary / 'unused')],
+                        env=env, check=False, capture_output=True, text=True, timeout=5,
+                    )
+                    self.assertEqual(output.returncode, 0, output.stderr)
+                    self.assertEqual(output.stdout, flag or '')
+
+
 if __name__ == '__main__':
     unittest.main()

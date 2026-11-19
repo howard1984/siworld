@@ -272,6 +272,40 @@ impl SignedPreparedIssuance {
         fee: &IssuanceFeeReceipt,
         config: &Config,
     ) -> Result<WalletIssuance, String> {
+        self.prove_with(
+            fee,
+            config,
+            |witness| {
+                let (proof, _) = prover
+                    .prove(witness)
+                    .map_err(|_| "native issuance proving failed")?;
+                postcard::to_allocvec(&proof).map_err(|_| "issuance proof encoding failed".into())
+            },
+            |record| IssuanceVerifier::new()?.verify(record),
+        )
+    }
+    /// Generate and independently verify V2 under the authenticated genesis domain.
+    pub fn prove_for_genesis(
+        self,
+        prover: &crate::proofs::NativeProver,
+        fee: &IssuanceFeeReceipt,
+        genesis: &crate::proofs::NativeProofGenesis,
+    ) -> Result<WalletIssuance, String> {
+        let verifier = crate::proofs::NativeVerifier::for_genesis(genesis)?;
+        self.prove_with(
+            fee,
+            genesis.config(),
+            |witness| prover.issuance(witness),
+            |record| verifier.verify_issuance(record),
+        )
+    }
+    fn prove_with(
+        self,
+        fee: &IssuanceFeeReceipt,
+        config: &Config,
+        generate: impl FnOnce(&IssuanceWitness) -> Result<Vec<u8>, String>,
+        verify: impl FnOnce(&IssuanceRecord) -> Result<(), String>,
+    ) -> Result<WalletIssuance, String> {
         if self.signed.declaration != self.witness.0.declaration
             || fee.declaration != self.signed.declaration.binding()
         {
@@ -298,18 +332,16 @@ impl SignedPreparedIssuance {
                 return Err("issuance opening note mismatch".into());
             }
         }
-        let (proof, _) = prover
-            .prove(&self.witness.0)
-            .map_err(|e| format!("native issuance proof: {e:?}"))?;
+        let proof = generate(&self.witness.0)?;
         let record = IssuanceRecord {
             signed: self.signed,
             ciphertexts: self.witness.0.ciphertexts.clone(),
-            proof: postcard::to_allocvec(&proof).map_err(|_| "issuance proof encoding failed")?,
+            proof,
             fee_commitment: fee.commitment,
             fee_rho: fee.rho,
         };
         record.validate(config)?;
-        IssuanceVerifier::new()?.verify(&record)?;
+        verify(&record)?;
         Ok(WalletIssuance {
             record,
             openings: self.openings,

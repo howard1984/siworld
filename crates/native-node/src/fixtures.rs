@@ -75,12 +75,31 @@ pub(crate) fn candidate(state: &State, seed: u32) -> Block {
         issuances: Vec::new(),
         settlement_proof: vec![1],
     };
-    let seed = block.pow_seed().unwrap();
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, block.nonce, state.config.pow_iterations),
-        &block.target,
-    ) {
-        block.nonce += 1;
-    }
+    find_test_nonce(&mut block, state.config.pow_iterations, true);
     block
+}
+
+/// Search only negligible-difficulty fixture work within two independent limits.
+pub(crate) fn find_test_nonce(block: &mut Block, iterations: u64, valid: bool) {
+    assert!(
+        iterations <= 1_000,
+        "fixture PoW iterations exceed the test-only limit"
+    );
+    let seed = block.pow_seed().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    for _ in 0..65_536 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture PoW deadline exceeded"
+        );
+        let accepted = siworld_core::pow::meets_target(
+            &siworld_core::pow::pow_hash(&seed, block.nonce, iterations),
+            &block.target,
+        );
+        if accepted == valid {
+            return;
+        }
+        block.nonce = block.nonce.checked_add(1).expect("fixture nonce exhausted");
+    }
+    panic!("fixture PoW nonce limit exceeded");
 }

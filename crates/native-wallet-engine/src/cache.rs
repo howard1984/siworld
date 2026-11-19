@@ -72,9 +72,9 @@ impl LightWallet {
             .state
             .snapshots
             .iter_mut()
-            .zip(roots.chunks_exact(48))
+            .zip(roots.as_chunks::<48>().0.iter())
         {
-            row.recent_root = bytes.try_into().unwrap();
+            row.recent_root = *bytes;
             let _ = decode_digest(&row.recent_root).map_err(|_| "Invalid cached recent root.")?;
         }
         result.state.assets =

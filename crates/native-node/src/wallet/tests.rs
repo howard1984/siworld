@@ -61,6 +61,38 @@ fn encrypted_record(
         opening,
     )
 }
+
+#[cfg(all(unix, feature = "eng2-runtime"))]
+#[test]
+fn preinclusion_payment_identity_uses_original_opening_without_mutating_receipts() {
+    let network = [4; 32];
+    let state = State::new(Config::development(network, 0).unwrap()).unwrap();
+    let recipient = wallet(network, 5);
+    let (record, notes, opening) = encrypted_record(&state, &recipient, SIP_ASSET_ID, 123_456, 500);
+    let public = PublicTransaction::decode(&record.body).unwrap();
+    let expected =
+        encode_digest(&Hasher::new().nullifier(&recipient.keys.spend_key(), &notes[0].rho));
+    assert_eq!(
+        recipient
+            .planned_payment_nullifier(&public, &opening)
+            .unwrap(),
+        expected
+    );
+    assert!(recipient.receipts().is_empty());
+    assert!(recipient.head().is_none());
+    assert!(
+        wallet(network, 6)
+            .planned_payment_nullifier(&public, &opening)
+            .is_err()
+    );
+    let mut changed = public;
+    changed.cm[0] = changed.cm[1];
+    assert!(
+        recipient
+            .planned_payment_nullifier(&changed, &opening)
+            .is_err()
+    );
+}
 fn insert_record(block: &mut Block, record: PublicRecord) {
     block.transactions[0].record = record;
     block

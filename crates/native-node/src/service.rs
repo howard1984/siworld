@@ -1242,8 +1242,9 @@ fn active_run(status: &Value) -> Result<&str, String> {
         .get("run_id")
         .and_then(Value::as_str)
         .ok_or("service status has no run identity")?;
-    if !matches!(
-        status.get("phase").and_then(Value::as_str),
+    let phase = status.get("phase").and_then(Value::as_str);
+    let active = matches!(
+        phase,
         Some(
             "starting"
                 | "replaying"
@@ -1254,7 +1255,11 @@ fn active_run(status: &Value) -> Result<&str, String> {
                 | "networking"
                 | "stopping"
         )
-    ) {
+    );
+    // Only the explicitly enabled production fixture exports this pause.
+    #[cfg(feature = "eng2-rehearsal")]
+    let active = active || phase == Some("rehearsal_paused");
+    if !active {
         return Err("no active service run is exported".into());
     }
     Ok(run)

@@ -128,13 +128,7 @@ fn candidate(state: &State, seed: u32) -> Block {
         issuances: Vec::new(),
         settlement_proof: vec![1],
     };
-    let seed = block.pow_seed().unwrap();
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, block.nonce, state.config.pow_iterations),
-        &block.target,
-    ) {
-        block.nonce += 1;
-    }
+    crate::fixtures::find_test_nonce(&mut block, state.config.pow_iterations, true);
     block
 }
 fn populated(path: &Path) -> (Block, Hash) {
@@ -1622,13 +1616,7 @@ fn canonical_selection_uses_actual_work_even_when_winner_is_shorter() {
 
 fn remine(block: &mut Block, state: &State) {
     block.nonce = 0;
-    let seed = block.pow_seed().unwrap();
-    while !siworld_core::pow::meets_target(
-        &siworld_core::pow::pow_hash(&seed, block.nonce, state.config.pow_iterations),
-        &block.target,
-    ) {
-        block.nonce += 1;
-    }
+    crate::fixtures::find_test_nonce(block, state.config.pow_iterations, true);
 }
 
 #[test]

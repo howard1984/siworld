@@ -83,6 +83,18 @@ impl VerifiedHeaders {
             .collect()
     }
     pub fn verify(rules: HeaderRules, headers: Vec<Header>) -> Result<Self, SelectionError> {
+        Self::verify_bounded(rules, headers, || true)
+    }
+    /// The same header checks with an owner-selected finite work deadline.
+    /// Cancellation changes no proof, work or selection rule.
+    pub(crate) fn verify_bounded(
+        rules: HeaderRules,
+        headers: Vec<Header>,
+        available: impl Fn() -> bool,
+    ) -> Result<Self, SelectionError> {
+        if !available() {
+            return Err(SelectionError::Limit);
+        }
         if rules.network == [0; 32]
             || rules.genesis == [0; 32]
             || rules.genesis_timestamp == 0
@@ -103,6 +115,9 @@ impl VerifiedHeaders {
             .map_err(|_| SelectionError::Limit)?;
         let mut cumulative = Work::zero();
         for (index, header) in headers.iter().enumerate() {
+            if !available() {
+                return Err(SelectionError::Limit);
+            }
             if header.network != rules.network
                 || header.height != index as u64 + 1
                 || header.parent != parent
@@ -130,6 +145,9 @@ impl VerifiedHeaders {
             ) {
                 return Err(SelectionError::Work);
             }
+            if !available() {
+                return Err(SelectionError::Limit);
+            }
             cumulative = cumulative
                 .checked_add(pow::block_work(&header.target))
                 .ok_or(SelectionError::WorkOverflow)?;
@@ -145,6 +163,82 @@ impl VerifiedHeaders {
             headers,
             work,
         })
+    }
+    /// Qualify new headers against this already checked prefix. The existing
+    /// headers are immutable; an error leaves the original path unchanged.
+    /// Body commitments remain claims until ordinary native body admission.
+    pub fn verify_extension(&self, additional: &[Header]) -> Result<Self, SelectionError> {
+        let count = self
+            .headers
+            .len()
+            .checked_add(additional.len())
+            .ok_or(SelectionError::Limit)?;
+        if count > self.rules.max_headers {
+            return Err(SelectionError::Limit);
+        }
+        let mut result = self.clone();
+        result
+            .headers
+            .try_reserve_exact(additional.len())
+            .map_err(|_| SelectionError::Limit)?;
+        result
+            .work
+            .try_reserve_exact(additional.len())
+            .map_err(|_| SelectionError::Limit)?;
+        let window = siworld_core::params::MEDIAN_TIME_PAST_WINDOW;
+        let mut timestamps = VecDeque::new();
+        if self.headers.len() < window {
+            timestamps.push_back(self.rules.genesis_timestamp);
+        }
+        timestamps.extend(
+            self.headers
+                .iter()
+                .skip(self.headers.len().saturating_sub(window))
+                .map(|header| header.timestamp),
+        );
+        let mut parent = self.id(self.height())?;
+        let mut cumulative = self.cumulative_work();
+        for header in additional {
+            let index = result.headers.len();
+            if header.network != self.rules.network
+                || header.height != index as u64 + 1
+                || header.parent != parent
+            {
+                return Err(SelectionError::Link);
+            }
+            let times: Vec<_> = timestamps.iter().copied().collect();
+            if header.timestamp <= pow::median_time_past(&times).ok_or(SelectionError::Time)? {
+                return Err(SelectionError::Time);
+            }
+            let target = pow::asert_target(
+                &self.rules.genesis_target,
+                self.rules.genesis_timestamp,
+                self.rules.target_interval,
+                index as u64,
+                *timestamps.back().ok_or(SelectionError::Time)?,
+            );
+            if header.target != target {
+                return Err(SelectionError::Difficulty);
+            }
+            let seed = header.pow_seed().map_err(SelectionError::Header)?;
+            if !pow::meets_target(
+                &pow::pow_hash(&seed, header.nonce, self.rules.pow_iterations),
+                &header.target,
+            ) {
+                return Err(SelectionError::Work);
+            }
+            cumulative = cumulative
+                .checked_add(pow::block_work(&header.target))
+                .ok_or(SelectionError::WorkOverflow)?;
+            parent = header.id().map_err(SelectionError::Header)?;
+            result.headers.push(header.clone());
+            result.work.push(cumulative);
+            timestamps.push_back(header.timestamp);
+            while timestamps.len() > window {
+                timestamps.pop_front();
+            }
+        }
+        Ok(result)
     }
     pub fn height(&self) -> u64 {
         self.headers.len() as u64
@@ -297,6 +391,37 @@ mod tests {
                 chain,
             })
             .collect()
+    }
+
+    #[test]
+    fn incremental_qualification_matches_full_path_without_mutating_the_prefix() {
+        let all = headers(24, 3);
+        for split in [0, 1, 10, 11, 12, 23, 24] {
+            let prefix = VerifiedHeaders::verify(rules(), all[..split].to_vec()).unwrap();
+            let extended = prefix.verify_extension(&all[split..]).unwrap();
+            let complete = VerifiedHeaders::verify(rules(), all.clone()).unwrap();
+            assert_eq!(extended.cumulative_work(), complete.cumulative_work());
+            assert_eq!(extended.id(24), complete.id(24));
+            assert_eq!(prefix.height(), split as u64);
+        }
+        let prefix = VerifiedHeaders::verify(rules(), all[..12].to_vec()).unwrap();
+        for field in 0..5 {
+            let mut suffix = all[12..].to_vec();
+            match field {
+                0 => suffix[0].network = [9; 32],
+                1 => suffix[0].parent = [9; 32],
+                2 => suffix[0].height += 1,
+                3 => suffix[0].timestamp = 1,
+                _ => suffix[0].target[0] = 0,
+            }
+            let mut full = all[..12].to_vec();
+            full.extend_from_slice(&suffix);
+            assert_eq!(
+                prefix.verify_extension(&suffix).unwrap_err(),
+                VerifiedHeaders::verify(rules(), full).unwrap_err()
+            );
+            assert_eq!(prefix.height(), 12);
+        }
     }
 
     #[test]

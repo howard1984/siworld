@@ -7,15 +7,15 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
 };
 
-pub(super) struct Files(File);
-pub(super) struct Lock(File);
+pub(in crate::eng2::resident) struct Files(File);
+pub(in crate::eng2::resident) struct Lock(File);
 impl Drop for Lock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
 }
 impl Files {
-    pub(super) fn open(directory: &Path) -> Result<Self, String> {
+    pub(in crate::eng2::resident) fn open(directory: &Path) -> Result<Self, String> {
         let parent = OpenOptions::new()
             .read(true)
             .custom_flags((OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC).bits() as i32)
@@ -54,7 +54,7 @@ impl Files {
         }
         Ok(())
     }
-    pub(super) fn lock(&self) -> Result<Lock, String> {
+    pub(in crate::eng2::resident) fn lock(&self) -> Result<Lock, String> {
         Self::check(&self.0, true, 0)?;
         let file = File::from(
             openat(
@@ -85,7 +85,11 @@ impl Files {
             }
         }
     }
-    pub(super) fn read(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>, String> {
+    pub(in crate::eng2::resident) fn read(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, String> {
         let fd = match openat(
             &self.0,
             name,
@@ -107,7 +111,7 @@ impl Files {
         }
         Ok(Some(bytes))
     }
-    pub(super) fn remove(&self, name: &str, limit: usize) -> Result<(), String> {
+    pub(in crate::eng2::resident) fn remove(&self, name: &str, limit: usize) -> Result<(), String> {
         if self.read(name, limit)?.is_some() {
             unlinkat(&self.0, name, AtFlags::empty())
                 .map_err(|_| "operations request consumption failed")?;
@@ -117,7 +121,12 @@ impl Files {
         }
         Ok(())
     }
-    pub(super) fn replace(&self, name: &str, bytes: &[u8], limit: usize) -> Result<(), String> {
+    pub(in crate::eng2::resident) fn replace(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        limit: usize,
+    ) -> Result<(), String> {
         if bytes.len() > limit {
             return Err("operations byte bound exceeded".into());
         }
@@ -142,5 +151,108 @@ impl Files {
         self.0
             .sync_all()
             .map_err(|_| "operations directory durability failed".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Read, os::unix::fs::DirBuilderExt};
+
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let mut random = [0; 16];
+            getrandom::fill(&mut random).unwrap();
+            let root = std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
+                .join(format!("eng2-mailbox-{}", crate::local::hex(&random)));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn opened_result_replaced_before_check_loses_required_link() {
+        let root = Directory::new();
+        let files = Files::open(&root.0).unwrap();
+        let original = br#"{"version":1,"sequence":1,"result":{}}"#;
+        files
+            .replace("historical-result.json", original, 1024)
+            .unwrap();
+        let mut old = File::from(
+            openat(
+                &files.0,
+                "historical-result.json",
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .unwrap(),
+        );
+        {
+            let _lock = files.lock().unwrap();
+            files
+                .replace(
+                    "historical-result.json",
+                    br#"{"version":1,"sequence":2,"result":{}}"#,
+                    1024,
+                )
+                .unwrap();
+        }
+        assert_eq!(old.metadata().unwrap().nlink(), 0);
+        assert_eq!(
+            Files::check(&old, false, 1024).unwrap_err(),
+            "operations file ownership, type, permissions or bound rejected"
+        );
+        let mut bytes = Vec::new();
+        old.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, original);
+        // Replacement does not justify accepting an unlinked or unsafe file.
+        assert!(Files::check(&old, false, 1024).is_err());
+    }
+    #[test]
+    fn mailbox_lock_serializes_result_read_and_replacement() {
+        let root = Directory::new();
+        let files = Files::open(&root.0).unwrap();
+        let original = br#"{"version":1,"sequence":1,"result":{}}"#;
+        let replacement = br#"{"version":1,"sequence":2,"result":{}}"#;
+        files
+            .replace("historical-result.json", original, 1024)
+            .unwrap();
+        let lock = files.lock().unwrap();
+        let path = root.0.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let files = Files::open(&path).unwrap();
+            started_tx.send(()).unwrap();
+            let _lock = files.lock().unwrap();
+            files
+                .replace("historical-result.json", replacement, 1024)
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert_eq!(
+            files.read("historical-result.json", 1024).unwrap().unwrap(),
+            original
+        );
+        drop(lock);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+        let _lock = files.lock().unwrap();
+        assert_eq!(
+            files.read("historical-result.json", 1024).unwrap().unwrap(),
+            replacement
+        );
     }
 }

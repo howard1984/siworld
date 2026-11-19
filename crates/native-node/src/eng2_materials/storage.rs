@@ -81,10 +81,11 @@ impl Directory {
         Ok(Self(file))
     }
     pub(super) fn write_once(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        if !matches!(
+        if !(matches!(
             name,
             "pending.secret" | "public.json" | "checkpoint-bound.secret"
-        ) {
+        ) || cfg!(feature = "eng2-rehearsal") && name == "rehearsal.json")
+        {
             return Err(failure());
         }
         // An atomic hard-link publishes a fully synced file without replacing

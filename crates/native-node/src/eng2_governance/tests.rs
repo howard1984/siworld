@@ -67,6 +67,27 @@ fn advance(state: &mut GovernanceState, height: u64) {
     }
 }
 #[test]
+fn unchanged_owner_authorization_survives_288_blocks_and_cannot_replay() {
+    let mut state = fixture();
+    let authorization = signed(
+        1,
+        ActionKind::ProposeIssuanceFee {
+            amount_atoms: 100_000_000,
+        },
+        &[SignerRole::Founder],
+    );
+    let original_bytes = authorization.encode().unwrap();
+    advance(&mut state, 288);
+    let events = state
+        .apply_block(289, std::slice::from_ref(&authorization))
+        .unwrap();
+    assert_eq!(events[0].included_height, 289);
+    assert_eq!(authorization.encode().unwrap(), original_bytes);
+    let before_replay = state.clone();
+    assert!(state.apply_block(290, &[authorization]).is_err());
+    assert_eq!(state, before_replay);
+}
+#[test]
 fn roster_replacement_requires_both_owner_roles_and_is_atomic() {
     let initial = fixture();
     for roles in [
