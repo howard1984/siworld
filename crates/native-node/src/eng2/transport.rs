@@ -2106,10 +2106,13 @@ pub(crate) mod tests {
                     .unwrap()
                     .is_none()
             );
-            let (timing, _) = client.take_fetch_observation();
-            let timing = timing.unwrap();
-            assert_eq!(timing.outcome, 2);
-            assert_eq!(timing.received_bytes, 0);
+            #[cfg(feature = "eng2-runtime")]
+            {
+                let (timing, _) = client.take_fetch_observation();
+                let timing = timing.unwrap();
+                assert_eq!(timing.outcome, 2);
+                assert_eq!(timing.received_bytes, 0);
+            }
         }
         assert!(origin.elapsed() < std::time::Duration::from_secs(3));
         let ownership =
@@ -2136,6 +2139,7 @@ pub(crate) mod tests {
         assert!(fetch_after_unavailable_replies(3));
     }
 
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn wire_after_unavailable(
         g: &Genesis,
         body: &Body,
@@ -2155,6 +2159,7 @@ pub(crate) mod tests {
         sender.session.test_channel().output.clone()
     }
 
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn tip_wire(g: &Genesis, height: u64, id: Hash) -> Vec<u8> {
         let mut sender = Peer::new(
             session(vec![], binding(g), p2p::Budget::default()),
@@ -2166,6 +2171,7 @@ pub(crate) mod tests {
         sender.session.test_channel().output.clone()
     }
 
+    #[cfg(feature = "eng2-runtime")]
     pub(crate) fn authenticated_offer(
         g: &Genesis,
         header: &Header,
