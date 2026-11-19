@@ -361,7 +361,7 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
 ) -> Result<Pulled, Error> {
     let mut accepted = 0;
     let mut used_requests = 0;
-    while accepted < limits.blocks {
+    loop {
         // Bind the reported head and the remote-prefix comparison in one
         // owner critical section. Later phases cannot relabel this evidence.
         let comparison = with_owner(owner, |o| {
@@ -392,6 +392,12 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
         })?;
         let (local, caught_up) = match comparison {
             Ok(value) => value,
+            Err(Error::ForkUnsupported) if accepted >= limits.blocks => {
+                return Ok(Pulled {
+                    accepted,
+                    checked_head: None,
+                });
+            }
             Err(Error::ForkUnsupported) => {
                 discover_fork(
                     peer,
@@ -423,7 +429,9 @@ fn pull_with_checkpoint_headers<S: Read + Write, O: Owner>(
                 checked_head: Some(local),
             });
         }
-        if used_requests >= usize::from(limits.blocks) * 2 {
+        // Even the final allowed admission needs the exact-prefix comparison
+        // above. It does not grant another body or network request.
+        if accepted >= limits.blocks || used_requests >= usize::from(limits.blocks) * 2 {
             break;
         }
         let next = local.0.checked_add(1).ok_or(Error::Protocol)?;
@@ -1136,6 +1144,32 @@ mod tests {
             budget,
         )
     }
+    #[test]
+    fn final_allowed_body_records_exact_canonical_head() {
+        let (mut client_peer, mut server_peer, _) = peers();
+        let client = Arc::new(Mutex::new(fixture(0)));
+        let remote = Arc::new(Mutex::new(fixture(1)));
+        let target = remote.lock().unwrap().head().unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (request, message) = server_peer.receive_request().unwrap();
+                serve(&mut server_peer, &remote, request, message).unwrap();
+            }
+        });
+        let result = pull(
+            &mut client_peer,
+            &client,
+            &mut Sequence::default(),
+            target,
+            Limits { blocks: 1 },
+        );
+        worker.join().unwrap();
+        let result = result.expect("the final permitted body reaches the remote head");
+        assert_eq!(result.accepted, 1);
+        assert_eq!(client.lock().unwrap().head().unwrap(), target);
+        assert_eq!(result.checked_head, Some(target));
+    }
+
     #[test]
     fn deferred_body_authorization_keeps_first_negotiated_round_connected() {
         struct Deferred(Fixture);
