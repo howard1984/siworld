@@ -14,6 +14,7 @@ fn cache_charge() -> usize {
     512 * 1024 + MAX_HEADERS * std::mem::size_of::<Entry>()
 }
 const MAX_DOWNLOADS: usize = 4;
+const MAX_BODY_SOURCE_HINTS: usize = 8;
 #[cfg(test)]
 const MAX_ATTEMPTS: usize = 4;
 const RETENTION: Duration = Duration::from_secs(30);
@@ -49,6 +50,7 @@ struct Inner {
     sequence: u64,
     rate_start: Instant,
     offers: usize,
+    body_tips: BTreeMap<Hash, (u64, u64, Hash)>,
 }
 pub(crate) struct LocalBody {
     header: Header,
@@ -271,6 +273,7 @@ impl Hub {
                 sequence: 0,
                 rate_start: now,
                 offers: 0,
+                body_tips: BTreeMap::new(),
             }),
             waiting: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -354,6 +357,7 @@ impl Hub {
             .inner
             .lock()
             .map_err(|_| "header cache lock poisoned")?;
+        let head_changed = inner.canonical.id != canonical.id;
         inner.canonical = canonical.clone();
         inner.anchors = contexts.into_iter().map(|c| (c.id, c)).collect();
         if head.height > 0 {
@@ -387,10 +391,31 @@ impl Hub {
                 });
             }
         }
+        Self::canonical_body_available(
+            &mut inner,
+            head.id,
+            self.local,
+            head_changed,
+            Instant::now(),
+        );
+        self.reconcile(&mut inner, Instant::now());
+        Ok(())
+    }
+    fn canonical_body_available(
+        inner: &mut Inner,
+        id: Hash,
+        local: Hash,
+        head_changed: bool,
+        now: Instant,
+    ) {
         for entry in &mut inner.entries {
-            if entry.context.id == head.id {
+            if entry.context.id == id {
+                if head_changed {
+                    entry.first = now;
+                    entry.sent.clear();
+                }
                 entry.complete = true;
-                if entry.source != self.local {
+                if entry.source != local {
                     entry.body = None;
                 }
                 for download in entry.downloads.values() {
@@ -398,8 +423,6 @@ impl Hub {
                 }
             }
         }
-        self.reconcile(&mut inner, Instant::now());
-        Ok(())
     }
     fn reconcile(&self, inner: &mut Inner, now: Instant) {
         inner.entries.retain(|entry| {
@@ -811,7 +834,7 @@ impl Hub {
         peer: Hash,
         mode: p2p::BodyMode,
     ) -> Result<Option<Download>, String> {
-        self.download_selected(peer, mode, None, &Default::default())
+        self.download_selected(peer, mode, None, &Default::default(), false, None)
     }
     #[cfg(test)]
     pub(crate) fn download_exact(
@@ -819,7 +842,14 @@ impl Hub {
         peer: Hash,
         id: Hash,
     ) -> Result<Option<Download>, String> {
-        self.download_selected(peer, p2p::BodyMode::Pieces, Some(id), &Default::default())
+        self.download_selected(
+            peer,
+            p2p::BodyMode::Pieces,
+            Some(id),
+            &Default::default(),
+            false,
+            None,
+        )
     }
     pub(crate) fn download_preferred(
         self: &Arc<Self>,
@@ -828,7 +858,121 @@ impl Hub {
         target: Option<Hash>,
         connected: &std::collections::BTreeSet<Hash>,
     ) -> Result<Option<Download>, String> {
-        self.download_selected(peer, mode, target, connected)
+        self.download_selected(peer, mode, target, connected, true, None)
+    }
+    #[cfg(test)]
+    fn download_unqualified(
+        self: &Arc<Self>,
+        peer: Hash,
+        mode: p2p::BodyMode,
+        target: Option<Hash>,
+        connected: &std::collections::BTreeSet<Hash>,
+    ) -> Result<Option<Download>, String> {
+        self.download_selected(peer, mode, target, connected, false, None)
+    }
+    pub(crate) fn download_offered(
+        self: &Arc<Self>,
+        offer: &crate::eng2::transport::propagation::Offer,
+        connected: &std::collections::BTreeSet<Hash>,
+    ) -> Result<Option<Download>, String> {
+        if offer.binding() != self.binding {
+            return Err("body offer binding differs".into());
+        }
+        let id = offer
+            .header()
+            .id()
+            .map_err(|_| "body offer identity rejected")?;
+        self.download_selected(
+            offer.peer(),
+            p2p::BodyMode::Pieces,
+            Some(id),
+            connected,
+            true,
+            Some((offer.peer(), id)),
+        )
+    }
+    pub(crate) fn observe_body_tip(
+        &self,
+        peer: Hash,
+        session: u64,
+        height: u64,
+        id: Hash,
+    ) -> Result<(), String> {
+        self.ensure_available()?;
+        if peer == [0; 32]
+            || session == 0
+            || height > self.rules.max_headers as u64
+            || (height == 0 && id != self.binding.genesis)
+        {
+            return Err("body source announcement rejected".into());
+        }
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "header cache lock poisoned")?;
+        if !inner.body_tips.contains_key(&peer) && inner.body_tips.len() == MAX_BODY_SOURCE_HINTS {
+            // An idle or unqualified tip cannot crowd out a known candidate's
+            // holder. The fixed source-hint capacity is not expanded.
+            if let Some(stale) = inner.body_tips.iter().find_map(|(source, &(_, h, id))| {
+                (!inner
+                    .entries
+                    .iter()
+                    .any(|e| !e.complete && e.header.height == h && e.context.id == id))
+                .then_some(*source)
+            }) {
+                inner.body_tips.remove(&stale);
+            }
+        }
+        if inner.body_tips.contains_key(&peer) || inner.body_tips.len() < MAX_BODY_SOURCE_HINTS {
+            inner.body_tips.insert(peer, (session, height, id));
+        }
+        Ok(())
+    }
+    pub(crate) fn forget_body_tip(&self, peer: Hash, session: u64) {
+        if let Ok(mut inner) = self.inner.lock()
+            && inner
+                .body_tips
+                .get(&peer)
+                .is_some_and(|tip| tip.0 == session)
+        {
+            inner.body_tips.remove(&peer);
+        }
+    }
+    fn source_can_serve(
+        inner: &Inner,
+        peer: Hash,
+        target: &Entry,
+        offer: Option<(Hash, Hash)>,
+    ) -> bool {
+        if offer == Some((peer, target.context.id)) {
+            return true;
+        }
+        let Some(&(_, mut height, mut id)) = inner.body_tips.get(&peer) else {
+            return false;
+        };
+        // Height alone is never sufficient: follow only qualified exact hashes
+        // and parent links on the peer's announced canonical branch.
+        for _ in 0..MAX_HEADERS {
+            if height < target.header.height {
+                return false;
+            }
+            let Some(entry) = inner
+                .entries
+                .iter()
+                .find(|e| e.context.id == id && e.header.height == height)
+            else {
+                return false;
+            };
+            if id == target.context.id {
+                return true;
+            }
+            id = entry.header.parent;
+            let Some(parent_height) = height.checked_sub(1) else {
+                return false;
+            };
+            height = parent_height;
+        }
+        false
     }
     fn download_selected(
         self: &Arc<Self>,
@@ -836,6 +980,8 @@ impl Hub {
         mode: p2p::BodyMode,
         target: Option<Hash>,
         connected: &std::collections::BTreeSet<Hash>,
+        announced_only: bool,
+        offer: Option<(Hash, Hash)>,
     ) -> Result<Option<Download>, String> {
         self.ensure_available()?;
         let mut inner = self
@@ -871,7 +1017,11 @@ impl Hub {
             .filter(|(_, e)| {
                 target.is_none_or(|id| id == e.context.id)
                     && !e.complete
-                    && e.offered_sources.contains(&Some(peer))
+                    && (if announced_only {
+                        Self::source_can_serve(&inner, peer, e, offer)
+                    } else {
+                        e.offered_sources.contains(&Some(peer))
+                    })
                     && needed.contains(&e.context.id)
             })
             .map(|(index, e)| (e.header.height, e.sequence, index))
@@ -879,6 +1029,23 @@ impl Hub {
         eligible.sort_unstable();
         let mut selected = None;
         for (_, _, index) in eligible {
+            let alternatives: Vec<_> = if announced_only {
+                inner
+                    .body_tips
+                    .keys()
+                    .copied()
+                    .filter(|p| connected.contains(p))
+                    .filter(|p| Self::source_can_serve(&inner, *p, &inner.entries[index], offer))
+                    .collect()
+            } else {
+                inner.entries[index]
+                    .offered_sources
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .filter(|p| connected.contains(p))
+                    .collect()
+            };
             let entry = &mut inner.entries[index];
             let cancel = p2p::Cancellation::default();
             let deadline = p2p::Deadline::cancellable(
@@ -906,17 +1073,10 @@ impl Hub {
                 .authorization
                 .as_ref()
                 .ok_or("body authorization missing")?;
-            match self.budget.claim_body_preferred(
-                authorization,
-                peer,
-                mode,
-                entry
-                    .offered_sources
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .filter(|p| connected.contains(p)),
-            ) {
+            match self
+                .budget
+                .claim_body_preferred(authorization, peer, mode, alternatives)
+            {
                 Ok(claim) => {
                     selected = Some((index, claim.cancellation(), claim));
                     break;
@@ -1295,6 +1455,7 @@ mod tests {
                 sequence: 0,
                 rate_start: Instant::now(),
                 offers: 0,
+                body_tips: BTreeMap::new(),
             }),
             waiting: AtomicBool::new(false),
             failed: AtomicBool::new(false),
@@ -1791,12 +1952,12 @@ mod retry_cache_regressions {
         hub.offer(h.clone(), [6; 32]).unwrap();
         let connected = std::collections::BTreeSet::from([[5; 32], [6; 32]]);
         assert!(
-            hub.download_preferred([5; 32], p2p::BodyMode::Legacy, None, &connected)
+            hub.download_unqualified([5; 32], p2p::BodyMode::Legacy, None, &connected)
                 .unwrap()
                 .is_none()
         );
         let two = hub
-            .download_preferred([6; 32], p2p::BodyMode::Pieces, None, &connected)
+            .download_unqualified([6; 32], p2p::BodyMode::Pieces, None, &connected)
             .unwrap()
             .unwrap();
         assert_eq!(two.deadline.expires_at(), deadline);
@@ -1804,7 +1965,7 @@ mod retry_cache_regressions {
         two.ownership().unwrap().begin_query([6; 32]).unwrap();
         drop(two);
         let three = hub
-            .download_preferred([5; 32], p2p::BodyMode::Legacy, None, &connected)
+            .download_unqualified([5; 32], p2p::BodyMode::Legacy, None, &connected)
             .unwrap()
             .unwrap();
         assert_eq!(three.ownership().unwrap().source_ordinal(), Some(3));
@@ -1834,15 +1995,728 @@ mod source_selection_regressions {
         hub.offer(header, [5; 32]).unwrap();
         let connected = std::collections::BTreeSet::from([[5; 32], [6; 32]]);
         assert!(
-            hub.download_preferred([6; 32], p2p::BodyMode::Legacy, None, &connected)
+            hub.download_unqualified([6; 32], p2p::BodyMode::Legacy, None, &connected)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(hub.budget.retained_body_accounting().0, 0);
         assert!(
-            hub.download_preferred([5; 32], p2p::BodyMode::Legacy, None, &connected)
+            hub.download_unqualified([5; 32], p2p::BodyMode::Legacy, None, &connected)
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn hub_fetch_after_unavailable_replies(unavailable_count: u64) -> bool {
+        use crate::eng2::transport::{Peer, binding, tests as wire};
+        let g = wire::genesis();
+        let (mut body, mut header) = wire::body_header(&g);
+        // Match this scheduler fixture's known height-zero parent. No state admission is requested.
+        body.height = 1;
+        header.height = 1;
+        header.body_commitment = body.commitment(wire::policy()).unwrap();
+        let bound = binding(&g);
+        let mut owned = Arc::try_unwrap(super::tests::hub()).ok().unwrap();
+        owned.binding = bound;
+        owned.rules.network = bound.network;
+        owned.rules.genesis = bound.genesis;
+        {
+            let inner = owned.inner.get_mut().unwrap();
+            inner.canonical.id = bound.genesis;
+            inner.anchors = BTreeMap::from([(bound.genesis, inner.canonical.clone())]);
+        }
+        let hub = Arc::new(owned);
+        let peer_id = [9; 32];
+        assert!(hub.offer(header.clone(), peer_id).unwrap());
+        assert_eq!(hub.budget.retained_body_accounting().0, 0);
+        let bytes = wire::wire_after_unavailable(&g, &body, &header, unavailable_count);
+        let mut client = Peer::new(
+            wire::session(bytes, bound, hub.budget.clone()),
+            &g,
+            wire::policy(),
+        )
+        .unwrap();
+        let connected = std::collections::BTreeSet::from([peer_id]);
+        let before = Instant::now();
+        let mut deadline = None;
+        for request in 1..=unavailable_count {
+            let mut download = hub
+                .download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+                .unwrap()
+                .unwrap();
+            if let Some(first) = deadline {
+                assert_eq!(download.deadline.expires_at(), first);
+            } else {
+                deadline = Some(download.deadline.expires_at());
+            }
+            let claim = download.take_ownership().unwrap();
+            assert!(
+                client
+                    .fetch_body_owned(request, &header, claim, None)
+                    .unwrap()
+                    .is_none()
+            );
+            let (timing, _) = client.take_fetch_observation();
+            assert_eq!(timing.unwrap().outcome, 2);
+            drop(download);
+            assert_eq!(hub.active_downloads(), 0);
+        }
+        assert!(before.elapsed() < Duration::from_secs(3));
+        assert_eq!(hub.budget.retained_body_accounting().0, 1);
+        // An existing header is retained, but its duplicate offer reports no insertion.
+        assert!(!hub.offer(header.clone(), peer_id).unwrap());
+        assert_eq!(
+            hub.inner.lock().unwrap().entries[0].context.id,
+            header.id().unwrap()
+        );
+        let Some(mut download) = hub
+            .download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+            .unwrap()
+        else {
+            let auth = hub.inner.lock().unwrap().entries[0]
+                .authorization
+                .as_ref()
+                .unwrap()
+                .clone();
+            assert!(matches!(
+                hub.budget
+                    .claim_body_authorized(&auth, peer_id, p2p::BodyMode::Legacy),
+                Err(p2p::BodyClaimError::QueryLimit)
+            ));
+            return false;
+        };
+        assert_eq!(Some(download.deadline.expires_at()), deadline);
+        let body = client
+            .fetch_body_owned(
+                unavailable_count + 1,
+                &header,
+                download.take_ownership().unwrap(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body.body.commitment(wire::policy()).unwrap(),
+            header.body_commitment
+        );
+        assert!(before.elapsed() < Duration::from_secs(3));
+        true
+    }
+    #[test]
+    fn three_unavailable_replies_leave_one_query_for_the_body() {
+        assert!(hub_fetch_after_unavailable_replies(3));
+    }
+    fn metadata_failure_then_legacy_fetch(legacy_unavailable: u64, reopen: bool) -> bool {
+        use crate::eng2::transport::{Peer, binding, tests as wire};
+        let g = wire::genesis();
+        let (mut body, mut header) = wire::body_header(&g);
+        // Match this scheduler fixture's known height-zero parent. No state admission is requested.
+        body.height = 1;
+        header.height = 1;
+        header.body_commitment = body.commitment(wire::policy()).unwrap();
+        let bound = binding(&g);
+        let mut owned = Arc::try_unwrap(super::tests::hub()).ok().unwrap();
+        owned.binding = bound;
+        owned.rules.network = bound.network;
+        owned.rules.genesis = bound.genesis;
+        {
+            let inner = owned.inner.get_mut().unwrap();
+            inner.canonical.id = bound.genesis;
+            inner.anchors = BTreeMap::from([(bound.genesis, inner.canonical.clone())]);
+        }
+        let hub = Arc::new(owned);
+        use crate::eng2::propagation::pipeline::{DescriptorLedger, Limits};
+        let peer_id = [9; 32];
+        assert!(hub.offer(header.clone(), peer_id).unwrap());
+        let connected = std::collections::BTreeSet::from([peer_id]);
+        let started = Instant::now();
+        let metadata_download = hub
+            .download_unqualified(peer_id, p2p::BodyMode::Pieces, None, &connected)
+            .unwrap()
+            .unwrap();
+        let original_deadline = metadata_download.deadline.expires_at();
+        assert_eq!(
+            metadata_download.ownership().unwrap().source_ordinal(),
+            Some(1)
+        );
+        let mut ledger = DescriptorLedger::new(
+            header.id().unwrap(),
+            &[peer_id],
+            Limits {
+                requests: 4,
+                wire_bytes: crate::eng2::transport::propagation::maximum_wire(
+                    wire::policy().max_body_bytes,
+                )
+                .unwrap(),
+                peer_requests: 1,
+                peer_wire_bytes: crate::eng2::transport::propagation::maximum_wire(
+                    wire::policy().max_body_bytes,
+                )
+                .unwrap(),
+                parallel: 1,
+                lifetime: original_deadline.duration_since(Instant::now()),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        // The sender uses the real nine-byte UNAVAILABLE response. The trailing
+        // body is never read on this failed metadata connection.
+        let bytes = wire::wire_after_unavailable(&g, &body, &header, 1);
+        let mut metadata_peer = Peer::new(
+            wire::session(bytes, bound, hub.budget.clone()),
+            &g,
+            wire::policy(),
+        )
+        .unwrap();
+        assert!(matches!(
+            metadata_peer.fetch_propagation_metadata_at(
+                1,
+                &header,
+                &mut ledger,
+                metadata_download.ownership().unwrap()
+            ),
+            Err(p2p::Error::InvalidProtocol)
+        ));
+        let after_metadata = hub.budget.body_registry_diagnostic();
+        assert_eq!(after_metadata["queries"], 1);
+        assert_eq!(after_metadata["window_queries"], 1);
+        let account = after_metadata["account"].as_u64().unwrap();
+        drop(metadata_peer);
+        drop(ledger);
+        drop(metadata_download);
+        assert_eq!(hub.active_downloads(), 0);
+        // A new peer instance models the failed optional body lane reconnect;
+        // it retains exactly the same node budget, binding and peer identity.
+        let bytes = wire::wire_after_unavailable(&g, &body, &header, legacy_unavailable);
+        let mut client = Peer::new(
+            wire::session(bytes, bound, hub.budget.clone()),
+            &g,
+            wire::policy(),
+        )
+        .unwrap();
+        for request in 1..=legacy_unavailable {
+            let mut download = hub
+                .download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+                .unwrap()
+                .unwrap();
+            assert_eq!(download.deadline.expires_at(), original_deadline);
+            assert_eq!(
+                download.ownership().unwrap().source_ordinal(),
+                Some((request + 1) as usize)
+            );
+            assert!(
+                client
+                    .fetch_body_owned(request, &header, download.take_ownership().unwrap(), None)
+                    .unwrap()
+                    .is_none()
+            );
+            let (timing, _) = client.take_fetch_observation();
+            assert_eq!(timing.as_ref().unwrap().outcome, 2);
+            assert_eq!(timing.as_ref().unwrap().received_bytes, 0);
+            drop(download);
+        }
+        assert!(!hub.offer(header.clone(), peer_id).unwrap());
+        let mut next = hub
+            .download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+            .unwrap();
+        if next.is_none() {
+            {
+                let auth = hub.inner.lock().unwrap().entries[0]
+                    .authorization
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                assert!(matches!(
+                    hub.budget
+                        .claim_body_authorized(&auth, peer_id, p2p::BodyMode::Legacy),
+                    Err(p2p::BodyClaimError::QueryLimit)
+                ));
+            }
+            let blocked = hub.budget.body_registry_diagnostic();
+            assert_eq!(blocked["queries"], 4);
+            assert_eq!(blocked["window_queries"], 4);
+            assert_eq!(blocked["account"].as_u64(), Some(account));
+
+            if !reopen {
+                return false;
+            }
+            // Simulate elapsed account age through the existing test hook. No
+            // wall-clock wait, quota refund, new scope or window rollover occurs.
+            hub.budget.age_test_body_accounts(Duration::from_secs(181));
+            assert!(
+                hub.download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(hub.inner.lock().unwrap().entries[0].authorization.is_none());
+            // Expiration alone must not skip the original first-reopen backoff.
+            assert!(
+                hub.download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(hub.budget.body_registry_diagnostic()["code"], "expired");
+            let wire_before = hub.budget.body_wire_usage();
+            hub.budget.age_test_body_accounts(Duration::from_secs(15));
+            next = hub
+                .download_unqualified(peer_id, p2p::BodyMode::Legacy, None, &connected)
+                .unwrap();
+            assert!(next.is_some());
+            let reopened = hub.budget.body_registry_diagnostic();
+            assert!(reopened["account"].as_u64().unwrap() > account);
+            assert_eq!(reopened["queries"], 0);
+            assert_eq!(reopened["window_queries"], 4);
+            assert_eq!(hub.budget.body_wire_usage(), wire_before);
+        }
+        let mut next = next.unwrap();
+        let received = client
+            .fetch_body_owned(
+                legacy_unavailable + 1,
+                &header,
+                next.take_ownership().unwrap(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received.body.commitment(wire::policy()).unwrap(),
+            header.body_commitment
+        );
+        let final_state = hub.budget.body_registry_diagnostic();
+        assert_eq!(final_state["window_queries"], legacy_unavailable + 2);
+        if reopen {
+            assert_eq!(final_state["queries"], 1);
+        } else {
+            assert_eq!(next.deadline.expires_at(), original_deadline);
+        }
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        true
+    }
+    #[test]
+    fn metadata_and_two_unavailable_replies_preserve_the_last_body_query() {
+        assert!(metadata_failure_then_legacy_fetch(2, false));
+    }
+    #[test]
+    fn expired_metadata_account_reopens_after_backoff_without_refund() {
+        assert!(metadata_failure_then_legacy_fetch(3, true));
+    }
+}
+
+#[cfg(test)]
+mod body_source_regressions {
+    use super::*;
+    #[test]
+    fn forwarded_header_without_body_announcement_cannot_claim() {
+        let hub = super::tests::hub();
+        let header = super::tests::header([2; 32], 1, 3);
+        assert!(hub.offer(header, [5; 32]).unwrap());
+        let connected = std::collections::BTreeSet::from([[5; 32]]);
+        assert!(
+            hub.download_preferred([5; 32], p2p::BodyMode::Legacy, None, &connected)
+                .unwrap()
+                .is_none(),
+            "a forwarded header is not a body availability announcement"
+        );
+        assert_eq!(hub.budget.retained_body_accounting().0, 0);
+        assert_eq!(hub.active_downloads(), 0);
+    }
+
+    fn available(hub: &Arc<Hub>, peer: Hash, header: &Header) -> Option<Download> {
+        let connected = std::collections::BTreeSet::from([peer]);
+        hub.download_preferred(
+            peer,
+            p2p::BodyMode::Legacy,
+            Some(header.id().unwrap()),
+            &connected,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn exact_tip_and_known_ancestor_path_qualify_without_admitting_state() {
+        let hub = super::tests::hub();
+        let one = super::tests::header([2; 32], 1, 3);
+        let two = super::tests::header(one.id().unwrap(), 2, 4);
+        hub.offer(one.clone(), [5; 32]).unwrap();
+        hub.offer(two.clone(), [5; 32]).unwrap();
+        hub.observe_body_tip([6; 32], 61, 2, two.id().unwrap())
+            .unwrap();
+        let first = available(&hub, [6; 32], &one).unwrap();
+        assert_eq!(first.header.id().unwrap(), one.id().unwrap());
+        let deadline = first.deadline.expires_at();
+        first.ownership().unwrap().begin_query([6; 32]).unwrap();
+        drop(first);
+        hub.observe_body_tip([6; 32], 61, 2, two.id().unwrap())
+            .unwrap();
+        let retry = available(&hub, [6; 32], &one).unwrap();
+        assert_eq!(retry.deadline.expires_at(), deadline);
+        assert_eq!(hub.tip().unwrap(), (0, [2; 32]));
+        assert!(hub.waiting());
+        assert!(!hub.inner.lock().unwrap().entries[0].complete);
+    }
+    #[test]
+    fn height_alone_wrong_branch_and_unknown_tip_cannot_qualify() {
+        let hub = super::tests::hub();
+        let one = super::tests::header([2; 32], 1, 3);
+        let other = super::tests::header([2; 32], 1, 4);
+        hub.offer(one.clone(), [5; 32]).unwrap();
+        hub.offer(other.clone(), [6; 32]).unwrap();
+        for (height, id) in [
+            (1, other.id().unwrap()),
+            (2, [7; 32]),
+            (2, one.id().unwrap()),
+        ] {
+            hub.observe_body_tip([5; 32], 51, height, id).unwrap();
+            assert!(available(&hub, [5; 32], &one).is_none());
+        }
+        assert_eq!(hub.budget.retained_body_accounting().0, 0);
+    }
+    #[test]
+    fn tip_withdrawal_disconnect_and_old_session_drop_do_not_renew_account() {
+        let hub = super::tests::hub();
+        let one = super::tests::header([2; 32], 1, 3);
+        hub.offer(one.clone(), [5; 32]).unwrap();
+        hub.observe_body_tip([5; 32], 51, 1, one.id().unwrap())
+            .unwrap();
+        let first = available(&hub, [5; 32], &one).unwrap();
+        let expiry = first.deadline.expires_at();
+        first.ownership().unwrap().begin_query([5; 32]).unwrap();
+        drop(first);
+        hub.observe_body_tip([5; 32], 51, 0, [2; 32]).unwrap();
+        assert!(available(&hub, [5; 32], &one).is_none());
+        hub.observe_body_tip([5; 32], 52, 1, one.id().unwrap())
+            .unwrap();
+        hub.forget_body_tip([5; 32], 51);
+        let next = available(&hub, [5; 32], &one).unwrap();
+        assert_eq!(next.deadline.expires_at(), expiry);
+        next.ownership().unwrap().begin_query([5; 32]).unwrap();
+        drop(next);
+        hub.forget_body_tip([5; 32], 52);
+        assert!(available(&hub, [5; 32], &one).is_none());
+        assert_eq!(hub.budget.body_registry_diagnostic()["window_queries"], 2);
+    }
+    #[test]
+    fn source_reorganization_changes_only_eligible_exact_branch() {
+        let hub = super::tests::hub();
+        let one = super::tests::header([2; 32], 1, 3);
+        let other = super::tests::header([2; 32], 1, 4);
+        hub.offer(one.clone(), [5; 32]).unwrap();
+        hub.offer(other.clone(), [5; 32]).unwrap();
+        hub.observe_body_tip([5; 32], 51, 1, one.id().unwrap())
+            .unwrap();
+        let download = available(&hub, [5; 32], &one).unwrap();
+        download.ownership().unwrap().begin_query([5; 32]).unwrap();
+        drop(download);
+        assert!(available(&hub, [5; 32], &other).is_none());
+        hub.observe_body_tip([5; 32], 51, 1, other.id().unwrap())
+            .unwrap();
+        assert!(available(&hub, [5; 32], &one).is_none());
+        assert!(available(&hub, [5; 32], &other).is_some());
+        assert_eq!(hub.tip().unwrap(), (0, [2; 32]));
+    }
+    #[test]
+    fn full_forwarder_slots_cannot_exclude_actual_announced_holder() {
+        let hub = super::tests::hub();
+        let one = super::tests::header([2; 32], 1, 3);
+        for value in 1..=8 {
+            hub.offer(one.clone(), [value; 32]).unwrap();
+            hub.observe_body_tip([value; 32], value as u64, 0, [2; 32])
+                .unwrap();
+        }
+        assert_eq!(
+            hub.inner.lock().unwrap().entries[0]
+                .offered_sources
+                .iter()
+                .flatten()
+                .count(),
+            8
+        );
+        hub.observe_body_tip([9; 32], 91, 1, one.id().unwrap())
+            .unwrap();
+        assert!(available(&hub, [9; 32], &one).is_some());
+        assert_eq!(hub.inner.lock().unwrap().body_tips.len(), 8);
+    }
+    fn wire_fixture() -> (crate::eng2::genesis::Genesis, Body, Header, Arc<Hub>) {
+        use crate::eng2::transport::{binding, tests as wire};
+        let g = wire::genesis();
+        let (mut body, mut header) = wire::body_header(&g);
+        body.height = 1;
+        header.height = 1;
+        header.body_commitment = body.commitment(wire::policy()).unwrap();
+        let bound = binding(&g);
+        let mut owned = Arc::try_unwrap(super::tests::hub()).ok().unwrap();
+        owned.binding = bound;
+        owned.rules.network = bound.network;
+        owned.rules.genesis = bound.genesis;
+        {
+            let inner = owned.inner.get_mut().unwrap();
+            inner.canonical.id = bound.genesis;
+            inner.anchors = BTreeMap::from([(bound.genesis, inner.canonical.clone())]);
+        }
+        (g, body, header, Arc::new(owned))
+    }
+    #[test]
+    fn actual_tip_frame_allows_immediate_real_body_fetch() {
+        use crate::eng2::transport::{Peer, binding, tests as wire};
+        let (g, body, header, hub) = wire_fixture();
+        hub.offer(header.clone(), [5; 32]).unwrap();
+        let bytes = wire::tip_wire(&g, header.height, header.id().unwrap());
+        let mut peer = Peer::new(
+            wire::session(bytes, binding(&g), hub.budget.clone()),
+            &g,
+            wire::policy(),
+        )
+        .unwrap();
+        let (height, id) = peer.fetch_tip(77).unwrap();
+        hub.observe_body_tip(peer.peer(), peer.propagation_session_id(), height, id)
+            .unwrap();
+        let bytes = wire::wire_after_unavailable(&g, &body, &header, 0);
+        let mut body_peer = Peer::new(
+            wire::session(bytes, binding(&g), hub.budget.clone()),
+            &g,
+            wire::policy(),
+        )
+        .unwrap();
+        let mut download = available(&hub, body_peer.peer(), &header).unwrap();
+        let received = body_peer
+            .fetch_body_owned(1, &header, download.take_ownership().unwrap(), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received.body.commitment(wire::policy()).unwrap(),
+            header.body_commitment
+        );
+        assert_eq!(hub.budget.body_registry_diagnostic()["window_queries"], 1);
+        assert_eq!(hub.tip().unwrap(), (0, binding(&g).genesis));
+    }
+    #[test]
+    fn repeated_lying_tip_does_not_refund_query_bytes_or_deadline() {
+        use crate::eng2::transport::{Peer, binding, tests as wire};
+        let (g, body, header, hub) = wire_fixture();
+        hub.offer(header.clone(), [9; 32]).unwrap();
+        let bytes = wire::wire_after_unavailable(&g, &body, &header, 4);
+        let mut client = Peer::new(
+            wire::session(bytes, binding(&g), hub.budget.clone()),
+            &g,
+            wire::policy(),
+        )
+        .unwrap();
+        let mut expiry = None;
+        let mut charged = 0;
+        for request in 1..=4 {
+            hub.observe_body_tip(
+                client.peer(),
+                client.propagation_session_id(),
+                1,
+                header.id().unwrap(),
+            )
+            .unwrap();
+            let mut download = available(&hub, client.peer(), &header).unwrap();
+            if let Some(first) = expiry {
+                assert_eq!(download.deadline.expires_at(), first);
+            } else {
+                expiry = Some(download.deadline.expires_at());
+            }
+            assert!(
+                client
+                    .fetch_body_owned(request, &header, download.take_ownership().unwrap(), None)
+                    .unwrap()
+                    .is_none()
+            );
+            let used = hub.budget.body_wire_usage().0;
+            assert!(used > charged);
+            charged = used;
+            drop(download);
+            hub.forget_body_tip(client.peer(), client.propagation_session_id());
+            assert!(available(&hub, client.peer(), &header).is_none());
+        }
+        hub.observe_body_tip(
+            client.peer(),
+            client.propagation_session_id(),
+            1,
+            header.id().unwrap(),
+        )
+        .unwrap();
+        assert!(available(&hub, client.peer(), &header).is_none());
+        let state = hub.budget.body_registry_diagnostic();
+        assert_eq!(state["code"], "query_limit");
+        assert_eq!(state["queries"], 4);
+        assert_eq!(state["window_queries"], 4);
+        assert_eq!(hub.budget.body_wire_usage().0, charged);
+        assert_eq!(hub.tip().unwrap(), (0, binding(&g).genesis));
+    }
+    #[test]
+    fn source_qualification_preserves_four_active_download_limit() {
+        let hub = super::tests::hub();
+        let mut held = Vec::new();
+        for value in 1..=5 {
+            let header = super::tests::header([2; 32], 1, value);
+            hub.offer(header.clone(), [value; 32]).unwrap();
+            hub.observe_body_tip([value; 32], value as u64, 1, header.id().unwrap())
+                .unwrap();
+            let download = available(&hub, [value; 32], &header);
+            if value <= 4 {
+                held.push(download.unwrap());
+            } else {
+                assert!(download.is_none());
+            }
+        }
+        assert_eq!(hub.active_downloads(), 4);
+        drop(held);
+        assert_eq!(hub.active_downloads(), 0);
+    }
+
+    #[test]
+    fn parsed_explicit_offer_qualifies_only_its_exact_known_header() {
+        use crate::eng2::transport::tests as wire;
+        let (g, body, header, hub) = wire_fixture();
+        hub.offer(header.clone(), [5; 32]).unwrap();
+        let offer = wire::authenticated_offer(&g, &header, &body);
+        hub.offer(header.clone(), offer.peer()).unwrap();
+        assert!(available(&hub, offer.peer(), &header).is_none());
+        let connected = std::collections::BTreeSet::from([offer.peer()]);
+        let download = hub.download_offered(&offer, &connected).unwrap().unwrap();
+        assert_eq!(download.header.id().unwrap(), header.id().unwrap());
+        assert_eq!(download.ownership().unwrap().source_ordinal(), Some(1));
+        assert!(hub.inner.lock().unwrap().body_tips.is_empty());
+        assert_eq!(hub.tip().unwrap(), (0, hub.binding.genesis));
+        drop(download);
+        let mut unknown = header.clone();
+        unknown.parent = [71; 32];
+        let offer = wire::authenticated_offer(&g, &unknown, &body);
+        assert!(!hub.offer(unknown.clone(), offer.peer()).unwrap());
+        assert!(hub.download_offered(&offer, &connected).unwrap().is_none());
+        assert_eq!(hub.active_downloads(), 0);
+        assert_eq!(hub.budget.retained_body_accounting().0, 1);
+    }
+
+    #[test]
+    fn cache_expiry_requires_requalified_header_after_late_holder_tip() {
+        let hub = super::tests::hub();
+        let one = super::tests::header([2; 32], 1, 3);
+        hub.offer(one.clone(), [5; 32]).unwrap();
+        assert!(available(&hub, [5; 32], &one).is_none());
+        assert_eq!(hub.active_downloads(), 0);
+        assert_eq!(hub.budget.retained_body_accounting().0, 0);
+        // Simulate a 100-second body wait, exceeding the unmodified 30-second
+        // header cache retention. There is no live download to extend it.
+        hub.inner.lock().unwrap().entries[0].first -= Duration::from_secs(100);
+        hub.tick().unwrap();
+        assert!(hub.inner.lock().unwrap().entries.is_empty());
+        hub.observe_body_tip([6; 32], 61, 1, one.id().unwrap())
+            .unwrap();
+        assert!(
+            available(&hub, [6; 32], &one).is_none(),
+            "a hash-only tip cannot recreate a qualified header"
+        );
+        assert_eq!(hub.budget.retained_body_accounting().0, 0);
+        // A fresh authenticated header with its known parent restores the
+        // optional path. This does not prove discovery republishes it in time.
+        assert!(hub.offer(one.clone(), [6; 32]).unwrap());
+        assert!(available(&hub, [6; 32], &one).is_some());
+    }
+
+    #[test]
+    fn late_canonical_body_republishes_after_receiver_cache_expiry() {
+        let source = super::tests::hub();
+        let receiver = super::tests::hub();
+        let header = super::tests::header([2; 32], 1, 3);
+        source.offer(header.clone(), [7; 32]).unwrap();
+        let outgoing = source.outgoing([6; 32]).unwrap();
+        assert_eq!(outgoing.len(), 1);
+        receiver.offer(outgoing[0].clone(), [5; 32]).unwrap();
+        receiver.inner.lock().unwrap().entries[0].first -= Duration::from_secs(100);
+        receiver.tick().unwrap();
+        assert!(receiver.inner.lock().unwrap().entries.is_empty());
+        {
+            let mut inner = source.inner.lock().unwrap();
+            // This is the exact publication helper called only after Driver's
+            // authenticated canonical Store head has changed. The fixture
+            // models that event; no native proof admission is claimed here.
+            inner.entries[0].first -= Duration::from_secs(100);
+            inner.canonical = inner.entries[0].context.clone();
+            Hub::canonical_body_available(
+                &mut inner,
+                header.id().unwrap(),
+                source.local,
+                true,
+                Instant::now(),
+            );
+        }
+        let announced = source.tip().unwrap();
+        receiver
+            .observe_body_tip([5; 32], 51, announced.0, announced.1)
+            .unwrap();
+        assert!(available(&receiver, [5; 32], &header).is_none());
+        let fresh = source.outgoing([6; 32]).unwrap();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "a newly canonical body must republish its exact header after an earlier speculative announcement"
+        );
+        assert!(receiver.offer(fresh[0].clone(), [5; 32]).unwrap());
+        assert!(available(&receiver, [5; 32], &header).is_some());
+        assert_eq!(RETENTION, Duration::from_secs(30));
+        assert!(source.outgoing([6; 32]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn same_head_notifications_do_not_renew_cache_claim_or_progress() {
+        let hub = super::tests::hub();
+        let header = super::tests::header([2; 32], 1, 3);
+        hub.offer(header.clone(), [5; 32]).unwrap();
+        hub.observe_body_tip([5; 32], 51, 1, header.id().unwrap())
+            .unwrap();
+        let download = available(&hub, [5; 32], &header).unwrap();
+        let deadline = download.deadline.expires_at();
+        download.ownership().unwrap().begin_query([5; 32]).unwrap();
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            inner.canonical = inner.entries[0].context.clone();
+            Hub::canonical_body_available(
+                &mut inner,
+                header.id().unwrap(),
+                hub.local,
+                true,
+                Instant::now(),
+            );
+        }
+        assert_eq!(hub.outgoing([6; 32]).unwrap().len(), 1);
+        let first = hub.inner.lock().unwrap().entries[0].first;
+        let state = hub.budget.body_registry_diagnostic();
+        let progress = hub.sync_progress_runs();
+        {
+            let mut inner = hub.inner.lock().unwrap();
+            Hub::canonical_body_available(
+                &mut inner,
+                header.id().unwrap(),
+                hub.local,
+                false,
+                Instant::now() + Duration::from_secs(100),
+            );
+        }
+        assert_eq!(hub.inner.lock().unwrap().entries[0].first, first);
+        assert!(hub.outgoing([6; 32]).unwrap().is_empty());
+        assert_eq!(download.deadline.expires_at(), deadline);
+        let after = hub.budget.body_registry_diagnostic();
+        for field in [
+            "scope",
+            "sequence",
+            "phase",
+            "code",
+            "height",
+            "account",
+            "generation",
+            "queries",
+            "window_queries",
+            "terminal",
+            "wire_charged_bytes",
+            "wire_reserved_bytes",
+            "wire_maximum_bytes",
+        ] {
+            assert_eq!(after[field], state[field], "changed invariant: {field}");
+        }
+        assert_eq!(hub.sync_progress_runs(), progress);
+        assert_eq!(RETENTION, Duration::from_secs(30));
     }
 }

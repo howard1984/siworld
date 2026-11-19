@@ -8,14 +8,24 @@ struct Fixture {
     _connection: super::super::Connected,
 }
 fn fixture(role: p2p::Role, remote_role: p2p::Role, seed: u8) -> Fixture {
+    fixture_with_expected(role, remote_role, seed, None)
+}
+fn fixture_with_expected(
+    role: p2p::Role,
+    remote_role: p2p::Role,
+    seed: u8,
+    trusted: Option<p2p::ExpectedPeer>,
+) -> Fixture {
     let state = crate::eng2::snapshot::tests::bootstrap();
+
     let genesis = Genesis::seal(
         state.chain.config,
         state.governance,
         crate::eng2::genesis::FeeMode::LegacyMiner,
     )
     .unwrap();
-    let expected = p2p::test_support::expected(genesis.peer_binding(), [seed; 32]);
+    let expected =
+        trusted.unwrap_or_else(|| p2p::test_support::expected(genesis.peer_binding(), [seed; 32]));
     let remote = expected.fingerprint();
     let mut entropy = [0; 16];
     getrandom::fill(&mut entropy).unwrap();
@@ -31,7 +41,9 @@ fn fixture(role: p2p::Role, remote_role: p2p::Role, seed: u8) -> Fixture {
         limits.chain,
     )
     .unwrap();
+
     let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+
     let mut driver = Driver::new(store, verifier, limits).unwrap();
     let budget = p2p::Budget::new(MEMORY_BYTES);
     let rules = crate::eng2::selection::HeaderRules {
@@ -71,6 +83,7 @@ fn fixture(role: p2p::Role, remote_role: p2p::Role, seed: u8) -> Fixture {
         legacy_checkpoint_peers: Default::default(),
         digest: String::new(),
     };
+
     let headers = Arc::new(header_lane::Hub::new(&driver, &budget, [99; 32]).unwrap());
     driver.observe_headers(headers.clone());
     let network = Arc::new(NetworkStatus::with_pinned_peers([(remote, false)]));
@@ -105,6 +118,7 @@ fn fixture(role: p2p::Role, remote_role: p2p::Role, seed: u8) -> Fixture {
         mailbox: Arc::new(CheckpointMailbox::new(budget)),
     });
     assert!(shared.relay.selected(remote, remote_role));
+
     Fixture {
         shared,
         genesis,
@@ -251,11 +265,16 @@ fn cancelled_candidate_keeps_its_claim_until_the_inflight_adapter_worker_release
         .unwrap()
         .unwrap();
     assert!(!requests.is_empty());
-    // The replacement source advertises the exact header before requesting it.
+    // A qualified replacement source also announces its exact canonical tip.
     receiver
         .shared
         .headers
         .offer(header.clone(), [7; 32])
+        .unwrap();
+    receiver
+        .shared
+        .headers
+        .observe_body_tip([7; 32], 71, header.height, header.id().unwrap())
         .unwrap();
     receiver.shared.transfers.cancel();
     receiver.shared.transfers.reap(&receiver.shared).unwrap();
@@ -914,7 +933,7 @@ fn queued_body_cannot_publish_after_its_original_scope_closes_while_waiting_for_
 }
 
 #[test]
-fn header_only_unused_source_consumes_its_opportunity_then_failed_source_can_retry() {
+fn header_only_unused_source_spends_no_query_and_qualified_sources_keep_retry_order() {
     let source = fixture(p2p::Role::Miner, p2p::Role::Validator, 2);
     let receiver = fixture(p2p::Role::Validator, p2p::Role::Miner, 1);
     let header = produced(&source, 7);
@@ -922,14 +941,38 @@ fn header_only_unused_source_consumes_its_opportunity_then_failed_source_can_ret
     let unused = [6; 32];
     let connected = std::collections::BTreeSet::from([old, unused]);
     receiver.shared.headers.offer(header.clone(), old).unwrap();
+    receiver
+        .shared
+        .headers
+        .observe_body_tip(old, 51, header.height, header.id().unwrap())
+        .unwrap();
     let mut original_deadline = None;
     let mut expected_wire = 0;
-    for (index, fingerprint) in [old, unused, old].into_iter().enumerate() {
+    for (index, fingerprint) in [old, old, unused].into_iter().enumerate() {
         if index == 1 {
             receiver
                 .shared
                 .headers
                 .offer(header.clone(), unused)
+                .unwrap();
+            assert!(
+                receiver
+                    .shared
+                    .headers
+                    .download_preferred(unused, p2p::BodyMode::Legacy, None, &connected)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                receiver.shared.budget.body_registry_diagnostic()["window_queries"],
+                1
+            );
+        }
+        if index == 2 {
+            receiver
+                .shared
+                .headers
+                .observe_body_tip(unused, 61, header.height, header.id().unwrap())
                 .unwrap();
             assert!(
                 receiver
@@ -1029,4 +1072,186 @@ fn header_only_unused_source_consumes_its_opportunity_then_failed_source_can_ret
     drop(receiver.shared);
     std::fs::remove_dir_all(source.directory).unwrap();
     std::fs::remove_dir_all(receiver.directory).unwrap();
+}
+
+#[test]
+fn native_tls_pull_one_waits_for_exact_tip_then_uses_real_metadata_and_batch() {
+    use crate::identity::{NativeIdentity, PeerPin};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    let state = crate::eng2::snapshot::tests::bootstrap();
+    let genesis = Genesis::seal(
+        state.chain.config,
+        state.governance,
+        crate::eng2::genesis::FeeMode::LegacyMiner,
+    )
+    .unwrap();
+    let binding = genesis.peer_binding();
+    let mut entropy = [0; 16];
+    getrandom::fill(&mut entropy).unwrap();
+    let root =
+        std::env::temp_dir().join(format!("body-source-tls-{}", crate::local::hex(&entropy)));
+    std::fs::create_dir(&root).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = |name: &str| {
+        let path = root.join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        Arc::new(NativeIdentity::initialize(&path.canonicalize().unwrap(), binding).unwrap())
+    };
+    let source_id = identity("source");
+    let receiver_id = identity("receiver");
+    let expected = |identity: &NativeIdentity| {
+        let descriptor = identity.descriptor().unwrap();
+        let pin = PeerPin::from_trusted_descriptor(&descriptor, &binding).unwrap();
+        p2p::ExpectedPeer::from_pinned_descriptor(binding, descriptor, pin).unwrap()
+    };
+    let source_expected = expected(&source_id);
+    let receiver_expected = expected(&receiver_id);
+    let source = fixture_with_expected(
+        p2p::Role::Miner,
+        p2p::Role::Validator,
+        2,
+        Some(receiver_expected.clone()),
+    );
+    let receiver = fixture_with_expected(
+        p2p::Role::Validator,
+        p2p::Role::Miner,
+        1,
+        Some(source_expected.clone()),
+    );
+    let header = produced(&source, 17);
+    receiver
+        .shared
+        .headers
+        .offer(header.clone(), receiver.remote)
+        .unwrap();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    drop(listener);
+    let cancellation = p2p::Cancellation::default();
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard_cancel = cancellation.clone();
+    let guard_done = done.clone();
+    let watchdog = thread::spawn(move || {
+        for _ in 0..160 {
+            if guard_done.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        guard_cancel.cancel();
+    });
+    let source_shared = source.shared.clone();
+    let source_genesis = Genesis::decode(&genesis.encode().unwrap()).unwrap();
+    let source_header = header.clone();
+    let source_cancel = cancellation.clone();
+    let worker = thread::spawn(move || {
+        let context = p2p::AdmissionContext::new(
+            receiver_expected,
+            p2p::ConnectionRole::Responder,
+            source_cancel,
+        );
+        let mut provider =
+            p2p::NativeTlsAuthenticator::new(source_id, source_shared.budget.clone());
+        let session = p2p::establish_socket(
+            server,
+            &mut provider,
+            &context,
+            p2p::Role::Miner,
+            source_shared.budget.clone(),
+        )
+        .unwrap();
+        let mut peer = Peer::new(
+            session,
+            &source_genesis,
+            source_shared.headers.body_policy(),
+        )
+        .unwrap();
+        let mut incoming = 1;
+        let mut tips = 0;
+        for _ in 0..7 {
+            let before = peer.application_totals();
+            super::super::receive_turn(&mut peer, &mut incoming, |peer, request, message| {
+                match message {
+                    crate::eng2::transport::Request::Header {
+                        height: crate::eng2::transport::propagation::CAPABILITY_HEIGHT,
+                    } => peer.send_propagation_capabilities(request).unwrap(),
+                    crate::eng2::transport::Request::GetTip => {
+                        tips += 1;
+                        let tip = if tips <= 2 {
+                            (0, source_genesis.id())
+                        } else {
+                            (source_header.height, source_header.id().unwrap())
+                        };
+                        peer.advertise_tip(request, tip.0, tip.1).unwrap();
+                    }
+                    crate::eng2::transport::Request::Propagation(message) => {
+                        let received = peer.application_totals().received - before.received;
+                        serve(peer, &source_shared, request, message, received).unwrap();
+                    }
+                    _ => panic!("unexpected body worker request"),
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    });
+    let context = p2p::AdmissionContext::new(
+        source_expected,
+        p2p::ConnectionRole::Initiator,
+        cancellation.clone(),
+    );
+    let mut provider =
+        p2p::NativeTlsAuthenticator::new(receiver_id, receiver.shared.budget.clone());
+    let session = p2p::establish_socket(
+        client,
+        &mut provider,
+        &context,
+        p2p::Role::Validator,
+        receiver.shared.budget.clone(),
+    )
+    .unwrap();
+    let mut peer = Peer::new(session, &genesis, receiver.shared.headers.body_policy()).unwrap();
+    let mut outgoing = 1;
+    let mut source_announced = false;
+    for turn in 0..7 {
+        super::super::pull_one(
+            &mut peer,
+            &receiver.shared,
+            &mut outgoing,
+            &mut source_announced,
+        )
+        .unwrap();
+        peer.finish_round(outgoing).unwrap();
+        if turn <= 3 {
+            assert_eq!(receiver.shared.headers.active_downloads(), 0);
+            assert_eq!(receiver.shared.budget.retained_body_accounting().0, 0);
+        }
+    }
+    worker.join().unwrap();
+    done.store(true, std::sync::atomic::Ordering::Release);
+    watchdog.join().unwrap();
+    assert!(!cancellation.is_cancelled());
+    receiver.shared.transfers.reap(&receiver.shared).unwrap();
+    assert_eq!(receiver.shared.transfers.diagnostic()["decoded"], 1);
+    let ready = body_admission::test_take(&receiver.shared.bodies);
+    assert_eq!(ready.download.header.id().unwrap(), header.id().unwrap());
+    assert_eq!(
+        receiver.shared.budget.body_registry_diagnostic()["window_queries"],
+        2
+    );
+    assert_eq!(receiver.shared.headers.tip().unwrap(), (0, genesis.id()));
+    assert_eq!(
+        receiver.shared.owner.lock().unwrap().head().unwrap().height,
+        0
+    );
+    drop(ready);
+    drop(peer);
+    drop(source.shared);
+    drop(receiver.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(receiver.directory).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
 }

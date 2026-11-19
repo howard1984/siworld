@@ -882,15 +882,15 @@ impl Peer<p2p::NativeTlsChannel> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::genesis::FeeMode;
     use super::*;
     use std::io::Cursor;
 
     #[derive(Default)]
-    struct Script {
+    pub(crate) struct Script {
         input: Cursor<Vec<u8>>,
-        output: Vec<u8>,
+        pub(crate) output: Vec<u8>,
     }
     impl Read for Script {
         fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -906,7 +906,7 @@ mod tests {
             Ok(())
         }
     }
-    fn genesis() -> Genesis {
+    pub(crate) fn genesis() -> Genesis {
         let state = crate::eng2::snapshot::tests::bootstrap();
         Genesis::seal(
             state.chain.config.clone(),
@@ -915,14 +915,18 @@ mod tests {
         )
         .unwrap()
     }
-    fn policy() -> Policy {
+    pub(crate) fn policy() -> Policy {
         Policy {
             profile: crate::proofs::protocol_profile_fingerprint(),
             max_body_bytes: 4 * 1024 * 1024,
             max_settlement_proof_bytes: 3 * 1024 * 1024,
         }
     }
-    fn session(input: Vec<u8>, binding: p2p::Binding, budget: p2p::Budget) -> p2p::Session<Script> {
+    pub(crate) fn session(
+        input: Vec<u8>,
+        binding: p2p::Binding,
+        budget: p2p::Budget,
+    ) -> p2p::Session<Script> {
         p2p::Session::from_test_channel(
             Script {
                 input: Cursor::new(input),
@@ -942,7 +946,7 @@ mod tests {
         wire.extend_from_slice(bytes);
         wire
     }
-    fn body_header(g: &Genesis) -> (Body, Header) {
+    pub(crate) fn body_header(g: &Genesis) -> (Body, Header) {
         let mut body = crate::eng2::body::tests::body();
         body.network = g.config().network;
         body.profile = policy().profile;
@@ -2058,5 +2062,137 @@ mod tests {
             budget.body_wire_usage().0,
             first_bytes + second.sent + second.received
         );
+    }
+
+    // Framed UNAVAILABLE replies followed by an available body.
+    fn fetch_after_unavailable_replies(unavailable_count: u64) -> bool {
+        let g = genesis();
+        let (body, header) = body_header(&g);
+        let bound = binding(&g);
+        let mut sender =
+            Peer::new(session(vec![], bound, p2p::Budget::default()), &g, policy()).unwrap();
+        for request in 1..=unavailable_count {
+            sender.send_unavailable(request, header.height).unwrap();
+        }
+        sender
+            .send_body(unavailable_count + 1, &header, &body)
+            .unwrap();
+        let wire = sender.session.test_channel().output.clone();
+        let budget = p2p::Budget::new(32 * 1024 * 1024);
+        let scope = budget
+            .resident_body_scope(
+                717,
+                std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
+        let authorization = budget
+            .authorize_body(
+                &scope,
+                bound,
+                header.height,
+                header.id().unwrap(),
+                &p2p::Deadline::new(BODY_FETCH_TIMEOUT),
+            )
+            .unwrap();
+        let mut client = Peer::new(session(wire, bound, budget.clone()), &g, policy()).unwrap();
+        let origin = std::time::Instant::now();
+        for request in 1..=unavailable_count {
+            let ownership = client
+                .claim_body_authorized(&header, &authorization, p2p::BodyMode::Legacy)
+                .unwrap();
+            assert!(
+                client
+                    .fetch_body_owned(request, &header, ownership, None)
+                    .unwrap()
+                    .is_none()
+            );
+            let (timing, _) = client.take_fetch_observation();
+            let timing = timing.unwrap();
+            assert_eq!(timing.outcome, 2);
+            assert_eq!(timing.received_bytes, 0);
+        }
+        assert!(origin.elapsed() < std::time::Duration::from_secs(3));
+        let ownership =
+            match client.claim_body_authorized(&header, &authorization, p2p::BodyMode::Legacy) {
+                Ok(v) => v,
+                Err(e) => {
+                    assert_eq!(e, p2p::BodyClaimError::QueryLimit);
+                    return false;
+                }
+            };
+        let received = client
+            .fetch_body_owned(unavailable_count + 1, &header, ownership, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received.body.commitment(policy()).unwrap(),
+            header.body_commitment
+        );
+        assert!(origin.elapsed() < std::time::Duration::from_secs(3));
+        true
+    }
+    #[test]
+    fn three_unavailable_replies_preserve_the_last_body_query() {
+        assert!(fetch_after_unavailable_replies(3));
+    }
+
+    pub(crate) fn wire_after_unavailable(
+        g: &Genesis,
+        body: &Body,
+        header: &Header,
+        count: u64,
+    ) -> Vec<u8> {
+        let mut sender = Peer::new(
+            session(vec![], binding(g), p2p::Budget::default()),
+            g,
+            policy(),
+        )
+        .unwrap();
+        for request in 1..=count {
+            sender.send_unavailable(request, header.height).unwrap();
+        }
+        sender.send_body(count + 1, header, body).unwrap();
+        sender.session.test_channel().output.clone()
+    }
+
+    pub(crate) fn tip_wire(g: &Genesis, height: u64, id: Hash) -> Vec<u8> {
+        let mut sender = Peer::new(
+            session(vec![], binding(g), p2p::Budget::default()),
+            g,
+            policy(),
+        )
+        .unwrap();
+        sender.advertise_tip(77, height, id).unwrap();
+        sender.session.test_channel().output.clone()
+    }
+
+    pub(crate) fn authenticated_offer(
+        g: &Genesis,
+        header: &Header,
+        body: &Body,
+    ) -> propagation::Offer {
+        let mut message = vec![0x46, 1];
+        message.extend_from_slice(&(body.encoded_len(policy()).unwrap() as u64).to_le_bytes());
+        message.extend_from_slice(&header.encode().unwrap());
+        let bound = binding(g);
+        let mut receiver = Peer::new(
+            session(frame(77, &message, bound), bound, p2p::Budget::default()),
+            g,
+            policy(),
+        )
+        .unwrap();
+        receiver.propagation_supported = Some(true);
+        let (request, message) = receiver
+            .receive_propagation_request(
+                std::time::Instant::now(),
+                std::time::Duration::from_secs(3),
+                p2p::Cancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(request, 77);
+        let propagation::PropagationRequest::Offer(offer) = message else {
+            panic!("expected a parsed propagation offer")
+        };
+        offer
     }
 }
