@@ -164,12 +164,9 @@ pub(super) fn serve<S: std::io::Read + std::io::Write>(
             // Qualification verifies the complete known-parent timestamp/work
             // context before a policy ticket, body buffer or Credit is granted.
             shared.headers.offer(header.clone(), peer.peer())?;
-            let Some(download) = shared.headers.download_preferred(
-                peer.peer(),
-                p2p::BodyMode::Pieces,
-                Some(header.id().map_err(|_| "relay header identity rejected")?),
-                &shared.network.body_sources()?,
-            )?
+            let Some(download) = shared
+                .headers
+                .download_offered(&offer, &shared.network.body_sources()?)?
             else {
                 return peer
                     .reject_propagation_offer(

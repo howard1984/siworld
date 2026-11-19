@@ -192,6 +192,30 @@ fn retained_budget_diagnostic_existing_live_identity_requires_duplicate_workspac
             used
         }
     );
+    // The same real pinned Store and prior complete native validation can
+    // match without the duplicate 16x workspace while pressure remains held.
+    let before_match = budget.available().unwrap();
+    assert!(
+        native
+            .matches_restore_read(&read, height, limits, &snapshot)
+            .unwrap()
+    );
+    assert_eq!(budget.available().unwrap(), before_match);
+    let mut changed_snapshot = snapshot.clone();
+    changed_snapshot[10] ^= 1;
+    assert!(
+        !native
+            .matches_restore_read(&read, height, limits, &changed_snapshot)
+            .unwrap()
+    );
+    drop(changed_snapshot);
+    let mut changed_limits = limits;
+    changed_limits.chain.max_leaves += 1;
+    assert!(
+        !native
+            .matches_restore_read(&read, height, changed_limits, &snapshot)
+            .unwrap()
+    );
     drop(pressure);
     let duplicate = ArchiveWork::from_restore_read(&read, height, limits, &budget).unwrap();
     assert!(native.matches(&duplicate, &snapshot).unwrap());
@@ -202,6 +226,6 @@ fn retained_budget_diagnostic_existing_live_identity_requires_duplicate_workspac
     assert_eq!(budget.available().unwrap(), MAXIMUM);
     println!(
         "{}",
-        serde_json::json!({"result":"LOCAL_REAL_ARCHIVE_LIVE_IDENTITY_DUPLICATE_WORKSPACE_REPRODUCED","checkpoint_height":height,"base_archive_bytes":archive_bytes,"suffix_body_bytes":0,"requested":charge,"used":used,"maximum":MAXIMUM,"native_validation_performed":true,"same_identity_matches_after_pressure_released":true,"changed_snapshot_rejected":true,"production_cause_established":false,"proof_generation":false,"database_writes":0})
+        serde_json::json!({"result":"LOCAL_REAL_ARCHIVE_LIVE_IDENTITY_DUPLICATE_WORKSPACE_REPRODUCED","checkpoint_height":height,"base_archive_bytes":archive_bytes,"suffix_body_bytes":0,"requested":charge,"used":used,"maximum":MAXIMUM,"native_validation_performed":true,"same_identity_matches_after_pressure_released":true,"same_identity_matches_while_pressure_held":true,"snapshot_and_limits_changes_rejected":true,"changed_snapshot_rejected":true,"production_cause_established":false,"proof_generation":false,"database_writes":0})
     );
 }

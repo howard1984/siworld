@@ -245,6 +245,15 @@ impl CheckpointRestoreRead {
     pub(crate) fn header(&self, height: u64) -> Result<Header, String> {
         self.archive.compact(height).map(|value| value.0)
     }
+    /// Inspect the complete pinned reconstruction input without allocating a
+    /// second native reconstruction workspace. This digest grants no authority.
+    pub(crate) fn archive_input_digest(
+        &self,
+        height: u64,
+        limits: super::snapshot::ImportLimits,
+    ) -> Result<Hash, String> {
+        self.archive.input_digest(height, limits)
+    }
     pub(crate) fn archive(
         &self,
         height: u64,
@@ -340,6 +349,75 @@ impl CheckpointArchiveRead {
             return Err("captured checkpoint index context differs".into());
         }
         Ok(value)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn input_digest(
+        &self,
+        height: u64,
+        limits: super::snapshot::ImportLimits,
+    ) -> Result<Hash, String> {
+        let table = self
+            .transaction
+            .open_table(ANCHORS)
+            .map_err(|_| "captured checkpoint archive unavailable")?;
+        let lower = height
+            .saturating_sub(crate::eng2::runtime_export::LEGACY_CHECKPOINT_INTERVAL - 1)
+            .max(1);
+        let mut entries = table
+            .range(lower..=height)
+            .map_err(|_| "captured checkpoint archive range unavailable")?;
+        let (key, bytes) = entries
+            .next_back()
+            .ok_or("captured checkpoint archive missing within bounded migration window")?
+            .map_err(|_| "captured checkpoint archive read failed")?;
+        if bytes.value().len() > limits.max_snapshot_bytes {
+            return Err("captured checkpoint archive exceeds byte bound".into());
+        }
+        let base_height = key.value();
+        let base = self.compact(base_height)?.0;
+        let mut input = blake3::Hasher::new_derive_key(
+            "siworld eng2 checkpoint captured reconstruction input v1",
+        );
+        input.update(
+            &base
+                .encode()
+                .map_err(|_| "captured archive base header invalid")?,
+        );
+        input.update(&(bytes.value().len() as u64).to_le_bytes());
+        input.update(bytes.value());
+        let blocks = self
+            .transaction
+            .open_table(BLOCKS)
+            .map_err(|_| "captured checkpoint blocks unavailable")?;
+        for h in base_height + 1..=height {
+            if h <= self.imported_prefix {
+                return Err(
+                    "captured checkpoint proof body unavailable before imported prefix".into(),
+                );
+            }
+            let (expected, length) = self.compact(h)?;
+            let row = blocks
+                .get(h)
+                .map_err(|_| "captured checkpoint block read failed")?
+                .ok_or("captured checkpoint block missing")?;
+            let raw = row.value();
+            if raw.len() != HEADER_BYTES + length
+                || raw.get(..HEADER_BYTES)
+                    != Some(
+                        expected
+                            .encode()
+                            .map_err(|_| "captured checkpoint header invalid")?
+                            .as_slice(),
+                    )
+            {
+                return Err("captured checkpoint body differs from accepted index".into());
+            }
+            // Hash every byte, including proofs. Only equality with a still-live
+            // prior native validation permits reuse; a mismatch must revalidate.
+            input.update(&(raw.len() as u64).to_le_bytes());
+            input.update(raw);
+        }
+        Ok(*input.finalize().as_bytes())
     }
     pub(crate) fn read(
         &self,
@@ -1915,6 +1993,115 @@ mod tests {
         let store = Store::resume_existing(&path, genesis(), limits).unwrap();
         assert_eq!(store.rollback_points().unwrap(), vec![third]);
         drop(store);
+        fs_remove_fixture(directory);
+    }
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn retained_input_scan_binds_complete_bytes_and_pinned_revision() {
+        // Framing-only input cannot grant native validation or signing authority.
+        let directory = private_directory("retained-input-scan");
+        let database = Database::create(directory.join("input.redb")).unwrap();
+        let engine = Engine::new(genesis(), crate::eng2::snapshot::tests::limits().chain).unwrap();
+        let first = Header {
+            network: engine.state().network(),
+            height: 1,
+            parent: engine.state().tip(),
+            timestamp: 1,
+            target: [0xff; 32],
+            execution_commitment: [3; 32],
+            body_commitment: [4; 32],
+            nonce: 0,
+        };
+        let second = Header {
+            height: 2,
+            parent: first.id().unwrap(),
+            timestamp: 2,
+            ..first.clone()
+        };
+        let base = b"synthetic archive framing";
+        let mut raw = second.encode().unwrap().to_vec();
+        raw.extend_from_slice(b"synthetic proof bytes");
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(ANCHORS)
+            .unwrap()
+            .insert(1, base.as_slice())
+            .unwrap();
+        {
+            let mut index = write.open_table(INDEX).unwrap();
+            index
+                .insert(1, compact_record(&first, 1).unwrap().as_slice())
+                .unwrap();
+            index
+                .insert(
+                    2,
+                    compact_record(&second, raw.len() - HEADER_BYTES)
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap();
+        }
+        write
+            .open_table(BLOCKS)
+            .unwrap()
+            .insert(2, raw.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        let capture = || CheckpointArchiveRead {
+            transaction: std::sync::Arc::new(database.begin_read().unwrap()),
+            network: engine.state().network(),
+            head: 2,
+            imported_prefix: 0,
+            policy: engine.body_policy(),
+        };
+        let limits = crate::eng2::snapshot::tests::limits();
+        let pinned = capture();
+        let original = pinned.input_digest(2, limits).unwrap();
+        let mut expected = blake3::Hasher::new_derive_key(
+            "siworld eng2 checkpoint captured reconstruction input v1",
+        );
+        expected.update(&first.encode().unwrap());
+        expected.update(&(base.len() as u64).to_le_bytes());
+        expected.update(base);
+        expected.update(&(raw.len() as u64).to_le_bytes());
+        expected.update(&raw);
+        assert_eq!(original, *expected.finalize().as_bytes());
+        // A proof-byte change changes the identity even though its header and
+        // length are unchanged. The old pinned read remains the original input.
+        *raw.last_mut().unwrap() ^= 1;
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(BLOCKS)
+            .unwrap()
+            .insert(2, raw.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        assert_ne!(capture().input_digest(2, limits).unwrap(), original);
+        assert_eq!(pinned.input_digest(2, limits).unwrap(), original);
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(ANCHORS)
+            .unwrap()
+            .insert(1, b"changed archive framing".as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        let changed_base = capture().input_digest(2, limits).unwrap();
+        assert_ne!(changed_base, original);
+        // Missing bodies and inconsistent accepted-index framing are errors.
+        let write = database.begin_write().unwrap();
+        write
+            .open_table(BLOCKS)
+            .unwrap()
+            .insert(2, &raw[..raw.len() - 1])
+            .unwrap();
+        write.commit().unwrap();
+        assert!(capture().input_digest(2, limits).is_err());
+        let write = database.begin_write().unwrap();
+        write.open_table(BLOCKS).unwrap().remove(2).unwrap();
+        write.commit().unwrap();
+        assert!(capture().input_digest(2, limits).is_err());
+        drop(pinned);
+        drop(database);
         fs_remove_fixture(directory);
     }
     #[test]

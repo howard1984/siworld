@@ -9,6 +9,7 @@ struct ConnectedLane {
     peer: Hash,
     lane: Lane,
     ordinal: u64,
+    session_id: u64,
 }
 impl Drop for ConnectedLane {
     fn drop(&mut self) {
@@ -17,6 +18,8 @@ impl Drop for ConnectedLane {
         }
         if self.lane == Lane::Headers {
             self.headers.disconnected(self.peer);
+        } else {
+            self.headers.forget_body_tip(self.peer, self.session_id);
         }
     }
 }
@@ -31,6 +34,7 @@ pub(super) fn lane_session(
         let ordinal = shared.network.admit_lane(fingerprint, lane)?;
         ConnectedLane {
             ordinal,
+            session_id: peer.propagation_session_id(),
             status: shared.network.clone(),
             headers: shared.headers.clone(),
             peer: fingerprint,
@@ -117,18 +121,19 @@ fn bodies(
 ) -> Result<(), String> {
     let mut outgoing = 1u64;
     let mut incoming = 1u64;
+    let mut source_announced = false;
     while !shared.cancel.is_cancelled() {
         if !peer.ready_for_cycle() {
             return Ok(());
         }
         if initiator {
-            pull_one(peer, shared, &mut outgoing)?;
+            pull_one(peer, shared, &mut outgoing, &mut source_announced)?;
             peer.finish_round(outgoing)
                 .map_err(|_| "body lane turn completion failed")?;
             serve_turn(peer, shared, &mut incoming)?;
         } else {
             serve_turn(peer, shared, &mut incoming)?;
-            pull_one(peer, shared, &mut outgoing)?;
+            pull_one(peer, shared, &mut outgoing, &mut source_announced)?;
             peer.finish_round(outgoing)
                 .map_err(|_| "body lane turn completion failed")?;
         }
@@ -140,6 +145,7 @@ fn pull_one(
     peer: &mut Peer<p2p::NativeTlsChannel>,
     shared: &Shared,
     sequence: &mut u64,
+    source_announced: &mut bool,
 ) -> Result<(), String> {
     *sequence = sequence
         .checked_add(1)
@@ -147,6 +153,11 @@ fn pull_one(
     if !peer.propagation_known() {
         peer.probe_propagation(*sequence)
             .map_err(|_| "body propagation negotiation failed")?;
+        return Ok(());
+    }
+    if !*source_announced {
+        refresh_body_tip(peer, &shared.headers, *sequence)?;
+        *source_announced = true;
         return Ok(());
     }
     shared.transfers.reap(shared)?;
@@ -215,13 +226,27 @@ fn pull_one(
                 received,
                 path,
             });
+        } else {
+            shared
+                .headers
+                .forget_body_tip(peer.peer(), peer.propagation_session_id());
+            *source_announced = false;
         }
     } else {
-        peer.fetch_tip(*sequence)
-            .map_err(|_| "body lane heartbeat failed")?;
+        refresh_body_tip(peer, &shared.headers, *sequence)?;
         pause(shared, 50);
     }
     Ok(())
+}
+fn refresh_body_tip<S: std::io::Read + std::io::Write>(
+    peer: &mut Peer<S>,
+    headers: &Hub,
+    request: u64,
+) -> Result<(), String> {
+    let (height, id) = peer
+        .fetch_tip(request)
+        .map_err(|_| "body lane heartbeat failed")?;
+    headers.observe_body_tip(peer.peer(), peer.propagation_session_id(), height, id)
 }
 fn serve_turn<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,

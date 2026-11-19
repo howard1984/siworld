@@ -97,6 +97,23 @@ A heartbeat reads the actual committed header-cache tip without acquiring anothe
 body's validation lock. Each turn contains one request and an exactly matched
 completion; unexpected messages or sequences close that lane.
 
+Before an unsolicited body request, the lane reads the peer's authenticated
+canonical tip. A forwarded header alone does not establish body availability.
+Source selection requires an exact qualified tip and a known parent path to the
+candidate, or a parsed propagation offer for that exact independently qualified
+header and network binding. A height alone, unknown tip or different branch
+cannot qualify the source. These announcements are scheduling hints; they grant
+no execution validity or canonical, checkpoint or wallet authority.
+
+At most eight peer hints are retained. An idle or unqualified hint can yield its
+slot to a known candidate's holder. A definite whole-body `UNAVAILABLE` response
+withdraws the current session's hint. Body-lane disconnect cleanup removes only
+that session's hint, so late cleanup cannot remove a newer session's announcement.
+Repeated announcements and session replacement do not refund queries or bytes,
+renew an existing body's absolute deadline, or bypass the exact-body registry.
+A peer that falsely announces availability can still consume its ordinary
+bounded account.
+
 The node has at most four active downloads, at most two sources for one header
 and four distinct source attempts per retained header. Qualified ancestors needed
 by an eligible competing tip are scheduled before descendants. A retained lease
@@ -111,6 +128,15 @@ deadline. Decoded body buffers keep the original shared memory
 reservation through every consumer. The ordinary legacy body's ten-second
 initial response and absolute 180-second chunk deadline are preserved. Other
 control messages retain their existing ten-second payload limit.
+
+An inactive qualified header still expires after 30 seconds. A later tip hash
+cannot recreate an evicted header; a fresh known-parent header or ordinary
+discovery is required. When actual canonical acceptance changes the head, the
+cache republishes that exact header, including when it was forwarded before its
+body arrived. Repeating a notification for the same head does not renew the
+publication age or exact-body account. This preserves the existing cache and
+transfer bounds; it does not establish a network-wide discovery or convergence
+latency bound.
 
 The optional `sync_progress` status object describes the highest-work uncompleted
 remote header in this qualified cache. It reports the candidate and canonical
