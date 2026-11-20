@@ -50,7 +50,13 @@ struct Inner {
     sequence: u64,
     rate_start: Instant,
     offers: usize,
-    body_tips: BTreeMap<Hash, (u64, u64, Hash)>,
+    body_tips: BTreeMap<Hash, BodyTip>,
+}
+struct BodyTip {
+    session: u64,
+    height: u64,
+    id: Hash,
+    pieces: bool,
 }
 pub(crate) struct LocalBody {
     header: Header,
@@ -891,12 +897,24 @@ impl Hub {
             Some((offer.peer(), id)),
         )
     }
+    #[cfg(test)]
     pub(crate) fn observe_body_tip(
         &self,
         peer: Hash,
         session: u64,
         height: u64,
         id: Hash,
+    ) -> Result<(), String> {
+        self.observe_body_lane_tip(peer, session, height, id, false)
+    }
+
+    pub(super) fn observe_body_lane_tip(
+        &self,
+        peer: Hash,
+        session: u64,
+        height: u64,
+        id: Hash,
+        pieces: bool,
     ) -> Result<(), String> {
         self.ensure_available()?;
         if peer == [0; 32]
@@ -913,18 +931,25 @@ impl Hub {
         if !inner.body_tips.contains_key(&peer) && inner.body_tips.len() == MAX_BODY_SOURCE_HINTS {
             // An idle or unqualified tip cannot crowd out a known candidate's
             // holder. The fixed source-hint capacity is not expanded.
-            if let Some(stale) = inner.body_tips.iter().find_map(|(source, &(_, h, id))| {
-                (!inner
-                    .entries
-                    .iter()
-                    .any(|e| !e.complete && e.header.height == h && e.context.id == id))
+            if let Some(stale) = inner.body_tips.iter().find_map(|(source, tip)| {
+                (!inner.entries.iter().any(|e| {
+                    !e.complete && e.header.height == tip.height && e.context.id == tip.id
+                }))
                 .then_some(*source)
             }) {
                 inner.body_tips.remove(&stale);
             }
         }
         if inner.body_tips.contains_key(&peer) || inner.body_tips.len() < MAX_BODY_SOURCE_HINTS {
-            inner.body_tips.insert(peer, (session, height, id));
+            inner.body_tips.insert(
+                peer,
+                BodyTip {
+                    session,
+                    height,
+                    id,
+                    pieces,
+                },
+            );
         }
         Ok(())
     }
@@ -933,10 +958,40 @@ impl Hub {
             && inner
                 .body_tips
                 .get(&peer)
-                .is_some_and(|tip| tip.0 == session)
+                .is_some_and(|tip| tip.session == session)
         {
             inner.body_tips.remove(&peer);
         }
+    }
+    pub(super) fn piece_sources(
+        &self,
+        id: Hash,
+        peer: Hash,
+        session: u64,
+        connected: &std::collections::BTreeSet<Hash>,
+    ) -> Result<std::collections::BTreeSet<Hash>, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "header cache lock poisoned")?;
+        let Some(entry) = inner
+            .entries
+            .iter()
+            .find(|entry| entry.context.id == id && !entry.complete)
+        else {
+            return Ok(Default::default());
+        };
+        Ok(connected
+            .iter()
+            .copied()
+            .filter(|source| {
+                inner
+                    .body_tips
+                    .get(source)
+                    .is_some_and(|tip| tip.pieces && (*source != peer || tip.session == session))
+                    && Self::source_can_serve(&inner, *source, entry, None)
+            })
+            .collect())
     }
     fn source_can_serve(
         inner: &Inner,
@@ -947,7 +1002,10 @@ impl Hub {
         if offer == Some((peer, target.context.id)) {
             return true;
         }
-        let Some(&(_, mut height, mut id)) = inner.body_tips.get(&peer) else {
+        let Some(&BodyTip {
+            mut height, mut id, ..
+        }) = inner.body_tips.get(&peer)
+        else {
             return false;
         };
         // Height alone is never sufficient: follow only qualified exact hashes

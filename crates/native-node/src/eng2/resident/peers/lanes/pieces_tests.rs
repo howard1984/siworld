@@ -16,6 +16,15 @@ fn fixture_with_expected(
     seed: u8,
     trusted: Option<p2p::ExpectedPeer>,
 ) -> Fixture {
+    fixture_with_sources(role, remote_role, seed, trusted, &[])
+}
+fn fixture_with_sources(
+    role: p2p::Role,
+    remote_role: p2p::Role,
+    seed: u8,
+    trusted: Option<p2p::ExpectedPeer>,
+    additional_seeds: &[u8],
+) -> Fixture {
     let state = crate::eng2::snapshot::tests::bootstrap();
 
     let genesis = Genesis::seal(
@@ -67,17 +76,26 @@ fn fixture_with_expected(
     driver
         .enable_reorganization_with_budget(branches, budget.clone())
         .unwrap();
+    let mut peers = vec![expected];
+    peers.extend(
+        additional_seeds
+            .iter()
+            .map(|&value| p2p::test_support::expected(genesis.peer_binding(), [value; 32])),
+    );
     let config = config::Configuration {
         role,
         proof_retention: None,
         listen: None,
         mining: false,
-        peers: vec![config::Destination {
-            endpoint: "127.0.0.1:1".parse().unwrap(),
-            dial: false,
-            checkpoint_reference: false,
-            expected,
-        }],
+        peers: peers
+            .into_iter()
+            .map(|expected| config::Destination {
+                endpoint: "127.0.0.1:1".parse().unwrap(),
+                dial: false,
+                checkpoint_reference: false,
+                expected,
+            })
+            .collect(),
         fixed_relay_peers: std::collections::BTreeSet::from([remote]),
         checkpoint_key: None,
         legacy_checkpoint_peers: Default::default(),
@@ -86,7 +104,12 @@ fn fixture_with_expected(
 
     let headers = Arc::new(header_lane::Hub::new(&driver, &budget, [99; 32]).unwrap());
     driver.observe_headers(headers.clone());
-    let network = Arc::new(NetworkStatus::with_pinned_peers([(remote, false)]));
+    let network = Arc::new(NetworkStatus::with_pinned_peers(
+        config
+            .peers
+            .iter()
+            .map(|peer| (peer.expected.fingerprint(), false)),
+    ));
     let connection = network.connected(remote).unwrap();
     network.admit_lane(remote, Lane::Bodies).unwrap();
     let shared = Arc::new(Shared {
@@ -126,6 +149,118 @@ fn fixture_with_expected(
         directory,
         _connection: connection,
     }
+}
+
+#[test]
+fn live_tip_session_can_join_an_offer_transfer_without_an_extra_descriptor() {
+    let source = fixture(p2p::Role::Miner, p2p::Role::Validator, 2);
+    let receiver = fixture_with_sources(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[3]);
+    let header = produced(&source, 25);
+    let id = header.id().unwrap();
+    let alternate =
+        p2p::test_support::expected(receiver.genesis.peer_binding(), [3; 32]).fingerprint();
+    let _connection = receiver.shared.network.connected(alternate).unwrap();
+    receiver
+        .shared
+        .network
+        .admit_lane(alternate, Lane::Bodies)
+        .unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut source_peer = peer(a, &source, p2p::Role::Validator);
+    let mut receiver_peer = peer(b, &receiver, p2p::Role::Miner);
+    let source_shared = source.shared.clone();
+    let worker = thread::spawn(move || {
+        assert!(source_peer.probe_propagation(2).unwrap());
+        source_peer.finish_round(2).unwrap();
+        assert!(offer(&mut source_peer, &source_shared, 3).unwrap());
+        source_peer.finish_round(3).unwrap();
+        let mut incoming = 1;
+        super::super::serve_turn(&mut source_peer, &source_shared, &mut incoming).unwrap();
+    });
+    let mut incoming = 1;
+    super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming).unwrap();
+    super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming).unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut alternate_peer = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            a,
+            receiver.genesis.peer_binding(),
+            receiver.shared.budget.clone(),
+            alternate,
+            p2p::Role::Miner,
+        ),
+        &receiver.genesis,
+        receiver.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let mut alternate_server = peer(b, &source, p2p::Role::Validator);
+    assert!(!pull_batch(&mut alternate_peer, &receiver.shared, 2).unwrap());
+    receiver
+        .shared
+        .headers
+        .observe_body_tip(
+            alternate,
+            alternate_peer.propagation_session_id(),
+            header.height,
+            id,
+        )
+        .unwrap();
+    assert!(!pull_batch(&mut alternate_peer, &receiver.shared, 2).unwrap());
+    let source_shared = source.shared.clone();
+    let second = thread::spawn(move || {
+        let mut incoming = 1;
+        super::super::serve_turn(&mut alternate_server, &source_shared, &mut incoming).unwrap();
+        super::super::receive_turn(
+            &mut alternate_server,
+            &mut incoming,
+            |peer, request, message| {
+                assert!(matches!(message, crate::eng2::transport::Request::GetTip));
+                peer.advertise_tip(request, header.height, id).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        super::super::serve_turn(&mut alternate_server, &source_shared, &mut incoming).unwrap();
+    });
+    assert!(alternate_peer.probe_propagation(2).unwrap());
+    alternate_peer.finish_round(2).unwrap();
+    super::super::refresh_body_tip(&mut alternate_peer, &receiver.shared.headers, 3).unwrap();
+    alternate_peer.finish_round(3).unwrap();
+    let stale_session = alternate_peer.propagation_session_id().wrapping_add(1);
+    let connected = receiver.shared.network.body_sources().unwrap();
+    assert!(
+        !receiver
+            .shared
+            .headers
+            .piece_sources(id, alternate, stale_session, &connected)
+            .unwrap()
+            .contains(&alternate)
+    );
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(pull_batch(&mut receiver_peer, &receiver.shared, 2).unwrap());
+            receiver_peer.finish_round(2).unwrap();
+        });
+        assert!(pull_batch(&mut alternate_peer, &receiver.shared, 4).unwrap());
+        alternate_peer.finish_round(4).unwrap();
+    });
+    worker.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(
+        receiver.shared.budget.body_registry_diagnostic()["window_queries"],
+        3
+    );
+    receiver.shared.transfers.reap(&receiver.shared).unwrap();
+    assert_eq!(receiver.shared.transfers.diagnostic()["decoded"], 1);
+    assert!(!pull_batch(&mut alternate_peer, &receiver.shared, 5).unwrap());
+    receiver.shared.bodies.clear().unwrap();
+    drop(alternate_peer);
+    drop(receiver_peer);
+    drop(source.shared);
+    drop(receiver.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(receiver.directory).unwrap();
 }
 fn peer(socket: UnixStream, fixture: &Fixture, role: p2p::Role) -> Peer<UnixStream> {
     socket
@@ -260,6 +395,8 @@ fn cancelled_candidate_keeps_its_claim_until_the_inflight_adapter_worker_release
         .transfers
         .batch(
             receiver.remote,
+            receiver_peer.propagation_session_id(),
+            &receiver.shared.headers,
             &receiver.shared.network.body_sources().unwrap(),
         )
         .unwrap()

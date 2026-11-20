@@ -500,7 +500,7 @@ impl<S: Read + Write> Peer<S> {
         result
     }
 
-    #[cfg(feature = "eng2-runtime")]
+    #[cfg(all(test, feature = "eng2-runtime"))]
     pub(crate) fn fetch_propagation_confirmation_at(
         &mut self,
         request: u64,
@@ -730,9 +730,12 @@ impl<S: Read + Write> Peer<S> {
             let query = codec::encode_query(height, requests, count).map_err(invalid)?;
             let sequence = external_request.unwrap_or(requests[0].sequence);
             let before = peer.session.io_totals();
+            let send_deadline = deadline
+                .clone()
+                .capped_at(Instant::now() + Duration::from_secs(10));
             let sent = ownership
                 .begin_query(peer.peer())
-                .and_then(|()| peer.send_application_before(sequence, &query, &deadline));
+                .and_then(|()| peer.send_application_before(sequence, &query, &send_deadline));
             lock(transfer)?
                 .sent(
                     peer.peer(),
@@ -745,8 +748,11 @@ impl<S: Read + Write> Peer<S> {
                 sent?;
                 for _ in 0..requests.len() {
                     let frame_before = peer.session.io_totals().received;
+                    let frame_deadline = deadline
+                        .clone()
+                        .capped_at(Instant::now() + Duration::from_secs(10));
                     let (response, frame, _charge) =
-                        peer.receive_application_before(&deadline, PIECE_BYTES + 38)?;
+                        peer.receive_application_before(&frame_deadline, PIECE_BYTES + 38)?;
                     let piece = codec::decode_piece(&frame, count).map_err(invalid)?;
                     let assigned = requests
                         .iter()
@@ -1842,7 +1848,7 @@ mod tests {
                 .spawn(|| second.fetch_propagation_confirmation_at(92, &header, &transfer, &owner));
             seen.recv_timeout(Duration::from_secs(1)).unwrap();
             let connected = std::collections::BTreeSet::from([[9; 32], [2; 32]]);
-            assert_eq!(transfer.lock().unwrap().batch_capacity(&connected), 0);
+            assert!(transfer.lock().unwrap().batch_capacity(&connected) > 0);
             assert!(pending.join().unwrap().is_err());
         });
         delayed.join().unwrap();

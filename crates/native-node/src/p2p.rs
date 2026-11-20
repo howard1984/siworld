@@ -607,6 +607,12 @@ impl Deadline {
         result.body_cancellation = Some(lease.cancel.clone());
         result
     }
+    pub(crate) fn capped_at(mut self, expires: Instant) -> Self {
+        self.limit = self
+            .limit
+            .min(expires.saturating_duration_since(self.started));
+        self
+    }
     pub(crate) fn expires_at(&self) -> Instant {
         self.started + self.limit
     }

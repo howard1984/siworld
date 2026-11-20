@@ -190,9 +190,14 @@ fn pull_one(
                 .transfers
                 .metadata_observed(shared, &download, &ledger, metadata.is_ok());
             let metadata = metadata.map_err(|_| "piece metadata interrupted or rejected")?;
-            shared
-                .transfers
-                .insert(download, metadata, ledger, validation, shared)?;
+            shared.transfers.insert(
+                download,
+                metadata,
+                ledger,
+                validation,
+                peer.propagation_session_id(),
+                shared,
+            )?;
             return Ok(());
         }
     }
@@ -246,7 +251,13 @@ fn refresh_body_tip<S: std::io::Read + std::io::Write>(
     let (height, id) = peer
         .fetch_tip(request)
         .map_err(|_| "body lane heartbeat failed")?;
-    headers.observe_body_tip(peer.peer(), peer.propagation_session_id(), height, id)
+    headers.observe_body_lane_tip(
+        peer.peer(),
+        peer.propagation_session_id(),
+        height,
+        id,
+        peer.propagation_supported(),
+    )
 }
 fn serve_turn<S: std::io::Read + std::io::Write>(
     peer: &mut Peer<S>,
