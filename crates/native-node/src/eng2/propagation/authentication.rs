@@ -152,7 +152,7 @@ impl Descriptor {
 }
 
 impl Authenticated {
-    #[cfg(feature = "eng2-runtime")]
+    #[cfg(all(test, feature = "eng2-runtime"))]
     pub(crate) fn same_descriptor(&self, other: &Self) -> bool {
         self.block == other.block
             && self.context == other.context

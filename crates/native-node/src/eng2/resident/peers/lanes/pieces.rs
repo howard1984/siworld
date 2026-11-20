@@ -7,48 +7,35 @@ pub(super) fn pull_batch<S: std::io::Read + std::io::Write>(
     shared: &Shared,
     request: u64,
 ) -> Result<bool, String> {
-    if let Some(job) = shared.transfers.confirmation(peer.peer())? {
-        let usage = shared.relay.take(
-            peer.peer(),
-            peer.propagation_session_id(),
-            job.download
-                .header
-                .id()
-                .map_err(|_| "piece header identity rejected")?,
-        )?;
-        let operation = |peer: &mut Peer<S>| {
-            peer.fetch_propagation_confirmation_at(
-                request,
-                &job.download.header,
-                &job.transfer,
-                &job.ownership,
-            )
-        };
-        let result = if let Some(usage) = &usage {
-            peer.with_wire_fence(usage.clone(), operation)
-        } else {
-            operation(peer)
-        };
-        if let Some(usage) = usage {
-            let _ = shared.relay.close(usage);
-        }
-        if result.map_err(|_| "piece source confirmation interrupted or rejected")? {
-            return Ok(true);
-        }
-    }
-    let Some((job, requests)) = shared
-        .transfers
-        .batch(peer.peer(), &shared.network.body_sources()?)?
+    let Some((job, requests)) = shared.transfers.batch(
+        peer.peer(),
+        peer.propagation_session_id(),
+        &shared.headers,
+        &shared.network.body_sources()?,
+    )?
     else {
         return Ok(false);
     };
     // The transfer mutex is acquired only for assignments, accounting and
     // authenticated pieces. It is never retained across a socket read/write.
-    let usage = shared.relay.take(
+    let abandon = || -> Result<(), String> {
+        job.transfer
+            .lock()
+            .map_err(|_| "piece transfer lock poisoned")?
+            .abandon_batch(requests[0].peer, requests[0].sequence, Instant::now());
+        Ok(())
+    };
+    let usage = match shared.relay.take(
         peer.peer(),
         peer.propagation_session_id(),
         requests[0].block,
-    )?;
+    ) {
+        Ok(usage) => usage,
+        Err(error) => {
+            abandon()?;
+            return Err(error);
+        }
+    };
     let operation = |peer: &mut Peer<S>| {
         peer.fetch_propagation_batch_observed_at(
             request,
@@ -73,7 +60,10 @@ pub(super) fn pull_batch<S: std::io::Read + std::io::Write>(
     if let Some(usage) = usage {
         let _ = shared.relay.close(usage);
     }
-    result.map_err(|_| "piece batch interrupted or rejected")?;
+    if result.is_err() {
+        abandon()?;
+        return Err("piece batch interrupted or rejected".into());
+    }
     Ok(true)
 }
 pub(super) fn offer<S: std::io::Read + std::io::Write>(
@@ -220,9 +210,14 @@ pub(super) fn serve<S: std::io::Read + std::io::Write>(
                         download.deadline.clone(),
                         permit,
                     )?;
-                    shared
-                        .transfers
-                        .insert(download, metadata, ledger, validation, shared)?;
+                    shared.transfers.insert(
+                        download,
+                        metadata,
+                        ledger,
+                        validation,
+                        peer.propagation_session_id(),
+                        shared,
+                    )?;
                 }
                 Err(_) => {
                     shared.relay.close(permit)?;

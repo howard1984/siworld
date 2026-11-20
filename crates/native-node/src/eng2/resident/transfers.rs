@@ -10,6 +10,7 @@ pub(super) struct Job {
     pub(super) ownership: p2p::BodyClaim,
     pub(super) download: header_lane::Download,
     pub(super) validation: Option<Arc<super::super::native_pipeline::Pipeline>>,
+    source_session: u64,
     path: Vec<super::super::header::Header>,
     _charge: p2p::Reservation,
 }
@@ -133,6 +134,7 @@ impl Transfers {
         metadata: Metadata,
         ledger: DescriptorLedger,
         validation: Option<Arc<super::super::native_pipeline::Pipeline>>,
+        source_session: u64,
         shared: &Shared,
     ) -> Result<(), String> {
         let path = shared.headers.path(&download.header)?;
@@ -155,6 +157,7 @@ impl Transfers {
             ownership,
             download,
             validation,
+            source_session,
             path,
             _charge: charge,
         });
@@ -178,28 +181,11 @@ impl Transfers {
             }
         }
     }
-    pub(super) fn confirmation(&self, peer: Hash) -> Result<Option<Arc<Job>>, String> {
-        let jobs = self
-            .jobs
-            .lock()
-            .map_err(|_| "piece job registry lock poisoned")?
-            .clone();
-        for job in jobs {
-            let available = job
-                .transfer
-                .lock()
-                .map_err(|_| "piece transfer lock poisoned")?
-                .confirmation_available(peer, &job.ownership);
-            if available {
-                return Ok(Some(job));
-            }
-        }
-        Ok(None)
-    }
-
     pub(super) fn batch(
         &self,
         peer: Hash,
+        session: u64,
+        headers: &header_lane::Hub,
         connected: &std::collections::BTreeSet<Hash>,
     ) -> Result<Option<Batch>, String> {
         let jobs = self
@@ -211,16 +197,24 @@ impl Transfers {
             if job.ownership.deadline().check().is_err() || job.download.cancel.is_cancelled() {
                 continue;
             }
-            // A source has one batch. Leave disjoint work for up to two other
-            // configured sources within the shared four-query ceiling.
+            let id = job
+                .download
+                .header
+                .id()
+                .map_err(|_| "piece header identity rejected")?;
+            let holders = headers.piece_sources(id, peer, session, connected)?;
             let mut transfer = job
                 .transfer
                 .lock()
                 .map_err(|_| "piece transfer lock poisoned")?;
-            if !transfer.confirmed_source(peer) {
+            if !(job.source_session == session && transfer.confirmed_source(peer)
+                || holders.contains(&peer))
+                || !job.ownership.can_query(peer, 1)
+            {
                 continue;
             }
-            let maximum = transfer.batch_capacity(connected);
+            let maximum =
+                transfer.qualified_batch_capacity(peer, connected, &holders, &job.ownership);
             if maximum == 0 {
                 continue;
             }
@@ -270,6 +264,7 @@ impl Transfers {
                 ownership,
                 download,
                 validation,
+                source_session: _,
                 path,
                 _charge,
             } = job;
