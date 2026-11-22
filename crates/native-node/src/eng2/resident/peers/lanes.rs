@@ -389,6 +389,7 @@ mod tests {
             let policy = crate::eng2::body::Policy {
                 profile: crate::proofs::protocol_profile_fingerprint(),
                 max_body_bytes: 1024,
+                slot_rule: crate::wire::SlotRule::Legacy,
                 max_settlement_proof_bytes: 1024,
             };
             let mut peer = Peer::new(session, &genesis, policy).unwrap();

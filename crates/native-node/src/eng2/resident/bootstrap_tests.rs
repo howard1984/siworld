@@ -152,6 +152,7 @@ fn hybrid_rollover_reauthenticates_exact_lease_resumes_and_rejects_expired_or_fo
     let body = super::super::super::body::Policy {
         profile: crate::proofs::protocol_profile_fingerprint(),
         max_body_bytes: 1024,
+        slot_rule: crate::wire::SlotRule::Legacy,
         max_settlement_proof_bytes: 1024,
     };
     let server_connector = Connector::new(

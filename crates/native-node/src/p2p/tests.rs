@@ -295,6 +295,8 @@ fn operation_deadline_covers_header_and_body_without_resetting() {
     let mut session = Session::from_test_channel(channel, binding(), Budget::default());
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -316,6 +318,8 @@ fn expired_deadlines_fail_before_touching_the_channel() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -362,6 +366,8 @@ fn reused_exchange_deadline_does_not_reset_between_missing_proof_frames() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -408,6 +414,8 @@ fn paired_request_header_can_arrive_after_the_ordinary_control_deadline() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: Duration::from_secs(180),
         cancellation: Cancellation::default(),
@@ -459,6 +467,8 @@ fn paired_request_header_deadline_is_absolute_under_fragmentation() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: Duration::from_secs(180),
         cancellation: Cancellation::default(),
@@ -1114,4 +1124,57 @@ mod post_io_accounting {
     fn write_counter_overflow_still_settles_shared_and_outer_accounts() {
         check(false, true);
     }
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn admitted_forwarding_retains_cutoff_and_hard_revocation() {
+    use std::sync::atomic::AtomicBool;
+
+    for revoked in 0..4 {
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut local = Deadline::test_clock(Duration::from_secs(5), clock.clone());
+        let claim = Arc::new(AtomicBool::new(false));
+        local.body_cancellation = Some(claim.clone());
+        let shutdown = Cancellation::default();
+        let transfer = Cancellation::default();
+        let header = Cancellation::default();
+        let context = Cancellation::default();
+        let candidate = ForwardingCandidate::new(header.clone(), context.clone());
+        let forwarding = local.clone().for_candidate_forwarding(
+            shutdown.clone(),
+            transfer.clone(),
+            candidate.clone(),
+        );
+        assert_eq!(forwarding.expires_at(), local.expires_at());
+        assert!(forwarding.check().is_ok());
+        claim.store(true, Ordering::Release);
+        assert!(forwarding.check().is_err());
+        candidate.authenticated();
+        assert!(forwarding.check().is_err());
+        candidate.accepted();
+        candidate.abandon_unless_accepted();
+        assert!(local.check().is_err() && forwarding.check().is_ok());
+        let capped = forwarding
+            .clone()
+            .capped_at(forwarding.expires_at() - Duration::from_secs(1));
+        clock.store(4000, Ordering::Relaxed);
+        assert!(capped.check().is_err() && forwarding.check().is_ok());
+        clock.store(5000, Ordering::Relaxed);
+        assert!(forwarding.check().is_err());
+        clock.store(0, Ordering::Relaxed);
+        [shutdown, transfer, header, context][revoked].cancel();
+        assert!(forwarding.check().is_err());
+    }
+
+    let abandoned = ForwardingCandidate::default();
+    abandoned.abandon_unless_accepted();
+    abandoned.authenticated();
+    abandoned.accepted();
+    assert!(
+        Deadline::new(Duration::from_secs(5))
+            .for_candidate_forwarding(Cancellation::default(), Cancellation::default(), abandoned)
+            .check()
+            .is_err()
+    );
 }

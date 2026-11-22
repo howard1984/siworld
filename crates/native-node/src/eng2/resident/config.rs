@@ -16,10 +16,13 @@ pub(super) struct Destination {
 pub(super) struct Configuration {
     pub role: p2p::Role,
     pub proof_retention: Option<super::super::proof_retention::Policy>,
+    #[cfg(any(unix, test))]
+    pub checkpoint_worker_budget_bytes: Option<usize>,
     pub listen: Option<SocketAddr>,
     pub mining: bool,
     pub peers: Vec<Destination>,
     pub fixed_relay_peers: BTreeSet<Hash>,
+    pub service_relay_peers: BTreeSet<Hash>,
     pub checkpoint_key: Option<PathBuf>,
     pub legacy_checkpoint_peers: BTreeSet<Hash>,
     pub digest: String,
@@ -35,17 +38,17 @@ fn unhex<const N: usize>(value: &Value) -> Result<[u8; N], String> {
         .try_into()
         .map_err(|_| "public configuration field width differs".into())
 }
-fn fixed_relay_role(entry: &Value, local: p2p::Role) -> Result<bool, String> {
+fn fixed_relay_role(entry: &Value, local: p2p::Role, streaming: bool) -> Result<bool, String> {
     match entry.get("fixed_relay_role") {
         None => Ok(false),
         Some(Value::String(role))
             if (local == p2p::Role::Miner && role == "service")
                 || (matches!(local, p2p::Role::Bootstrap | p2p::Role::Validator)
-                    && role == "miner") =>
+                    && (role == "miner" || streaming && role == "service")) =>
         {
             Ok(true)
         }
-        _ => Err("fixed relay requires an explicitly pinned opposite miner or service role".into()),
+        _ => Err("fixed relay role is not permitted by the local role and genesis profile".into()),
     }
 }
 fn checkpoint_reference(entry: &Value) -> Result<bool, String> {
@@ -54,6 +57,23 @@ fn checkpoint_reference(entry: &Value) -> Result<bool, String> {
         Some(value) => value
             .as_bool()
             .ok_or_else(|| "peer checkpoint reference selection requires a boolean".into()),
+    }
+}
+/// A separate explicit bound is supported by the Unix checkpoint worker.
+/// Unchanged configurations use the existing shared budget.
+fn checkpoint_worker_budget(
+    value: Option<&Value>,
+    supported: bool,
+) -> Result<Option<usize>, String> {
+    match (value, supported) {
+        (None, _) => Ok(None),
+        (Some(value), true) => value
+            .as_u64()
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .map(Some)
+            .ok_or_else(|| "checkpoint worker budget must be positive bytes".into()),
+        (Some(_), false) => Err("checkpoint worker budget is unavailable on this platform".into()),
     }
 }
 impl Configuration {
@@ -79,6 +99,7 @@ impl Configuration {
         if object.len()
             != 7 + usize::from(object.contains_key("legacy_checkpoint_peers"))
                 + usize::from(object.contains_key("proof_retention"))
+                + usize::from(object.contains_key("checkpoint_worker_budget_bytes"))
             || value["version"] != 2
             || value["engineering"] != true
         {
@@ -149,6 +170,7 @@ impl Configuration {
         let mut endpoints = BTreeSet::new();
         let mut peers = Vec::new();
         let mut fixed_relay_peers = BTreeSet::new();
+        let mut service_relay_peers = BTreeSet::new();
         for entry in entries {
             let object = entry.as_object().ok_or("invalid resident peer entry")?;
             if object.len()
@@ -168,9 +190,15 @@ impl Configuration {
                 .as_bool()
                 .ok_or("explicit peer dial selection required")?;
             let checkpoint_reference = checkpoint_reference(entry)?;
-            let fixed_relay = fixed_relay_role(entry, role)?;
-            let passive_fixed_miner =
-                !dial && fixed_relay && matches!(role, p2p::Role::Bootstrap | p2p::Role::Validator);
+            let fixed_relay = fixed_relay_role(
+                entry,
+                role,
+                crate::eng2::transport::propagation_profile(genesis),
+            )?;
+            let passive_fixed_miner = !dial
+                && fixed_relay
+                && entry["fixed_relay_role"] == "miner"
+                && matches!(role, p2p::Role::Bootstrap | p2p::Role::Validator);
             if endpoint.port() == 0
                 || endpoint.ip().is_unspecified()
                 || endpoint.ip().is_multicast()
@@ -194,6 +222,11 @@ impl Configuration {
                     .map_err(|_| "configured peer identity differs from pin")?;
             if fixed_relay {
                 fixed_relay_peers.insert(fingerprint);
+                if entry["fixed_relay_role"] == "service"
+                    && matches!(role, p2p::Role::Bootstrap | p2p::Role::Validator)
+                {
+                    service_relay_peers.insert(fingerprint);
+                }
             }
             peers.push(Destination {
                 endpoint,
@@ -221,14 +254,21 @@ impl Configuration {
         }
         let proof_retention =
             super::super::proof_retention::configured(object.get("proof_retention"), role)?;
+        let worker_budget =
+            checkpoint_worker_budget(object.get("checkpoint_worker_budget_bytes"), cfg!(unix))?;
+        #[cfg(not(any(unix, test)))]
+        let _ = worker_budget;
         Ok(Self {
             role,
             proof_retention,
+            #[cfg(any(unix, test))]
+            checkpoint_worker_budget_bytes: worker_budget,
             listen,
             mining,
             peers,
             checkpoint_key,
             fixed_relay_peers,
+            service_relay_peers,
             legacy_checkpoint_peers,
             digest: crate::local::hex(&Sha256::digest(&bytes)),
         })
@@ -240,20 +280,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checkpoint_worker_budget_requires_positive_bytes_and_platform_support() {
+        assert_eq!(checkpoint_worker_budget(None, true).unwrap(), None);
+        assert_eq!(checkpoint_worker_budget(None, false).unwrap(), None);
+        assert!(checkpoint_worker_budget(Some(&json!(0)), true).is_err());
+        assert!(checkpoint_worker_budget(Some(&json!(-1)), true).is_err());
+        assert!(checkpoint_worker_budget(Some(&Value::Null), true).is_err());
+        assert!(checkpoint_worker_budget(Some(&json!(128)), false).is_err());
+        assert_eq!(
+            checkpoint_worker_budget(Some(&json!(128)), true).unwrap(),
+            Some(128)
+        );
+    }
+
+    #[test]
     fn relay_roles_are_explicit_opposite_roles_and_unknown_values_fail_closed() {
-        assert!(!fixed_relay_role(&json!({}), p2p::Role::Miner).unwrap());
+        assert!(!fixed_relay_role(&json!({}), p2p::Role::Miner, false).unwrap());
         assert!(
-            fixed_relay_role(&json!({"fixed_relay_role":"service"}), p2p::Role::Miner).unwrap()
+            fixed_relay_role(
+                &json!({"fixed_relay_role":"service"}),
+                p2p::Role::Miner,
+                false
+            )
+            .unwrap()
         );
         assert!(
-            fixed_relay_role(&json!({"fixed_relay_role":"miner"}), p2p::Role::Validator).unwrap()
+            fixed_relay_role(
+                &json!({"fixed_relay_role":"miner"}),
+                p2p::Role::Validator,
+                false
+            )
+            .unwrap()
         );
         for value in [Value::Null, json!(true), json!("validator"), json!("miner")] {
             assert!(
-                fixed_relay_role(&json!({"fixed_relay_role":value}), p2p::Role::Miner).is_err()
+                fixed_relay_role(&json!({"fixed_relay_role":value}), p2p::Role::Miner, false)
+                    .is_err()
             );
         }
-        assert!(fixed_relay_role(&json!({"fixed_relay_role":"miner"}), p2p::Role::Wallet).is_err());
+        assert!(
+            fixed_relay_role(
+                &json!({"fixed_relay_role":"miner"}),
+                p2p::Role::Wallet,
+                false
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn service_forwarding_requires_the_distinct_genesis_profile() {
+        for local in [p2p::Role::Bootstrap, p2p::Role::Validator] {
+            let entry = json!({"fixed_relay_role": "service"});
+            assert!(fixed_relay_role(&entry, local, false).is_err());
+            assert!(fixed_relay_role(&entry, local, true).unwrap());
+        }
+        assert!(
+            fixed_relay_role(
+                &json!({"fixed_relay_role":"service"}),
+                p2p::Role::Wallet,
+                true
+            )
+            .is_err()
+        );
     }
     #[test]
     fn checkpoint_reference_selection_preserves_existing_peers_and_rejects_ambiguous_values() {

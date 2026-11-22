@@ -69,6 +69,7 @@ fn io_error(error: io::Error) -> Error {
 #[derive(Default, Debug)]
 struct Usage {
     bytes: usize,
+    peak: usize,
     handshakes: usize,
     handshake_bytes: usize,
 }
@@ -314,6 +315,7 @@ impl Budget {
             return Err(Error::ResourceExhausted);
         }
         usage.bytes = next;
+        usage.peak = usage.peak.max(next);
         Ok(Reservation {
             budget: self.0.clone(),
             bytes,
@@ -342,6 +344,7 @@ impl Budget {
             return Err(ReserveFailure::Exhausted(observed));
         }
         usage.bytes = next;
+        usage.peak = usage.peak.max(next);
         Ok((
             Reservation {
                 budget: self.0.clone(),
@@ -352,6 +355,11 @@ impl Budget {
                 used: next,
             },
         ))
+    }
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn reservation_peak(&self) -> Result<usize, Error> {
+        let usage = self.0.usage.lock().map_err(|_| Error::Unavailable)?;
+        Ok(usage.peak)
     }
     pub(crate) fn available(&self) -> Result<usize, Error> {
         let usage = self.0.usage.lock().map_err(|_| Error::Unavailable)?;
@@ -374,6 +382,7 @@ impl Budget {
             return Err(Error::ResourceExhausted);
         }
         usage.bytes = next_bytes;
+        usage.peak = usage.peak.max(next_bytes);
         usage.handshakes += 1;
         usage.handshake_bytes = next_handshake_bytes;
         Ok(HandshakeReservation(self.0.clone(), true))
@@ -553,12 +562,78 @@ impl Drop for HandshakeReservation {
     }
 }
 
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForwardingCandidate {
+    outcome: Arc<std::sync::atomic::AtomicU8>,
+    header_revoked: Cancellation,
+    context_revoked: Cancellation,
+}
+
+#[cfg(feature = "eng2-runtime")]
+impl ForwardingCandidate {
+    pub(crate) fn new(header_revoked: Cancellation, context_revoked: Cancellation) -> Self {
+        Self {
+            header_revoked,
+            context_revoked,
+            ..Self::default()
+        }
+    }
+
+    const AUTHENTICATED: u8 = 1;
+    const ACCEPTED: u8 = 2;
+    const DRAIN: u8 = Self::AUTHENTICATED | Self::ACCEPTED;
+    const ABANDONED: u8 = 4;
+
+    pub(crate) fn authenticated(&self) {
+        self.outcome
+            .fetch_or(Self::AUTHENTICATED, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn accepted(&self) {
+        self.outcome
+            .fetch_or(Self::ACCEPTED, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn abandon_unless_accepted(&self) {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .outcome
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |outcome| {
+                (outcome & Self::DRAIN != Self::DRAIN).then_some(outcome | Self::ABANDONED)
+            });
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.status().0
+    }
+
+    fn status(&self) -> (bool, bool) {
+        let outcome = self.outcome.load(std::sync::atomic::Ordering::Acquire);
+        let revoked = outcome & Self::ABANDONED != 0
+            || self.header_revoked.is_cancelled()
+            || self.context_revoked.is_cancelled();
+        (revoked, outcome & Self::DRAIN == Self::DRAIN)
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Debug)]
+struct ForwardingGuard {
+    shutdown: Cancellation,
+    transfer_cancelled: Cancellation,
+    candidate: ForwardingCandidate,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Deadline {
     started: Instant,
     limit: Duration,
     cancellation: Cancellation,
     body_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(feature = "eng2-runtime")]
+    forwarding: Option<ForwardingGuard>,
     #[cfg(test)]
     elapsed: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
@@ -573,6 +648,8 @@ impl Deadline {
             limit,
             cancellation,
             body_cancellation: None,
+            #[cfg(feature = "eng2-runtime")]
+            forwarding: None,
             #[cfg(test)]
             elapsed: None,
         }
@@ -607,6 +684,23 @@ impl Deadline {
         result.body_cancellation = Some(lease.cancel.clone());
         result
     }
+    /// An already authorized forwarding exchange may drain its authenticated
+    /// bytes after local admission releases its claim. It keeps the original
+    /// absolute deadline and remains interruptible by resident shutdown.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn for_candidate_forwarding(
+        mut self,
+        shutdown: Cancellation,
+        transfer_cancelled: Cancellation,
+        candidate: ForwardingCandidate,
+    ) -> Self {
+        self.forwarding = Some(ForwardingGuard {
+            shutdown,
+            transfer_cancelled,
+            candidate,
+        });
+        self
+    }
     pub(crate) fn capped_at(mut self, expires: Instant) -> Self {
         self.limit = self
             .limit
@@ -620,12 +714,26 @@ impl Deadline {
         self.check_at(Instant::now())
     }
     pub(crate) fn check_at(&self, now: Instant) -> io::Result<()> {
-        if self.cancellation.is_cancelled()
+        // Read lease retirement before the admission outcome. Successful
+        // admission publishes the outcome before retiring the exact lease.
+        let lease_cancelled = self.cancellation.is_cancelled()
             || self
                 .body_cancellation
                 .as_ref()
-                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire))
-        {
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire));
+        #[cfg(feature = "eng2-runtime")]
+        let forwarding = self.forwarding.as_ref();
+        #[cfg(feature = "eng2-runtime")]
+        let (shutdown, drain) = forwarding.map_or((false, false), |guard| {
+            let (revoked, drain) = guard.candidate.status();
+            (
+                revoked || guard.shutdown.is_cancelled() || guard.transfer_cancelled.is_cancelled(),
+                drain,
+            )
+        });
+        #[cfg(not(feature = "eng2-runtime"))]
+        let (shutdown, drain) = (false, false);
+        if shutdown || (!drain && lease_cancelled) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "native admission cancelled",

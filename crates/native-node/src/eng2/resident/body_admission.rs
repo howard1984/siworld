@@ -100,6 +100,7 @@ pub(super) fn run(shared: Arc<Shared>) -> Result<(), String> {
         let result = admit(&shared, &ready);
         match result {
             Ok(true) => {
+                ready.download.forwarding_candidate.accepted();
                 ready.received.ownership.complete();
                 shared.headers.completed(&ready.download.header)?;
                 shared.bodies.completed.fetch_add(1, Ordering::Relaxed);
@@ -127,6 +128,7 @@ fn admit(shared: &Shared, ready: &Ready) -> Result<bool, String> {
         .lock()
         .map_err(|_| "resident owner lock poisoned")?;
     if ready.download.cancel.is_cancelled()
+        || ready.download.forwarding_candidate.is_revoked()
         || ready.received.ownership.check_active().is_err()
         || !owner.activities_allowed()
     {

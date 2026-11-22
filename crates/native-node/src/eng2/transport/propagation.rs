@@ -138,6 +138,7 @@ pub struct Metadata {
     authenticated: Authenticated,
     first: VerifiedPiece,
     indices: Vec<VerifiedPiece>,
+    stream_source: Option<Hash>,
     _reservation: p2p::Reservation,
 }
 impl Metadata {
@@ -152,6 +153,9 @@ impl Metadata {
             transfer
                 .index_piece(piece, Instant::now())
                 .map_err(resource)?;
+        }
+        if let Some(source) = self.stream_source {
+            transfer.begin_stream(source).map_err(resource)?;
         }
         Ok(transfer)
     }
@@ -212,6 +216,17 @@ fn bounded_deadline(
 }
 
 impl<S: Read + Write> Peer<S> {
+    /// Streaming is selected by the genesis profile and negotiated capability.
+    pub(crate) fn propagation_streaming(&self) -> bool {
+        self.propagation_streaming && self.propagation_supported()
+    }
+    fn propagation_version(&self) -> u8 {
+        if self.propagation_streaming {
+            2
+        } else {
+            VERSION
+        }
+    }
     pub fn propagation_session_id(&self) -> u64 {
         self.propagation_session
     }
@@ -232,7 +247,7 @@ impl<S: Read + Write> Peer<S> {
         if response != request {
             return Err(p2p::Error::InvalidProtocol);
         }
-        let available = if bytes.as_slice() == [CAPABILITY, VERSION] {
+        let available = if bytes.as_slice() == [CAPABILITY, self.propagation_version()] {
             true
         } else if bytes.len() == 9
             && bytes[0] == UNAVAILABLE
@@ -249,7 +264,7 @@ impl<S: Read + Write> Peer<S> {
         if request == 0 {
             return Err(p2p::Error::InvalidProtocol);
         }
-        self.send(request, &[CAPABILITY, VERSION])?;
+        self.send(request, &[CAPABILITY, self.propagation_version()])?;
         self.propagation_supported = Some(true);
         Ok(())
     }
@@ -275,14 +290,14 @@ impl<S: Read + Write> Peer<S> {
         }
         let block = header.id().map_err(invalid)?;
         let maximum_wire = maximum_wire(body_bytes)?;
-        let mut offer = vec![OFFER, VERSION];
+        let mut offer = vec![OFFER, self.propagation_version()];
         offer.extend_from_slice(&(body_bytes as u64).to_le_bytes());
         offer.extend_from_slice(&header.encode().map_err(invalid)?);
         self.send_application_before(request, &offer, &deadline)?;
         let (response, bytes, _charge) = self.receive_application_before(&deadline, 51)?;
         if response != request
             || bytes.len() != 51
-            || bytes[..2] != [CREDIT, VERSION]
+            || bytes[..2] != [CREDIT, self.propagation_version()]
             || bytes[3..35] != block
             || number(&bytes[35..43]) != header.height
         {
@@ -320,7 +335,11 @@ impl<S: Read + Write> Peer<S> {
         if !self.matches_offer(offer) {
             return Err(p2p::Error::InvalidProtocol);
         }
-        let mut bytes = vec![CREDIT, VERSION, u8::from(maximum_wire != 0)];
+        let mut bytes = vec![
+            CREDIT,
+            self.propagation_version(),
+            u8::from(maximum_wire != 0),
+        ];
         bytes.extend_from_slice(&offer.header.id().map_err(invalid)?);
         bytes.extend_from_slice(&offer.header.height.to_le_bytes());
         bytes.extend_from_slice(&maximum_wire.to_le_bytes());
@@ -414,11 +433,206 @@ impl<S: Read + Write> Peer<S> {
             return Err(p2p::Error::InvalidProtocol);
         }
         let before = self.session.io_totals().sent;
-        self.send_propagation_metadata_before(credit.request, header, body, &credit.deadline)?;
+        if self.propagation_streaming() {
+            let length = body.encoded_len(self.policy).map_err(invalid)?;
+            let _charge = self.reserve_body(length)?;
+            let encoded = body.encode(self.policy).map_err(invalid)?;
+            header
+                .verify_body(&encoded, self.policy.max_body_bytes)
+                .map_err(invalid)?;
+            let descriptor = Descriptor::build(&encoded, self.policy.max_body_bytes)
+                .map_err(invalid)?
+                .encode(self.policy.max_body_bytes)
+                .map_err(invalid)?;
+            self.send_stream_metadata(
+                credit.request,
+                header,
+                length,
+                &descriptor,
+                &authentication::encoded_piece(&encoded, 0).map_err(invalid)?,
+                &credit.deadline,
+            )?;
+            for index in 1..pieces(length)? {
+                self.send_application_before(
+                    credit.request,
+                    &codec::encode_piece(
+                        credit.block,
+                        index,
+                        &authentication::encoded_piece(&encoded, index).map_err(invalid)?,
+                    )
+                    .map_err(invalid)?,
+                    &credit.deadline,
+                )?;
+            }
+        } else {
+            self.send_propagation_metadata_before(credit.request, header, body, &credit.deadline)?;
+        }
         if self.session.io_totals().sent - before > credit.maximum_wire {
             return Err(p2p::Error::ResourceExhausted);
         }
         Ok(())
+    }
+
+    fn send_stream_metadata(
+        &mut self,
+        request: u64,
+        header: &Header,
+        length: usize,
+        descriptor: &[u8],
+        first: &[u8],
+        deadline: &p2p::Deadline,
+    ) -> Result<(), p2p::Error> {
+        let mut start = vec![METADATA, VERSION];
+        start.extend_from_slice(&(length as u64).to_le_bytes());
+        start.extend_from_slice(
+            &u32::try_from(descriptor.len())
+                .map_err(invalid)?
+                .to_le_bytes(),
+        );
+        start.extend_from_slice(&1u32.to_le_bytes());
+        self.send_application_before(request, &start, deadline)?;
+        for (index, part) in descriptor.chunks(DESCRIPTOR_CHUNK).enumerate() {
+            let mut frame = vec![DESCRIPTOR, VERSION];
+            frame.extend_from_slice(&((index * DESCRIPTOR_CHUNK) as u32).to_le_bytes());
+            frame.extend_from_slice(part);
+            self.send_application_before(request, &frame, deadline)?;
+        }
+        self.send_application_before(
+            request,
+            &codec::encode_piece(header.id().map_err(invalid)?, 0, first).map_err(invalid)?,
+            deadline,
+        )
+    }
+
+    /// A service forwards authenticated pieces while its source is still
+    /// delivering the tail. Socket I/O never retains the transfer mutex.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn send_credited_transfer(
+        &mut self,
+        credit: Credit,
+        header: &Header,
+        transfer: &Mutex<Transfer>,
+        forwarding_deadline: &p2p::Deadline,
+    ) -> Result<(), p2p::Error> {
+        if !self.propagation_streaming()
+            || credit.peer != self.peer()
+            || credit.binding != self.session.binding()
+            || credit.session_id != self.propagation_session
+            || credit.block != header.id().map_err(invalid)?
+            || credit.height != header.height
+        {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        let _metadata_charge = self.reserve_application(
+            descriptor_bytes(credit.body_bytes)? + 2 * p2p::MAX_CONTROL_BYTES,
+        )?;
+        let _piece_charge = self.reserve_application(2 * (PIECE_BYTES + 128))?;
+        let (descriptor, deadline, count) = {
+            let transfer = lock(transfer)?;
+            if transfer.block() != credit.block || transfer.body_bytes() != credit.body_bytes {
+                return Err(p2p::Error::InvalidProtocol);
+            }
+            (
+                transfer.forwarding_descriptor().map_err(resource)?,
+                forwarding_deadline
+                    .clone()
+                    .capped_at(credit.deadline.expires_at()),
+                transfer.piece_count(),
+            )
+        };
+        let before = self.session.io_totals().sent;
+        for index in 0..count {
+            let piece = loop {
+                credit
+                    .deadline
+                    .check()
+                    .map_err(|_| p2p::Error::Unavailable)?;
+                deadline.check().map_err(|_| p2p::Error::Unavailable)?;
+                if let Some(piece) = lock(transfer)?.forwarding_piece(index).map_err(resource)? {
+                    break piece;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            if index == 0 {
+                self.send_stream_metadata(
+                    credit.request,
+                    header,
+                    credit.body_bytes,
+                    &descriptor,
+                    &piece,
+                    &deadline,
+                )?;
+            } else {
+                self.send_application_before(
+                    credit.request,
+                    &codec::encode_piece(credit.block, index, &piece).map_err(invalid)?,
+                    &deadline,
+                )?;
+            }
+        }
+        if self.session.io_totals().sent - before > credit.maximum_wire {
+            return Err(p2p::Error::ResourceExhausted);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn receive_credited_transfer(
+        &mut self,
+        request: u64,
+        transfer: &Mutex<Transfer>,
+        ownership: &p2p::BodyClaim,
+        observe: &dyn Fn(&Transfer) -> Result<(), p2p::Error>,
+    ) -> Result<(), p2p::Error> {
+        if !self.propagation_streaming() || request == 0 {
+            return Err(p2p::Error::InvalidProtocol);
+        }
+        let (block, count, deadline) = {
+            let transfer = lock(transfer)?;
+            if !ownership.matches(
+                &self.session.shared_budget(),
+                self.session.binding(),
+                transfer.height(),
+                transfer.block(),
+            ) {
+                return Err(p2p::Error::InvalidProtocol);
+            }
+            (
+                transfer.block(),
+                transfer.piece_count(),
+                transfer.io_deadline().for_body_claim(ownership),
+            )
+        };
+        let mut accounted = self.session.io_totals().received;
+        let result = self.with_body_accounting(ownership, |peer| {
+            for index in 1..count {
+                let per_piece = deadline
+                    .clone()
+                    .capped_at(Instant::now() + Duration::from_secs(10));
+                let (response, frame, _charge) =
+                    peer.receive_application_before(&per_piece, PIECE_BYTES + 38)?;
+                let piece = codec::decode_piece(&frame, count).map_err(invalid)?;
+                if response != request || piece.block != block || piece.index != index {
+                    return Err(p2p::Error::InvalidProtocol);
+                }
+                let received = peer.session.io_totals().received;
+                let wire = received - accounted;
+                accounted = received;
+                let mut transfer = lock(transfer)?;
+                transfer
+                    .streamed_piece(peer.peer(), index, piece.bytes.to_vec(), wire)
+                    .map_err(resource)?;
+                ownership.received(transfer.verified_bytes(), transfer.body_bytes())?;
+                observe(&transfer)?;
+            }
+            Ok(())
+        });
+        lock(transfer)?.end_stream(
+            self.peer(),
+            result.is_ok(),
+            self.session.io_totals().received - accounted,
+        );
+        result
     }
     /// The caller has already acquired the exact candidate's Pieces claim.
     /// Busy must defer before calling this method, without spending a source.
@@ -597,6 +811,7 @@ impl<S: Read + Write> Peer<S> {
             || descriptor_length != descriptor_bytes(body_bytes)?
             || index_count == 0
             || index_count > pieces(body_bytes)?.min(MAX_INDEX_PIECES)
+            || expected_length.is_some() && self.propagation_streaming() && index_count != 1
         {
             return Err(p2p::Error::ResourceExhausted);
         }
@@ -663,6 +878,8 @@ impl<S: Read + Write> Peer<S> {
             authenticated,
             first,
             indices,
+            stream_source: (expected_length.is_some() && self.propagation_streaming())
+                .then(|| self.peer()),
             _reservation,
         })
     }
@@ -832,7 +1049,7 @@ impl<S: Read + Write> Peer<S> {
         {
             PropagationRequest::Capability
         } else if bytes.len() == 10 + crate::eng2::header::HEADER_BYTES
-            && bytes[..2] == [OFFER, VERSION]
+            && bytes[..2] == [OFFER, self.propagation_version()]
         {
             if !self.propagation_supported() {
                 return Err(p2p::Error::InvalidProtocol);
@@ -1022,6 +1239,7 @@ mod tests {
         let policy = Policy {
             profile: crate::proofs::protocol_profile_fingerprint(),
             max_body_bytes: 4 * 1024 * 1024,
+            slot_rule: crate::wire::SlotRule::Legacy,
             max_settlement_proof_bytes: 3 * 1024 * 1024,
         };
         let mut body = crate::eng2::body::tests::body();
@@ -1078,6 +1296,40 @@ mod tests {
             Instant::now(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn new_genesis_does_not_accept_a_legacy_stream_capability() {
+        let state = crate::eng2::snapshot::tests::bootstrap();
+        let genesis = Genesis::seal_with_rule(
+            state.chain.config,
+            state.governance,
+            FeeMode::LegacyMiner,
+            crate::wire::SlotRule::PublicGenesis,
+        )
+        .unwrap();
+        let (_, mut policy, _, _) = fixture();
+        policy.slot_rule = genesis.slot_rule();
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut client = peer(a, &genesis, policy, p2p::Budget::default());
+        let mut server = peer(b, &genesis, policy, p2p::Budget::default());
+        let worker = thread::spawn(move || {
+            let (request, message) = server
+                .receive_propagation_request(
+                    Instant::now(),
+                    Duration::from_secs(3),
+                    p2p::Cancellation::default(),
+                )
+                .unwrap();
+            assert!(matches!(message, PropagationRequest::Capability));
+            server.send(request, &[CAPABILITY, VERSION]).unwrap();
+        });
+        assert!(matches!(
+            client.probe_propagation(2),
+            Err(p2p::Error::InvalidProtocol)
+        ));
+        assert!(!client.propagation_streaming());
+        worker.join().unwrap();
     }
 
     #[test]

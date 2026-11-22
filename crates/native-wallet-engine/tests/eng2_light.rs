@@ -5,7 +5,7 @@ use siworld_core::pow;
 use siworld_native_wallet_engine::local::hex;
 pub use siworld_native_wallet_engine::wire;
 use siworld_native_wallet_engine::{
-    eng2_history::{BODY_DOMAIN, Context, Header, MAX_BODY_BYTES},
+    eng2_history::{BODY_DOMAIN, Context, Header, MAX_BODY_BYTES, ReceiptBlock},
     eng2_light::{Eng2LightState, native_profile},
     state::{Config, ORDINARY_FEE_RULES},
     wire::*,
@@ -16,8 +16,11 @@ use zeroize::Zeroizing;
 mod fixture_ranges;
 use fixture_ranges::RangeProof;
 fn genesis(config: &Config) -> (Vec<u8>, Hash) {
-    let profile = native_profile();
+    genesis_with_slots(config, SlotRule::Legacy)
+}
+fn genesis_with_slots(config: &Config, slot_rule: SlotRule) -> (Vec<u8>, Hash) {
     let governance = b"SWG2GOV2";
+    let profile = native_profile();
     let mut rules = blake3::Hasher::new_derive_key("siworld eng2 internal immutable rules v1");
     rules.update(&[0]);
     rules.update(&config.encode_rules());
@@ -26,11 +29,18 @@ fn genesis(config: &Config) -> (Vec<u8>, Hash) {
     rules.update(governance);
     rules.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
     rules.update(ORDINARY_FEE_RULES);
+    if slot_rule == SlotRule::PublicGenesis {
+        rules.update(PUBLIC_GENESIS_RULES);
+    }
     let id = blake3::derive_key(
         "siworld eng2 internal genesis v1",
         rules.finalize().as_bytes(),
     );
-    let mut bytes = b"SWE2GEN2".to_vec();
+    let mut bytes = match slot_rule {
+        SlotRule::Legacy => LEGACY_GENESIS_MAGIC,
+        SlotRule::PublicGenesis => PUBLIC_GENESIS_MAGIC,
+    }
+    .to_vec();
     bytes.push(0);
     bytes.extend(profile);
     bytes.extend(config.encode_rules());
@@ -319,6 +329,41 @@ fn malformed_headers_receipts_and_stale_candidate_do_not_change_accepted_state()
     }
     assert_eq!(wallet.local_cache().unwrap().as_slice(), cache.as_slice());
 }
+#[test]
+fn pinned_genesis_controls_wallet_receipt_slot_admission() {
+    let (config, block) = common::fixture_slots(16);
+    let (old_bytes, old_id) = genesis(&config);
+    let (new_bytes, new_id) = genesis_with_slots(&config, SlotRule::PublicGenesis);
+    assert_ne!(old_id, new_id);
+    assert!(Context::from_genesis(&new_bytes, old_id).is_err());
+    assert!(Context::from_genesis(&old_bytes, new_id).is_err());
+
+    let new = Context::from_genesis(&new_bytes, new_id).unwrap();
+    let old = Context::from_genesis(&old_bytes, old_id).unwrap();
+    let (header, bytes) = qualified_block(
+        &config,
+        &new,
+        block.clone(),
+        1,
+        new_id,
+        config.genesis_timestamp,
+    );
+    let encoded = header.encode().unwrap();
+    assert_eq!(
+        ReceiptBlock::decode(&new, &encoded, &bytes)
+            .unwrap()
+            .transactions()
+            .len(),
+        16
+    );
+    assert!(ReceiptBlock::decode(&old, &encoded, &bytes).is_err());
+
+    // A matching legacy envelope still cannot admit a 16-slot body.
+    let (header, bytes) =
+        qualified_block(&config, &old, block, 1, old_id, config.genesis_timestamp);
+    assert!(ReceiptBlock::decode(&old, &header.encode().unwrap(), &bytes).is_err());
+}
+
 #[test]
 fn legacy_genesis_compact_and_other_profile_are_rejected() {
     let (config, genesis, id, block) = fixture();

@@ -6,6 +6,51 @@ use crate::eng2::{
 };
 use std::os::unix::fs::symlink;
 
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn authenticated_publication_pin_rejects_replaced_or_missing_artifacts() {
+    let dir = Directory::new();
+    let store = dir.store();
+    let root = dir.private("retained-pin");
+    let export = PublicExport::open(&root, &store, limits()).unwrap();
+    let original = publication_name(12);
+    let names = [
+        "checkpoint-eng2.json",
+        original.as_str(),
+        "pin.snapshot-eng2.bin",
+        "pin.witness-eng2.bin",
+        "pin.certificate-eng2.bin",
+    ];
+    let budget = crate::p2p::Budget::new(512 * 1024);
+    for replaced in names {
+        for name in names {
+            export.write_once(name, b"test bytes").unwrap();
+        }
+        let reader = export.retained_reader(&budget).unwrap();
+        for name in names {
+            assert_eq!(
+                reader.read_optional(name, 128).unwrap().as_deref(),
+                Some(&b"test bytes"[..]),
+            );
+        }
+        let pin = reader.pin_publication(b"test bytes", 12).unwrap();
+        assert!(pin.matches(&export));
+        let artifact = root.join(replaced);
+        let still_open = fs::File::open(&artifact).unwrap();
+        fs::remove_file(&artifact).unwrap();
+        assert!(!pin.matches(&export));
+        export.write_once(replaced, b"test bytes").unwrap();
+        assert_ne!(
+            still_open.metadata().unwrap().ino(),
+            fs::metadata(&artifact).unwrap().ino(),
+        );
+        assert!(!pin.matches(&export));
+        for name in names {
+            fs::remove_file(root.join(name)).unwrap();
+        }
+    }
+}
+
 #[test]
 fn actual_genesis_files_reopen_bound_context_and_preserve_export_on_failure() {
     let dir = Directory::new();

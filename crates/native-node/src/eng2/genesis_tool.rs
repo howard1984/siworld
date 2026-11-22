@@ -4,7 +4,11 @@ use super::{
     genesis::{FeeMode, Genesis},
     state_components::{Binding, Limits},
 };
-use crate::{eng2_governance::GovernanceState, state::Config, wire::Hash};
+use crate::{
+    eng2_governance::GovernanceState,
+    state::Config,
+    wire::{Hash, SlotRule},
+};
 use native::codec::encode_digest;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -285,8 +289,7 @@ fn report(genesis: &Genesis, bytes: &[u8], expected: Expected) -> Result<Value> 
         .map(|(slot, key)| json!({"slot":slot,"public_key_sha256":hex(&digest(key))}))
         .collect();
     let issuance = config.issuance.as_ref().ok_or("issuance_config_required")?;
-    Ok(
-        json!({"version":1,"network":hex(&config.network),"genesis_id":hex(&genesis.id()),
+    let mut result = json!({"version":1,"network":hex(&config.network),"genesis_id":hex(&genesis.id()),
         "rules_commitment":hex(&genesis.rules_commitment()),
         "proof_profile":hex(&crate::proofs::protocol_profile_fingerprint()),
         "peer_verifier":hex(&genesis.peer_binding().verifier),"fee_mode":"legacy-miner",
@@ -304,8 +307,12 @@ fn report(genesis: &Genesis, bytes: &[u8], expected: Expected) -> Result<Value> 
                 "max_metadata_bytes":issuance.max_metadata_bytes,"max_per_block":issuance.max_per_block}},
         "h0":{"height":0,"tip":hex(&state.tip()),"parent":hex(&[0;32]),"components":rows,"execution_commitment":hex(&root)},
         "fixture_key_check":{"known_builtin_fingerprints":KNOWN_FIXTURE_KEYS.len(),"arbitrary_key_provenance_verified":false},
-        "chain_state_changed":false,"submitted":false,"network_started":false}),
-    )
+        "chain_state_changed":false,"submitted":false,"network_started":false});
+    if genesis.slot_rule() == SlotRule::PublicGenesis {
+        result["genesis_profile"] = crate::wire::PUBLIC_GENESIS_PROFILE.into();
+        result["parameters"]["minimum_transaction_slots"] = genesis.slot_rule().minimum().into();
+    }
+    Ok(result)
 }
 
 /// Create one absent public genesis file after all public preflight checks pass.
@@ -315,16 +322,33 @@ pub fn seal_public(
     output: &Path,
     expected: Expected,
 ) -> Result<Value> {
+    seal_public_profile(
+        config_path,
+        governance_path,
+        output,
+        expected,
+        SlotRule::Legacy,
+    )
+}
+
+/// Seal an explicitly selected profile without changing the legacy default.
+pub fn seal_public_profile(
+    config_path: &Path,
+    governance_path: &Path,
+    output: &Path,
+    expected: Expected,
+    rule: SlotRule,
+) -> Result<Value> {
     let config_bytes = public_read(config_path, crate::state::CONFIG_RULE_BYTES)?;
     let governance_bytes = public_read(governance_path, MAX_GOVERNANCE_BYTES)?;
     let config = decode_nonfixture_config(&config_bytes)?;
     let governance = GovernanceState::decode_component(&governance_bytes, expected.network)
         .map_err(|_| "invalid_governance")?;
-    let genesis =
-        Genesis::seal(config, governance, FeeMode::LegacyMiner).map_err(|_| "invalid_genesis")?;
+    let genesis = Genesis::seal_with_rule(config, governance, FeeMode::LegacyMiner, rule)
+        .map_err(|_| "invalid_genesis")?;
     let bytes = genesis.encode().map_err(|_| "invalid_genesis")?;
     let decoded = Genesis::decode(&bytes).map_err(|_| "invalid_genesis")?;
-    if decoded.encode().map_err(|_| "invalid_genesis")? != bytes {
+    if decoded.slot_rule() != rule || decoded.encode().map_err(|_| "invalid_genesis")? != bytes {
         return Err("noncanonical_genesis");
     }
     let mut result = report(&decoded, &bytes, expected)?;

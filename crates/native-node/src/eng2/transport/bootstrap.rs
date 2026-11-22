@@ -277,6 +277,7 @@ mod tests {
             Policy {
                 profile: crate::proofs::protocol_profile_fingerprint(),
                 max_body_bytes: 1024,
+                slot_rule: crate::wire::SlotRule::Legacy,
                 max_settlement_proof_bytes: 1024,
             },
         )
@@ -508,6 +509,7 @@ mod tests {
         let body_policy = Policy {
             profile: crate::proofs::protocol_profile_fingerprint(),
             max_body_bytes: 1024,
+            slot_rule: crate::wire::SlotRule::Legacy,
             max_settlement_proof_bytes: 1024,
         };
         let server_thread = std::thread::spawn(move || {

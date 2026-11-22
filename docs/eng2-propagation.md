@@ -98,6 +98,38 @@ reservations. Workers release the transfer mutex before socket I/O. A completed
 body and its claim move together into the existing admission queue. Cancellation
 keeps the claim until every actual I/O owner releases it.
 
+The distinct public genesis profile negotiates propagation capability version 2.
+The legacy profile retains capability version 1 and its metadata/continuation
+exchange. The authenticated session binds the capability to the genesis and
+verifier; a version-1 response cannot enable streaming in a version-2 session.
+
+In version 2, a qualified fixed miner offer grants one bounded credit for the
+descriptor, piece zero and the ordered remaining pieces. Metadata declares only
+piece zero. The receiver authenticates its length and descriptor against the
+header commitment, installs the candidate in the shared registry, then checks
+each remaining piece before installation. The entire credited stream consumes
+one application query, retains the original deadline and ends within the same
+socket turn. A live stream prevents duplicate pull assignments for that job.
+Disconnects and malformed or duplicate pieces retain partial byte charges and
+only the previously authenticated pieces; they grant no complete decode.
+
+A version-2 service may explicitly configure another independently pinned
+service with `fixed_relay_role: "service"`. Miner and service selections remain
+distinct and the authenticated remote role must match the selected category.
+An active candidate can be offered once to each selected service. Forwarding
+exports its authenticated descriptor and complete pieces only. The sender copies
+one bounded piece at a time under the shared memory budget, releases the transfer
+mutex before socket I/O, and waits for missing pieces within the original
+candidate deadline. Receiver credit and the existing fixed-peer wire fences
+bound every forwarding exchange. Neither a partial service relay nor completion
+of its stream changes full decode, native verification or admission requirements.
+Forwarding retains a shared reference to the authenticated encoded buffer,
+independently of the local candidate owner. Local completion transfers the
+decoded-body reservation into full native verification and admission while
+downstreams retain the single encoded allocation. A slow downstream does not
+hold the local admission claim or delay submission to native verification.
+The original candidate deadline bounds the remaining forwarding exchange.
+
 The body-ownership key includes network, genesis, verifier, height and header
 identity. Legacy, piece and fallback paths share one query ceiling and the
 original absolute deadline. Failed or reconnected sources consume another
@@ -146,7 +178,8 @@ checkpoint signing authority or canonical work.
 
 Fixed relay is disabled unless an existing pinned peer has an explicit
 `fixed_relay_role` of `miner` or `service`. The authenticated remote role must
-match the opposite local role. The policy selects only from the original pinned
+match the opposite local role on version 1; version 2 additionally permits the
+explicit service-to-service selection above. The policy selects only from the original pinned
 peer set. A service can retain an inbound-only fixed miner identity alongside
 an existing destination with the same endpoint reference. Entries with `dial`
 set to false are excluded from both ordinary and optional lane dialing. Original

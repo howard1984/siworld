@@ -1,6 +1,10 @@
 //! Immutable internal engineering genesis and explicit fee rules.
 
-use crate::{eng2_governance::GovernanceState, state::Config, wire::Hash};
+use crate::{
+    eng2_governance::GovernanceState,
+    state::Config,
+    wire::{Hash, LEGACY_GENESIS_MAGIC, PUBLIC_GENESIS_MAGIC, PUBLIC_GENESIS_RULES, SlotRule},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -22,6 +26,7 @@ pub struct Genesis {
     config: Config,
     governance: GovernanceState,
     mode: FeeMode,
+    slot_rule: SlotRule,
     id: Hash,
     rules: Hash,
 }
@@ -30,6 +35,16 @@ impl Genesis {
         config: Config,
         governance: GovernanceState,
         mode: FeeMode,
+    ) -> Result<Self, String> {
+        Self::seal_with_rule(config, governance, mode, SlotRule::Legacy)
+    }
+
+    /// Seal the selected slot rule into the genesis identity and peer domain.
+    pub(crate) fn seal_with_rule(
+        config: Config,
+        governance: GovernanceState,
+        mode: FeeMode,
+        slot_rule: SlotRule,
     ) -> Result<Self, String> {
         config.validate()?;
         if mode != FeeMode::LegacyMiner {
@@ -60,12 +75,16 @@ impl Genesis {
         hash.update(&governance_bytes);
         hash.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
         hash.update(crate::state::ORDINARY_FEE_RULES);
+        if slot_rule == SlotRule::PublicGenesis {
+            hash.update(PUBLIC_GENESIS_RULES);
+        }
         let rules = *hash.finalize().as_bytes();
         let id = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
         Ok(Self {
             config,
             governance,
             mode,
+            slot_rule,
             id,
             rules,
         })
@@ -88,6 +107,9 @@ impl Genesis {
             verifier: *hash.finalize().as_bytes(),
         }
     }
+    pub fn slot_rule(&self) -> SlotRule {
+        self.slot_rule
+    }
     pub fn fee_mode(&self) -> FeeMode {
         self.mode
     }
@@ -109,7 +131,12 @@ impl Genesis {
         let governance = self.governance.canonical_component_bytes()?;
         let length =
             u32::try_from(governance.len()).map_err(|_| "initial governance length overflow")?;
-        let mut bytes = b"SWE2GEN2".to_vec();
+        let mut bytes = if self.slot_rule == SlotRule::PublicGenesis {
+            PUBLIC_GENESIS_MAGIC
+        } else {
+            LEGACY_GENESIS_MAGIC
+        }
+        .to_vec();
         bytes.push(self.mode as u8);
         bytes.extend_from_slice(&crate::proofs::protocol_profile_fingerprint());
         bytes.extend_from_slice(&self.config.encode_rules());
@@ -121,12 +148,16 @@ impl Genesis {
         let prefix = 8 + 1 + 32 + crate::state::CONFIG_RULE_BYTES + 4;
         if bytes.len() < prefix
             || bytes.len() > prefix + 131_072
-            || &bytes[..8] != b"SWE2GEN2"
             || bytes[8] != FeeMode::LegacyMiner as u8
             || bytes[9..41] != crate::proofs::protocol_profile_fingerprint()
         {
             return Err("unsupported internal genesis encoding, fee mode or proof profile".into());
         }
+        let slot_rule = match &bytes[..8] {
+            magic if magic == LEGACY_GENESIS_MAGIC => SlotRule::Legacy,
+            magic if magic == PUBLIC_GENESIS_MAGIC => SlotRule::PublicGenesis,
+            _ => return Err("unsupported genesis version".into()),
+        };
         let config_end = 41 + crate::state::CONFIG_RULE_BYTES;
         let config = Config::decode_rules(&bytes[41..config_end])?;
         let length = u32::from_le_bytes(
@@ -138,7 +169,7 @@ impl Genesis {
             return Err("internal genesis governance length differs".into());
         }
         let governance = GovernanceState::decode_component(&bytes[prefix..], config.network)?;
-        let genesis = Self::seal(config, governance, FeeMode::LegacyMiner)?;
+        let genesis = Self::seal_with_rule(config, governance, FeeMode::LegacyMiner, slot_rule)?;
         if genesis.encode()? != bytes {
             return Err("noncanonical internal genesis encoding".into());
         }

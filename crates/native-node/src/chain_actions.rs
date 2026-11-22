@@ -8,8 +8,7 @@ use crate::state::{
     BlockVerifier, CanonicalSnapshot, CommitmentTree, SNAPSHOT_WINDOW, State, TransactionProof,
 };
 use crate::wire::{
-    DigestBytes, GROUP, Hash, MAX_REWARDS, MAX_SLOTS, MAX_TX_PROOF, MIN_SLOTS, RewardRecord,
-    Transaction,
+    DigestBytes, Hash, MAX_REWARDS, MAX_TX_PROOF, RewardRecord, SlotRule, Transaction,
 };
 use native::codec::{ProofContext, PublicTransaction, decode_digest, encode_digest};
 use native::multi_asset::{Digest, Hasher, RecentRoots};
@@ -152,6 +151,15 @@ impl<'a> PreparedActions<'a> {
         actions: Actions<'a>,
         issuance_policy: Option<&crate::issuance::ActiveIssuancePolicy<'_>>,
     ) -> Result<Self, String> {
+        Self::prepare_with_rules(parent, context, actions, issuance_policy, SlotRule::Legacy)
+    }
+    pub(crate) fn prepare_with_rules(
+        parent: &'a State,
+        context: Context,
+        actions: Actions<'a>,
+        issuance_policy: Option<&crate::issuance::ActiveIssuancePolicy<'_>>,
+        slot_rule: SlotRule,
+    ) -> Result<Self, String> {
         if context.network != parent.config.network {
             return Err("block network mismatch".into());
         }
@@ -167,8 +175,7 @@ impl<'a> PreparedActions<'a> {
         if context.target != parent.next_target() {
             return Err("block target does not match ASERT".into());
         }
-        if !(MIN_SLOTS..=MAX_SLOTS).contains(&actions.transactions.len())
-            || !actions.transactions.len().is_multiple_of(GROUP)
+        if !slot_rule.permits(actions.transactions.len())
             || actions.rewards.is_empty()
             || actions.rewards.len() > MAX_REWARDS
             || actions.issuances.len() > crate::issuance::RECORDS_CODEC_LIMIT

@@ -87,6 +87,7 @@ fn fixture() -> (Genesis, Header, usize, Vec<u8>) {
     let policy = crate::eng2::body::Policy {
         profile: context.profile(),
         max_body_bytes: codec::MAX_BODY_BYTES,
+        slot_rule: crate::wire::SlotRule::Legacy,
         max_settlement_proof_bytes: MAX_SETTLEMENT_PROOF,
     };
     let bytes = body.encode(policy).unwrap();

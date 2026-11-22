@@ -129,6 +129,20 @@ impl CheckpointRevision {
         self.check(store)?;
         Ok(true)
     }
+    /// Only a strictly longer chain preserving the captured tip qualifies.
+    pub(crate) fn is_canonical_extension(&self, store: &Store) -> Result<bool, String> {
+        if self.is_current_revision(store)? || self.height >= store.engine.state().height() {
+            return Ok(false);
+        }
+        if self.height == 0 {
+            return Ok(self.tip == store.engine.genesis().id());
+        }
+        let id = store
+            .header(self.height)?
+            .id()
+            .map_err(|_| "checkpoint captured header identity invalid")?;
+        Ok(id == self.tip)
+    }
     pub(crate) fn check(&self, store: &Store) -> Result<(), String> {
         store.ensure_exportable()?;
         if !std::sync::Arc::ptr_eq(&self.instance, &store.revision)

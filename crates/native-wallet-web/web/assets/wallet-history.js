@@ -63,7 +63,9 @@ export class WalletHistory {
         const span = document.createElement('span'); span.className = css; span.textContent = text; summary.append(span);
       }
       const fields = [row.height === null ? 'Not included in an accepted block' : `Block ${row.height}`];
-      if (row.confirmations!==null) fields.push(`Confirmations: ${row.confirmations}`);
+      if (row.confirmations!==null) {
+        fields.push(`Confirmations: ${row.confirmations}`, 'Wait for at least 24 confirmations for high-value payments.');
+      }
       if (row.recipient) fields.push(`Recipient: ${row.recipient}`);
       if (row.fee_atoms !== undefined) fields.push(`Fee: ${formatted(row.fee_atoms, sip)}`);
       if (row.statement_id) fields.push(`Statement: ${row.statement_id}`);

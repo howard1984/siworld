@@ -37,6 +37,11 @@ pub fn binding(genesis: &Genesis) -> p2p::Binding {
     genesis.peer_binding()
 }
 
+/// The streaming protocol is bound to the explicitly distinct genesis rules.
+pub(crate) fn propagation_profile(genesis: &Genesis) -> bool {
+    genesis.slot_rule() == crate::wire::SlotRule::PublicGenesis
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
     Propagation(propagation::PropagationRequest),
@@ -73,6 +78,7 @@ struct CompetingHead {
 pub struct Peer<S> {
     propagation_session: u64,
     propagation_supported: Option<bool>,
+    propagation_streaming: bool,
     session: p2p::Session<S>,
     policy: Policy,
     exact_blocks: Option<bool>,
@@ -104,6 +110,7 @@ impl<S: Read + Write> Peer<S> {
         Ok(Self {
             propagation_session: propagation::next_session()?,
             propagation_supported: None,
+            propagation_streaming: propagation_profile(genesis),
             session,
             policy,
             exact_blocks: None,
@@ -919,6 +926,7 @@ pub(crate) mod tests {
         Policy {
             profile: crate::proofs::protocol_profile_fingerprint(),
             max_body_bytes: 4 * 1024 * 1024,
+            slot_rule: crate::wire::SlotRule::Legacy,
             max_settlement_proof_bytes: 3 * 1024 * 1024,
         }
     }

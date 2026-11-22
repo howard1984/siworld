@@ -6,17 +6,36 @@ use super::*;
 type Batch = (Arc<Job>, Vec<super::super::propagation::pipeline::Request>);
 const CAPACITY: usize = 4;
 pub(super) struct Job {
-    pub(super) transfer: Mutex<Transfer>,
+    pub(super) transfer: Arc<Mutex<Transfer>>,
     pub(super) ownership: p2p::BodyClaim,
     pub(super) download: header_lane::Download,
     pub(super) validation: Option<Arc<super::super::native_pipeline::Pipeline>>,
     source_session: u64,
+    forwarded: Mutex<std::collections::BTreeSet<Hash>>,
     path: Vec<super::super::header::Header>,
     _charge: p2p::Reservation,
+}
+pub(super) struct Forwarding {
+    pub(super) transfer: Arc<Mutex<Transfer>>,
+    pub(super) header: super::super::header::Header,
+    pub(super) deadline: p2p::Deadline,
+    job: std::sync::Weak<Job>,
+    _charge: p2p::Reservation,
+}
+impl Forwarding {
+    pub(super) fn forwarding_deferred(&self, peer: Hash) {
+        let Some(job) = self.job.upgrade() else {
+            return;
+        };
+        if let Ok(mut forwarded) = job.forwarded.lock() {
+            forwarded.remove(&peer);
+        }
+    }
 }
 pub(super) struct Transfers {
     jobs: Mutex<Vec<Arc<Job>>>,
     configured: Vec<Hash>,
+    budget: p2p::Budget,
     completed: std::sync::atomic::AtomicU64,
     failed: std::sync::atomic::AtomicU64,
     _charge: p2p::Reservation,
@@ -45,6 +64,7 @@ impl Transfers {
         Ok(Self {
             jobs: Mutex::new(Vec::with_capacity(CAPACITY)),
             configured,
+            budget: budget.clone(),
             completed: std::sync::atomic::AtomicU64::new(0),
             failed: std::sync::atomic::AtomicU64::new(0),
             _charge: budget
@@ -136,28 +156,33 @@ impl Transfers {
         validation: Option<Arc<super::super::native_pipeline::Pipeline>>,
         source_session: u64,
         shared: &Shared,
-    ) -> Result<(), String> {
+    ) -> Result<Arc<Job>, String> {
         let path = shared.headers.path(&download.header)?;
         let charge = shared
             .budget
             .reserve(
                 std::mem::size_of::<Job>()
+                    + std::mem::size_of::<Mutex<Transfer>>()
+                    + 64
+                    + 8 * 64
                     + path.len() * std::mem::size_of::<super::super::header::Header>(),
             )
             .map_err(|_| "piece job memory unavailable")?;
-        let transfer = metadata
+        let mut transfer = metadata
             .into_transfer(ledger, &shared.budget)
             .map_err(|_| "piece assembly allocation rejected")?;
+        transfer.bind_forwarding_candidate(download.forwarding_candidate.clone());
         if let Some(pipeline) = &validation {
             let _ = pipeline.observe(&transfer);
         }
         let ownership = download.take_ownership()?;
         let job = Arc::new(Job {
-            transfer: Mutex::new(transfer),
+            transfer: Arc::new(Mutex::new(transfer)),
             ownership,
             download,
             validation,
             source_session,
+            forwarded: Mutex::new(Default::default()),
             path,
             _charge: charge,
         });
@@ -168,8 +193,69 @@ impl Transfers {
         if jobs.len() >= CAPACITY {
             return Err("piece job registry full".into());
         }
-        jobs.push(job);
-        Ok(())
+        jobs.push(job.clone());
+        Ok(job)
+    }
+    pub(super) fn forwarding(
+        &self,
+        peer: Hash,
+        shutdown: p2p::Cancellation,
+    ) -> Result<Option<Forwarding>, String> {
+        if !self.configured.contains(&peer) {
+            return Ok(None);
+        }
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| "piece job registry lock poisoned")?
+            .clone();
+        for job in jobs {
+            if job.download.cancel.is_cancelled() || job.ownership.deadline().check().is_err() {
+                continue;
+            }
+            let transfer = job
+                .transfer
+                .lock()
+                .map_err(|_| "piece transfer lock poisoned")?;
+            if transfer.confirmed_source(peer) || transfer.verified_bytes() == 0 {
+                continue;
+            }
+            let deadline = transfer.forwarding_deadline(shutdown.clone());
+            drop(transfer);
+            let mut forwarded = job
+                .forwarded
+                .lock()
+                .map_err(|_| "piece forwarding lock poisoned")?;
+            if forwarded.len() < 8 && forwarded.insert(peer) {
+                drop(forwarded);
+                // References keep both Arc allocations after Job is reaped.
+                // Retain those bounded metadata charges without retaining the
+                // admission owner or allocating another body buffer.
+                let charge = match self.budget.reserve(
+                    std::mem::size_of::<Forwarding>()
+                        + std::mem::size_of::<Job>()
+                        + std::mem::size_of::<Mutex<Transfer>>()
+                        + 128,
+                ) {
+                    Ok(charge) => charge,
+                    Err(_) => {
+                        job.forwarded
+                            .lock()
+                            .map_err(|_| "piece forwarding lock poisoned")?
+                            .remove(&peer);
+                        return Ok(None);
+                    }
+                };
+                return Ok(Some(Forwarding {
+                    transfer: job.transfer.clone(),
+                    header: job.download.header.clone(),
+                    deadline,
+                    job: Arc::downgrade(&job),
+                    _charge: charge,
+                }));
+            }
+        }
+        Ok(None)
     }
     pub(super) fn cancel(&self) {
         if let Ok(jobs) = self.jobs.lock() {
@@ -247,8 +333,10 @@ impl Transfers {
                 let exhausted = transfer.sources().iter().map(|s| s.queries).sum::<u64>() >= 4;
                 let cancelled =
                     job.download.cancel.is_cancelled() || job.ownership.deadline().check().is_err();
+                let streaming = transfer.stream_active();
                 drop(transfer);
-                if (complete || cancelled || exhausted) && Arc::strong_count(job) == 1 {
+                if (complete || cancelled || exhausted) && !streaming && Arc::strong_count(job) == 1
+                {
                     ready.push(jobs.remove(index));
                 } else {
                     index += 1;
@@ -265,11 +353,12 @@ impl Transfers {
                 download,
                 validation,
                 source_session: _,
+                forwarded: _,
                 path,
                 _charge,
             } = job;
-            let transfer = transfer
-                .into_inner()
+            let mut transfer = transfer
+                .lock()
                 .map_err(|_| "piece transfer lock poisoned")?;
             let timing = transfer.fetch_timing(&download.header, &ownership);
             // Four actual queries bound this fixed snapshot even when all eight
@@ -296,7 +385,7 @@ impl Transfers {
                 continue;
             }
             let receipts = validation.and_then(|pipeline| pipeline.finish(&transfer).ok());
-            match transfer.finish(
+            match transfer.finish_retained(
                 &download.header,
                 shared.headers.body_policy(),
                 Instant::now(),

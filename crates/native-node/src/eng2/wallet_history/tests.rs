@@ -86,6 +86,7 @@ fn policy(context: &Context) -> crate::eng2::body::Policy {
     crate::eng2::body::Policy {
         profile: context.profile(),
         max_body_bytes: codec::MAX_BODY_BYTES,
+        slot_rule: context.slot_rule(),
         max_settlement_proof_bytes: MAX_SETTLEMENT_PROOF,
     }
 }

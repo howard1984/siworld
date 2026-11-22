@@ -107,6 +107,7 @@ fn continuous(
             .map_err(|_| Failure::ProverInit)?;
         crate::eng2::genesis::Genesis::decode(&encoded).map_err(|_| Failure::ProverInit)?
     };
+    let minimum_positions = proof_genesis.slot_rule().minimum();
     let mut prover = None;
     let mut padding = padding::Pipeline::default();
     #[cfg(feature = "eng2-rehearsal")]
@@ -161,7 +162,7 @@ fn continuous(
         {
             let owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
             if !owner.activities_allowed()
-                || owner.ready_positions() < crate::pool::MIN_READY
+                || owner.ready_positions() < minimum_positions
                 || !isolated_permission(shared, &owner, Some(policy_revision))
                     .map_err(|_| Failure::ProductionControl)?
                     .0
@@ -181,7 +182,7 @@ fn continuous(
         let (generation, prepared, mut submission) = {
             let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
             if !owner.activities_allowed()
-                || owner.ready_positions() < crate::pool::MIN_READY
+                || owner.ready_positions() < minimum_positions
                 || !isolated_permission(shared, &owner, Some(policy_revision))
                     .map_err(|_| Failure::ProductionControl)?
                     .0
@@ -201,7 +202,7 @@ fn continuous(
             let mut submission = request::Request::take(shared, &head);
             let prepared = if let Some((operations, issuances)) = submission.inputs() {
                 match owner.prepare_block_with_operations(
-                    crate::pool::MIN_READY,
+                    minimum_positions,
                     timestamp,
                     settings,
                     operations,
@@ -215,7 +216,7 @@ fn continuous(
                 }
             } else {
                 owner
-                    .prepare_block(crate::pool::MIN_READY, timestamp, settings)
+                    .prepare_block(minimum_positions, timestamp, settings)
                     .map_err(|_| Failure::PrepareBlock)?
             };
             (owner.template_generation(), prepared, submission)

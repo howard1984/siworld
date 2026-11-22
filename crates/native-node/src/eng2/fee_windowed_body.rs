@@ -73,6 +73,7 @@ fn policy(registry: &CandidateRegistry) -> Result<Policy, String> {
     Ok(Policy {
         profile: registry.suite().id(),
         max_body_bytes: maximum_bytes()?,
+        slot_rule: crate::wire::SlotRule::Legacy,
         max_settlement_proof_bytes: MAX_FEE_PROOF_BYTES,
     })
 }

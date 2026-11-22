@@ -3,7 +3,7 @@
 
 use crate::pool::Padding;
 use crate::proofs::NativeProver;
-use crate::state::{State, base_fee, tail_slots};
+use crate::state::{State, base_fee};
 use crate::wire::{Block, GROUP, MAX_SLOTS, MIN_SLOTS, PublicRecord, RewardRecord, Transaction};
 use native::codec::{ProofContext, PublicTransaction, decode_digest, encode_digest};
 use native::confidential_fees::{FeeOpening, SettlementSlot};
@@ -492,6 +492,7 @@ impl PreparedPadding {
 
 pub(crate) struct PreparedCandidate {
     block: Block,
+    slot_rule: crate::wire::SlotRule,
     settlement: FixedSettlementWitness,
     reward_secret: Zeroizing<Vec<u8>>,
 }
@@ -506,7 +507,14 @@ fn prepare_candidate(
     settings: &MiningSettings,
 ) -> Result<PreparedCandidate, String> {
     let plan = state.reward_plan(settings.mode)?;
-    prepare_candidate_with_plan(state, positions, timestamp, settings, plan)
+    prepare_candidate_with_plan(
+        state,
+        positions,
+        timestamp,
+        settings,
+        plan,
+        crate::wire::SlotRule::Legacy,
+    )
 }
 
 pub(crate) fn prepare_candidate_with_plan(
@@ -515,8 +523,11 @@ pub(crate) fn prepare_candidate_with_plan(
     timestamp: u64,
     settings: &MiningSettings,
     plan: native::settlement::RewardPlan,
+    slot_rule: crate::wire::SlotRule,
 ) -> Result<PreparedCandidate, String> {
-    check_count(positions.len())?;
+    if !slot_rule.permits(positions.len()) {
+        return Err("candidate position count rejected by local rules".into());
+    }
     if timestamp <= state.median_time_past() {
         return Err("candidate timestamp must exceed median time past".into());
     }
@@ -574,7 +585,12 @@ pub(crate) fn prepare_candidate_with_plan(
         });
         transactions.push(value.transaction);
     }
-    slots.extend(tail_slots(state.config.network, height, count)?);
+    slots.extend(crate::state::tail_slots_for(
+        state.config.network,
+        height,
+        count,
+        slot_rule,
+    )?);
     let reward = prepare_rewards_with_plan(state, total_fees, settings, &plan)?;
     let block = Block {
         network: state.config.network,
@@ -611,6 +627,7 @@ pub(crate) fn prepare_candidate_with_plan(
         .map_err(|_| "invalid prepared fee settlement")?;
     Ok(PreparedCandidate {
         block,
+        slot_rule,
         settlement: witness,
         reward_secret: reward.secret,
     })
@@ -637,7 +654,7 @@ pub(crate) fn prove_candidate(
     mut prepared: PreparedCandidate,
 ) -> Result<ProducedBlock, String> {
     prepared.block.settlement_proof = prover.settlement(&prepared.settlement)?;
-    prepared.block.validate_shape()?;
+    prepared.block.validate_shape_for(prepared.slot_rule)?;
     validate_reward_secret(&prepared.block, &prepared.reward_secret)?;
     Ok(ProducedBlock {
         block: prepared.block,
@@ -939,6 +956,91 @@ mod tests {
             validate_reward_secret(&prepared.block, &prepared.reward_secret).unwrap();
             assert_eq!(state.fingerprint(), fingerprint);
         }
+    }
+
+    #[test]
+    #[ignore = "explicit native settlement proof fixture"]
+    fn public_genesis_sixteen_slot_template_proves_fixed_capacity_settlement() {
+        use crate::{proofs::NativeVerifier, wire::SlotRule};
+
+        let state = State::new(Config::development([44; 32], 0).unwrap()).unwrap();
+        let plan = state.reward_plan(RewardMode::Voyager).unwrap();
+        let amounts = [7, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let timestamp = state.timestamp() + 1;
+        let settings = settings(RewardMode::Voyager);
+        assert!(
+            prepare_candidate(
+                &state,
+                fee_positions(&state, &amounts),
+                timestamp,
+                &settings,
+            )
+            .is_err()
+        );
+        // Transaction records and openings are fixtures. Only the settlement
+        // proof is real; the template is never eligible for block admission.
+        let prepared = prepare_candidate_with_plan(
+            &state,
+            fee_positions(&state, &amounts),
+            timestamp,
+            &settings,
+            plan.clone(),
+            SlotRule::PublicGenesis,
+        )
+        .unwrap();
+        assert_eq!(prepared.settlement.slots.len(), MAX_SLOTS);
+        assert_eq!(
+            prepared.settlement.rewards[0].amount,
+            plan.allocations[0].amount + 26
+        );
+        let verifier = NativeVerifier::new().unwrap();
+        let produced = prove_candidate(&NativeProver::new().unwrap(), prepared).unwrap();
+        let block = produced.block;
+        assert_eq!(block.transactions.len(), 16);
+        let mut fees = block
+            .transactions
+            .iter()
+            .map(|tx| decode_digest(&tx.record.fee_commit).unwrap())
+            .collect::<Vec<_>>();
+        fees.extend(
+            crate::state::tail_slots_for(
+                block.network,
+                block.height,
+                block.transactions.len(),
+                SlotRule::PublicGenesis,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|slot| slot.commitment),
+        );
+        let rewards = block
+            .rewards
+            .iter()
+            .map(|reward| decode_digest(&reward.commitment).unwrap())
+            .collect::<Vec<_>>();
+        verifier
+            .verify_settlement(
+                &fees,
+                &plan,
+                block.network,
+                block.list_digest(),
+                &rewards,
+                &block.settlement_proof,
+            )
+            .unwrap();
+        fees[16] = fees[17];
+        assert!(
+            verifier
+                .verify_settlement(
+                    &fees,
+                    &plan,
+                    block.network,
+                    block.list_digest(),
+                    &rewards,
+                    &block.settlement_proof,
+                )
+                .is_err()
+        );
     }
 
     #[test]

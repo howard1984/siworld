@@ -35,6 +35,7 @@ pub struct Context {
     rules: Hash,
     profile: Hash,
     fee_mode: u8,
+    slot_rule: SlotRule,
 }
 impl Context {
     pub fn from_genesis(bytes: &[u8], expected: Hash) -> Result<Self, String> {
@@ -42,13 +43,17 @@ impl Context {
         let prefix = end + 4;
         if bytes.len() < prefix + 8
             || bytes.len() > prefix + 131072
-            || &bytes[..8] != b"SWE2GEN2"
             || bytes[8] != 0
             || bytes[9..41] != crate::proofs::protocol_profile_fingerprint()
             || expected == [0; 32]
         {
             return Err("wallet genesis encoding, fee mode or native profile rejected".into());
         }
+        let slot_rule = match &bytes[..8] {
+            magic if magic == LEGACY_GENESIS_MAGIC => SlotRule::Legacy,
+            magic if magic == PUBLIC_GENESIS_MAGIC => SlotRule::PublicGenesis,
+            _ => return Err("wallet genesis version rejected".into()),
+        };
         let config = Config::decode_rules(&bytes[41..end])?;
         if config.encode_rules().as_slice() != &bytes[41..end] {
             return Err("wallet genesis configuration is noncanonical".into());
@@ -67,6 +72,9 @@ impl Context {
         hash.update(&bytes[prefix..]);
         hash.update(RULES_SUFFIX);
         hash.update(crate::state::ORDINARY_FEE_RULES);
+        if slot_rule == SlotRule::PublicGenesis {
+            hash.update(PUBLIC_GENESIS_RULES);
+        }
         let rules = *hash.finalize().as_bytes();
         let genesis = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
         if genesis != expected {
@@ -78,7 +86,11 @@ impl Context {
             rules,
             profile,
             fee_mode: bytes[8],
+            slot_rule,
         })
+    }
+    pub fn slot_rule(&self) -> SlotRule {
+        self.slot_rule
     }
     pub fn config(&self) -> &Config {
         &self.config
@@ -197,8 +209,7 @@ fn parse(
     let funds_count = prefix[82] as usize;
     let governance_count = prefix[83] as usize;
     let issuances_count = prefix[84] as usize;
-    if !(MIN_SLOTS..=MAX_SLOTS).contains(&count)
-        || !count.is_multiple_of(GROUP)
+    if !context.slot_rule().permits(count)
         || rewards_count != reward_count(mode)
         || funds_count > MAX_FUND_SPENDS
         || governance_count > MAX_GOVERNANCE_ACTIONS

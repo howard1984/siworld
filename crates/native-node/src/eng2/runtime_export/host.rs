@@ -297,6 +297,8 @@ pub struct Host {
     tick_failure: Option<TickFailureReason>,
     #[cfg(feature = "eng2-runtime")]
     retained_failure: Option<retained_diagnostic::Failure>,
+    #[cfg(feature = "eng2-runtime")]
+    retained_budget_failures: u64,
     wallet: Option<WalletPublisher>,
     wallet_requested: bool,
     wallet_paused: bool,
@@ -309,6 +311,10 @@ pub struct Host {
     retained_ready: bool,
     #[cfg(feature = "eng2-runtime")]
     last_retained_material: Option<Hash>,
+    #[cfg(feature = "eng2-runtime")]
+    pruning_publication: Option<(u64, files::RetainedPublicationPin)>,
+    #[cfg(feature = "eng2-runtime")]
+    restoration_unready_since: Option<std::time::Instant>,
 }
 struct ResidentPreparation {
     budget: crate::p2p::Budget,
@@ -362,6 +368,10 @@ impl Host {
         self.retained_failure
             .map(retained_diagnostic::Failure::json)
     }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn retained_budget_failures(&self) -> u64 {
+        self.retained_budget_failures
+    }
     /// The failed operation's bounded origin; the original Result is unchanged.
     pub fn tick_failure_reason(&self) -> Option<TickFailureReason> {
         self.tick_failure
@@ -409,6 +419,8 @@ impl Host {
             tick_failure: None,
             #[cfg(feature = "eng2-runtime")]
             retained_failure: None,
+            #[cfg(feature = "eng2-runtime")]
+            retained_budget_failures: 0,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -421,6 +433,10 @@ impl Host {
             retained_ready: true,
             #[cfg(feature = "eng2-runtime")]
             last_retained_material: None,
+            #[cfg(feature = "eng2-runtime")]
+            pruning_publication: None,
+            #[cfg(feature = "eng2-runtime")]
+            restoration_unready_since: None,
         })
     }
     /// Open retained local publications without granting an obsolete
@@ -451,6 +467,8 @@ impl Host {
             tick_failure: None,
             #[cfg(feature = "eng2-runtime")]
             retained_failure: None,
+            #[cfg(feature = "eng2-runtime")]
+            retained_budget_failures: 0,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -463,6 +481,10 @@ impl Host {
             retained_ready: true,
             #[cfg(feature = "eng2-runtime")]
             last_retained_material: None,
+            #[cfg(feature = "eng2-runtime")]
+            pruning_publication: None,
+            #[cfg(feature = "eng2-runtime")]
+            restoration_unready_since: None,
         };
         value.reconcile_retained(store, retained)?;
         Ok(value)
@@ -624,6 +646,13 @@ impl Host {
     /// Signer journals remain untouched; the resident skips signing ticks until
     /// switching finishes and authenticated readiness has been re-established.
     pub fn pause_reorganization_exports(&mut self) -> Result<(), String> {
+        #[cfg(feature = "eng2-runtime")]
+        {
+            self.pruning_publication = None;
+        }
+        self.pause_current_exports()
+    }
+    fn pause_current_exports(&mut self) -> Result<(), String> {
         self.retained_ready = false;
         if let Some(preparation) = &mut self.preparation {
             preparation.invalidate()?;

@@ -7,6 +7,7 @@ pub(crate) fn policy() -> Policy {
     Policy {
         profile: [19; 32],
         max_body_bytes: 2 * 1024 * 1024,
+        slot_rule: crate::wire::SlotRule::Legacy,
         max_settlement_proof_bytes: 4096,
     }
 }
@@ -294,4 +295,50 @@ fn holder_mode_issuance_and_stream_writer_use_the_identical_canonical_bytes() {
             .kind(),
         std::io::ErrorKind::TimedOut
     );
+}
+
+#[test]
+fn public_genesis_slot_bounds_apply_to_encoding_and_decoding() {
+    let mut template = body();
+    let txs = template.transactions.clone();
+    for index in txs.len()..592 {
+        let mut tx = txs[index % txs.len()].clone();
+        tx.record.body[..48].copy_from_slice(&digest(30_000 + index as u32));
+        template.transactions.push(tx);
+    }
+    template
+        .transactions
+        .sort_by_key(|tx| tx.record.statement_id(&template.network));
+    let public = Policy {
+        slot_rule: SlotRule::PublicGenesis,
+        max_body_bytes: 4 * 1024 * 1024,
+        ..policy()
+    };
+    for count in [16, 32, 64, 576] {
+        let mut block = template.clone();
+        block.transactions.truncate(count);
+        let bytes = block.encode(public).unwrap();
+        assert_eq!(
+            Body::decode(&bytes, block.network, block.height, public).unwrap(),
+            block
+        );
+        let legacy = Policy {
+            slot_rule: SlotRule::Legacy,
+            ..public
+        };
+        assert_eq!(
+            Body::decode(&bytes, block.network, block.height, legacy).is_ok(),
+            count >= MIN_SLOTS
+        );
+        let mut changed = bytes;
+        for invalid in [0u16, 15, 17, 592] {
+            changed[78..80].copy_from_slice(&invalid.to_le_bytes());
+            assert!(Body::decode(&changed, block.network, block.height, public).is_err());
+        }
+    }
+    for count in [0, 15, 17, 592] {
+        let mut block = template.clone();
+        block.transactions.truncate(count);
+        assert!(block.encode(public).is_err());
+    }
 }

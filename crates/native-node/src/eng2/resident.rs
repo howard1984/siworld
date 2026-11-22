@@ -369,7 +369,7 @@ struct ExportState<'a> {
     wallet_export: Option<bool>,
     checkpoint_tick_reason: Option<&'a str>,
     wallet_diagnostic: Option<(&'a str, Option<&'a str>)>,
-    retained_diagnostic: Option<Value>,
+    retained_diagnostic: Option<(Option<Value>, u64, Option<Value>)>,
     proof_retention: Option<Value>,
 }
 fn export_status(
@@ -457,7 +457,12 @@ fn export_status(
         "historical_proof_replay":false
     });
     status["body_registry_decision"] = shared.budget.body_registry_diagnostic();
-    status["retained_restoration_failure"] = json!(retained_diagnostic);
+    let (retained_failure, retained_budget_failures, retained_budget) = retained_diagnostic
+        .map(|(failure, count, budget)| (failure, Some(count), budget))
+        .unwrap_or_default();
+    status["retained_restoration_failure"] = json!(retained_failure);
+    status["retained_restoration_budget_failures"] = json!(retained_budget_failures);
+    status["checkpoint_worker_budget"] = json!(retained_budget);
     status["proof_retention"] = json!(proof_retention);
     status["checkpoint_error"] = json!(checkpoint_error);
     status["checkpoint_tick_reason"] = json!(checkpoint_tick_reason);
@@ -684,6 +689,8 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         config.checkpoint_key.is_some(),
     )?;
     #[cfg(unix)]
+    let service_pruning = config.proof_retention == Some(super::proof_retention::Policy::Service);
+    #[cfg(unix)]
     let mut proof_maintenance = config
         .proof_retention
         .map(super::store::ProofMaintenance::new)
@@ -719,6 +726,21 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     )?;
     check_windows_admission(cfg!(windows), store.imported_checkpoint_height())?;
     let budget = p2p::Budget::new(MEMORY_BYTES);
+    #[cfg(unix)]
+    let checkpoint_worker_budget_bytes = config.checkpoint_worker_budget_bytes;
+    #[cfg(unix)]
+    let checkpoint_budget = checkpoint_worker_budget_bytes
+        .map(p2p::Budget::new)
+        .unwrap_or_else(|| budget.clone());
+    #[cfg(unix)]
+    let checkpoint_budget_status = || {
+        checkpoint_worker_budget_bytes.and_then(|maximum| {
+            checkpoint_budget
+                .reservation_peak()
+                .ok()
+                .map(|peak| json!({"maximum_bytes":maximum,"peak_reserved_bytes":peak}))
+        })
+    };
     let mut driver = Driver::new(store, NativeVerifier::for_genesis(&genesis)?, limits())?;
     let header_rules = super::selection::HeaderRules {
         network: genesis.config().network,
@@ -888,7 +910,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             owner.store(),
             limits(),
             config.checkpoint_key.as_deref(),
-            &shared.budget,
+            &checkpoint_budget,
         )?;
         if !owner.activities_allowed() {
             host.pause_reorganization_exports()?;
@@ -983,6 +1005,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     .map_err(|_| "resident owner lock poisoned")?;
                 let _switch_result = owner.reorganization_tick(|ancestor_height| {
                     shared.headers.invalidate_progress_context();
+                    shared.headers.revoke_forwarding_context();
                     shared.transfers.cancel();
                     shared.network.invalidate_head_evidence()?;
                     #[cfg(unix)]
@@ -1045,11 +1068,14 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             // signing; canonical validation and peers keep running.
                             shared.mailbox.publish(&[])?;
                             checkpoint_progress.restoration(&shared.headers, restored.is_err());
-                            checkpoint_error = Some(if restored.is_err() {
-                                "checkpoint_retained_restoration_failed"
-                            } else {
-                                "checkpoint_retained_restoration_pending"
-                            });
+                            checkpoint_error =
+                                Some(if checkpoint_host.restoration_stalled(Instant::now()) {
+                                    "checkpoint_retained_restoration_stalled"
+                                } else if restored.is_err() {
+                                    "checkpoint_retained_restoration_failed"
+                                } else {
+                                    "checkpoint_retained_restoration_pending"
+                                });
                             checkpoint_tick_reason = Some("retained_restoration");
                         } else {
                             let incoming = shared.mailbox.drain()?;
@@ -1119,10 +1145,21 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                     if owner.activities_allowed() {
                         // Storage failure pauses maintenance only. Signing and
                         // readiness continue to use their existing independent gates.
+                        // Hold the observer gate through maintenance so a known
+                        // checkpoint conflict cannot authorize deletion.
+                        let observer = service_pruning
+                            .then(|| shared.checkpoint_observer.lock())
+                            .transpose()
+                            .map_err(|_| "checkpoint observer lock poisoned")?;
+                        let checkpoint = match observer.as_ref() {
+                            Some(observer) if observer.conflicted() => None,
+                            Some(_) => checkpoint_host.pruning_checkpoint(owner.store()),
+                            None => checkpoint_host.latest_checkpoint(),
+                        };
                         proof_retention_status = Some(
                             match owner.maintain_proofs(
                                 maintenance,
-                                checkpoint_host.latest_checkpoint(),
+                                checkpoint,
                                 unix_ms()? / 1000,
                                 started.elapsed().as_secs(),
                                 &shared.budget,
@@ -1156,7 +1193,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                         retained_diagnostic: {
                             #[cfg(unix)]
                             {
-                                checkpoint_host.retained_failure_diagnostic()
+                                Some((
+                                    checkpoint_host.retained_failure_diagnostic(),
+                                    checkpoint_host.retained_budget_failures(),
+                                    checkpoint_budget_status(),
+                                ))
                             }
                             #[cfg(not(unix))]
                             {
@@ -1222,7 +1263,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
             retained_diagnostic: {
                 #[cfg(unix)]
                 {
-                    checkpoint_host.retained_failure_diagnostic()
+                    Some((
+                        checkpoint_host.retained_failure_diagnostic(),
+                        checkpoint_host.retained_budget_failures(),
+                        checkpoint_budget_status(),
+                    ))
                 }
                 #[cfg(not(unix))]
                 {

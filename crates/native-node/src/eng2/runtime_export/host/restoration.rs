@@ -31,6 +31,7 @@ impl Host {
             last_status: None,
             tick_failure: None,
             retained_failure: None,
+            retained_budget_failures: 0,
             wallet: None,
             wallet_requested: false,
             wallet_paused: false,
@@ -42,12 +43,34 @@ impl Host {
             restore_required: true,
             retained_ready: false,
             last_retained_material: None,
+            pruning_publication: None,
+            restoration_unready_since: None,
         };
         // Startup has no authenticated retained capability to reuse. Existing
         // wallet history remains readable without granting current readiness.
         value.export.pause_wallet_head()?;
         value.enable_async_preparation(budget)?;
         Ok(value)
+    }
+    /// A successful retained inspection may authorize pruning while the next
+    /// inspection is in flight. This reference is never used for exports.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn pruning_checkpoint(&self, store: &Store) -> Option<&CertifiedCheckpoint> {
+        let checkpoint = self.latest.as_ref()?;
+        let (generation, publication) = self.pruning_publication.as_ref()?;
+        // The signing retirement watermark also includes certificates still
+        // advertised at the active cursor. It does not retire their archive.
+        if *generation != self.export.material_generation() || !publication.matches(&self.export) {
+            return None;
+        }
+        checkpoint.check_current(store).ok()?;
+        Some(checkpoint)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn restoration_stalled(&self, now: std::time::Instant) -> bool {
+        self.restoration_unready_since.is_some_and(|since| {
+            now.saturating_duration_since(since) >= std::time::Duration::from_secs(300)
+        })
     }
     /// Each fresh restoration examines actual artifact contents, including on
     /// an unchanged head. Pending or failed work only pauses checkpoint exports.
@@ -61,14 +84,24 @@ impl Host {
         let mut generation_mismatches = 0;
         let result =
             self.reconcile_retained_step(store, headers, &mut stage, &mut generation_mismatches);
+        if matches!(result, Ok(true)) {
+            self.restoration_unready_since = None;
+        } else {
+            self.restoration_unready_since
+                .get_or_insert_with(std::time::Instant::now);
+        }
         if let Err(error) = &result {
             let sequence = self
                 .retained_failure
                 .map_or(1, |old| old.sequence.saturating_add(1));
+            let cause = Cause::classify(error);
+            if error.budget.is_some() || cause == Cause::Budget {
+                self.retained_budget_failures = self.retained_budget_failures.saturating_add(1);
+            }
             self.retained_failure = Some(Failure {
                 sequence,
                 stage,
-                cause: Cause::classify(error),
+                cause,
                 budget: error.budget,
                 generation_mismatches,
                 withdrawal: None,
@@ -117,7 +150,11 @@ impl Host {
                     *stage = Stage::Revision;
                     if !result.revision.is_current_revision(store)? {
                         *stage = Stage::StaleWithdrawal;
-                        self.pause_reorganization_exports()?;
+                        if result.revision.is_canonical_extension(store)? {
+                            self.pause_current_exports()?;
+                        } else {
+                            self.pause_reorganization_exports()?;
+                        }
                         return Ok(false);
                     }
                     *stage = Stage::Install;
@@ -316,6 +353,9 @@ impl Host {
         {
             self.retire_anchor(height)?;
         }
+        self.pruning_publication = result
+            .pruning_publication
+            .map(|pin| (self.export.material_generation(), pin));
         let material_changed = self.last_retained_material != Some(result.material);
         self.last_retained_material = Some(result.material);
         self.retained_head = Some((

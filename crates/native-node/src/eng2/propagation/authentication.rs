@@ -152,6 +152,11 @@ impl Descriptor {
 }
 
 impl Authenticated {
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn encoded_descriptor(&self) -> Result<Vec<u8>, Error> {
+        self.descriptor.encode(self.body_bytes())
+    }
+
     #[cfg(all(test, feature = "eng2-runtime"))]
     pub(crate) fn same_descriptor(&self, other: &Self) -> bool {
         self.block == other.block

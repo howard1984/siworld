@@ -122,6 +122,7 @@ impl Engine {
     }
     pub fn body_policy(&self) -> body::Policy {
         body::Policy {
+            slot_rule: self.genesis.slot_rule(),
             profile: crate::proofs::protocol_profile_fingerprint(),
             max_body_bytes: crate::wire::MAX_BLOCK_BYTES
                 + crate::wire::REWARD_RECORD_BYTES
@@ -341,6 +342,12 @@ enum PreparationLayout<'a> {
     },
 }
 impl PreparationLayout<'_> {
+    fn slot_rule(self) -> crate::wire::SlotRule {
+        match self {
+            Self::Legacy(policy) => policy.slot_rule,
+            Self::Windowed { .. } => crate::wire::SlotRule::Legacy,
+        }
+    }
     fn commitment(self, body: &body::Body) -> Result<Hash, String> {
         match self {
             Self::Legacy(policy) => body.commitment(policy),
@@ -379,6 +386,7 @@ pub struct PreparedBlock<'a> {
     actions: PreparedActions<'a>,
     ledgers: CandidateLedgers,
     header_use: HeaderUse,
+    slot_rule: crate::wire::SlotRule,
 }
 /// One isolated chain/ledger preparation using the complete fee-first body.
 /// Fields are private and there is no conversion to NativeTransactions or a
@@ -419,6 +427,7 @@ pub struct NativeTransactions<'a> {
     actions: CheckedActions<'a>,
     ledgers: CandidateLedgers,
     header_use: HeaderUse,
+    slot_rule: crate::wire::SlotRule,
 }
 impl<'a> PreparedBlock<'a> {
     pub fn prepare(
@@ -493,7 +502,7 @@ impl<'a> PreparedBlock<'a> {
             frozen.active_fee_destination(),
             frozen.issuance_fee_atoms(),
         )?;
-        let actions = PreparedActions::prepare_with_issuance_policy(
+        let actions = PreparedActions::prepare_with_rules(
             &parent.chain,
             Context {
                 network: header.network,
@@ -508,6 +517,7 @@ impl<'a> PreparedBlock<'a> {
                 rewards: &body.rewards,
             },
             Some(&issuance_policy),
+            layout.slot_rule(),
         )?;
         // Both clones are bounded governance state. The frozen policy activates
         // only previously included operations; new actions cannot change this
@@ -584,6 +594,7 @@ impl<'a> PreparedBlock<'a> {
             body,
             binding,
             header_use,
+            slot_rule: layout.slot_rule(),
             actions,
             ledgers: CandidateLedgers {
                 economics,
@@ -623,6 +634,7 @@ impl<'a> PreparedBlock<'a> {
             body: self.body,
             binding: self.binding,
             header_use: self.header_use,
+            slot_rule: self.slot_rule,
             actions,
             ledgers: self.ledgers,
         })
@@ -652,6 +664,7 @@ impl<'a> PreparedBlock<'a> {
             body: self.body,
             binding: self.binding,
             header_use: self.header_use,
+            slot_rule: self.slot_rule,
             actions,
             ledgers: self.ledgers,
         })
@@ -700,10 +713,11 @@ impl NativeTransactions<'_> {
         }
         let mut fees = self.actions.fees().to_vec();
         fees.extend(
-            crate::state::tail_slots(
+            crate::state::tail_slots_for(
                 self.header.network,
                 self.header.height,
                 self.body.transactions.len(),
+                self.slot_rule,
             )?
             .iter()
             .map(|slot| slot.commitment),
@@ -764,10 +778,11 @@ impl NativeTransactions<'_> {
         }
         let mut fees = self.actions.fees().to_vec();
         fees.extend(
-            crate::state::tail_slots(
+            crate::state::tail_slots_for(
                 self.header.network,
                 self.header.height,
                 self.body.transactions.len(),
+                self.slot_rule,
             )
             .map_err(precommit_failure)?
             .iter()

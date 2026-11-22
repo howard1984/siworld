@@ -645,9 +645,7 @@ impl Driver {
     ) -> Result<PreparedBlock, String> {
         self.ensure_activities_allowed()?;
         self.store.ensure_exportable()?;
-        if !(crate::wire::MIN_SLOTS..=crate::wire::MAX_SLOTS).contains(&count)
-            || !count.is_multiple_of(crate::wire::GROUP)
-        {
+        if !self.store.engine().genesis().slot_rule().permits(count) {
             return Err("production position count rejected".into());
         }
         let state = self.store.engine().state().chain();

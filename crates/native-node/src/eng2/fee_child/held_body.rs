@@ -147,6 +147,7 @@ fn policy() -> Policy {
     Policy {
         profile: crate::proofs::protocol_profile_fingerprint(),
         max_body_bytes: wire::MAX_BLOCK_BYTES + wire::REWARD_RECORD_BYTES,
+        slot_rule: crate::wire::SlotRule::Legacy,
         max_settlement_proof_bytes: MAX_FEE_PROOF_BYTES,
     }
 }

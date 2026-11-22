@@ -366,6 +366,7 @@ pub struct Transfer {
     queries: u64,
     reserved_wire: u64,
     cancelled: bool,
+    streaming: Option<Hash>,
     cancellation: p2p::Cancellation,
     binding: Option<p2p::Binding>,
     original_deadline: Option<p2p::Deadline>,
@@ -377,7 +378,10 @@ pub struct Transfer {
     metadata_complete: Instant,
     #[cfg(feature = "eng2-runtime")]
     body_complete: Option<Instant>,
-    reservation: p2p::Reservation,
+    #[cfg(feature = "eng2-runtime")]
+    forwarding_candidate: Option<p2p::ForwardingCandidate>,
+    _encoded_reservation: p2p::Reservation,
+    decode_reservation: Option<p2p::Reservation>,
 }
 
 impl Transfer {
@@ -432,7 +436,16 @@ impl Transfer {
                 )
             })
             .ok_or(Error::Resources)?;
-        let reservation = budget.reserve(charge).map_err(|_| Error::Resources)?;
+        let decode_charge = authenticated
+            .body_bytes()
+            .checked_mul(2)
+            .ok_or(Error::Resources)?;
+        let encoded_reservation = budget
+            .reserve(charge - decode_charge)
+            .map_err(|_| Error::Resources)?;
+        let decode_reservation = budget
+            .reserve(decode_charge)
+            .map_err(|_| Error::Resources)?;
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(authenticated.body_bytes())
@@ -459,6 +472,7 @@ impl Transfer {
             queries: requests,
             reserved_wire,
             cancelled: false,
+            streaming: None,
             cancellation,
             binding,
             original_deadline,
@@ -470,7 +484,10 @@ impl Transfer {
             metadata_complete: Instant::now(),
             #[cfg(feature = "eng2-runtime")]
             body_complete: None,
-            reservation,
+            #[cfg(feature = "eng2-runtime")]
+            forwarding_candidate: None,
+            _encoded_reservation: encoded_reservation,
+            decode_reservation: Some(decode_reservation),
         };
         transfer.check(Instant::now())?;
         transfer.install(first)?;
@@ -694,6 +711,9 @@ impl Transfer {
         now: Instant,
     ) -> Result<Vec<Request>, Error> {
         self.check(now)?;
+        if self.streaming.is_some() {
+            return Ok(vec![]);
+        }
         if self
             .confirmation_pending
             .is_some_and(|attempt| attempt.peer == peer || self.limits.parallel == 1)
@@ -975,6 +995,141 @@ impl Transfer {
         self.install(piece)
     }
 
+    /// Continue the credited descriptor exchange without a second body query.
+    pub(crate) fn begin_stream(&mut self, peer: Hash) -> Result<(), Error> {
+        self.check(Instant::now())?;
+        let source = self.sources.get(&peer).ok_or(Error::Peer)?;
+        if self.streaming.is_some()
+            || !self.pending.is_empty()
+            || !source.connected
+            || !source.metadata_confirmed
+            || source.body_batch_used
+        {
+            return Err(Error::Request);
+        }
+        self.streaming = Some(peer);
+        Ok(())
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn streamed_piece(
+        &mut self,
+        peer: Hash,
+        index: usize,
+        bytes: Vec<u8>,
+        wire: u64,
+    ) -> Result<(), Error> {
+        self.check(Instant::now())?;
+        if self.streaming != Some(peer) {
+            return Err(Error::Request);
+        }
+        let source = self.sources.get_mut(&peer).ok_or(Error::Peer)?;
+        source.bytes.received = source
+            .bytes
+            .received
+            .checked_add(wire)
+            .ok_or(Error::Bounds)?;
+        if wire < bytes.len() as u64
+            || wire > source.continuation_wire
+            || source
+                .bytes
+                .received
+                .checked_add(source.bytes.sent)
+                .is_none_or(|total| total > source.bytes.reserved_wire)
+        {
+            return Err(Error::Bounds);
+        }
+        source.continuation_wire -= wire;
+        let piece = self.authenticated.verify(index, bytes).map_err(|error| {
+            source.bytes.bad_pieces += 1;
+            Error::Authentication(error)
+        })?;
+        self.install(piece)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn end_stream(&mut self, peer: Hash, succeeded: bool, partial_wire: u64) {
+        if self.streaming != Some(peer) {
+            return;
+        }
+        self.streaming = None;
+        if let Some(source) = self.sources.get_mut(&peer) {
+            source.bytes.received = source.bytes.received.saturating_add(partial_wire);
+            source.continuation_wire = source.continuation_wire.saturating_sub(partial_wire);
+            if !succeeded {
+                source.connected = false;
+                source.bytes.failures += 1;
+            }
+        }
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn stream_active(&self) -> bool {
+        self.streaming.is_some()
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn height(&self) -> u64 {
+        self.authenticated.height()
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn bind_forwarding_candidate(&mut self, candidate: p2p::ForwardingCandidate) {
+        self.forwarding_candidate = Some(candidate);
+    }
+
+    /// Successful local admission can retire the lease without shortening
+    /// an existing forwarding exchange or extending its original cutoff.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn forwarding_deadline(&self, shutdown: p2p::Cancellation) -> p2p::Deadline {
+        let deadline = self.io_deadline();
+        match &self.forwarding_candidate {
+            Some(candidate) => deadline.for_candidate_forwarding(
+                shutdown,
+                self.cancellation.clone(),
+                candidate.clone(),
+            ),
+            None => deadline,
+        }
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    fn check_forwarding(&self) -> Result<(), Error> {
+        if self.cancelled {
+            return Err(Error::Cancelled);
+        }
+        self.forwarding_deadline(self.cancellation.clone())
+            .check()
+            .map_err(|_| Error::Expired)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn forwarding_descriptor(&self) -> Result<Vec<u8>, Error> {
+        self.check_forwarding()?;
+        self.authenticated
+            .encoded_descriptor()
+            .map_err(Error::Authentication)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn forwarding_piece(&self, index: usize) -> Result<Option<Vec<u8>>, Error> {
+        self.check_forwarding()?;
+        let state = self.pieces.get(index).ok_or(Error::Bounds)?;
+        if !state.complete {
+            return Ok(None);
+        }
+        let range = self
+            .authenticated
+            .range(index)
+            .map_err(Error::Authentication)?;
+        let mut bytes = Vec::with_capacity(range.len() + if index == 0 { 8 } else { 0 });
+        if index == 0 {
+            bytes.extend_from_slice(&(self.body_bytes() as u64).to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.encoded[range]);
+        Ok(Some(bytes))
+    }
+
     /// Return only already authenticated bytes. A range crossing an unfinished
     /// piece remains unavailable even if its backing allocation contains zeros.
     pub fn authenticated_bytes(&self, range: std::ops::Range<usize>) -> Option<&[u8]> {
@@ -1179,12 +1334,28 @@ impl Transfer {
     /// Completion still performs unchanged full-body commitment and canonical
     /// decode. This yields transport material, never an accepted block.
     pub fn finish(
-        self,
+        mut self,
         header: &Header,
         policy: BodyPolicy,
         now: Instant,
         ownership: p2p::BodyClaim,
     ) -> Result<ReceivedBody, Error> {
+        self.finish_retained(header, policy, now, ownership)
+    }
+
+    /// Decode once while authenticated encoded pieces remain available to
+    /// bounded downstream exchanges. Only the decoded allocation reservation
+    /// moves into local admission; relays retain the shared encoded allocation.
+    pub(crate) fn finish_retained(
+        &mut self,
+        header: &Header,
+        policy: BodyPolicy,
+        now: Instant,
+        ownership: p2p::BodyClaim,
+    ) -> Result<ReceivedBody, Error> {
+        if self.decode_reservation.is_none() {
+            return Err(Error::Resources);
+        }
         self.check(now)?;
         if self.pieces.iter().any(|piece| !piece.complete) {
             return Err(Error::Incomplete);
@@ -1220,12 +1391,17 @@ impl Transfer {
             )
             .map(|frame| frame.with_fetch_timing(timing))
         };
+        let reservation = self.decode_reservation.take().ok_or(Error::Resources)?;
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(candidate) = &self.forwarding_candidate {
+            candidate.authenticated();
+        }
         Ok(ReceivedBody {
             #[cfg(feature = "eng2-runtime")]
             receipts: None,
             ownership,
             body,
-            reservation: self.reservation,
+            reservation,
             #[cfg(feature = "eng2-runtime")]
             observation,
         })
@@ -1255,6 +1431,7 @@ mod tests {
         let policy = BodyPolicy {
             profile: body.profile,
             max_body_bytes: 1024 * 1024,
+            slot_rule: crate::wire::SlotRule::Legacy,
             max_settlement_proof_bytes: 1024 * 1024,
         };
         let encoded = body.encode(policy).unwrap();
@@ -1802,6 +1979,7 @@ mod tests {
         let policy = BodyPolicy {
             profile: body.profile,
             max_body_bytes: 1024 * 1024,
+            slot_rule: crate::wire::SlotRule::Legacy,
             max_settlement_proof_bytes: 1024 * 1024,
         };
         let encoded = body.encode(policy).unwrap();

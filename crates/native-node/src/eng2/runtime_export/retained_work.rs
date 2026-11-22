@@ -68,6 +68,7 @@ pub(super) struct ValidatedRetained {
     pub(super) authenticated_retired_through: Option<u64>,
     pub(super) material: Hash,
     pub(super) cursor: Option<Vec<u8>>,
+    pub(super) pruning_publication: Option<files::RetainedPublicationPin>,
     pub(super) latest: Restored<PublicationResult>,
     pub(super) pending: Restored<PreparedResult>,
 }
@@ -404,6 +405,13 @@ impl RetainedWork {
             }
             None => Restored::Absent,
         };
+        let pruning_publication = match (&cursor, &latest) {
+            (Some(cursor), Restored::Current(value)) => Some(
+                self.reader
+                    .pin_publication(cursor, value.certificate.statement.checkpoint_height)?,
+            ),
+            _ => None,
+        };
         // A captured live candidate is a required record at its own exact
         // filename, independently of the local eligible height or current epoch.
         // Noncadence checkpoint heights remain valid under existing rules.
@@ -449,6 +457,7 @@ impl RetainedWork {
             authenticated_retired_through,
             material: self.reader.material_identity(),
             cursor,
+            pruning_publication,
             latest,
             pending,
         })

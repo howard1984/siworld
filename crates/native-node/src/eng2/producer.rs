@@ -124,6 +124,7 @@ pub fn prepare(
         timestamp,
         settings,
         crate::state::plan_from_allocation(&reward),
+        engine.genesis().slot_rule(),
     )?;
     Ok(PreparedBlock {
         parent: state.tip(),

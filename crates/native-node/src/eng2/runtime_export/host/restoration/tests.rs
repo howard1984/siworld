@@ -14,6 +14,7 @@ fn empty_result(host: &Host, store: &Store) -> ValidatedRetained {
         authenticated_retired_through: None,
         material: [0; 32],
         cursor: None,
+        pruning_publication: None,
         latest: Restored::Absent,
         pending: Restored::Absent,
     }
@@ -61,6 +62,10 @@ fn delayed_cold_restoration_releases_owner_and_keeps_exports_unavailable() {
         .unwrap();
     preparation.retained_request = true;
     started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let running = Instant::now();
+    host.restoration_unready_since = running.checked_sub(Duration::from_secs(299));
+    assert!(!host.restoration_stalled(running));
+    assert!(host.restoration_stalled(running + Duration::from_secs(1)));
     for now in 1..=3 {
         let store = owner
             .try_lock()
@@ -68,6 +73,7 @@ fn delayed_cold_restoration_releases_owner_and_keeps_exports_unavailable() {
         assert!(!host.reconcile_retained_async(&store, || Ok(None)).unwrap());
         assert_eq!(public_projection(&store, now, None).unwrap()["height"], 0);
         assert!(host.latest_checkpoint().is_none());
+        assert!(host.pruning_checkpoint(&store).is_none());
         assert!(host.tick(&store, now, &[]).is_err());
         assert!(host.tick_wallet_export(&store, now, &budget).is_err());
         assert_eq!(
@@ -90,6 +96,7 @@ fn delayed_cold_restoration_releases_owner_and_keeps_exports_unavailable() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(host.retained_ready);
+    assert!(!host.restoration_stalled(running + Duration::from_secs(600)));
     assert_eq!(budget.available().unwrap(), 64 * 1024 * 1024);
     host.stop_preparation().unwrap();
 }
@@ -480,6 +487,7 @@ fn assert_budget_pressure(
             .unwrap();
     }
     let external = budget.reserve(MAXIMUM - free).unwrap();
+    assert_eq!(host.retained_budget_failures(), 0);
     let before_generation = host.preparation.as_ref().unwrap().generation;
     let deadline = Instant::now() + Duration::from_secs(5);
     let error = loop {
@@ -509,6 +517,7 @@ fn assert_budget_pressure(
     };
     assert_eq!(diagnostic["budget_operation"], operation);
     assert_eq!(diagnostic["budget_failure"], "exhausted");
+    assert_eq!(host.retained_budget_failures(), 1);
     assert_eq!(diagnostic["budget_requested"], requested);
     assert_eq!(diagnostic["budget_used"], used);
     assert_eq!(diagnostic["budget_maximum"], MAXIMUM);

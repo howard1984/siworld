@@ -26,7 +26,12 @@ header/execution/fund/governance revision string and the explicit ordinary-fee
 rule (standard divisor, priority multiplier and miner recipient). The genesis
 identifier derives from that digest with context `siworld eng2 internal genesis v1`.
 
-The canonical public genesis file consists of `SWE2GEN2`, fee-mode byte zero,
+The canonical genesis file begins with `SWE2GEN2` for the existing engineering
+rules or `SWE2POW3` for the public 16-slot rules. The `pow-16-v1` profile adds
+`slots:min16-step16-max576` to the immutable rules digest. The profile changes
+transaction slot admission and selects authenticated piece streaming. Both
+formats use the same proof-of-work and signed-checkpoint rules. The magic is
+followed by fee-mode byte zero,
 the 32-byte complete native proof-profile fingerprint, fixed-width native
 configuration, little-endian u32 governance length and canonical governance
 component. Governance bytes are bounded by 131,072. Decoding verifies the exact

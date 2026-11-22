@@ -37,6 +37,7 @@ struct Entry {
     relay_sent: std::collections::BTreeSet<Hash>,
     offered_sources: [Option<Hash>; 8],
     downloads: BTreeMap<Hash, DownloadState>,
+    forwarding_revoked: p2p::Cancellation,
     authorization: Option<p2p::BodyAuthorization>,
     complete: bool,
     body: Option<Arc<LocalBody>>,
@@ -44,6 +45,7 @@ struct Entry {
 struct Inner {
     progress_owner: Option<super::progress_runs::OwnerContext>,
     progress_epoch: u64,
+    forwarding_context: p2p::Cancellation,
     canonical: Context,
     anchors: BTreeMap<Hash, Context>,
     entries: VecDeque<Entry>,
@@ -95,6 +97,7 @@ struct DownloadState {
     cancel: p2p::Cancellation,
     deadline: p2p::Deadline,
     progress: Arc<DownloadProgress>,
+    forwarding_candidate: p2p::ForwardingCandidate,
 }
 struct DownloadProgress {
     attempt_index: usize,
@@ -184,6 +187,7 @@ pub(crate) struct Download {
     pub header: Header,
     pub cancel: p2p::Cancellation,
     pub deadline: p2p::Deadline,
+    pub(crate) forwarding_candidate: p2p::ForwardingCandidate,
     progress: Arc<DownloadProgress>,
     peer: Hash,
     hub: Arc<Hub>,
@@ -223,6 +227,7 @@ impl Download {
 }
 impl Drop for Download {
     fn drop(&mut self) {
+        self.forwarding_candidate.abandon_unless_accepted();
         self.hub
             .progress_runs
             .end(self.candidate.id, self.candidate.attempt_index);
@@ -273,6 +278,7 @@ impl Hub {
             inner: Mutex::new(Inner {
                 progress_owner: None,
                 progress_epoch: 0,
+                forwarding_context: Default::default(),
                 canonical: genesis,
                 anchors: BTreeMap::new(),
                 entries: VecDeque::new(),
@@ -305,6 +311,7 @@ impl Hub {
             self.invalidate_progress_context();
             self.failed.store(true, Ordering::Release);
             self.waiting.store(true, Ordering::Release);
+            self.revoke_forwarding_context();
             if let Ok(mut inner) = self.inner.lock() {
                 for entry in &inner.entries {
                     for download in entry.downloads.values() {
@@ -372,6 +379,7 @@ impl Hub {
                 if inner.entries.len() >= MAX_HEADERS
                     && let Some(evicted) = inner.entries.pop_front()
                 {
+                    evicted.forwarding_revoked.cancel();
                     for download in evicted.downloads.values() {
                         download.cancel.cancel();
                     }
@@ -391,6 +399,7 @@ impl Hub {
                     relay_sent: Default::default(),
                     offered_sources: Default::default(),
                     downloads: Default::default(),
+                    forwarding_revoked: Default::default(),
                     authorization: None,
                     complete: true,
                     body: None,
@@ -515,6 +524,14 @@ impl Hub {
     pub(crate) fn invalidate_progress_context(&self) {
         self.set_progress_context(false, true);
     }
+    /// Revoke the previous network context, including already detached senders.
+    /// An ordinary append only updates progress; it does not call this method.
+    pub(crate) fn revoke_forwarding_context(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        inner.forwarding_context.cancel();
+        inner.forwarding_context = Default::default();
+    }
+
     fn set_progress_context(&self, eligible: bool, force: bool) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
@@ -592,12 +609,18 @@ impl Hub {
         if header.network != self.binding.network {
             return Err("accepted body context differs".into());
         }
+        let id = header.id().map_err(|_| "accepted body identity rejected")?;
+        // The driver calls this after durable admission. Publish it before
+        // retiring the exact body's lease below, which also cancels I/O.
+        if let Ok(inner) = self.inner.lock() {
+            for entry in inner.entries.iter().filter(|entry| entry.context.id == id) {
+                for download in entry.downloads.values() {
+                    download.forwarding_candidate.accepted();
+                }
+            }
+        }
         self.budget
-            .accepted_body(
-                self.binding,
-                header.height,
-                header.id().map_err(|_| "accepted body identity rejected")?,
-            )
+            .accepted_body(self.binding, header.height, id)
             .map_err(|_| "accepted body retirement unavailable")?;
         Ok(())
     }
@@ -804,6 +827,7 @@ impl Hub {
             relay_sent: Default::default(),
             offered_sources: std::array::from_fn(|i| (i == 0).then_some(peer)),
             downloads: Default::default(),
+            forwarding_revoked: Default::default(),
             authorization: None,
             complete: body.is_some(),
             body,
@@ -1158,7 +1182,10 @@ impl Hub {
         let Some((index, cancel, ownership)) = selected else {
             return Ok(None);
         };
+        let context_revoked = inner.forwarding_context.clone();
         let entry = &mut inner.entries[index];
+        let forwarding_candidate =
+            p2p::ForwardingCandidate::new(entry.forwarding_revoked.clone(), context_revoked);
         let deadline = ownership.deadline().clone();
         let source_ordinal = ownership
             .source_ordinal()
@@ -1170,6 +1197,7 @@ impl Hub {
                 cancel: cancel.clone(),
                 deadline: deadline.clone(),
                 progress: progress.clone(),
+                forwarding_candidate: forwarding_candidate.clone(),
             },
         );
         self.active_downloads.fetch_add(1, Ordering::AcqRel);
@@ -1185,6 +1213,7 @@ impl Hub {
             header: entry.header.clone(),
             cancel,
             deadline,
+            forwarding_candidate,
             progress,
             peer,
             hub: self.clone(),
@@ -1258,6 +1287,7 @@ impl Hub {
         }
         inner.entries.retain(|entry| {
             if rejected.contains(&entry.context.id) {
+                entry.forwarding_revoked.cancel();
                 for download in entry.downloads.values() {
                     download.cancel.cancel();
                 }
@@ -1497,6 +1527,7 @@ mod tests {
             policy: Policy {
                 profile: crate::proofs::protocol_profile_fingerprint(),
                 max_body_bytes: 4 * 1024 * 1024,
+                slot_rule: crate::wire::SlotRule::Legacy,
                 max_settlement_proof_bytes: 3 * 1024 * 1024,
             },
             budget,
@@ -1507,6 +1538,7 @@ mod tests {
             inner: Mutex::new(Inner {
                 progress_owner: None,
                 progress_epoch: 0,
+                forwarding_context: Default::default(),
                 canonical: context.clone(),
                 anchors: BTreeMap::from([(context.id, context)]),
                 entries: VecDeque::new(),

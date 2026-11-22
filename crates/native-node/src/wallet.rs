@@ -226,7 +226,7 @@ impl Wallet {
     }
     /// Predict this recipient's note identity from the original checked payment
     /// before inclusion. This does not scan, add a receipt or authorize a spend.
-    #[cfg(all(unix, feature = "eng2-runtime"))]
+    #[cfg(all(unix, feature = "eng2-runtime", any(test, feature = "eng2-rehearsal")))]
     pub(crate) fn planned_payment_nullifier(
         &self,
         public: &PublicTransaction,

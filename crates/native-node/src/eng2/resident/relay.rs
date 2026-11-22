@@ -30,13 +30,15 @@ impl Use {
             .lock()
             .map_err(|_| "fixed relay capability lock poisoned")?;
         let permit = permit.as_ref().ok_or("fixed relay capability closed")?;
-        let now = self.core.millis(Instant::now())?;
         let mut policy = self
             .core
             .policy
             .lock()
             .map_err(|_| "fixed relay policy lock poisoned")?;
         let policy = policy.as_mut().ok_or("fixed relay unconfigured")?;
+        // Sample after taking the shared policy lock so concurrent lanes
+        // cannot present valid clock samples in reversed order.
+        let now = self.core.millis(Instant::now())?;
         if actual {
             policy.account_wire(permit, bytes, now)
         } else {
@@ -51,11 +53,13 @@ impl Use {
             .map_err(|_| "fixed relay capability lock poisoned")?
             .take();
         if let Some(permit) = permit {
-            let now = self.core.millis(Instant::now())?;
-            self.core
+            let mut policy = self
+                .core
                 .policy
                 .lock()
-                .map_err(|_| "fixed relay policy lock poisoned")?
+                .map_err(|_| "fixed relay policy lock poisoned")?;
+            let now = self.core.millis(Instant::now())?;
+            policy
                 .as_mut()
                 .ok_or("fixed relay unconfigured")?
                 .close(permit, now)
@@ -82,6 +86,7 @@ pub(super) struct Relay {
     core: Arc<Core>,
     local_role: p2p::Role,
     selected: std::collections::BTreeSet<Hash>,
+    service_selected: std::collections::BTreeSet<Hash>,
     saved: Mutex<Vec<Saved>>,
 }
 impl Relay {
@@ -126,7 +131,7 @@ impl Relay {
                 std::mem::size_of::<Self>()
                     + std::mem::size_of::<Core>()
                     + std::mem::size_of::<Policy>()
-                    + 16 * 32
+                    + 32 * 128
                     + 32 * (std::mem::size_of::<Saved>() + std::mem::size_of::<Use>()),
             )
             .map_err(|_| "fixed relay policy memory unavailable")?;
@@ -138,6 +143,7 @@ impl Relay {
             }),
             local_role: config.role,
             selected,
+            service_selected: config.service_relay_peers.clone(),
             saved: Mutex::new(Vec::with_capacity(32)),
         })
     }
@@ -145,12 +151,19 @@ impl Relay {
         self.selected.contains(&peer)
             && match self.local_role {
                 p2p::Role::Miner => matches!(role, p2p::Role::Bootstrap | p2p::Role::Validator),
-                p2p::Role::Bootstrap | p2p::Role::Validator => role == p2p::Role::Miner,
+                p2p::Role::Bootstrap | p2p::Role::Validator => {
+                    role == p2p::Role::Miner && !self.service_selected.contains(&peer)
+                }
                 _ => false,
             }
     }
     pub(super) fn sender(&self) -> bool {
         self.local_role == p2p::Role::Miner
+    }
+    pub(super) fn forwarding_selected(&self, peer: Hash, role: p2p::Role) -> bool {
+        self.service_selected.contains(&peer)
+            && matches!(self.local_role, p2p::Role::Bootstrap | p2p::Role::Validator)
+            && matches!(role, p2p::Role::Bootstrap | p2p::Role::Validator)
     }
     pub(super) fn open(
         &self,
@@ -161,7 +174,6 @@ impl Relay {
         body_bytes: usize,
         deadline: &p2p::Deadline,
     ) -> Result<Arc<Use>, String> {
-        let now = self.core.millis(Instant::now())?;
         let expiry = self.core.millis(deadline.expires_at())?;
         let block = header
             .id()
@@ -174,6 +186,7 @@ impl Relay {
             .lock()
             .map_err(|_| "fixed relay policy lock poisoned")?;
         let policy = state.as_mut().ok_or("fixed relay unconfigured")?;
+        let now = self.core.millis(Instant::now())?;
         let ticket = policy
             .open_offer(
                 OfferContext {

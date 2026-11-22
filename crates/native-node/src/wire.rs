@@ -22,6 +22,29 @@ pub const MAX_TX_PROOF: usize = 655_360;
 /// independent of the leaf limit and applies before any proof allocation.
 pub const MAX_SETTLEMENT_PROOF: usize = 655_360;
 pub const MIN_SLOTS: usize = 64;
+pub const PUBLIC_GENESIS_MIN_SLOTS: usize = 16;
+pub const PUBLIC_GENESIS_MAGIC: &[u8; 8] = b"SWE2POW3";
+pub const LEGACY_GENESIS_MAGIC: &[u8; 8] = b"SWE2GEN2";
+pub const PUBLIC_GENESIS_RULES: &[u8] = b"slots:min16-step16-max576";
+pub const PUBLIC_GENESIS_PROFILE: &str = "pow-16-v1";
+
+/// Locally selected minimum from the independently pinned genesis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRule {
+    Legacy,
+    PublicGenesis,
+}
+impl SlotRule {
+    pub const fn minimum(self) -> usize {
+        match self {
+            Self::Legacy => MIN_SLOTS,
+            Self::PublicGenesis => PUBLIC_GENESIS_MIN_SLOTS,
+        }
+    }
+    pub fn permits(self, count: usize) -> bool {
+        (self.minimum()..=MAX_SLOTS).contains(&count) && count.is_multiple_of(GROUP)
+    }
+}
 pub const MAX_SLOTS: usize = 576;
 pub const GROUP: usize = 16;
 pub const PUBLIC_BYTES: usize = 2027;
@@ -218,10 +241,15 @@ pub struct Block {
 
 impl Block {
     pub fn validate_shape(&self) -> Result<(), String> {
+        self.validate_shape_for(SlotRule::Legacy)
+    }
+    pub(crate) fn validate_shape_for(&self, rule: SlotRule) -> Result<(), String> {
         if self.timestamp == 0 || self.target == [0; 32] {
             return Err("invalid engineering block time or target".into());
         }
-        validate_slots(self.transactions.len())?;
+        if !rule.permits(self.transactions.len()) {
+            return Err("block slot count rejected by local rules".into());
+        }
         validate_proof_len(
             self.settlement_proof.len(),
             MAX_SETTLEMENT_PROOF,

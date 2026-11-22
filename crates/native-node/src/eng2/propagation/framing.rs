@@ -115,8 +115,7 @@ pub fn inspect(transfer: &Transfer, header: &Header, policy: Policy) -> Result<L
     let claims = usize::from(prefix[82]);
     let governance = usize::from(prefix[83]);
     let issuances = usize::from(prefix[84]);
-    if !(MIN_SLOTS..=MAX_SLOTS).contains(&count)
-        || !count.is_multiple_of(GROUP)
+    if !policy.slot_rule.permits(count)
         || rewards != reward_count(reward_mode)
         || claims > MAX_FUND_SPENDS
         || governance > crate::eng2_governance::MAX_ACTIONS_PER_BLOCK

@@ -318,6 +318,8 @@ impl PublicExport {
             budget: budget.clone(),
             memory: std::cell::RefCell::new(vec![memory]),
             material: std::cell::RefCell::new(material),
+            #[cfg(feature = "eng2-runtime")]
+            publication_files: Default::default(),
         })
     }
     pub fn latest_height(&self) -> Option<u64> {
@@ -1095,7 +1097,60 @@ pub(super) struct RetainedReader {
     budget: crate::p2p::Budget,
     memory: std::cell::RefCell<Vec<crate::p2p::Reservation>>,
     material: std::cell::RefCell<blake3::Hasher>,
+    #[cfg(feature = "eng2-runtime")]
+    publication_files: std::cell::RefCell<std::collections::BTreeMap<String, PublicationFile>>,
 }
+
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PublicationFile {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+#[cfg(feature = "eng2-runtime")]
+impl From<&fs::Metadata> for PublicationFile {
+    fn from(value: &fs::Metadata) -> Self {
+        Self {
+            device: value.dev(),
+            inode: value.ino(),
+            length: value.len(),
+            modified: (value.mtime(), value.mtime_nsec()),
+            changed: (value.ctime(), value.ctime_nsec()),
+        }
+    }
+}
+
+/// Bounded readback of the files already authenticated by the retained worker.
+/// The resident owner is the sole writer. Full artifact hashing stays off the
+/// canonical owner lock; metadata changes revoke the capability immediately.
+#[cfg(feature = "eng2-runtime")]
+pub(super) struct RetainedPublicationPin {
+    cursor: Vec<u8>,
+    files: std::collections::BTreeMap<String, PublicationFile>,
+}
+#[cfg(feature = "eng2-runtime")]
+impl RetainedPublicationPin {
+    pub(super) fn matches(&self, export: &PublicExport) -> bool {
+        let checked = || -> Option<()> {
+            if export.read_optional("checkpoint-eng2.json", 8192).ok()?? != self.cursor {
+                return None;
+            }
+            for (name, stamp) in &self.files {
+                let bound = usize::try_from(stamp.length).ok()?;
+                let file = export.open_read(name, bound).ok()??;
+                if PublicationFile::from(&file.metadata().ok()?) != *stamp {
+                    return None;
+                }
+            }
+            Some(())
+        };
+        checked().is_some()
+    }
+}
+
 #[cfg(any(test, feature = "eng2-runtime"))]
 impl RetainedReader {
     fn observe(&self, name: &str, bytes: Option<&[u8]>) {
@@ -1213,9 +1268,43 @@ impl RetainedReader {
             return Err("checkpoint retained capacity exceeds reservation".into());
         }
         self.observe(name, Some(&bytes));
+        #[cfg(feature = "eng2-runtime")]
+        if name == "checkpoint-eng2.json"
+            || name.starts_with("checkpoint-publication-")
+            || name.ends_with(".snapshot-eng2.bin")
+            || name.ends_with(".witness-eng2.bin")
+            || name.ends_with(".certificate-eng2.bin")
+        {
+            self.publication_files
+                .borrow_mut()
+                .insert(name.to_owned(), PublicationFile::from(&after));
+        }
         self.memory.borrow_mut().push(reservation);
         Ok(Some(bytes))
     }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn pin_publication(
+        &self,
+        cursor: &[u8],
+        height: u64,
+    ) -> Result<RetainedPublicationPin, BudgetError> {
+        let files = std::mem::take(&mut *self.publication_files.borrow_mut());
+        if files.len() != 5
+            || !files.contains_key("checkpoint-eng2.json")
+            || !files.contains_key(&publication_name(height))
+        {
+            return Err("checkpoint retained publication identity incomplete".into());
+        }
+        let pin = RetainedPublicationPin {
+            cursor: cursor.to_vec(),
+            files,
+        };
+        if !pin.matches(&self.export) {
+            return Err("checkpoint retained publication changed after authentication".into());
+        }
+        Ok(pin)
+    }
+
     #[cfg(feature = "eng2-runtime")]
     pub(super) fn read_publication(
         &self,

@@ -311,6 +311,80 @@ fn real_store_prune_reopen_replay_and_signed_checkpoint_sync() {
     let mut maintenance = Maintenance::new(policy).unwrap();
     let mut tick = 0;
     let mut removed_bytes = 0;
+    #[cfg(feature = "eng2-runtime")]
+    {
+        use crate::eng2::runtime_export::{PublicExport, host::Host};
+        use std::time::Duration;
+        let export_root = directory.0.join("retained-publication");
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&export_root)
+            .unwrap();
+        let mut export = PublicExport::open(&export_root, &store, imports).unwrap();
+        assert!(
+            export
+                .publish_checkpoint(&store, &checkpoint, imports)
+                .unwrap()
+        );
+        drop(export);
+        // Fixture allowance, independent of any deployment budget.
+        let checkpoint_budget = crate::p2p::Budget::new(2 * 1024 * 1024 * 1024);
+        let mut host =
+            Host::open_resident(&export_root, &store, imports, None, &checkpoint_budget).unwrap();
+        // Replay the observed occupancy as reservation pressure. Its causes
+        // cannot be distinguished from the historical failure counters.
+        let historical_pressure = budget.reserve(1_048_274_467).unwrap();
+        assert!(budget.reserve(38_736_346).is_err());
+        assert!(host.pruning_checkpoint(&store).is_none());
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !host.reconcile_retained_async(&store, || Ok(None)).unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(host.pruning_checkpoint(&store).is_some());
+        assert!(host.retained_failure_diagnostic().is_none());
+        drop(historical_pressure);
+        assert!(!host.reconcile_retained_async(&store, || Ok(None)).unwrap());
+        assert!(host.latest_checkpoint().is_none());
+        assert_eq!(
+            host.pruning_checkpoint(&store).unwrap().certificate(),
+            checkpoint.certificate(),
+        );
+        tick += 1;
+        let pinned = host.pruning_checkpoint(&store);
+        let warmup = maintenance
+            .tick(&mut store, pinned, published + tick, tick, &budget, &pins)
+            .unwrap();
+        assert_eq!(warmup.paused, Some(Pause::ClockUncertain));
+        assert_eq!(warmup.removed_blocks, 0);
+        tick += 1;
+        let pinned = host.pruning_checkpoint(&store);
+        let report = maintenance
+            .tick(&mut store, pinned, published + tick, tick, &budget, &pins)
+            .unwrap();
+        assert!(report.removed_blocks > 0 && report.removed_encoded_bytes > 0);
+        assert!(report.paused.is_none());
+        removed_bytes += report.removed_encoded_bytes;
+        let unready_since = Instant::now();
+        assert!(host.restoration_stalled(unready_since + Duration::from_secs(300)));
+        std::fs::remove_file(export_root.join("checkpoint-eng2.json")).unwrap();
+        assert!(host.pruning_checkpoint(&store).is_none());
+        tick += 1;
+        let blocked = maintenance
+            .tick(&mut store, None, published + tick, tick, &budget, &pins)
+            .unwrap();
+        assert_eq!(blocked.paused, Some(Pause::CheckpointUnavailable));
+        assert_eq!(blocked.removed_blocks, 0);
+        host.pause_reorganization_exports_at(36).unwrap();
+        assert!(host.pruning_checkpoint(&store).is_none());
+        host.stop_preparation().unwrap();
+        drop(host);
+        let occupied = checkpoint_budget.reserve(1_048_274_467).unwrap();
+        let request = checkpoint_budget.reserve(47_667_586).unwrap();
+        drop((occupied, request));
+    }
+
     let mut removed_branch_bytes = 0;
     let mut replayed = 0;
     {
@@ -542,6 +616,6 @@ fn real_store_prune_reopen_replay_and_signed_checkpoint_sync() {
     assert_eq!(synced.engine().state().tip(), store.engine().state().tip());
     println!(
         "{}",
-        serde_json::json!({"scope":"owner-local-real-native-proof-retention","native_initial_appends":36,"retained_replay_depths":[1,2,7],"native_replayed_blocks":replayed,"append_after_pruning":true,"exact_production_template_after_pruning":true,"authenticated_pruned_reopen":true,"forged_signature_rejected":true,"missing_and_stale_checkpoint_paused":true,"fresh_two_of_three_import_height":37,"logical_encoded_bytes_removed":removed_bytes,"canonical_branch_duplicate_bytes_removed":removed_branch_bytes,"elapsed_seconds":start.elapsed().as_secs_f64(),"source_modified":false,"new_proof_generation":false,"mining":false,"physical_shrink_measured":false})
+        serde_json::json!({"scope":"owner-local-real-native-proof-retention","native_initial_appends":36,"retained_replay_depths":[1,2,7],"native_replayed_blocks":replayed,"append_after_pruning":true,"exact_production_template_after_pruning":true,"authenticated_pruned_reopen":true,"pending_authenticated_deletion":cfg!(feature = "eng2-runtime"),"stalled_missing_cursor_blocked":cfg!(feature = "eng2-runtime"),"historical_shared_pressure_checkpoint_worker_isolated":cfg!(feature = "eng2-runtime"),"forged_signature_rejected":true,"missing_and_stale_checkpoint_paused":true,"fresh_two_of_three_import_height":37,"logical_encoded_bytes_removed":removed_bytes,"canonical_branch_duplicate_bytes_removed":removed_branch_bytes,"elapsed_seconds":start.elapsed().as_secs_f64(),"source_modified":false,"new_proof_generation":false,"mining":false,"physical_shrink_measured":false})
     );
 }

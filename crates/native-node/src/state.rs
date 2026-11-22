@@ -1,7 +1,7 @@
 //! Deterministic native engineering-chain transition shared by production and replay.
 //! No peer-supplied verifier key, private fee opening, or local clock enters this transition.
 use crate::proofs::NativeVerifier;
-use crate::wire::{Block, DigestBytes, GROUP, Hash, MAX_SLOTS, MIN_SLOTS, Snapshot};
+use crate::wire::{Block, DigestBytes, Hash, MAX_SLOTS, SlotRule, Snapshot};
 use native::codec::{ProofContext, PublicTransaction, decode_digest, encode_digest};
 use native::confidential_fees::{FeeOpening, SettlementSlot};
 use native::multi_asset::{Digest, F, Hasher, RecentRoots, TREE_DEPTH};
@@ -851,7 +851,15 @@ pub fn satisfies_work(id: &Hash, bits: u8) -> bool {
 /// Public, deterministic zero-fee rows of the fixed-576 relation. These are
 /// internal settlement rows, never additional transactions or chain flags.
 pub fn tail_slots(network: Hash, height: u64, count: usize) -> Result<Vec<SettlementSlot>, String> {
-    if !(MIN_SLOTS..=MAX_SLOTS).contains(&count) || !count.is_multiple_of(GROUP) {
+    tail_slots_for(network, height, count, SlotRule::Legacy)
+}
+pub(crate) fn tail_slots_for(
+    network: Hash,
+    height: u64,
+    count: usize,
+    rule: SlotRule,
+) -> Result<Vec<SettlementSlot>, String> {
+    if !rule.permits(count) {
         return Err("invalid settlement position count".into());
     }
     let h = Hasher::new();

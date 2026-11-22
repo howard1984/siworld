@@ -71,6 +71,58 @@ pub(super) fn offer<S: std::io::Read + std::io::Write>(
     shared: &Shared,
     request: u64,
 ) -> Result<bool, String> {
+    if peer.propagation_streaming()
+        && shared.relay.forwarding_selected(peer.peer(), peer.role())
+        && let Some(forwarding) = shared
+            .transfers
+            .forwarding(peer.peer(), shared.cancel.clone())?
+    {
+        let body_bytes = forwarding
+            .transfer
+            .lock()
+            .map_err(|_| "piece transfer lock poisoned")?
+            .body_bytes();
+        let now = Instant::now();
+        let Some(lifetime) = forwarding.deadline.expires_at().checked_duration_since(now) else {
+            return Ok(false);
+        };
+        let permit = match shared.relay.open(
+            peer.peer(),
+            peer.propagation_session_id(),
+            request,
+            &forwarding.header,
+            body_bytes,
+            &forwarding.deadline,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                forwarding.forwarding_deferred(peer.peer());
+                return Ok(false);
+            }
+        };
+        let result = peer.with_wire_fence(permit.clone(), |peer| {
+            let credit = peer.offer_propagation(
+                request,
+                &forwarding.header,
+                body_bytes,
+                now,
+                lifetime,
+                shared.cancel.clone(),
+            )?;
+            if let Some(credit) = credit {
+                peer.send_credited_transfer(
+                    credit,
+                    &forwarding.header,
+                    &forwarding.transfer,
+                    &forwarding.deadline,
+                )?;
+            }
+            Ok(())
+        });
+        shared.relay.close(permit)?;
+        result.map_err(|_| "verified piece forwarding interrupted or rejected")?;
+        return Ok(true);
+    }
     if !shared.relay.sender() || !shared.relay.selected(peer.peer(), peer.role()) {
         return Ok(false);
     }
@@ -110,7 +162,7 @@ pub(super) fn offer<S: std::io::Read + std::io::Write>(
             None => Ok(false),
         })
     });
-    if matches!(result, Ok(true)) {
+    if matches!(result, Ok(true)) && !peer.propagation_streaming() {
         shared.relay.save(
             peer.peer(),
             peer.propagation_session_id(),
@@ -138,8 +190,10 @@ pub(super) fn serve<S: std::io::Read + std::io::Write>(
             .send_propagation_capabilities(request)
             .map_err(|_| "piece capability response failed")?,
         PropagationRequest::Offer(offer) => {
-            let accepted =
-                shared.relay.selected(peer.peer(), peer.role()) && !shared.relay.sender();
+            let accepted = shared.relay.selected(peer.peer(), peer.role())
+                && !shared.relay.sender()
+                || peer.propagation_streaming()
+                    && shared.relay.forwarding_selected(peer.peer(), peer.role());
             if !accepted {
                 return peer
                     .reject_propagation_offer(
@@ -203,21 +257,48 @@ pub(super) fn serve<S: std::io::Read + std::io::Write>(
                 .metadata_observed(shared, &download, &ledger, metadata.is_ok());
             match metadata {
                 Ok(metadata) => {
-                    shared.relay.save(
-                        peer.peer(),
-                        peer.propagation_session_id(),
-                        header.id().map_err(|_| "relay header identity rejected")?,
-                        download.deadline.clone(),
-                        permit,
-                    )?;
-                    shared.transfers.insert(
+                    let deadline = download.deadline.clone();
+                    let job = match shared.transfers.insert(
                         download,
                         metadata,
                         ledger,
                         validation,
                         peer.propagation_session_id(),
                         shared,
-                    )?;
+                    ) {
+                        Ok(job) => job,
+                        Err(error) => {
+                            shared.relay.close(permit)?;
+                            return Err(error);
+                        }
+                    };
+                    if peer.propagation_streaming() {
+                        let result = peer.with_wire_fence(permit.clone(), |peer| {
+                            peer.receive_credited_transfer(
+                                request,
+                                &job.transfer,
+                                &job.ownership,
+                                &|transfer| {
+                                    job.download
+                                        .received(transfer.verified_bytes(), transfer.body_bytes());
+                                    if let Some(pipeline) = &job.validation {
+                                        let _ = pipeline.observe(transfer);
+                                    }
+                                    Ok(())
+                                },
+                            )
+                        });
+                        shared.relay.close(permit)?;
+                        result.map_err(|_| "credited body stream interrupted or rejected")?;
+                    } else {
+                        shared.relay.save(
+                            peer.peer(),
+                            peer.propagation_session_id(),
+                            header.id().map_err(|_| "relay header identity rejected")?,
+                            deadline,
+                            permit,
+                        )?;
+                    }
                 }
                 Err(_) => {
                     shared.relay.close(permit)?;

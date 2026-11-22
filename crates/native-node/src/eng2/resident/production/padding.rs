@@ -58,11 +58,10 @@ pub(super) enum RefillStage {
 fn dispatch_refill(
     stage: RefillStage,
     ready_positions: usize,
+    minimum_positions: usize,
     refill: impl FnOnce() -> Result<(), Failure>,
 ) -> Result<(), Failure> {
-    if matches!(stage, RefillStage::WaitingForPositions)
-        && ready_positions >= crate::pool::MIN_READY
-    {
+    if matches!(stage, RefillStage::WaitingForPositions) && ready_positions >= minimum_positions {
         return Ok(());
     }
     refill()
@@ -123,7 +122,8 @@ impl Pipeline {
         }
         // Polling above always consumes completed output first. Ready stock
         // gives foreground assembly priority over starting any new proof.
-        dispatch_refill(stage, owner.ready_positions(), || {
+        let minimum = owner.engine().genesis().slot_rule().minimum();
+        dispatch_refill(stage, owner.ready_positions(), minimum, || {
             let generation = owner.template_generation();
             let Some(task) = owner
                 .prepare_padding()
@@ -194,6 +194,7 @@ mod tests {
         dispatch_refill(
             RefillStage::WaitingForPositions,
             crate::pool::MIN_READY,
+            crate::pool::MIN_READY,
             || task.start(|| panic!("ready assembly must not dispatch refill")),
         )
         .unwrap();
@@ -202,14 +203,19 @@ mod tests {
         let (entered, receive) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);
         let background = prover.clone();
-        dispatch_refill(RefillStage::NonceSearch, crate::pool::MIN_READY, || {
-            task.start(move || {
-                let mut guard = background.lock().unwrap();
-                guard.push("refill");
-                entered.send(()).unwrap();
-                wait.recv_timeout(Duration::from_secs(1)).unwrap();
-            })
-        })
+        dispatch_refill(
+            RefillStage::NonceSearch,
+            crate::pool::MIN_READY,
+            crate::pool::MIN_READY,
+            || {
+                task.start(move || {
+                    let mut guard = background.lock().unwrap();
+                    guard.push("refill");
+                    entered.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(1)).unwrap();
+                })
+            },
+        )
         .unwrap();
         receive.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(task.busy());
@@ -221,6 +227,7 @@ mod tests {
         dispatch_refill(
             RefillStage::WaitingForPositions,
             crate::pool::MIN_READY - 1,
+            crate::pool::MIN_READY,
             || {
                 prepared = true;
                 Ok(())

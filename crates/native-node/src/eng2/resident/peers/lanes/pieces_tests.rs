@@ -25,12 +25,27 @@ fn fixture_with_sources(
     trusted: Option<p2p::ExpectedPeer>,
     additional_seeds: &[u8],
 ) -> Fixture {
+    fixture_with_profile(role, remote_role, seed, trusted, additional_seeds, false)
+}
+fn fixture_with_profile(
+    role: p2p::Role,
+    remote_role: p2p::Role,
+    seed: u8,
+    trusted: Option<p2p::ExpectedPeer>,
+    additional_seeds: &[u8],
+    streaming: bool,
+) -> Fixture {
     let state = crate::eng2::snapshot::tests::bootstrap();
 
-    let genesis = Genesis::seal(
+    let genesis = Genesis::seal_with_rule(
         state.chain.config,
         state.governance,
         crate::eng2::genesis::FeeMode::LegacyMiner,
+        if streaming {
+            crate::wire::SlotRule::PublicGenesis
+        } else {
+            crate::wire::SlotRule::Legacy
+        },
     )
     .unwrap();
     let expected =
@@ -82,9 +97,28 @@ fn fixture_with_sources(
             .iter()
             .map(|&value| p2p::test_support::expected(genesis.peer_binding(), [value; 32])),
     );
+    let selected = if streaming {
+        peers.iter().map(|peer| peer.fingerprint()).collect()
+    } else {
+        std::collections::BTreeSet::from([remote])
+    };
+    let service_selected = if streaming
+        && matches!(role, p2p::Role::Bootstrap | p2p::Role::Validator)
+    {
+        peers
+            .iter()
+            .map(|peer| peer.fingerprint())
+            .filter(|&peer| {
+                peer != remote || matches!(remote_role, p2p::Role::Bootstrap | p2p::Role::Validator)
+            })
+            .collect()
+    } else {
+        Default::default()
+    };
     let config = config::Configuration {
         role,
         proof_retention: None,
+        checkpoint_worker_budget_bytes: None,
         listen: None,
         mining: false,
         peers: peers
@@ -96,7 +130,8 @@ fn fixture_with_sources(
                 expected,
             })
             .collect(),
-        fixed_relay_peers: std::collections::BTreeSet::from([remote]),
+        fixed_relay_peers: selected,
+        service_relay_peers: service_selected,
         checkpoint_key: None,
         legacy_checkpoint_peers: Default::default(),
         digest: String::new(),
@@ -140,7 +175,10 @@ fn fixture_with_sources(
         operations: None,
         mailbox: Arc::new(CheckpointMailbox::new(budget)),
     });
-    assert!(shared.relay.selected(remote, remote_role));
+    assert!(
+        shared.relay.selected(remote, remote_role)
+            || streaming && shared.relay.forwarding_selected(remote, remote_role)
+    );
 
     Fixture {
         shared,
@@ -301,6 +339,9 @@ fn produced(fixture: &Fixture, tag: u8) -> Header {
     body.governance.clear();
     body.fund_claims.clear();
     body.issuances.clear();
+    if crate::eng2::transport::propagation_profile(&fixture.genesis) {
+        body.transactions.truncate(16);
+    }
     body.transactions
         .sort_by_key(|tx| tx.record.statement_id(&body.network));
     body.settlement_proof = vec![tag; 32 * 4096];
@@ -324,6 +365,363 @@ fn produced(fixture: &Fixture, tag: u8) -> Header {
         .unwrap();
     header
 }
+#[test]
+fn credited_stream_decodes_without_a_followup_query() {
+    let source = fixture_with_profile(p2p::Role::Miner, p2p::Role::Validator, 2, None, &[], true);
+    let receiver = fixture_with_profile(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[], true);
+    let header = produced(&source, 31);
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut source_peer = peer(a, &source, p2p::Role::Validator);
+    let mut receiver_peer = peer(b, &receiver, p2p::Role::Miner);
+    let source_shared = source.shared.clone();
+    let before = receiver.shared.budget.available().unwrap();
+    let worker = thread::spawn(move || {
+        assert!(source_peer.probe_propagation(2).unwrap());
+        assert!(source_peer.propagation_streaming());
+        source_peer.finish_round(2).unwrap();
+        assert!(offer(&mut source_peer, &source_shared, 3).unwrap());
+        source_peer.finish_round(3).unwrap();
+    });
+    let mut incoming = 1;
+    super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming).unwrap();
+    assert!(receiver_peer.propagation_streaming());
+    super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming).unwrap();
+    assert_eq!(incoming, 3);
+    worker.join().unwrap();
+    {
+        let job = receiver.shared.transfers.test_job(header.id().unwrap());
+        let transfer = job.transfer.lock().unwrap();
+        assert_eq!(transfer.verified_bytes(), transfer.body_bytes());
+        assert!(!transfer.stream_active());
+        let source = transfer
+            .sources()
+            .into_iter()
+            .find(|source| source.queries > 0)
+            .unwrap();
+        assert_eq!(source.requested, 1);
+        assert_eq!(source.queries, 1);
+        assert!(source.received + source.sent <= source.reserved_wire);
+    }
+    assert!(!pull_batch(&mut receiver_peer, &receiver.shared, 4).unwrap());
+    receiver.shared.transfers.reap(&receiver.shared).unwrap();
+    assert_eq!(receiver.shared.transfers.diagnostic()["decoded"], 1);
+    let ready = body_admission::test_take(&receiver.shared.bodies);
+    let original_head = receiver.shared.owner.lock().unwrap().head().unwrap();
+    assert!(body_admission::test_admit(&receiver.shared, &ready).is_err());
+    assert_eq!(
+        receiver.shared.owner.lock().unwrap().head().unwrap().id,
+        original_head.id
+    );
+    drop(ready);
+    assert_body_resources_released(&receiver, before, 1);
+    drop(receiver_peer);
+    drop(source.shared);
+    drop(receiver.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(receiver.directory).unwrap();
+}
+
+struct StreamTailGate {
+    socket: UnixStream,
+    blocked: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    fired: bool,
+}
+impl std::io::Read for StreamTailGate {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.socket, bytes)
+    }
+}
+impl std::io::Write for StreamTailGate {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !self.fired
+            && bytes.len() > 38
+            && bytes[..2] == [0x41, 1]
+            && u32::from_le_bytes(bytes[34..38].try_into().unwrap()) == 2
+        {
+            self.fired = true;
+            self.blocked
+                .send(())
+                .map_err(|_| std::io::ErrorKind::ConnectionReset)?;
+            self.release
+                .recv_timeout(Duration::from_secs(3))
+                .map_err(|_| std::io::ErrorKind::TimedOut)?;
+        }
+        std::io::Write::write(&mut self.socket, bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.socket)
+    }
+}
+
+#[test]
+fn service_forwards_verified_pieces_before_the_upstream_tail_arrives() {
+    let source = fixture_with_profile(p2p::Role::Miner, p2p::Role::Validator, 2, None, &[], true);
+    let middle = fixture_with_profile(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[3], true);
+    let destination = fixture_with_profile(
+        p2p::Role::Validator,
+        p2p::Role::Validator,
+        2,
+        None,
+        &[],
+        true,
+    );
+    let header = produced(&source, 32);
+    let id = header.id().unwrap();
+    let destination_id =
+        p2p::test_support::expected(middle.genesis.peer_binding(), [3; 32]).fingerprint();
+    let (a, b) = UnixStream::pair().unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    let (blocked, reached) = std::sync::mpsc::sync_channel(1);
+    let (release, resume) = std::sync::mpsc::sync_channel(1);
+    let mut source_peer = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            StreamTailGate {
+                socket: a,
+                blocked,
+                release: resume,
+                fired: false,
+            },
+            source.genesis.peer_binding(),
+            source.shared.budget.clone(),
+            source.remote,
+            p2p::Role::Validator,
+        ),
+        &source.genesis,
+        source.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let mut middle_input = peer(b, &middle, p2p::Role::Miner);
+    let source_shared = source.shared.clone();
+    let upstream = thread::spawn(move || {
+        assert!(source_peer.probe_propagation(2).unwrap());
+        source_peer.finish_round(2).unwrap();
+        assert!(offer(&mut source_peer, &source_shared, 3).unwrap());
+        source_peer.finish_round(3).unwrap();
+    });
+    let middle_shared = middle.shared.clone();
+    let middle_worker = thread::spawn(move || {
+        let mut incoming = 1;
+        super::super::serve_turn(&mut middle_input, &middle_shared, &mut incoming).unwrap();
+        super::super::serve_turn(&mut middle_input, &middle_shared, &mut incoming).unwrap();
+    });
+    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+    let wait = Instant::now() + Duration::from_secs(2);
+    while middle.shared.transfers.diagnostic()["active"] != 1 {
+        assert!(Instant::now() < wait);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let (a, b) = UnixStream::pair().unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut middle_output = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            a,
+            middle.genesis.peer_binding(),
+            middle.shared.budget.clone(),
+            destination_id,
+            p2p::Role::Validator,
+        ),
+        &middle.genesis,
+        middle.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let mut destination_peer = peer(b, &destination, p2p::Role::Validator);
+    let middle_shared = middle.shared.clone();
+    let forward = thread::spawn(move || {
+        assert!(middle_output.probe_propagation(2).unwrap());
+        middle_output.finish_round(2).unwrap();
+        assert!(offer(&mut middle_output, &middle_shared, 3).unwrap());
+        middle_output.finish_round(3).unwrap();
+        assert!(!offer(&mut middle_output, &middle_shared, 4).unwrap());
+    });
+    let destination_shared = destination.shared.clone();
+    let downstream = thread::spawn(move || {
+        let mut incoming = 1;
+        super::super::serve_turn(&mut destination_peer, &destination_shared, &mut incoming)
+            .unwrap();
+        super::super::serve_turn(&mut destination_peer, &destination_shared, &mut incoming)
+            .unwrap();
+    });
+    let wait = Instant::now() + Duration::from_secs(2);
+    while destination.shared.transfers.diagnostic()["active"] != 1 {
+        assert!(Instant::now() < wait);
+        thread::sleep(Duration::from_millis(5));
+    }
+    {
+        let middle_job = middle.shared.transfers.test_job(id);
+        let destination_job = destination.shared.transfers.test_job(id);
+        let middle_transfer = middle_job.transfer.lock().unwrap();
+        let destination_transfer = destination_job.transfer.lock().unwrap();
+        assert!(destination_transfer.verified_bytes() > 0);
+        assert!(middle_transfer.verified_bytes() < middle_transfer.body_bytes());
+        assert!(destination_transfer.verified_bytes() < destination_transfer.body_bytes());
+        assert!(destination_transfer.stream_active());
+        assert_eq!(
+            destination_transfer.forwarding_piece(0).unwrap(),
+            middle_transfer.forwarding_piece(0).unwrap()
+        );
+        assert!(destination_transfer.forwarding_piece(2).unwrap().is_none());
+        assert_eq!(middle.shared.transfers.diagnostic()["decoded"], 0);
+        assert_eq!(destination.shared.transfers.diagnostic()["decoded"], 0);
+    }
+    release.send(()).unwrap();
+    upstream.join().unwrap();
+    middle_worker.join().unwrap();
+    forward.join().unwrap();
+    downstream.join().unwrap();
+    middle.shared.transfers.reap(&middle.shared).unwrap();
+    destination
+        .shared
+        .transfers
+        .reap(&destination.shared)
+        .unwrap();
+    assert_eq!(middle.shared.transfers.diagnostic()["decoded"], 1);
+    assert_eq!(destination.shared.transfers.diagnostic()["decoded"], 1);
+    middle.shared.bodies.clear().unwrap();
+    destination.shared.bodies.clear().unwrap();
+    drop(source.shared);
+    drop(middle.shared);
+    drop(destination.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(middle.directory).unwrap();
+    std::fs::remove_dir_all(destination.directory).unwrap();
+}
+
+#[test]
+fn slow_forwarding_stops_after_local_rejection_or_queue_discard() {
+    for reject in [true, false] {
+        check_discarded_forwarding(reject);
+    }
+}
+
+fn check_discarded_forwarding(reject: bool) {
+    let source = fixture_with_profile(p2p::Role::Miner, p2p::Role::Validator, 2, None, &[], true);
+    let middle = fixture_with_profile(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[3], true);
+    let destination = fixture_with_profile(
+        p2p::Role::Validator,
+        p2p::Role::Validator,
+        2,
+        None,
+        &[],
+        true,
+    );
+    let header = produced(&source, 33);
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut source_peer = peer(a, &source, p2p::Role::Validator);
+    let mut middle_input = peer(b, &middle, p2p::Role::Miner);
+    let before = middle.shared.budget.available().unwrap();
+    let source_shared = source.shared.clone();
+    let upstream = thread::spawn(move || {
+        assert!(source_peer.probe_propagation(2).unwrap());
+        source_peer.finish_round(2).unwrap();
+        assert!(offer(&mut source_peer, &source_shared, 3).unwrap());
+        source_peer.finish_round(3).unwrap();
+    });
+    let mut incoming = 1;
+    super::super::serve_turn(&mut middle_input, &middle.shared, &mut incoming).unwrap();
+    super::super::serve_turn(&mut middle_input, &middle.shared, &mut incoming).unwrap();
+    upstream.join().unwrap();
+    let encoded = {
+        let job = middle.shared.transfers.test_job(header.id().unwrap());
+        Arc::downgrade(&job.transfer)
+    };
+    let (a, b) = UnixStream::pair().unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    b.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    let (blocked, reached) = std::sync::mpsc::sync_channel(1);
+    let (release, resume) = std::sync::mpsc::sync_channel(1);
+    let destination_id =
+        p2p::test_support::expected(middle.genesis.peer_binding(), [3; 32]).fingerprint();
+    let mut middle_output = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            StreamTailGate {
+                socket: a,
+                blocked,
+                release: resume,
+                fired: false,
+            },
+            middle.genesis.peer_binding(),
+            middle.shared.budget.clone(),
+            destination_id,
+            p2p::Role::Validator,
+        ),
+        &middle.genesis,
+        middle.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let mut destination_peer = peer(b, &destination, p2p::Role::Validator);
+    let middle_shared = middle.shared.clone();
+    let forward = thread::spawn(move || {
+        assert!(middle_output.probe_propagation(2).unwrap());
+        middle_output.finish_round(2).unwrap();
+        assert!(offer(&mut middle_output, &middle_shared, 3).is_err());
+    });
+    let destination_shared = destination.shared.clone();
+    let downstream = thread::spawn(move || {
+        let mut incoming = 1;
+        super::super::serve_turn(&mut destination_peer, &destination_shared, &mut incoming)
+            .unwrap();
+        assert!(
+            super::super::serve_turn(&mut destination_peer, &destination_shared, &mut incoming)
+                .is_err()
+        );
+    });
+    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+    let blocked_at = Instant::now();
+    middle.shared.transfers.reap(&middle.shared).unwrap();
+    assert_eq!(middle.shared.transfers.diagnostic()["active"], 0);
+    assert_eq!(middle.shared.transfers.diagnostic()["decoded"], 1);
+    // The relay owns the same encoded allocation after the local Job is gone.
+    assert_eq!(Arc::strong_count(&encoded.upgrade().unwrap()), 2);
+    let original_head = middle.shared.owner.lock().unwrap().head().unwrap();
+    if reject {
+        // The decoded synthetic proof is invalid during full native admission.
+        let worker = middle.shared.clone();
+        let admission = thread::spawn(move || body_admission::run(worker));
+        let limit = Instant::now() + Duration::from_secs(2);
+        while middle.shared.bodies.diagnostic()["rejected"] != 1 {
+            assert!(Instant::now() < limit);
+            thread::sleep(Duration::from_millis(2));
+        }
+        // Keep the resident live: shutdown itself would mask stale forwarding.
+        assert!(!forward.is_finished());
+        release.send(()).unwrap();
+        forward.join().unwrap();
+        middle.shared.cancel.cancel();
+        admission.join().unwrap().unwrap();
+    } else {
+        middle.shared.bodies.clear().unwrap();
+        assert!(!forward.is_finished());
+        release.send(()).unwrap();
+        forward.join().unwrap();
+    }
+    assert_eq!(
+        middle.shared.owner.lock().unwrap().head().unwrap().id,
+        original_head.id
+    );
+    downstream.join().unwrap();
+    assert!(blocked_at.elapsed() < Duration::from_secs(5));
+    assert!(encoded.upgrade().is_none());
+    assert_body_resources_released(&middle, before, 1);
+    assert_eq!(destination.shared.transfers.diagnostic()["decoded"], 0);
+    destination.shared.transfers.cancel();
+    destination
+        .shared
+        .transfers
+        .reap(&destination.shared)
+        .unwrap();
+    drop(middle_input);
+    drop(source.shared);
+    drop(middle.shared);
+    drop(destination.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(middle.directory).unwrap();
+    std::fs::remove_dir_all(destination.directory).unwrap();
+}
+
 #[test]
 fn miner_offer_and_service_batch_use_the_real_adapter_and_keep_outer_request() {
     let source = fixture(p2p::Role::Miner, p2p::Role::Validator, 2);
@@ -466,6 +864,7 @@ struct FaultStream {
     mode: u8,
     header: Vec<u8>,
     fired: bool,
+    minimum_index: u32,
 }
 impl std::io::Read for FaultStream {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -478,7 +877,10 @@ impl std::io::Write for FaultStream {
             if bytes.starts_with(b"SWPF") {
                 self.header = bytes.to_vec();
             }
-            if bytes.len() > 38 && bytes[..2] == [0x41, 1] {
+            if bytes.len() > 38
+                && bytes[..2] == [0x41, 1]
+                && u32::from_le_bytes(bytes[34..38].try_into().unwrap()) >= self.minimum_index
+            {
                 self.fired = true;
                 if self.mode == 1 {
                     return Err(std::io::ErrorKind::ConnectionReset.into());
@@ -517,6 +919,7 @@ fn corrupt_disconnected_and_duplicate_sources_never_reach_the_admission_queue() 
             mode,
             header: Vec::new(),
             fired: false,
+            minimum_index: 0,
         };
         let mut source_peer = Peer::new(
             p2p::Session::from_test_peer_channel(
@@ -560,6 +963,87 @@ fn corrupt_disconnected_and_duplicate_sources_never_reach_the_admission_queue() 
         std::fs::remove_dir_all(receiver.directory).unwrap();
     }
 }
+#[test]
+fn corrupted_disconnected_and_duplicate_stream_tails_are_never_decoded() {
+    for mode in 0..3 {
+        let source =
+            fixture_with_profile(p2p::Role::Miner, p2p::Role::Validator, 2, None, &[], true);
+        let receiver =
+            fixture_with_profile(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[], true);
+        let header = produced(&source, 33);
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let source_stream = FaultStream {
+            socket: a,
+            armed: armed.clone(),
+            mode,
+            header: Vec::new(),
+            fired: false,
+            minimum_index: 1,
+        };
+        let mut source_peer = Peer::new(
+            p2p::Session::from_test_peer_channel(
+                source_stream,
+                source.genesis.peer_binding(),
+                source.shared.budget.clone(),
+                source.remote,
+                p2p::Role::Validator,
+            ),
+            &source.genesis,
+            source.shared.headers.body_policy(),
+        )
+        .unwrap();
+        let mut receiver_peer = peer(b, &receiver, p2p::Role::Miner);
+        let source_shared = source.shared.clone();
+        let before = receiver.shared.budget.available().unwrap();
+        let worker = thread::spawn(move || {
+            assert!(source_peer.probe_propagation(2).unwrap());
+            source_peer.finish_round(2).unwrap();
+            armed.store(true, std::sync::atomic::Ordering::Release);
+            if offer(&mut source_peer, &source_shared, 3).is_ok() {
+                let _ = source_peer.finish_round(3);
+            }
+        });
+        let mut incoming = 1;
+        super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming).unwrap();
+        assert!(
+            super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming).is_err()
+        );
+        drop(receiver_peer);
+        worker.join().unwrap();
+        {
+            let job = receiver.shared.transfers.test_job(header.id().unwrap());
+            let transfer = job.transfer.lock().unwrap();
+            assert!(!transfer.stream_active());
+            assert!(transfer.verified_bytes() < transfer.body_bytes());
+            assert!(transfer.forwarding_piece(0).unwrap().is_some());
+            assert!(transfer.forwarding_piece(2).unwrap().is_none());
+            if mode == 0 {
+                assert!(transfer.forwarding_piece(1).unwrap().is_none());
+            }
+            let source = transfer
+                .sources()
+                .into_iter()
+                .find(|source| source.queries > 0)
+                .unwrap();
+            assert_eq!(source.queries, 1);
+            assert_eq!(source.failures, 1);
+            assert!(source.received > 0);
+        }
+        receiver.shared.transfers.cancel();
+        receiver.shared.transfers.reap(&receiver.shared).unwrap();
+        assert_eq!(receiver.shared.transfers.diagnostic()["decoded"], 0);
+        assert_eq!(receiver.shared.transfers.diagnostic()["active"], 0);
+        assert_body_resources_released(&receiver, before, 1);
+        drop(source.shared);
+        drop(receiver.shared);
+        std::fs::remove_dir_all(source.directory).unwrap();
+        std::fs::remove_dir_all(receiver.directory).unwrap();
+    }
+}
+
 #[test]
 fn fixed_service_refuses_an_offer_from_a_role_outside_its_pinned_miner_policy() {
     let source = fixture(p2p::Role::Miner, p2p::Role::Validator, 2);
