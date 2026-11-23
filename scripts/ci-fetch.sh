@@ -9,6 +9,11 @@ case "$job" in
  bench-plonky3) manifest=crates/bench-stark/Cargo.toml ;;
  native-multi-asset) manifest=crates/bench-multi-asset/Cargo.toml ;;
  native-runtime) manifest=crates/native-node/Cargo.toml ;;
+ sivault)
+  for crate in sivault-core sivault-releaser; do
+   cargo fetch --locked --manifest-path "crates/$crate/Cargo.toml"
+  done
+  exit 0 ;;
  wallet)
   for crate in native-wallet-core native-wallet-engine native-wallet-web; do
    cargo fetch --locked --manifest-path "crates/$crate/Cargo.toml"

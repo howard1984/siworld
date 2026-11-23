@@ -31,6 +31,7 @@ jobs:
       native_transaction: ${{ steps.paths.outputs.native_transaction }}
       native_runtime: ${{ steps.paths.outputs.native_runtime }}
       wallet: ${{ steps.paths.outputs.wallet }}
+      sivault: ${{ steps.paths.outputs.sivault }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -408,6 +409,36 @@ jobs:
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib service::stale_acceptance::tests::
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib store::retention_tests::acceptance_finality_observation_preserves_backlog_until_explicit_bounded_probe -- --exact
           cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib checkpoint_stale_runtime::tests::
+
+  sivault:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.sivault == 'true') }}
+    name: SIVault offline target checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: |
+          toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal \
+            --target aarch64-apple-darwin,x86_64-pc-windows-msvc,wasm32-unknown-unknown
+      - name: Acquire locked dependencies
+        run: bash scripts/ci-fetch.sh sivault
+      - name: Check SIVault packages
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        run: |
+          for crate in sivault-core sivault-releaser; do
+            cargo fmt --manifest-path "crates/$crate/Cargo.toml" --check
+            cargo clippy --locked --offline --manifest-path "crates/$crate/Cargo.toml" --all-targets -- -D warnings
+            cargo test --locked --offline --manifest-path "crates/$crate/Cargo.toml"
+            for target in aarch64-apple-darwin x86_64-pc-windows-msvc wasm32-unknown-unknown; do
+              cargo check --locked --offline --target "$target" --manifest-path "crates/$crate/Cargo.toml"
+            done
+          done
 
   wallet:
     needs: changes

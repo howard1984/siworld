@@ -16,6 +16,17 @@ repository_spec.loader.exec_module(repository)
 
 
 class RepositoryManifestTests(unittest.TestCase):
+    def test_sivault_application_scope_excludes_runtime_and_private_files(self):
+        for name in ("package-lock.json", "src/App.tsx", "src/styles.css",
+                     "src-tauri/Cargo.toml", "src-tauri/src/lib.rs",
+                     "src-tauri/capabilities/default.json", "wallet-dev-bridge.py",
+                     "tests/test_wallet_dev_bridge.py"):
+            self.assertTrue(repository.allowed(Path("apps/sivault-desktop") / name))
+        for name in ("private.json", "runtime/state.json", "source.png",
+                     "src/secrets.json", "node_modules/a/index.ts", "tests/private.py",
+                     "src-tauri/target/generated.rs", "src-tauri/capabilities/private.json"):
+            self.assertFalse(repository.allowed(Path("apps/sivault-desktop") / name))
+
     def test_explorer_publication_is_exactly_scoped(self):
         names = (
             "README.md", "chain-client.mjs", "explorer-config.example.json",

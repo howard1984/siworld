@@ -3,7 +3,7 @@
 //! These APIs do not authorize submission or change the read-only website gate.
 use super::*;
 use crate::{
-    proofs::NativeVerifier,
+    proofs::{NativeProver, NativeVerifier},
     wallet::FeeTier,
     wire::{MAX_ENVELOPE_BYTES, SIDECAR_BYTES, Sidecar, Transaction},
 };
@@ -37,6 +37,25 @@ impl PaymentAnchor {
 }
 
 impl Eng2LightState {
+    pub fn prepare_sip_recipient(
+        &mut self,
+        expected: Hash,
+        anchor: Snapshot,
+        recipient: &[u8; 1232],
+        amount: u64,
+        priority: bool,
+        reserved: &[DigestBytes],
+    ) -> Result<String, String> {
+        let owner = decode_digest(recipient[..48].try_into().expect("recipient owner width"))
+            .map_err(|_| "Invalid recipient owner.")?;
+        let address = PaymentAddress::new(
+            owner,
+            recipient[48..].try_into().expect("recipient key width"),
+        )
+        .map_err(|_| "Invalid recipient key.")?;
+        self.prepare_sip(expected, anchor, &address, amount, priority, reserved)
+    }
+
     pub fn check_payment_anchor(
         &self,
         expected: Hash,
@@ -164,9 +183,42 @@ impl Eng2LightState {
         Ok(packet)
     }
 
+    /// Produce the salted transport envelope required by the pinned ENG2
+    /// genesis. The legacy offline proof API remains separate.
+    pub fn prove_sip_for_genesis(&mut self) -> Result<Vec<u8>, String> {
+        let expected = self.context.config().network;
+        let payment = self.prepared.take().ok_or("no reserved eng2 payment")?;
+        self.check_payment_anchor(expected, payment.record().snapshot)?;
+        let prover = NativeProver::for_genesis(&self.context)?;
+        let proved = payment.prove(&prover)?;
+        let mut packet = proved.transaction.encode_envelope(&expected)?;
+        packet.extend_from_slice(&proved.sidecar.encode()?);
+        self.check_payment_packet_for_genesis(expected, &packet)?;
+        Ok(packet)
+    }
+
     /// Verify the exact network, retained eng2 snapshot, opening and native proof.
     /// This is not full-node admission: global non-owned spends are not available.
     pub fn check_payment_packet(&self, expected: Hash, packet: &[u8]) -> Result<String, String> {
+        self.check_payment_packet_with_verifier(expected, packet, NativeVerifier::new)
+    }
+
+    pub fn check_payment_packet_for_genesis(
+        &self,
+        expected: Hash,
+        packet: &[u8],
+    ) -> Result<String, String> {
+        self.check_payment_packet_with_verifier(expected, packet, || {
+            NativeVerifier::for_genesis(&self.context)
+        })
+    }
+
+    fn check_payment_packet_with_verifier(
+        &self,
+        expected: Hash,
+        packet: &[u8],
+        verifier: impl FnOnce() -> Result<NativeVerifier, String>,
+    ) -> Result<String, String> {
         if expected != self.context.config().network
             || !(crate::wire::TX_PREFIX_BYTES + SIDECAR_BYTES..=MAX_ENVELOPE_BYTES + SIDECAR_BYTES)
                 .contains(&packet.len())
@@ -185,7 +237,7 @@ impl Eng2LightState {
                 return Err("eng2 payment owned input is already spent".into());
             }
         }
-        NativeVerifier::new()?.verify_transaction(
+        verifier()?.verify_transaction(
             &public,
             &ProofContext::for_snapshot(
                 expected,

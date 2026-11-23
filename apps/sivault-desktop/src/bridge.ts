@@ -1,0 +1,50 @@
+import { invoke, isTauri } from '@tauri-apps/api/core';
+import { en } from './locale/en';
+
+export type Entry = {
+  id: string;
+  parent: string | null;
+  name: string;
+  is_dir: boolean;
+  size: number;
+};
+
+export type SafeInfo = {
+  id: string;
+  name: string;
+  sessionId: string;
+  readOnly: boolean;
+};
+
+export const native = isTauri();
+export const demoAvailable = import.meta.env.DEV && !native;
+
+export interface SafeBridge {
+  create(name: string): Promise<SafeInfo | null>;
+  open(readOnly: boolean): Promise<SafeInfo | null>;
+  unlock(id: string, readOnly: boolean): Promise<SafeInfo | null>;
+  list(sessionId: string, parent: string | null): Promise<Entry[]>;
+  importFiles(sessionId: string, parent: string | null): Promise<number>;
+  exportFile(sessionId: string, entryId: string): Promise<boolean>;
+  createDirectory(sessionId: string, name: string, parent: string | null): Promise<Entry>;
+  lock(sessionId: string): Promise<void>;
+}
+
+export const nativeBridge: SafeBridge = {
+  create: (name) => invoke('safe_create', { name }),
+  open: (readOnly) => invoke('safe_open', { readOnly }),
+  unlock: (id, readOnly) => invoke('safe_unlock', { id, readOnly }),
+  list: (sessionId, parent) => invoke('safe_list', { sessionId, parent }),
+  importFiles: (sessionId, parent) => invoke('safe_import', { sessionId, parent }),
+  exportFile: (sessionId, entryId) => invoke('safe_export', { sessionId, entryId }),
+  createDirectory: (sessionId, name, parent) => invoke('safe_create_directory', { sessionId, name, parent }),
+  lock: (sessionId) => invoke('safe_lock', { sessionId }),
+};
+
+export function message(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error &&
+      typeof error.code === 'string' && Object.hasOwn(en.errors, error.code)) {
+    return en.errors[error.code as keyof typeof en.errors];
+  }
+  return en.genericError;
+}

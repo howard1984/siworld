@@ -1,0 +1,40 @@
+[package]
+name = "sivault-core"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Portable SIVault format library"
+
+[workspace]
+
+[features]
+dev-windows-write = []
+
+[dependencies]
+aead = { version = "=0.5.2", features = ["stream"] }
+argon2 = { version = "=0.5.3", features = ["zeroize"] }
+chacha20poly1305 = "=0.10.1"
+getrandom = { version = "=0.2.17", features = ["js"] }
+hkdf = "=0.12.4"
+hmac = "=0.12.1"
+precis-profiles = "=0.2.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+sha2 = "=0.10.9"
+zeroize = { version = "=1.9.1", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "=1.1.5", features = ["fs"] }
+
+[dev-dependencies]
+serde_json = "=1.0.149"
+tempfile = "=3.27.0"
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[lints.rust]
+unsafe_code = "forbid"
