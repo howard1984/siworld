@@ -1,11 +1,28 @@
-//! Fixed-size geometry and preflight allocation for authenticated roots.
+//! Fixed-size geometry, authenticated payload records, and allocation preflight.
 //!
-//! This module does not open media or publish a format. A caller must verify
-//! the root chains and hold the exclusive writer before planning mutations.
+//! A caller must verify the root chains and hold the exclusive writer before
+//! planning mutations. The segment reader never opens writable handles.
 
 use std::collections::BTreeSet;
 
 use crate::{Error, Result};
+
+pub mod enrollment;
+mod index;
+pub mod payload;
+pub mod records;
+pub mod segments;
+pub mod transaction;
+
+impl Geometry {
+    fn binding(self) -> [u8; 12] {
+        let mut bytes = [0; 12];
+        bytes[..4].copy_from_slice(&UNIT_BYTES.to_le_bytes());
+        bytes[4..8].copy_from_slice(&UNITS_PER_SEGMENT.to_le_bytes());
+        bytes[8..].copy_from_slice(&(self.units / UNITS_PER_SEGMENT).to_le_bytes());
+        bytes
+    }
+}
 
 pub const UNIT_BYTES: u32 = 65_536;
 pub const UNITS_PER_SEGMENT: u32 = 16_384;

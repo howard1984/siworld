@@ -41,13 +41,13 @@ pub struct Entry {
     revision: [u8; 16],
 }
 
-struct Directory {
+pub(crate) struct Directory {
     path: PathBuf,
     handle: File,
 }
 
 impl Directory {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if !fs::symlink_metadata(path)?.is_dir() {
             return Err(Error::InvalidName);
         }
@@ -83,7 +83,11 @@ impl Directory {
         })
     }
 
-    fn file(&self, name: &str, create: bool) -> Result<File> {
+    pub(crate) fn file(&self, name: &str, create: bool) -> Result<File> {
+        self.file_access(name, create, false)
+    }
+
+    pub(crate) fn file_access(&self, name: &str, create: bool, update: bool) -> Result<File> {
         if name.contains(['/', '\\']) || name == "." || name == ".." {
             return Err(Error::InvalidName);
         }
@@ -92,6 +96,8 @@ impl Directory {
             use rustix::fs::{Mode, OFlags, openat};
             let flags = if create {
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL
+            } else if update {
+                OFlags::RDWR
             } else {
                 OFlags::RDONLY
             };
@@ -108,7 +114,7 @@ impl Directory {
         #[cfg(not(unix))]
         let f = {
             let mut options = OpenOptions::new();
-            options.read(!create).write(create).create_new(create);
+            options.read(!create).write(create || update).create_new(create);
             #[cfg(windows)]
             {
                 use std::os::windows::fs::OpenOptionsExt;
@@ -740,7 +746,7 @@ fn source_read(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-fn validate_name(name: &str) -> Result<()> {
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 255
         || name.contains(['\0', '/', '\\'])
