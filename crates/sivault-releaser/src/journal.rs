@@ -76,6 +76,7 @@ enum Entry {
         incarnation: Id,
         tombstone: Id,
     },
+    RecoveryActivation(crate::ledger::RecoveryActivation),
 }
 
 impl Entry {
@@ -114,6 +115,7 @@ impl Entry {
                 incarnation: *incarnation,
                 tombstone: *tombstone,
             },
+            Event::ActivateRecovery(change) => Self::RecoveryActivation(*change),
         })
     }
 
@@ -145,6 +147,7 @@ impl Entry {
                 incarnation,
                 tombstone,
             },
+            Self::RecoveryActivation(change) => Event::ActivateRecovery(change),
         })
     }
 }

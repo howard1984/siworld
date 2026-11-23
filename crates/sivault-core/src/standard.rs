@@ -307,6 +307,47 @@ impl Safe {
         Ok(bytes)
     }
 
+    /// Stage one candidate without changing the active registration. A digest
+    /// in the filename lets an interrupted attempt coexist with a later retry.
+    pub fn stage_controlled_pending(
+        &self,
+        version: u64,
+        commitment: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.writable()?;
+        if self.magic != CONTROLLED_MAGIC
+            || !(1..=MAX_CONTROLLED_REGISTRATION).contains(&bytes.len())
+        {
+            return Err(Error::InvalidFormat);
+        }
+        let name = controlled_pending_name(version, commitment)?;
+        match self.directory.bytes(&name, MAX_CONTROLLED_REGISTRATION) {
+            Ok(old) if old == bytes => return self.directory.sync(),
+            Ok(_) => return Err(Error::Authentication),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.directory.publish_generation(&name, bytes)?;
+        if self.directory.bytes(&name, MAX_CONTROLLED_REGISTRATION)? != bytes {
+            return Err(Error::Authentication);
+        }
+        self.directory.sync()
+    }
+
+    pub fn read_controlled_pending(
+        path: impl AsRef<Path>,
+        version: u64,
+        commitment: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let name = controlled_pending_name(version, commitment)?;
+        let bytes = Directory::open(path.as_ref())?.bytes(&name, MAX_CONTROLLED_REGISTRATION)?;
+        if bytes.is_empty() {
+            return Err(Error::InvalidFormat);
+        }
+        Ok(bytes)
+    }
+
     pub fn has_controlled_registration(path: impl AsRef<Path>) -> Result<bool> {
         match Directory::open(path.as_ref())?.file(CONTROLLED_REGISTRATION, false) {
             Ok(_) => Ok(true),
@@ -913,6 +954,13 @@ fn array<const N: usize>(bytes: &[u8]) -> [u8; N] {
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn controlled_pending_name(version: u64, commitment: &[u8; 32]) -> Result<String> {
+    if version < 2 || *commitment == [0; 32] {
+        return Err(Error::InvalidFormat);
+    }
+    Ok(format!("c-{version:016x}-{}", hex(commitment)))
 }
 fn is_hex(b: u8) -> bool {
     b.is_ascii_digit() || (b'a'..=b'f').contains(&b)

@@ -10,7 +10,11 @@ use std::{
 
 use sivault_releaser::{
     journal::{Checkpoint, Journal, MarkerStore},
-    ledger::{AuthorityError, Error, Outcome, PolicyError, Releaser, SlotIdentity},
+    ledger::{
+        AuthorityError, Error, Event, Outcome, PolicyError, RecoveryActivation, Releaser,
+        SlotIdentity,
+    },
+    message::Operation,
 };
 use support::*;
 
@@ -143,4 +147,68 @@ fn uncertain_marker_update_never_authorizes_a_charge() {
         Journal::open(&path, marker, slot()),
         Err(AuthorityError::InvalidEvidence)
     ));
+}
+
+#[test]
+fn recovery_activation_survives_restart_and_cannot_restore_allowance_or_override_revocation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("ledger");
+    let marker = TestMarker::default();
+    let mut releaser =
+        service(Journal::provision(&path, marker.clone(), slot(), id(90), 3, record()).unwrap());
+    let previous = attempt(1);
+    releaser.apply(register(&previous)).unwrap();
+    releaser.apply(charge(&previous)).unwrap();
+    let mut recovery = attempt(2);
+    recovery.domain.operation = Operation::Recovery;
+    releaser.apply(register(&recovery)).unwrap();
+    let change = RecoveryActivation {
+        domain: recovery.domain,
+        previous_version: 1,
+        next_record: id(99),
+        commitment: id(100),
+        sealed_material: id(101),
+    };
+    let activation = Event::ActivateRecovery(change);
+    assert_eq!(
+        releaser.apply(activation.clone()).unwrap_err(),
+        Error::Policy(PolicyError::MissingChallenge)
+    );
+    releaser.apply(charge(&recovery)).unwrap();
+    assert!(matches!(
+        releaser.apply(activation.clone()),
+        Ok(Outcome::RecoveryActivated)
+    ));
+    let after = releaser.snapshot().unwrap().clone();
+    assert_eq!(after.normal_version(), 2);
+    assert_eq!(after.latest_replacement(), Some(&change));
+    assert_eq!(after.remaining(), 1);
+    drop(releaser);
+
+    let mut releaser = service(Journal::open(&path, marker, slot()).unwrap());
+    assert!(matches!(
+        releaser.apply(activation.clone()),
+        Ok(Outcome::RecoveryActivated)
+    ));
+    assert_eq!(releaser.snapshot().unwrap(), &after);
+    let different = RecoveryActivation {
+        commitment: id(102),
+        ..change
+    };
+    assert_eq!(
+        releaser
+            .apply(Event::ActivateRecovery(different))
+            .unwrap_err(),
+        Error::Policy(PolicyError::Conflict)
+    );
+    assert_eq!(
+        releaser.apply(register(&attempt(3))).unwrap_err(),
+        Error::Policy(PolicyError::WrongRecord)
+    );
+    releaser.apply(command(retire(1))).unwrap();
+    assert_eq!(
+        releaser.apply(activation).unwrap_err(),
+        Error::Policy(PolicyError::InvalidPhase)
+    );
+    assert_eq!(releaser.snapshot().unwrap().remaining(), 1);
 }

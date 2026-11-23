@@ -1,4 +1,4 @@
-//! One normal controlled opening over an authenticated channel.
+//! One controlled opening over an authenticated channel.
 //! Enrollment and owner commands establish the trusted record separately.
 
 use std::{
@@ -58,8 +58,27 @@ impl From<sivault_core::Error> for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpeningPurpose {
+    Normal,
+    Recovery,
+}
+
+impl OpeningPurpose {
+    fn operation(self) -> Operation {
+        match self {
+            Self::Normal => Operation::Normal,
+            Self::Recovery => Operation::Recovery,
+        }
+    }
+}
+
 impl OpeningRecord {
     pub fn context(&self) -> RecordContext {
+        self.context_for(OpeningPurpose::Normal)
+    }
+
+    pub fn context_for(&self, purpose: OpeningPurpose) -> RecordContext {
         RecordContext {
             suite: self.slot.suite,
             version: 1,
@@ -68,13 +87,13 @@ impl OpeningRecord {
             generation: self.record.generation,
             slot: self.slot.slot.0,
             ledger: self.slot.ledger.0,
-            operation: Operation::Normal as u8,
+            operation: purpose.operation() as u8,
             record: self.record_id.0,
             argon_salt: self.salt.0,
         }
     }
 
-    fn domain(&self, request: Id) -> Domain {
+    fn domain(&self, request: Id, purpose: OpeningPurpose) -> Domain {
         Domain {
             suite: self.slot.suite,
             network: self.slot.network,
@@ -83,7 +102,7 @@ impl OpeningRecord {
             slot: self.slot.slot,
             incarnation: self.record.incarnation,
             request,
-            operation: Operation::Normal,
+            operation: purpose.operation(),
         }
     }
 }
@@ -104,10 +123,28 @@ pub fn serve<R: Read, W: Write, A: DurableAuthority>(
 }
 
 pub fn serve_init<R: Read, W: Write, A: DurableAuthority>(
+    session: Session<R, W>,
+    releaser: &mut Releaser<A>,
+    material: &ReleaseMaterial,
+    init_bytes: &[u8],
+) -> Result<()> {
+    serve_init_for(
+        session,
+        releaser,
+        material,
+        init_bytes,
+        OpeningPurpose::Normal,
+    )
+}
+
+/// The caller selects the enrolled material for the requested purpose before
+/// registering any challenge or spending any of the slot's shared allowance.
+pub fn serve_init_for<R: Read, W: Write, A: DurableAuthority>(
     mut session: Session<R, W>,
     releaser: &mut Releaser<A>,
     material: &ReleaseMaterial,
     init_bytes: &[u8],
+    purpose: OpeningPurpose,
 ) -> Result<()> {
     let init = Message::decode(init_bytes).map_err(|_| Error::InvalidMessage)?;
     let Body::OpenInit {
@@ -120,7 +157,7 @@ pub fn serve_init<R: Read, W: Write, A: DurableAuthority>(
         return Err(Error::InvalidMessage);
     };
     let scope = &material.scope;
-    if init.domain != scope.domain(init.domain.request)
+    if init.domain != scope.domain(init.domain.request, purpose)
         || record != scope.record_id
         || &reply_key_digest.0 != session.reply_key_digest()?
         || session.claimed_folder_key()? != &folder_key_id(&material.folder_key).0
@@ -175,7 +212,7 @@ pub fn serve_init<R: Read, W: Write, A: DurableAuthority>(
     if predecessor != attempt.challenge_digest.0 {
         return Err(Error::InvalidMessage);
     }
-    let transcript = transcript(&session, scope, &attempt)?;
+    let transcript = transcript(&session, scope, &attempt, purpose)?;
     let signature = MLDSA65Signature::new(signature.try_into().map_err(|_| Error::InvalidMessage)?);
     if verify_possession(&material.folder_key, &transcript, &signature).is_err() {
         return refuse(
@@ -213,13 +250,31 @@ pub fn serve_init<R: Read, W: Write, A: DurableAuthority>(
 }
 
 pub fn open<R: Read, W: Write>(
-    mut session: Session<R, W>,
+    session: Session<R, W>,
     scope: &OpeningRecord,
     credential: ClientCredential,
     possession_key: &MLDSA65SigningKey,
     envelope: &Envelope,
 ) -> Result<Secret> {
-    let domain = scope.domain(Id(random()?));
+    open_for(
+        session,
+        scope,
+        credential,
+        possession_key,
+        envelope,
+        OpeningPurpose::Normal,
+    )
+}
+
+pub fn open_for<R: Read, W: Write>(
+    mut session: Session<R, W>,
+    scope: &OpeningRecord,
+    credential: ClientCredential,
+    possession_key: &MLDSA65SigningKey,
+    envelope: &Envelope,
+    purpose: OpeningPurpose,
+) -> Result<Secret> {
+    let domain = scope.domain(Id(random()?), purpose);
     let client_nonce = Id(random()?);
     let reply_key_digest = Id(*session.reply_key_digest()?);
     let init = Message {
@@ -272,7 +327,7 @@ pub fn open<R: Read, W: Write>(
         reply_key_digest,
         deadline,
     };
-    let transcript = transcript(&session, scope, &attempt)?;
+    let transcript = transcript(&session, scope, &attempt, purpose)?;
     let signature = sign_possession(possession_key, &transcript)?;
     let mut proof = Zeroizing::new(attempt.challenge_digest.0.to_vec());
     proof.extend_from_slice(&credential.proof(&transcript));
@@ -291,7 +346,7 @@ pub fn open<R: Read, W: Write>(
     }
     let share = Secret::new(result[64..].try_into().map_err(|_| Error::InvalidMessage)?);
     Ok(credential.verify_and_unwrap(
-        &scope.context(),
+        &scope.context_for(purpose),
         &transcript,
         result[32..64]
             .try_into()
@@ -360,6 +415,7 @@ fn transcript<R: Read, W: Write>(
     session: &Session<R, W>,
     scope: &OpeningRecord,
     attempt: &Attempt,
+    purpose: OpeningPurpose,
 ) -> Result<Vec<u8>> {
     Ok(AttemptContext {
         request: attempt.domain.request.0,
@@ -373,7 +429,7 @@ fn transcript<R: Read, W: Write>(
         deadline: attempt.deadline,
         channel_binding: session.binding()?,
     }
-    .encode(&scope.context()))
+    .encode(&scope.context_for(purpose)))
 }
 
 fn digest(label: &[u8], bytes: &[u8]) -> Id {
@@ -390,4 +446,64 @@ fn now() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
         .map_err(|_| Error::Clock)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_and_normal_openings_bind_distinct_domains_and_wraps() {
+        let scope = OpeningRecord {
+            slot: SlotIdentity {
+                suite: 1,
+                network: Id([1; 32]),
+                safe: Id([2; 32]),
+                slot: Id([3; 32]),
+                ledger: Id([4; 32]),
+            },
+            record: Record {
+                generation: 1,
+                incarnation: Id([5; 32]),
+                manifest: Id([6; 32]),
+                root: Id([7; 32]),
+            },
+            record_id: Id([8; 32]),
+            salt: Id([9; 32]),
+        };
+        let request = Id([10; 32]);
+        let normal = scope.domain(request, OpeningPurpose::Normal);
+        let recovery = scope.domain(request, OpeningPurpose::Recovery);
+        assert_eq!(
+            recovery,
+            Domain {
+                operation: Operation::Recovery,
+                ..normal
+            }
+        );
+        let normal = scope.context();
+        let recovery = scope.context_for(OpeningPurpose::Recovery);
+        assert_ne!(normal.encode(), recovery.encode());
+        let folder = Secret::new([11; 32]);
+        let share = Secret::new([12; 32]);
+        let key = Secret::new([13; 32]);
+        let password = "synthetic test input";
+        let a = ClientCredential::new(password, &folder, &normal).unwrap();
+        let b = ClientCredential::new(password, &folder, &recovery).unwrap();
+        let transcript = b"synthetic attempt";
+        let envelope = a.wrap(&normal, &share, &key).unwrap();
+        let verifier = a.enrollment_verifier();
+        assert!(
+            verifier
+                .evaluate_charged_proof(transcript, &b.proof(transcript))
+                .is_err()
+        );
+        let mac = verifier
+            .evaluate_charged_proof(transcript, &a.proof(transcript))
+            .unwrap();
+        assert!(
+            b.verify_and_unwrap(&recovery, transcript, &mac, &share, &envelope)
+                .is_err()
+        );
+    }
 }

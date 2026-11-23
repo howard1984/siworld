@@ -16,6 +16,10 @@ pub mod message;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod opening;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod recovery_assignment;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod recovery_replacement;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod registration;
 pub mod scheduler;
 #[cfg(not(target_arch = "wasm32"))]

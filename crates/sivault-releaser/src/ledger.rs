@@ -68,6 +68,21 @@ pub enum Possession {
     Rejected,
 }
 
+/// The protocol adapter authenticates the successful recovery session and
+/// verifies durable readback of the pending wrap and sealed verifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+pub struct RecoveryActivation {
+    pub domain: Domain,
+    pub previous_version: u64,
+    pub next_record: Id,
+    pub commitment: Id,
+    pub sealed_material: Id,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     RegisterChallenge {
@@ -91,6 +106,7 @@ pub enum Event {
         incarnation: Id,
         tombstone: Id,
     },
+    ActivateRecovery(RecoveryActivation),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +155,8 @@ pub struct Ledger {
     issued: BTreeMap<Id, Attempt>,
     consumed: BTreeMap<Id, Attempt>,
     commands: BTreeMap<Id, AppliedCommand>,
+    replacements: BTreeMap<Id, RecoveryActivation>,
+    active_replacement: BTreeMap<(u64, Id), Id>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +193,7 @@ enum Effect {
     CredentialReady(Box<Attempt>),
     Command(CommandReceipt),
     DeletionConfirmed,
+    RecoveryActivated,
 }
 
 /// A proposal for one atomic durable transition, including its authenticated
@@ -216,6 +235,8 @@ impl Ledger {
             issued: BTreeMap::new(),
             consumed: BTreeMap::new(),
             commands: BTreeMap::new(),
+            replacements: BTreeMap::new(),
+            active_replacement: BTreeMap::new(),
         }
     }
 
@@ -262,6 +283,17 @@ impl Ledger {
         self.commands.len()
     }
 
+    pub fn normal_version(&self) -> u64 {
+        self.latest_replacement()
+            .map_or(1, |entry| entry.previous_version + 1)
+    }
+
+    pub fn latest_replacement(&self) -> Option<&RecoveryActivation> {
+        self.active_replacement
+            .get(&(self.active.generation, self.active.incarnation))
+            .and_then(|id| self.replacements.get(id))
+    }
+
     pub fn transition(&self, event: Event) -> Result<Transition, PolicyError> {
         let mut next = self.clone();
         let (effect, changed) = next.apply(&event)?;
@@ -296,6 +328,13 @@ impl Ledger {
             return Err(PolicyError::DomainMismatch);
         }
         if a.record_manifest != self.active.manifest {
+            return Err(PolicyError::WrongRecord);
+        }
+        if a.domain.operation == Operation::Normal
+            && self
+                .latest_replacement()
+                .is_some_and(|entry| entry.next_record != a.selected_record)
+        {
             return Err(PolicyError::WrongRecord);
         }
         if now >= a.deadline {
@@ -401,7 +440,54 @@ impl Ledger {
                 old.deletion_confirmed = true;
                 Ok((Effect::DeletionConfirmed, changed))
             }
+            Event::ActivateRecovery(change) => self.activate_recovery(*change),
         }
+    }
+
+    fn activate_recovery(
+        &mut self,
+        change: RecoveryActivation,
+    ) -> Result<(Effect, bool), PolicyError> {
+        if !self.serving {
+            return Err(PolicyError::InvalidPhase);
+        }
+        if !self.active_matches(&change.domain) || change.domain.operation != Operation::Recovery {
+            return Err(PolicyError::DomainMismatch);
+        }
+        let request = change.domain.request;
+        if let Some(previous) = self.replacements.get(&request) {
+            return if *previous == change {
+                Ok((Effect::RecoveryActivated, false))
+            } else {
+                Err(PolicyError::Conflict)
+            };
+        }
+        let attempt = self
+            .consumed
+            .get(&request)
+            .ok_or(PolicyError::MissingChallenge)?;
+        if attempt.domain != change.domain || attempt.record_manifest != self.active.manifest {
+            return Err(PolicyError::WrongRecord);
+        }
+        if change.previous_version != self.normal_version()
+            || change.previous_version == u64::MAX
+            || change.next_record == Id::default()
+            || change.commitment == Id::default()
+            || change.sealed_material == Id::default()
+            || change.next_record == attempt.selected_record
+            || self
+                .replacements
+                .values()
+                .any(|entry| entry.next_record == change.next_record)
+        {
+            return Err(PolicyError::Conflict);
+        }
+        self.replacements.insert(request, change);
+        self.active_replacement.insert(
+            (change.domain.generation, change.domain.incarnation),
+            request,
+        );
+        Ok((Effect::RecoveryActivated, true))
     }
 
     fn owner(
@@ -721,6 +807,7 @@ pub enum Outcome {
     CredentialReady(CredentialReady),
     Command(CommandReceipt),
     DeletionConfirmed,
+    RecoveryActivated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -792,6 +879,7 @@ impl<A: DurableAuthority> Releaser<A> {
             }
             Effect::Command(receipt) => Outcome::Command(receipt),
             Effect::DeletionConfirmed => Outcome::DeletionConfirmed,
+            Effect::RecoveryActivated => Outcome::RecoveryActivated,
         })
     }
 }
