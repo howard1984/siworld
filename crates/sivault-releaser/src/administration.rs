@@ -122,6 +122,10 @@ pub struct Service<M> {
 }
 
 impl<M: MarkerStore> Service<M> {
+    pub fn ledger(&self) -> Option<&crate::ledger::Ledger> {
+        self.releaser.snapshot()
+    }
+
     pub fn new(
         releaser: Releaser<Journal<M>>,
         release: ReleaseMaterial,

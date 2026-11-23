@@ -31,6 +31,8 @@ export default function App() {
   const [localReleaser, setLocalReleaser] = useState<ReleaserStatus | null>(null);
   const [ownerId, setOwnerId] = useState<string | null>(null);
   const [controlled, setControlled] = useState(false);
+  const [controlledName, setControlledName] = useState('');
+  const [setupOwner, setSetupOwner] = useState<string | null>(null);
   const [demo, setDemo] = useState(false);
   const [recent, setRecent] = useState<Recent[]>([]);
   const [safe, setSafe] = useState<SafeInfo | null>(null);
@@ -56,6 +58,22 @@ export default function App() {
     else dialogRef.current?.close();
   }, [modal]);
 
+  useEffect(() => {
+    if (section !== 'releaser' || busy || !localReleaser?.address) return;
+    let active = true;
+    const timer = window.setInterval(() => {
+      void releaserStatus().then((status) => {
+        if (active) setLocalReleaser(status);
+      }).catch(() => {
+        if (active) {
+          setLocalReleaser(null);
+          setError(en.errors.RELEASER_UNAVAILABLE);
+        }
+      });
+    }, 1500);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [section, busy, localReleaser?.address]);
+
   async function run(action: () => Promise<void>) {
     if (busy) return;
     setBusy(true);
@@ -76,6 +94,7 @@ export default function App() {
     if (!safe || !bridge) return;
     await bridge.lock(safe.sessionId);
     setLocalReleaser(null);
+    setOwnerId(null);
     setSafe(null);
     setEntries([]);
     setSelectedId(null);
@@ -111,7 +130,9 @@ export default function App() {
     });
   }
 
-  function showModal(next: Modal) { setError(''); setNotice(''); setControlled(false); setModal(next); }
+  function showModal(next: Modal) {
+    setError(''); setNotice(''); setControlled(false); setControlledName(''); setSetupOwner(null); setModal(next);
+  }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -128,8 +149,14 @@ export default function App() {
         if (exported) setNotice(demo ? en.sampleExported : en.exported);
       } else {
         if (safe) await lock();
+        if (modal === 'create' && controlled && !setupOwner) {
+          setControlledName(name);
+          const owner = await prepareOwner();
+          if (owner) setSetupOwner(owner);
+          return;
+        }
         const info = modal === 'create' ? controlled && native
-          ? await createControlled(name, String(form.get('address') ?? ''), String(form.get('identifier') ?? ''), Number(form.get('allowance')))
+          ? await createControlled(controlledName, String(form.get('address') ?? '').trim(), String(form.get('identifier') ?? '').trim(), Number(form.get('allowance')))
           : await bridge.create(name)
           : modal === 'unlock' && chosenId ? await bridge.unlock(chosenId, readOnly)
           : await bridge.open(readOnly);
@@ -167,16 +194,20 @@ export default function App() {
       <button type="button" aria-current={section === 'wallet' ? 'page' : undefined} disabled={busy || modal !== null} onClick={() => run(async () => { await lock(); setSection('wallet'); })}><Wallet size={15} aria-hidden="true" />{en.walletTab}</button>
       {native && <button type="button" aria-current={section === 'releaser' ? 'page' : undefined} disabled={busy || modal !== null} onClick={() => run(async () => { setSection('releaser'); setLocalReleaser(await releaserStatus()); })}><KeyRound size={15} aria-hidden="true" />{en.releaserTab}</button>}
     </nav>{section === 'wallet' && native && <WalletNodeStatus />}</header>
-    {section === 'wallet' ? <WalletView /> : section === 'releaser' ? <main className="main" id="releaser" tabIndex={-1}>
+    {section === 'wallet' ? <WalletView /> : section === 'releaser' ? <main className="main releaser-page" id="releaser" tabIndex={-1}>
       <div className="view-heading"><h1>{en.releaserTab}</h1></div>
       {(error || notice) && <div role={error ? 'alert' : 'status'} className={`notification ${error ? 'error' : ''}`}>{error || notice}</div>}
-      <label className="check-field"><input type="checkbox" role="switch" checked={Boolean(localReleaser?.address)} disabled={busy} onChange={(event) => {
+      <section className="releaser-group" aria-labelledby="my-releasers"><h2 id="my-releasers">{en.myReleasers}</h2>
+      <h3>{en.localReleaser}</h3>
+      <label className="checkbox-field"><input type="checkbox" role="switch" checked={Boolean(localReleaser?.address)} disabled={busy} onChange={(event) => {
         const enabled = event.currentTarget.checked;
         void run(async () => setLocalReleaser(await setReleaserRunning(enabled)));
       }} />{en.runReleaser}</label>
       {localReleaser?.address && <p>{en.releaserAddress}: <code>{localReleaser.address}</code></p>}
       {localReleaser?.identifier && <p>{en.releaserIdentifier}: <code className="releaser-identifier">{localReleaser.identifier}</code></p>}
-      {localReleaser?.address && <p>{localReleaser.enrolled ? en.releaserServing : en.noReleaserEnrollment}</p>}
+      {localReleaser?.address && <p role="status">{!localReleaser.enrolled ? en.noReleaserEnrollment
+        : localReleaser.ledger?.state === 'active' ? (localReleaser.ledger.remaining > 0 ? en.attemptsRemaining(localReleaser.ledger.remaining) : en.allowanceExhausted)
+        : localReleaser.ledger?.state === 'revoked' ? en.releaserRevoked : en.releaserLedgerUnavailable}</p>}
       {localReleaser?.address && !localReleaser.enrolled && <form className="releaser-form" onSubmit={(event) => {
         event.preventDefault();
         const form = new FormData(event.currentTarget);
@@ -188,6 +219,8 @@ export default function App() {
         <label className="field">{en.attemptAllowance}<input name="allowance" type="number" required min={1} max={1000} defaultValue={2} /></label>
         <button type="submit" className="button" disabled={busy}>{en.allowEnrollment}</button>
       </form>}
+      </section>
+      <section className="releaser-group" aria-labelledby="owner-controls"><h2 id="owner-controls">{en.ownerControls}</h2>
       <button type="button" className="button" disabled={busy} onClick={() => run(async () => setOwnerId(await prepareOwner()))}>{en.showOwnerIdentifier}</button>
       {ownerId && <p>{en.ownerIdentifier}: <code className="releaser-identifier">{ownerId}</code></p>}
       <form className="releaser-form" onSubmit={(event) => {
@@ -211,6 +244,7 @@ export default function App() {
         <label className="field">{en.safeName}<input name="label" required maxLength={120} autoComplete="off" /></label>
         <button type="submit" className="button" disabled={busy}>{en.revokeSafe}</button>
       </form>
+      <p className="limit-note">{en.revokeLimits}</p>
       <form className="releaser-form" onSubmit={(event) => {
         event.preventDefault();
         const form = new FormData(event.currentTarget);
@@ -223,6 +257,7 @@ export default function App() {
         <label className="field">{en.releaserIdentifier}<input name="identifier" required minLength={64} maxLength={64} autoComplete="off" spellCheck={false} /></label>
         <button type="submit" className="button" disabled={busy}><ShieldCheck size={15} aria-hidden="true" />{en.verifyReleaser}</button>
       </form>
+      </section>
     </main> : <div className="workspace">
       <aside className="sidebar" aria-label={en.safeNavigation}>
         <div className="sidebar-heading"><span>{en.safesUpper}</span><IconButton label={en.createSafe} disabled={!bridge || busy} onClick={() => showModal('create')}><Plus size={17} /></IconButton></div>
@@ -263,22 +298,25 @@ export default function App() {
       </main>
     </div>}
     <dialog ref={dialogRef} className="modal" onCancel={(event) => { if (busy) event.preventDefault(); else setModal(null); }} onClose={() => { if (!busy) setModal(null); }} aria-labelledby="modal-title"><form onSubmit={submit} key={modal}>
-      <div className="modal-heading"><h2 id="modal-title">{modal === 'create' ? (native ? en.createSafe : en.createStandard) : modal === 'folder' ? en.newFolder : modal === 'export' ? en.exportFile : (native ? en.openSafe : en.openStandard)}</h2><IconButton label={en.closeDialog} disabled={busy} onClick={() => setModal(null)}><X size={18} /></IconButton></div>
-      {modal === 'create' && native && <label className="field">{en.safeType}<select value={controlled ? 'controlled' : 'offline'} onChange={(event) => setControlled(event.target.value === 'controlled')}>
+      <div className="modal-heading"><h2 id="modal-title">{modal === 'create' ? (setupOwner ? en.controlledDetails : native ? en.createSafe : en.createStandard) : modal === 'folder' ? en.newFolder : modal === 'export' ? en.exportFile : (native ? en.openSafe : en.openStandard)}</h2><IconButton label={en.closeDialog} disabled={busy} onClick={() => setModal(null)}><X size={18} /></IconButton></div>
+      {modal === 'create' && native && !setupOwner && <label className="field">{en.safeType}<select value={controlled ? 'controlled' : 'offline'} onChange={(event) => setControlled(event.target.value === 'controlled')}>
         <option value="offline">{en.offlineSafe}</option><option value="controlled">{en.controlledSafe}</option>
       </select></label>}
-      {modal === 'create' && controlled && <div className="controlled-fields">
+      {modal === 'create' && controlled && <p className="limit-note">{en.controlledLimits}</p>}
+      {modal === 'create' && setupOwner && <div className="controlled-fields">
+        <p>{en.ownerIdentifier}: <code className="releaser-identifier">{setupOwner}</code></p>
         <label className="field">{en.releaserAddress}<input name="address" required maxLength={21} autoComplete="off" /></label>
         <label className="field">{en.releaserIdentifier}<input name="identifier" required minLength={64} maxLength={64} autoComplete="off" spellCheck={false} /></label>
         <label className="field">{en.attemptAllowance}<input name="allowance" type="number" required min={1} max={1000} defaultValue={2} /></label>
       </div>}
       {demo && <p className="demo-note">{en.demoNote}</p>}
-      {(modal === 'create' || modal === 'folder') && <label className="field">{modal === 'folder' ? en.folderName : en.safeName}<input name="name" required autoFocus maxLength={120} pattern={'[^/\\\\]+'} autoComplete="off" placeholder={modal === 'folder' ? en.untitledFolder : en.personalArchive} /></label>}
+      {((modal === 'create' && !setupOwner) || modal === 'folder') && <label className="field">{modal === 'folder' ? en.folderName : en.safeName}<input name="name" required autoFocus maxLength={120} pattern={'[^/\\\\]+'} autoComplete="off" defaultValue={modal === 'create' ? controlledName : ''} placeholder={modal === 'folder' ? en.untitledFolder : en.personalArchive} /></label>}
       {modal === 'unlock' && <p className="unlock-name"><HardDrive size={17} />{chosen?.name}</p>}
       {(modal === 'open' || modal === 'unlock') && <label className="checkbox-field"><input type="checkbox" name="readOnly" />{en.openReadOnly}</label>}
       {modal === 'export' && <><p className="export-name"><FileText size={18} />{selected?.name}</p><p className="export-notice">{en.exportWarning}</p></>}
       {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="modal-actions"><button className="button" type="button" disabled={busy} onClick={() => setModal(null)}>{en.cancel}</button><button className="button primary" type="submit" disabled={busy}>{busy ? en.working : modal === 'create' ? en.createSafe : modal === 'folder' ? en.createFolder : modal === 'export' ? en.chooseDestination : modal === 'open' && !demo ? en.chooseSafe : en.openSafe}</button></div>
+      {busy && <p className="operation-status" role="status">{modal === 'open' || modal === 'unlock' ? en.openingSafe : setupOwner ? en.enrollingSafe : en.working}</p>}
+      <div className="modal-actions"><button className="button" type="button" disabled={busy} onClick={() => { if (setupOwner) setSetupOwner(null); else setModal(null); }}>{setupOwner ? en.back : en.cancel}</button><button className="button primary" type="submit" disabled={busy}>{modal === 'create' ? (controlled && !setupOwner ? en.continue : en.createSafe) : modal === 'folder' ? en.createFolder : modal === 'export' ? en.chooseDestination : modal === 'open' && !demo ? en.chooseSafe : en.openSafe}</button></div>
     </form></dialog>
   </div>;
 }

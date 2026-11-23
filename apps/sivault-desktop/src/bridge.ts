@@ -19,7 +19,12 @@ export type SafeInfo = {
 export const native = isTauri();
 export const demoAvailable = import.meta.env.DEV && !native;
 
-export type ReleaserStatus = { address: string | null; identifier: string | null; enrolled: boolean };
+export type ReleaserStatus = {
+  address: string | null;
+  identifier: string | null;
+  enrolled: boolean;
+  ledger: { state: 'active'; remaining: number } | { state: 'revoked' | 'unavailable' } | null;
+};
 export const releaserStatus = () => invoke<ReleaserStatus>('releaser_status');
 export const setReleaserRunning = (enabled: boolean) =>
   invoke<ReleaserStatus>('releaser_set_running', { enabled });

@@ -176,6 +176,57 @@ test('wallet shows fee, resolves errors, and distinguishes submission from inclu
   await expect(send).toBeEnabled();
 });
 
+test('controlled setup shows owner identifier without requesting secrets in the webview', async ({ page }) => {
+  const identifier = 'a'.repeat(64);
+  let finishEnrollment!: (result: null) => void;
+  await page.exposeFunction('controlledInvoke', (command: string, args: unknown) => {
+    if (command === 'owner_prepare') return true;
+    if (command === 'owner_identifier') return identifier;
+    if (command === 'safe_create_controlled') {
+      expect(args).toEqual({ name: 'Fixture', address: '127.0.0.1:1234', identifier, allowance: 2 });
+      return new Promise<null>((resolve) => { finishEnrollment = resolve; });
+    }
+    throw new Error(command);
+  });
+  await page.addInitScript(() => {
+    const mock = window as Window & { controlledInvoke: (...args: unknown[]) => Promise<unknown> };
+    Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: mock.controlledInvoke } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Create safe', exact: true }).first().click();
+  const dialog = page.getByRole('dialog');
+  await dialog.getByLabel('Safe name').fill('Fixture');
+  await dialog.getByLabel('Safe type').selectOption('controlled');
+  await dialog.getByRole('button', { name: 'Continue' }).click();
+  await expect(dialog.getByText(identifier, { exact: true })).toBeVisible();
+  await expect(dialog.locator('input[type=password]')).toHaveCount(0);
+  await dialog.getByLabel('Local address').fill('127.0.0.1:1234');
+  await dialog.getByLabel('Releaser identifier').fill(identifier);
+  await dialog.getByRole('button', { name: 'Create safe' }).click();
+  await expect(dialog.getByRole('status')).toContainText('Waiting for enrollment confirmation');
+  finishEnrollment(null);
+  await expect(dialog).not.toBeVisible();
+});
+
+test('releaser view follows the local ledger through exhaustion and revocation', async ({ page }) => {
+  let status: { state: string; remaining?: number } = { state: 'active', remaining: 2 };
+  await page.exposeFunction('releaserInvoke', (command: string) => {
+    expect(command).toBe('releaser_status');
+    return { address: '127.0.0.1:1234', identifier: 'b'.repeat(64), enrolled: true, ledger: status };
+  });
+  await page.addInitScript(() => {
+    const mock = window as Window & { releaserInvoke: (...args: unknown[]) => Promise<unknown> };
+    Object.assign(window, { isTauri: true, __TAURI_INTERNALS__: { invoke: mock.releaserInvoke } });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Releaser', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('2 attempts remaining');
+  status = { state: 'active', remaining: 0 };
+  await expect(page.getByRole('status')).toHaveText('Attempt allowance exhausted');
+  status = { state: 'revoked' };
+  await expect(page.getByRole('status')).toHaveText('Access revoked');
+});
+
 test('compact vault keeps actions and the file table near the top', async ({ page }, testInfo) => {
   await page.goto('/');
   await page.keyboard.press('Tab');

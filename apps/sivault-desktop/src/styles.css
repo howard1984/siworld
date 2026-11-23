@@ -263,3 +263,10 @@ tbody tr.selected { background: var(--selected); }
 }
 .releaser-form { max-width: 420px; }
 .releaser-identifier { overflow-wrap: anywhere; }
+.releaser-page { overflow-y: auto; }
+.releaser-group { min-width: 0; padding: 14px 0; border-top: 1px solid var(--line); }
+.releaser-group h2 { font-size: 14px; margin: 0 0 10px; }
+.releaser-group h3 { font-size: 12px; margin: 0 0 8px; }
+.releaser-group p, .controlled-fields p { font-size: 12px; margin: 8px 0; }
+.field select { min-height: 32px; padding: 4px 8px; border: 1px solid #d6d6d6; background: #fff; color: inherit; }
+.limit-note, .operation-status { color: var(--muted); font-size: 12px; margin: 8px 0; }

@@ -68,6 +68,7 @@ struct Listening {
     identifier: [u8; 32],
     worker: Worker,
     enrolled: Arc<AtomicBool>,
+    ledger: Arc<Mutex<Option<LedgerStatus>>>,
     #[cfg(any(target_os = "macos", windows))]
     authorization: Option<Arc<Mutex<Option<Authorization>>>>,
 }
@@ -96,6 +97,30 @@ pub struct ReleaserStatus {
     address: Option<String>,
     identifier: Option<String>,
     enrolled: bool,
+    ledger: Option<LedgerStatus>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum LedgerStatus {
+    Active { remaining: u64 },
+    Revoked,
+    Unavailable,
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn ledger_status(
+    service: &sivault_releaser::administration::Service<
+        sivault_releaser::journal::platform::PlatformMarker,
+    >,
+) -> LedgerStatus {
+    match service.ledger() {
+        Some(ledger) if ledger.is_serving() => LedgerStatus::Active {
+            remaining: ledger.remaining(),
+        },
+        Some(_) => LedgerStatus::Revoked,
+        None => LedgerStatus::Unavailable,
+    }
 }
 
 impl ReleaserState {
@@ -167,6 +192,7 @@ impl ReleaserState {
                 identifier,
                 worker,
                 enrolled: Arc::new(AtomicBool::new(false)),
+                ledger: Arc::default(),
                 #[cfg(any(target_os = "macos", windows))]
                 authorization: None,
             });
@@ -201,6 +227,8 @@ impl ReleaserState {
         let advertised = pins.encode();
         let enrolled = Arc::new(AtomicBool::new(false));
         let serving = Arc::clone(&enrolled);
+        let ledger = Arc::new(Mutex::new(None));
+        let observable = Arc::clone(&ledger);
         let authorization = Arc::new(Mutex::new(None::<Authorization>));
         let permitted = Arc::clone(&authorization);
         let mut active = None::<Service<PlatformMarker>>;
@@ -225,6 +253,9 @@ impl ReleaserState {
             if let Some(service) = &mut active {
                 if let Ok(now) = unix_now() {
                     let _ = service.serve(session, kind, &payload, &identity, &slot_path, now);
+                    if let Ok(mut view) = observable.lock() {
+                        *view = Some(ledger_status(service));
+                    }
                 }
                 return;
             }
@@ -290,7 +321,11 @@ impl ReleaserState {
                 ..accepted
             };
             let _ = enrollment::acknowledge(&mut session, &identity, &accepted, head);
-            active = Some(Service::new(service, accepted.release, accepted.owner_key));
+            let service = Service::new(service, accepted.release, accepted.owner_key);
+            if let Ok(mut view) = observable.lock() {
+                *view = Some(ledger_status(&service));
+            }
+            active = Some(service);
             serving.store(true, Ordering::Release);
         })?;
         lifecycle.listener = Some(Listening {
@@ -298,6 +333,7 @@ impl ReleaserState {
             identifier,
             worker,
             enrolled,
+            ledger,
             authorization: Some(authorization),
         });
         Ok(status(&lifecycle))
@@ -334,6 +370,8 @@ impl ReleaserState {
         let identifier = pins.identifier();
         let advertised = pins.encode();
         let mut service = Service::new(service, material.release, material.owner_key);
+        let ledger = Arc::new(Mutex::new(Some(ledger_status(&service))));
+        let observable = Arc::clone(&ledger);
         let mut state = self.0.lock().map_err(|_| unavailable())?;
         if state.exiting || state.epoch != epoch || state.listener.is_some() {
             return Err(unavailable());
@@ -346,6 +384,9 @@ impl ReleaserState {
                 && let Ok(now) = unix_now()
             {
                 let _ = service.serve(session, kind, &payload, &identity, &slot_path, now);
+                if let Ok(mut view) = observable.lock() {
+                    *view = Some(ledger_status(&service));
+                }
             }
         })?;
         state.listener = Some(Listening {
@@ -353,6 +394,7 @@ impl ReleaserState {
             identifier,
             worker,
             enrolled: Arc::new(AtomicBool::new(true)),
+            ledger,
             authorization: None,
         });
         Ok(status(&state))
@@ -383,6 +425,7 @@ fn status(state: &Lifecycle) -> ReleaserStatus {
         }),
         enrolled: listening(state)
             .is_some_and(|listener| listener.enrolled.load(Ordering::Acquire)),
+        ledger: listening(state).and_then(|listener| *listener.ledger.lock().ok()?),
     }
 }
 
