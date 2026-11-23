@@ -53,11 +53,26 @@ A bootstrap, validator or miner may explicitly select an existing checkpoint
 key; the host separately validates that key against the verified local roster.
 
 Each configured peer specifies an endpoint, a `dial` boolean, a fingerprint and
-a descriptor matching an independently persisted service pin. Duplicate
+a descriptor matching an independently persisted identity pin. Duplicate
 identities, endpoints, self-connections and unpinned targets are rejected.
+An optional per-peer `checkpoint_reference` boolean defaults to `true` for
+version 2 compatibility. All independently pinned configured identities may
+establish optional header and body lanes while their ordinary connection is
+active. Only peers selected as checkpoint references contribute to checkpoint
+readiness; a lane alone grants no reference or signing authority. To pin an
+outbound-only miner on a service node, set `dial: false` and
+`checkpoint_reference: false`. Its endpoint remains a required unique, valid
+configuration value; this selection creates no listener or reverse connection.
+Identity descriptors contain no mining or validation role. Configuration
+generators must explicitly exclude known miner identities from checkpoint
+references rather than infer a role from descriptor bytes.
 An optional top-level `legacy_checkpoint_peers` array defaults to empty. Each
-fingerprint must match an independently persisted pin for the current genesis.
-The selection creates no outbound destination or checkpoint-readiness reference.
+entry is an administrator-selected fingerprint; the array is limited to 16
+distinct, nonlocal identities. This advertisement selection does not require or
+create a peer pin, an outbound destination or a checkpoint-readiness reference.
+It grants no admission or signing authority. Before it can affect a connection,
+the peer must complete the existing hybrid handshake with a descriptor bound to
+the current genesis; selection then compares the authenticated peer fingerprint.
 It restricts checkpoint advertisements to each authenticated selected peer
 to statements accepted by the earlier 72-block publisher rule, including its
 24-block confirmation calculation. This filters proposals, votes and
@@ -72,12 +87,43 @@ Ordinary miners may connect to service nodes without manual registration. They
 still complete the encrypted hybrid handshake and all consensus verification.
 Services do not admit an unknown validator through the open miner route.
 
+The resident shares a finite 1 GiB logical byte budget between proof queues,
+network ownership, retained exports and checkpoint preparation. A new preparation
+may overlap a retained certified generation and bootstrap offers. All live
+reservations remain charged during this overlap, and admission still rejects
+requests that exceed the shared maximum. This limit is separate from process
+memory accounting; larger archives can still exceed the available workspace.
+Checkpoint reconstruction pins an immutable read transaction, authenticates the
+captured raw input and streams one suffix body through native validation at a
+time. Its reservation includes the base archive, accumulated public records and
+the largest encoded suffix body. Proof bodies are released between blocks;
+streaming does not raise the shared limit or replace native verification.
+
 At most eight connection workers share the node's byte-admission budget.
 Listening service pairs select one deterministic dialer. Failed connections use
-bounded backoff. A live connection alone does not establish readiness: a fresh
+backoff of 2, 4, 8, 16, 32 and then 60 seconds; a stable session resets the
+next delay to one second. Worker exit diagnostics retain bounded static reason
+codes without peer endpoints. A deferred body authorization ends that pull turn
+without repeatedly querying the same header or consuming the peer's request
+limit. A live connection alone does not establish readiness: a fresh
 completed bidirectional round must also show that the selected peer's available
 extension was exhausted. An exact full batch requires another round. Readiness
 expires after 30 seconds without a completed round and is revoked on disconnect.
+
+An optional body download has one fixed 180-second budget covering its request,
+initial response and all body chunks. The header cache retains an active
+download until that budget expires, even after its ordinary 30-second retention
+period. Expiry cancels the transfer; its slot and byte reservations remain owned
+until the download and its consumers release them. Cache eviction, rejection and
+shutdown still cancel work. The cache remains limited to 128 headers, four
+downloads globally, two simultaneous peers per body and four source attempts
+per exact account. A failed attempt does not reset that peer limit or
+retain partial body chunks for a replacement connection. Only authenticated
+peers that advertised the exact header may supply its optional body. Expired
+authorization pins are released so the bounded resident retry policy can reopen
+the exact account; aggregate request and wire limits remain charged. New
+discovery tickets cannot replace pending tickets from an earlier account, and
+candidate retention limits remain unchanged.
 
 ## Checkpoint signing readiness
 
@@ -219,7 +265,7 @@ The producer uses four proving workers. Native proving and bounded nonce-search
 slices run outside the consensus owner's mutex. A changed parent invalidates a
 prepared block. Every produced block returns through the same native verifier,
 execution-commitment comparison and durable admission path as a peer block.
-A production error is exported while validation and serving remain active.
+A production error is exported while validation and serving remain active. Returned production failures keep `error_code: native_production_failed` and add bounded `production_failure_stage` and `production_failure_code` fields. These fields identify the actual budget, initialization, control, padding, preparation, proof, work, commit, reward or status failure site using fixed labels; underlying error strings, paths and credentials are not exported. Both fields are null before a returned failure, and an unannotated returned error is explicitly `unknown` / `unknown_production_failure`. The first failure stays latched until cancellation; production is not retried, including worker-pool or prover initialization failures. Panics are not caught or classified by this returned-error interface.
 
 Status uses `connections`, `ready`, `sync_status`, the current committed head,
 a run identifier and freshness fields. A disconnected or stale session cannot

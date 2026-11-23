@@ -203,10 +203,11 @@ pub fn replay_blocks(
     Ok((state, report))
 }
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
+#[path = "audit/tests.rs"]
 pub(crate) mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 mod streaming_tests {
     use super::*;
     use crate::fixtures::{TestVerifier, candidate};

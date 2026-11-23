@@ -93,6 +93,19 @@ mod unix {
             Ok(())
         }
 
+        #[cfg(feature = "eng2-rehearsal")]
+        pub fn write_rehearsal_binding(&self, bytes: &[u8]) -> Result<(), String> {
+            if bytes.is_empty() || bytes.len() > 8192 {
+                return Err("isolated wallet public binding exceeds bound".into());
+            }
+            self.write_private("rehearsal.json", bytes, false, || Ok(()))
+        }
+
+        #[cfg(feature = "eng2-rehearsal")]
+        pub fn read_rehearsal_binding(&self) -> Result<Vec<u8>, String> {
+            self.read_private("rehearsal.json", 8192)
+        }
+
         pub fn read_vault(&self) -> Result<Vec<u8>, String> {
             let encoded = self.read_private(VAULT_FILENAME, VAULT_LEN)?;
             if encoded.len() != VAULT_LEN {
@@ -363,6 +376,19 @@ mod windows {
             }
             Ok(())
         }
+        #[cfg(feature = "eng2-rehearsal")]
+        pub fn write_rehearsal_binding(&self, bytes: &[u8]) -> Result<(), String> {
+            if bytes.is_empty() || bytes.len() > 8192 {
+                return Err("isolated wallet public binding exceeds bound".into());
+            }
+            self.write_private("rehearsal.json", bytes, false, || Ok(()))
+        }
+
+        #[cfg(feature = "eng2-rehearsal")]
+        pub fn read_rehearsal_binding(&self) -> Result<Vec<u8>, String> {
+            self.read_private("rehearsal.json", 8192)
+        }
+
         pub fn read_vault(&self) -> Result<Vec<u8>, String> {
             self.check_owner()?;
             let bytes = self.directory.read(VAULT_FILENAME, VAULT_LEN)?;

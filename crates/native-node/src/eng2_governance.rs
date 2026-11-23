@@ -22,6 +22,9 @@ pub const SIGNATURE_CONTEXT: &[u8] = b"siworld eng2 governance v1";
 pub type PublicKey = [u8; PUBLIC_KEY_BYTES];
 pub type AddressBytes = [u8; ADDRESS_BYTES];
 mod codec;
+mod windowed;
+pub(crate) use windowed::MIN_VALIDITY_BLOCKS as WINDOWED_MIN_VALIDITY_BLOCKS;
+pub use windowed::WindowedSignedAction;
 
 fn require(value: bool, message: &str) -> Result<(), String> {
     if value { Ok(()) } else { Err(message.into()) }
@@ -385,6 +388,18 @@ impl GovernanceState {
         Ok(())
     }
     fn authenticate(&self, signed: &SignedAction) -> Result<(), String> {
+        self.authenticate_message(
+            signed,
+            |role| signed.action.signing_bytes(role),
+            SIGNATURE_CONTEXT,
+        )
+    }
+    fn authenticate_message(
+        &self,
+        signed: &SignedAction,
+        message: impl Fn(SignerRole) -> Result<Vec<u8>, String>,
+        context: &[u8],
+    ) -> Result<(), String> {
         let action = &signed.action;
         require(
             action.network == self.network && action.sequence > self.sequence,
@@ -422,8 +437,8 @@ impl GovernanceState {
             };
             ml_dsa_65::verify(
                 &MLDSA65VerificationKey::new(key),
-                &action.signing_bytes(auth.role)?,
-                SIGNATURE_CONTEXT,
+                &message(auth.role)?,
+                context,
                 &MLDSA65Signature::new(auth.signature),
             )
             .map_err(|_| "governance ML-DSA-65 signature invalid")?;
@@ -432,7 +447,18 @@ impl GovernanceState {
     }
     fn include(&mut self, height: u64, signed: &SignedAction) -> Result<Inclusion, String> {
         self.authenticate(signed)?;
-        let action = &signed.action;
+        let digest = blake3::derive_key(
+            "siworld eng2 governance action v1",
+            &signed.action.unsigned_bytes()?,
+        );
+        self.include_authenticated(height, &signed.action, digest)
+    }
+    fn include_authenticated(
+        &mut self,
+        height: u64,
+        action: &Action,
+        action_digest: Hash,
+    ) -> Result<Inclusion, String> {
         let (kind, delay) = match &action.kind {
             ActionKind::ProposeIssuanceFee { amount_atoms } => {
                 self.issuance_fee_parameters.check_amount(*amount_atoms)?;
@@ -594,10 +620,7 @@ impl GovernanceState {
                 ActionKind::ProposeIssuanceFee { amount_atoms } => Some(amount_atoms),
                 _ => None,
             },
-            action_digest: blake3::derive_key(
-                "siworld eng2 governance action v1",
-                &action.unsigned_bytes()?,
-            ),
+            action_digest,
         })
     }
     fn check_target(&self, target: DestinationTarget) -> Result<(), String> {

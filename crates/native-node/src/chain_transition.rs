@@ -11,6 +11,55 @@ use crate::{
 pub use shared::ChainPreview;
 pub(crate) use shared::{Actions, ChainDelta, CheckedActions, Context, PreparedActions};
 
+#[cfg(feature = "eng2-runtime")]
+impl crate::proofs::NativeVerifier {
+    /// Keep the original four-decoder bound and canonical error ordering.
+    pub(crate) fn transactions_diagnosed(
+        &self,
+        proofs: &[&crate::state::TransactionProof<'_>],
+    ) -> Result<(), crate::eng2::accept_observation::Failure> {
+        for batch in proofs.chunks(4) {
+            let results = crate::verification_executor::map(batch, &|proof| {
+                self.verify_transaction_diagnosed(
+                    &proof.public,
+                    &proof.context,
+                    &proof.fee,
+                    &proof.root,
+                    proof.proof,
+                )
+            });
+            for result in results {
+                result?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+impl<'a> PreparedActions<'a> {
+    pub(crate) fn verify_native_diagnosed_with_receipts(
+        self,
+        verifier: &crate::proofs::NativeVerifier,
+        receipts: Option<&crate::eng2::native_pipeline::CandidateReceipts>,
+    ) -> Result<CheckedActions<'a>, crate::eng2::accept_observation::Failure> {
+        let pending: Vec<_> = self
+            .transaction_proofs
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, proof)| {
+                !receipts.is_some_and(|value| value.matches(*ordinal, proof))
+            })
+            .map(|(_, proof)| proof)
+            .collect();
+        verifier.transactions_diagnosed(&pending)?;
+        for issuance in self.actions.issuances {
+            verifier.verify_issuance_diagnosed(issuance)?;
+        }
+        Ok(CheckedActions { prepared: self })
+    }
+}
+
 impl ChainPreview<'_> {
     pub fn versioned_execution(
         &self,

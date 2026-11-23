@@ -294,6 +294,9 @@ fn operation_deadline_covers_header_and_body_without_resetting() {
     };
     let mut session = Session::from_test_channel(channel, binding(), Budget::default());
     let deadline = Deadline {
+        body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -314,6 +317,9 @@ fn expired_deadlines_fail_before_touching_the_channel() {
         Budget::default(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -359,6 +365,9 @@ fn reused_exchange_deadline_does_not_reset_between_missing_proof_frames() {
         Budget::default(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
         cancellation: Cancellation::default(),
@@ -404,6 +413,9 @@ fn paired_request_header_can_arrive_after_the_ordinary_control_deadline() {
         budget.clone(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: Duration::from_secs(180),
         cancellation: Cancellation::default(),
@@ -454,6 +466,9 @@ fn paired_request_header_deadline_is_absolute_under_fragmentation() {
         budget.clone(),
     );
     let deadline = Deadline {
+        body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        forwarding: None,
         started: Instant::now(),
         limit: Duration::from_secs(180),
         cancellation: Cancellation::default(),
@@ -783,4 +798,383 @@ fn reserved_block_send_rejects_foreign_or_small_guards_before_output() {
         Err(Error::ResourceExhausted)
     );
     assert!(sender.channel.into_inner().is_empty());
+}
+
+mod wire_fence {
+    use super::super::*;
+    use std::io::{self, Cursor, Read, Write};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+    struct Fence {
+        maximum: u64,
+        actual: AtomicU64,
+    }
+    impl WireFence for Fence {
+        fn check_wire(&self, bytes: u64) -> io::Result<()> {
+            if self
+                .actual
+                .load(Ordering::SeqCst)
+                .checked_add(bytes)
+                .is_none_or(|n| n > self.maximum)
+            {
+                Err(io::Error::other("wire ceiling"))
+            } else {
+                Ok(())
+            }
+        }
+        fn account_wire(&self, bytes: u64) -> io::Result<()> {
+            self.actual.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Channel {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        fail_write_after: Option<usize>,
+    }
+    impl Read for Channel {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for Channel {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let n = match self.fail_write_after {
+                Some(maximum) => {
+                    let remaining = maximum.saturating_sub(self.output.len());
+                    if remaining == 0 {
+                        return Err(io::Error::other("interrupted source"));
+                    }
+                    bytes.len().min(remaining)
+                }
+                None => bytes.len(),
+            };
+            self.output.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    fn fixture(
+        input: Vec<u8>,
+        fail_write_after: Option<usize>,
+        maximum: u64,
+    ) -> (Session<Channel>, Arc<Fence>, Budget) {
+        let budget = Budget::new(1024 * 1024);
+        let binding = Binding {
+            network: [1; 32],
+            genesis: [2; 32],
+            verifier: [3; 32],
+        };
+        let mut session = Session::from_test_channel(
+            Channel {
+                input: Cursor::new(input),
+                output: Vec::new(),
+                fail_write_after,
+            },
+            binding,
+            budget.clone(),
+        );
+        let fence = Arc::new(Fence {
+            maximum,
+            actual: AtomicU64::new(0),
+        });
+        session.set_wire_fence(Some(fence.clone())).unwrap();
+        (session, fence, budget)
+    }
+    fn frame() -> Vec<u8> {
+        let mut frame = frame_header(ENG2_MESSAGE, 7, &[1; 32], 20)
+            .unwrap()
+            .to_vec();
+        frame.extend_from_slice(&[5; 20]);
+        frame
+    }
+    #[test]
+    fn overrun_refused_before_write_or_received_payload_allocation() {
+        let (mut sender, fence, budget) = fixture(vec![], None, (HEADER_BYTES + 19) as u64);
+        let before = budget.available().unwrap();
+        assert!(sender.send_control(ENG2_MESSAGE, 7, &[5; 20]).is_err());
+        assert!(sender.test_channel().output.is_empty());
+        assert_eq!(fence.actual.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.available().unwrap(), before);
+        let (mut receiver, fence, budget) = fixture(frame(), None, HEADER_BYTES as u64);
+        let before = budget.available().unwrap();
+        assert!(receiver.receive().is_err());
+        assert_eq!(
+            receiver.test_channel().input.position(),
+            HEADER_BYTES as u64
+        );
+        assert_eq!(fence.actual.load(Ordering::SeqCst), HEADER_BYTES as u64);
+        assert_eq!(receiver.io_totals().received, HEADER_BYTES as u64);
+        assert_eq!(budget.available().unwrap(), before);
+    }
+    #[test]
+    fn partial_failed_frames_preserve_exact_actual_bytes_and_release_buffers() {
+        let partial = HEADER_BYTES + 10;
+        let (mut sender, fence, budget) = fixture(vec![], Some(partial), 1024);
+        let before = budget.available().unwrap();
+        assert!(sender.send_control(ENG2_MESSAGE, 7, &[5; 20]).is_err());
+        assert_eq!(sender.io_totals().sent, partial as u64);
+        assert_eq!(fence.actual.load(Ordering::SeqCst), partial as u64);
+        assert_eq!(budget.available().unwrap(), before);
+        let mut input = frame();
+        input.truncate(partial);
+        let (mut receiver, fence, budget) = fixture(input, None, 1024);
+        let before = budget.available().unwrap();
+        assert!(receiver.receive().is_err());
+        assert_eq!(receiver.io_totals().received, partial as u64);
+        assert_eq!(fence.actual.load(Ordering::SeqCst), partial as u64);
+        assert_eq!(budget.available().unwrap(), before);
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+mod shared_body_wire {
+    use super::*;
+    use std::sync::{
+        Barrier,
+        atomic::{AtomicU64, Ordering},
+    };
+    struct Meter {
+        bytes: AtomicU64,
+    }
+    impl WireFence for Meter {
+        fn check_wire(&self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn account_wire(&self, n: u64) -> io::Result<()> {
+            self.bytes.fetch_add(n, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    struct Sockets {
+        barrier: Arc<Barrier>,
+        actual: Arc<AtomicU64>,
+    }
+    impl Read for Sockets {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+    impl Write for Sockets {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.actual.fetch_add(b.len() as u64, Ordering::SeqCst);
+            if b.len() == HEADER_BYTES {
+                self.barrier.wait();
+            }
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn concurrent_streams_reserve_before_io_and_keep_the_outer_relay_fence() {
+        let budget = Budget::new(1024 * 1024);
+        let binding = Binding {
+            network: [1; 32],
+            genesis: [2; 32],
+            verifier: [3; 32],
+        };
+        let scope = budget
+            .resident_body_scope(1, Instant::now() + Duration::from_secs(3600))
+            .unwrap();
+        let maximum = (2 * HEADER_BYTES + 128) as u64;
+        budget.restrict_body_wire_limit(&scope, maximum).unwrap();
+        let auth = budget
+            .authorize_body(
+                &scope,
+                binding,
+                1,
+                [4; 32],
+                &Deadline::new(Duration::from_secs(180)),
+            )
+            .unwrap();
+        let claim = Arc::new(
+            budget
+                .claim_body_authorized(&auth, [7; 32], BodyMode::Pieces)
+                .unwrap(),
+        );
+        let barrier = Arc::new(Barrier::new(2));
+        let actual = Arc::new(AtomicU64::new(0));
+        let meter = Arc::new(Meter {
+            bytes: AtomicU64::new(0),
+        });
+        let mut threads = vec![];
+        for _ in 0..2 {
+            let (b, c, barrier, actual, meter) = (
+                budget.clone(),
+                claim.clone(),
+                barrier.clone(),
+                actual.clone(),
+                meter.clone(),
+            );
+            threads.push(std::thread::spawn(move || {
+                let mut s = Session::from_test_channel(Sockets { barrier, actual }, binding, b);
+                s.set_wire_fence(Some(meter.clone())).unwrap();
+                assert!(s.set_wire_fence(Some(meter)).is_err());
+                s.set_body_accounting(Some(&c)).unwrap();
+                s.send_control_before(
+                    ENG2_MESSAGE,
+                    1,
+                    &[0; 128],
+                    &Deadline::new(Duration::from_secs(2)),
+                )
+            }));
+        }
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(actual.load(Ordering::SeqCst), maximum);
+        assert_eq!(meter.bytes.load(Ordering::SeqCst), maximum);
+        assert_eq!(budget.body_wire_usage(), (maximum, 0, maximum));
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+mod post_io_accounting {
+    use super::*;
+
+    struct RejectingMeter {
+        actual: AtomicU64,
+    }
+    impl WireFence for RejectingMeter {
+        fn check_wire(&self, _: u64) -> io::Result<()> {
+            Ok(())
+        }
+        fn account_wire(&self, bytes: u64) -> io::Result<()> {
+            self.actual.fetch_add(bytes, Ordering::SeqCst);
+            Err(io::Error::other("synthetic post-I/O rejection"))
+        }
+    }
+    fn claim() -> (Budget, BodyClaim) {
+        let budget = Budget::new(1024 * 1024);
+        let scope = budget
+            .resident_body_scope(1, Instant::now() + Duration::from_secs(3600))
+            .unwrap();
+        let authorization = budget
+            .authorize_body(
+                &scope,
+                binding(),
+                1,
+                [4; 32],
+                &Deadline::new(Duration::from_secs(180)),
+            )
+            .unwrap();
+        let claim = budget
+            .claim_body_authorized(&authorization, [7; 32], BodyMode::Legacy)
+            .unwrap();
+        claim.begin_query([7; 32]).unwrap();
+        (budget, claim)
+    }
+    fn check(read: bool, overflow: bool) {
+        let (budget, claim) = claim();
+        let meter = RejectingMeter {
+            actual: AtomicU64::new(0),
+        };
+        let mut channel = Cursor::new(vec![5; 4]);
+        let initial = if overflow { u64::MAX - 1 } else { 0 };
+        let mut totals = IoTotals {
+            sent: if read { 0 } else { initial },
+            received: if read { initial } else { 0 },
+        };
+        let error = {
+            let mut io = Timed {
+                fence: Some(&meter),
+                body_wire: Some(claim.wire.as_ref()),
+                channel: &mut channel,
+                deadline: Deadline::new(Duration::from_secs(2)),
+                totals: Some(&mut totals),
+            };
+            if read {
+                io.read(&mut [0; 4]).unwrap_err()
+            } else {
+                io.write(&[6; 4]).unwrap_err()
+            }
+        };
+        assert_eq!(channel.position(), 4);
+        assert_eq!(meter.actual.load(Ordering::SeqCst), 4);
+        assert_eq!(budget.body_wire_usage().0, 4);
+        assert_eq!(budget.body_wire_usage().1, 0);
+        let counted = if read { totals.received } else { totals.sent };
+        if overflow {
+            assert_eq!(counted, initial);
+            assert_eq!(error.to_string(), "application byte counter exhausted");
+        } else {
+            assert_eq!(counted, 4);
+            assert_eq!(error.to_string(), "synthetic post-I/O rejection");
+        }
+        assert_eq!(if read { totals.sent } else { totals.received }, 0);
+    }
+    #[test]
+    fn successful_read_is_counted_when_outer_accounting_rejects() {
+        check(true, false);
+    }
+    #[test]
+    fn successful_write_is_counted_when_outer_accounting_rejects() {
+        check(false, false);
+    }
+    #[test]
+    fn read_counter_overflow_still_settles_shared_and_outer_accounts() {
+        check(true, true);
+    }
+    #[test]
+    fn write_counter_overflow_still_settles_shared_and_outer_accounts() {
+        check(false, true);
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn admitted_forwarding_retains_cutoff_and_hard_revocation() {
+    use std::sync::atomic::AtomicBool;
+
+    for revoked in 0..4 {
+        let clock = Arc::new(AtomicU64::new(0));
+        let mut local = Deadline::test_clock(Duration::from_secs(5), clock.clone());
+        let claim = Arc::new(AtomicBool::new(false));
+        local.body_cancellation = Some(claim.clone());
+        let shutdown = Cancellation::default();
+        let transfer = Cancellation::default();
+        let header = Cancellation::default();
+        let context = Cancellation::default();
+        let candidate = ForwardingCandidate::new(header.clone(), context.clone());
+        let forwarding = local.clone().for_candidate_forwarding(
+            shutdown.clone(),
+            transfer.clone(),
+            candidate.clone(),
+        );
+        assert_eq!(forwarding.expires_at(), local.expires_at());
+        assert!(forwarding.check().is_ok());
+        claim.store(true, Ordering::Release);
+        assert!(forwarding.check().is_err());
+        candidate.authenticated();
+        assert!(forwarding.check().is_err());
+        candidate.accepted();
+        candidate.abandon_unless_accepted();
+        assert!(local.check().is_err() && forwarding.check().is_ok());
+        let capped = forwarding
+            .clone()
+            .capped_at(forwarding.expires_at() - Duration::from_secs(1));
+        clock.store(4000, Ordering::Relaxed);
+        assert!(capped.check().is_err() && forwarding.check().is_ok());
+        clock.store(5000, Ordering::Relaxed);
+        assert!(forwarding.check().is_err());
+        clock.store(0, Ordering::Relaxed);
+        [shutdown, transfer, header, context][revoked].cancel();
+        assert!(forwarding.check().is_err());
+    }
+
+    let abandoned = ForwardingCandidate::default();
+    abandoned.abandon_unless_accepted();
+    abandoned.authenticated();
+    abandoned.accepted();
+    assert!(
+        Deadline::new(Duration::from_secs(5))
+            .for_candidate_forwarding(Cancellation::default(), Cancellation::default(), abandoned)
+            .check()
+            .is_err()
+    );
 }

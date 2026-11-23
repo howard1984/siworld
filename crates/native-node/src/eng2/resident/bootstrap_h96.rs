@@ -599,7 +599,7 @@ fn qualification() -> Result<(), String> {
         .engine()
         .state()
         .canonical_components(binding, limits().chain)?;
-    let mut driver = Driver::new(store, NativeVerifier::new()?, limits())?;
+    let mut driver = Driver::new(store, NativeVerifier::for_genesis(&genesis)?, limits())?;
     for _ in 0..72 {
         driver.refresh_bootstrap(Some(&certified), &budget)?;
     }
@@ -732,7 +732,7 @@ fn qualification() -> Result<(), String> {
         .map_err(|_| "fixture catchup hybrid authentication failed")?;
     let imported_owner = Arc::new(Mutex::new(Driver::new(
         imported,
-        NativeVerifier::new()?,
+        NativeVerifier::for_genesis(&genesis)?,
         limits(),
     )?));
     let round = network::initiate(

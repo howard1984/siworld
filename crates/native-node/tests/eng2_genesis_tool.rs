@@ -334,3 +334,37 @@ fn public_genesis_cli_requires_each_independent_expected_value() {
         assert_eq!(response["error"], "missing_expected_value");
     }
 }
+
+#[test]
+fn pow_genesis_changes_slots_and_preserves_checkpoint_configuration() {
+    use siworld_native_node::wire::{PUBLIC_GENESIS_MAGIC, SlotRule};
+
+    let directory = Directory::new();
+    let (config, governance, expected) = parameters();
+    let (c, g) = write_parameters(&directory, &config, &governance);
+    let new = directory.file("pow.bin");
+    let legacy =
+        genesis_tool::seal_public(&c, &g, &directory.file("legacy.bin"), expected).unwrap();
+    let result =
+        genesis_tool::seal_public_profile(&c, &g, &new, expected, SlotRule::PublicGenesis).unwrap();
+    let bytes = fs::read(&new).unwrap();
+    assert_eq!(&bytes[..8], PUBLIC_GENESIS_MAGIC);
+    assert_eq!(
+        Genesis::decode(&bytes).unwrap().slot_rule(),
+        SlotRule::PublicGenesis
+    );
+    let mut unsupported = bytes.clone();
+    unsupported[..8].copy_from_slice(b"SWE2GEN3");
+    assert!(Genesis::decode(&unsupported).is_err());
+    assert_eq!(result["parameters"]["minimum_transaction_slots"], 16);
+    assert_eq!(result["parameters"]["target_interval_seconds"], "300");
+    assert_eq!(
+        result["parameters"]["checkpoint_slots"],
+        legacy["parameters"]["checkpoint_slots"]
+    );
+    assert_ne!(result["rules_commitment"], legacy["rules_commitment"]);
+    assert_ne!(result["genesis_id"], legacy["genesis_id"]);
+    let mut inspected = genesis_tool::inspect(&new, expected).unwrap();
+    inspected["output_created"] = true.into();
+    assert_eq!(inspected, result);
+}

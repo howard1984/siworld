@@ -7,9 +7,13 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>SIP Wallet · SIP Vault — siworld</title>
 <link rel="stylesheet" href="assets/native-wallet.css">
-<script type="module" src="assets/native-wallet.js"></script>
 </head>
 <body>
+<dialog id="wallet-startup" class="wallet-startup-dialog" aria-label="Local encryption core" aria-describedby="wallet-startup-message" aria-busy="true" tabindex="-1" open>
+<p id="wallet-startup-message" role="status" aria-live="polite">Loading local encryption core… Please wait.</p>
+<progress id="wallet-startup-progress" aria-label="Loading local encryption core"></progress>
+<button id="wallet-startup-reload" type="button" hidden>Reload wallet</button>
+</dialog>
 <a class="skip" href="#main">Skip to wallet</a>
 <header><a href="wallet.html" class="brand">siworld</a><span class="edition">SIP Wallet / SIP Vault</span><span class="network-badge"><i></i> siworld-eng-1 · Engineering network</span><button id="lock" type="button" disabled>Lock this session ↗</button></header>
 <div class="workbench">
@@ -62,4 +66,6 @@
 <div id="vault-reveal" hidden><label for="vault-open-title">Title</label><input id="vault-open-title" readonly><label for="vault-open-secret">Secret content</label><textarea id="vault-open-secret" rows="6" readonly spellcheck="false"></textarea><p class="help">This view closes after 60 seconds or when the page leaves the foreground.</p></div><div data-vault-illustration="saved" aria-hidden="true" hidden></div><button id="vault-download" type="button" hidden>Download encrypted backup ↓</button><p id="vault-error" role="alert"></p><button id="vault-next" class="primary" type="submit">Encrypt and save ↗</button></form></dialog>
 <dialog id="send-flow" aria-labelledby="send-title"><form id="send-form" autocomplete="off"><button id="send-close" class="close" type="button" aria-label="Close payment">×</button><p class="eyebrow">SIWORLD-ENG-1 · SIP</p><h2 id="send-title">Send from this device.</h2><p id="send-source" class="help"></p><p>Balances trust full-node transaction consensus. Phone sending remains disabled until physical-device measurements pass.</p><label for="send-recipient">Recipient short or full V1 address</label><textarea id="send-recipient" maxlength="2200" rows="3" required spellcheck="false"></textarea><label for="send-amount">Amount in SIP</label><input id="send-amount" inputmode="decimal" maxlength="22" required><label><input id="send-priority" type="checkbox"> Priority fee (4 × standard)</label><button id="send-prepare" class="primary" type="submit">Prepare and prove locally ↗</button><section id="send-progress" class="proof-progress" aria-labelledby="send-progress-label" hidden><p id="send-progress-label" role="status" aria-live="polite"></p><progress id="send-progress-bar" max="1" aria-labelledby="send-progress-label"></progress><p id="send-progress-detail" class="help"></p></section><div id="send-ready" hidden><p id="send-review"></p><p>The admission node can see the fee opening and associate submission with your IP and timing. A network timeout does not cancel a payment.</p><label><input id="send-disclosure" type="checkbox"> I reviewed this payment and the submission disclosure.</label></div><button id="send-transmit" class="primary" type="button" hidden>Transmit this exact payment ↗</button><p id="send-error" role="status"></p></form></dialog>
 <dialog id="wallet-name-dialog" aria-labelledby="wallet-name-title"><form id="wallet-name-form" autocomplete="off"><h2 id="wallet-name-title">Wallet name</h2><p>Only saved in encrypted browser storage. Never uploaded to a server.</p><label for="wallet-name">Name</label><input id="wallet-name" maxlength="96" required autocomplete="off"><p id="wallet-name-error" role="alert"></p><div class="actions"><button id="wallet-name-cancel" type="button">Cancel</button><button id="wallet-name-save" type="submit">Save name</button></div></form></dialog>
+<script src="assets/wallet-startup.js"></script>
+<script type="module" src="assets/native-wallet.js"></script>
 </body></html>

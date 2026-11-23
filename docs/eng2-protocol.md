@@ -214,3 +214,68 @@ Record the actual offline interval, catchup duration, downloaded bytes, disk
 occupancy and result. Do not substitute a changed clock or another network's
 recovery result. The ordinary eight-core catchup target of 30 minutes requires a
 source-bound machine measurement; unit tests do not establish it.
+
+
+## Exact competing-block exchange primitives
+
+The [canonical reorganization design](eng2-reorganization.md) defines the
+separate savepoint, execution and activity-gate requirements for adoption.
+
+The engineering transport defines an optional exact header request (opcode
+`0x0f`) containing a nonzero height and a 32-byte block ID. The response must
+match the request number, network, height and computed header ID. An exact
+missing response (`0x10`) repeats both height and ID; a height-only missing
+response cannot complete this request. The existing body request already binds
+height and ID, and body chunks retain the existing authenticated framing,
+commitment checks and allocation reservations.
+
+The network owner may expose an independent raw-branch header, persisted body
+length and complete raw body. Canonical lookup has priority only when its ID
+matches the request. Raw body size is read and node-wide memory is reserved
+before extracting or decoding the body. Exact header requests consume the same
+bounded round request allowance as other ordinary requests. These interfaces
+do not qualify proof-of-work, execute native proofs, update the canonical head,
+or initiate a reorganization.
+
+A live session confirms extension support with the existing `GET_HEADER(0)`
+request before any exact-header opcode is sent. A legacy peer responds with
+`UNAVAILABLE(0)` and remains usable for ordinary canonical exchange. An enabled
+peer responds with opcode `0x11`, capability version `1`, and an exact-exchange
+flag. The response is bound to the request number and has strict length,
+version, and flag checks. Confirmation is cached only in that live session;
+reconnection requires another probe. The handshake alone does not establish
+support.
+
+When the driver enables branch discovery, an unknown equal-height or lower-height
+remote head, or a mismatching parent during forward synchronization, starts a
+bounded exact-ancestor walk. One node-owned ledger retains candidates, expiry,
+authenticated peer identities, attempts, header storage and body-byte accounting
+across rounds and connections. Duplicate advertisements do not extend candidate
+lifetimes. Only expiry of the fixed node-wide window resets accounting. A
+linear request ticket reserves an object attempt before capability probing, so
+negative probes and reconnects cannot replenish the allowance. At most one
+probe precedes an object attempt; wire requests are therefore bounded by twice
+the ledger object-request limit. Both probe and object count against the same
+round allowance. A round with only one wire slot left defers new capability
+probing before reserving an object attempt. A live-session scheduling hint for
+an unchanged local/remote tip pair lets the next round enter discovery directly,
+rather than spending that slot on the same mismatching canonical header. This
+hint neither qualifies a header nor resets the ledger.
+
+The discovery owner checks an ancestor against the canonical store, qualifies
+the complete header path and accumulated work, and retains each missing raw
+body separately from canonical state. Socket I/O occurs outside the owner lock.
+Transport memory remains reserved until body retention completes. Discovery
+readiness means that raw materials exist; it does not establish native proof
+validity or authorize adoption. Full execution and state-commitment checks
+remain part of the separate append-based switching path. The rollback depth
+limit does not impose the same length limit on a replacement branch.
+
+Ordinary committed blocks enter the independent archive through an indexed
+capability-checked insertion, without revalidating all historical headers.
+A process-local revision changes only when committed header eligibility
+changes, allowing the driver to reuse an unchanged bounded selection scan.
+The archive writes immediate transactions with quick-repair allocator snapshots;
+strict reopen rejects a request for full repair. Local component and disposable
+fixture tests do not establish deployment, distributed convergence, propagation
+latency, or the twelve-hour multi-miner acceptance result.

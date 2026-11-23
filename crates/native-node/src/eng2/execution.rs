@@ -17,6 +17,17 @@ use crate::{
     wire::{Hash, RewardRecord},
 };
 
+#[cfg(feature = "eng2-runtime")]
+fn precommit_failure(original: String) -> super::accept_observation::Failure {
+    use super::accept_observation::{CommitKnowledge, Failure, OtherClass, Phase};
+    Failure::other(
+        original,
+        OtherClass::CandidateValidation,
+        Phase::Execution,
+        CommitKnowledge::NotReached,
+    )
+}
+
 /// The fixed body slot is unused under `LegacyMiner`, is not appended to the
 /// commitment tree and cannot carry a payment or alternate fee destination.
 pub fn legacy_fee_output() -> RewardRecord {
@@ -111,12 +122,38 @@ impl Engine {
     }
     pub fn body_policy(&self) -> body::Policy {
         body::Policy {
+            slot_rule: self.genesis.slot_rule(),
             profile: crate::proofs::protocol_profile_fingerprint(),
             max_body_bytes: crate::wire::MAX_BLOCK_BYTES
                 + crate::wire::REWARD_RECORD_BYTES
                 + 4 * 1024 * 1024,
             max_settlement_proof_bytes: crate::wire::MAX_SETTLEMENT_PROOF,
         }
+    }
+    /// Prepare an isolated fee-first transition against the actual local parent.
+    /// This candidate has no native-verifier, work-verification or publication
+    /// method. It neither activates a fee mode nor replaces historical roots.
+    /// The returned inputs still borrow this Engine; detached runtime ownership
+    /// and registered V2 proof qualification remain separate requirements.
+    pub fn prepare_fee_candidate<'a>(
+        &'a self,
+        generation: u64,
+        header: &'a Header,
+        candidate: &'a super::fee_windowed_body::PreparedCandidateBody<'_>,
+    ) -> Result<PreparedFeeCandidate<'a>, String> {
+        let captured = self.capture_fee_candidate_context(generation, header, candidate)?;
+        let prepared = PreparedBlock::prepare_layout(
+            &self.state,
+            header,
+            &candidate.body().body,
+            self.binding(self.state.tip()),
+            HeaderUse::Template,
+            PreparationLayout::Windowed {
+                commitment: candidate.commitment(),
+                authorizations: &candidate.body().authorizations,
+            },
+        )?;
+        Ok(PreparedFeeCandidate { prepared, captured })
     }
     fn binding(&self, parent: Hash) -> Binding {
         Binding {
@@ -133,6 +170,9 @@ impl Engine {
         timestamp: u64,
         verifier: &NativeVerifier,
     ) -> Result<Header, String> {
+        if !verifier.authenticates(&self.genesis) {
+            return Err("native verifier differs from sealed salted genesis".into());
+        }
         let mut header = Header {
             network: self.state.network(),
             height: self
@@ -177,6 +217,9 @@ impl Engine {
         body: &body::Body,
         verifier: &NativeVerifier,
     ) -> Result<StagedBlock, String> {
+        if !verifier.authenticates(&self.genesis) {
+            return Err("native verifier differs from sealed salted genesis".into());
+        }
         if self.state.fee_mode() != self.genesis.fee_mode()
             || self.genesis.fee_mode() != FeeMode::LegacyMiner
         {
@@ -191,6 +234,38 @@ impl Engine {
         )?
         .verify_transactions(verifier)?
         .legacy_delta(verifier, self.limits)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn stage_diagnosed_with_receipts(
+        &self,
+        header: &Header,
+        body: &body::Body,
+        verifier: &NativeVerifier,
+        receipts: Option<&super::native_pipeline::CandidateReceipts>,
+    ) -> Result<StagedBlock, super::accept_observation::Failure> {
+        let receipts = receipts.filter(|value| value.matches_engine(self, header));
+        if !verifier.authenticates(&self.genesis) {
+            return Err(precommit_failure(
+                "native verifier differs from sealed salted genesis".into(),
+            ));
+        }
+        if self.state.fee_mode() != self.genesis.fee_mode()
+            || self.genesis.fee_mode() != FeeMode::LegacyMiner
+        {
+            return Err(precommit_failure(
+                "native engine fee mode differs from sealed genesis".into(),
+            ));
+        }
+        PreparedBlock::prepare(
+            &self.state,
+            header,
+            body,
+            self.binding(self.state.tip()),
+            self.body_policy(),
+        )
+        .map_err(precommit_failure)?
+        .verify_transactions_diagnosed_with_receipts(verifier, receipts)?
+        .legacy_delta_diagnosed(verifier, self.limits)
     }
     pub(super) fn publish(&mut self, staged: StagedBlock) -> Result<CommittedBlock, String> {
         let StagedBlock {
@@ -258,6 +333,28 @@ enum HeaderUse {
     Mined,
     Template,
 }
+#[derive(Clone, Copy)]
+enum PreparationLayout<'a> {
+    Legacy(body::Policy),
+    Windowed {
+        commitment: Hash,
+        authorizations: &'a super::windowed_authorization::WindowedAuthorizationBody,
+    },
+}
+impl PreparationLayout<'_> {
+    fn slot_rule(self) -> crate::wire::SlotRule {
+        match self {
+            Self::Legacy(policy) => policy.slot_rule,
+            Self::Windowed { .. } => crate::wire::SlotRule::Legacy,
+        }
+    }
+    fn commitment(self, body: &body::Body) -> Result<Hash, String> {
+        match self {
+            Self::Legacy(policy) => body.commitment(policy),
+            Self::Windowed { commitment, .. } => Ok(commitment),
+        }
+    }
+}
 use crate::eng2_settlement::{FeeSchedule, SettlementPolicy};
 use native::{codec::decode_digest, encryption::PaymentAddress, multi_asset::Digest};
 
@@ -289,6 +386,36 @@ pub struct PreparedBlock<'a> {
     actions: PreparedActions<'a>,
     ledgers: CandidateLedgers,
     header_use: HeaderUse,
+    slot_rule: crate::wire::SlotRule,
+}
+/// One isolated chain/ledger preparation using the complete fee-first body.
+/// Fields are private and there is no conversion to NativeTransactions or a
+/// staged block. The current parent fee mode and snapshot roots are preserved.
+pub struct PreparedFeeCandidate<'a> {
+    prepared: PreparedBlock<'a>,
+    captured: super::fee_child::owner::CapturedContext,
+}
+impl PreparedFeeCandidate<'_> {
+    pub fn parent(&self) -> &SnapshotState {
+        self.prepared.parent
+    }
+    pub fn header(&self) -> &Header {
+        self.prepared.header
+    }
+    pub fn ledgers(&self) -> VersionedLedgers<'_> {
+        self.prepared.ledgers.view()
+    }
+    /// A legacy parent cannot supply a confidential fee policy. Structural
+    /// preparation alone must not reinterpret its historical fee commitments.
+    pub fn settlement_policy(&self) -> Result<&SettlementPolicy, String> {
+        if self.prepared.parent.fee_mode() != FeeMode::ConfidentialDestination {
+            return Err("fee candidate parent does not select confidential fees".into());
+        }
+        Ok(&self.prepared.ledgers.settlement)
+    }
+    pub fn captured_context(&self) -> &super::fee_child::owner::CapturedContext {
+        &self.captured
+    }
 }
 /// Actual native transaction and issuance proofs passed for these exact inputs.
 /// This is not settlement verification, an executable delta or live admission.
@@ -300,6 +427,7 @@ pub struct NativeTransactions<'a> {
     actions: CheckedActions<'a>,
     ledgers: CandidateLedgers,
     header_use: HeaderUse,
+    slot_rule: crate::wire::SlotRule,
 }
 impl<'a> PreparedBlock<'a> {
     pub fn prepare(
@@ -319,8 +447,28 @@ impl<'a> PreparedBlock<'a> {
         policy: body::Policy,
         header_use: HeaderUse,
     ) -> Result<Self, String> {
+        Self::prepare_layout(
+            parent,
+            header,
+            body,
+            binding,
+            header_use,
+            PreparationLayout::Legacy(policy),
+        )
+    }
+    fn prepare_layout(
+        parent: &'a SnapshotState,
+        header: &'a Header,
+        body: &'a body::Body,
+        binding: Binding,
+        header_use: HeaderUse,
+        layout: PreparationLayout<'_>,
+    ) -> Result<Self, String> {
         parent.check_context()?;
-        if parent.fee_mode() == FeeMode::LegacyMiner && body.fee_output != legacy_fee_output() {
+        if matches!(layout, PreparationLayout::Legacy(_))
+            && parent.fee_mode() == FeeMode::LegacyMiner
+            && body.fee_output != legacy_fee_output()
+        {
             return Err("legacy fee output must be the unused all-zero sentinel".into());
         }
         if binding.genesis == [0; 32]
@@ -329,7 +477,7 @@ impl<'a> PreparedBlock<'a> {
             || header.network != parent.network()
             || body.network != header.network
             || body.height != header.height
-            || body.commitment(policy)? != header.body_commitment
+            || layout.commitment(body)? != header.body_commitment
         {
             return Err("isolated block binding or complete body commitment differs".into());
         }
@@ -354,7 +502,7 @@ impl<'a> PreparedBlock<'a> {
             frozen.active_fee_destination(),
             frozen.issuance_fee_atoms(),
         )?;
-        let actions = PreparedActions::prepare_with_issuance_policy(
+        let actions = PreparedActions::prepare_with_rules(
             &parent.chain,
             Context {
                 network: header.network,
@@ -369,12 +517,20 @@ impl<'a> PreparedBlock<'a> {
                 rewards: &body.rewards,
             },
             Some(&issuance_policy),
+            layout.slot_rule(),
         )?;
         // Both clones are bounded governance state. The frozen policy activates
         // only previously included operations; new actions cannot change this
         // block's settlement destination or fund recipients.
         let mut governance = parent.governance.clone();
-        let inclusions = governance.apply_block(header.height, &body.governance)?;
+        let inclusions = match layout {
+            PreparationLayout::Legacy(_) => {
+                governance.apply_block(header.height, &body.governance)?
+            }
+            PreparationLayout::Windowed { authorizations, .. } => {
+                governance.apply_windowed_block(header.height, &authorizations.governance)?
+            }
+        };
         let allocation = parent
             .chain
             .config
@@ -391,12 +547,36 @@ impl<'a> PreparedBlock<'a> {
             siworld_core::v1_economics::subsidy(header.height)
                 .map_err(|error| error.to_string())?,
         )?;
-        let mut outputs = Vec::with_capacity(body.fund_claims.len());
-        for claim in &body.fund_claims {
-            outputs.push(
-                AuthorizedFundClaim::verify(claim, &parent.chain.config, &frozen, header.height)?
-                    .debit(&mut fund)?,
-            );
+        let mut outputs = Vec::new();
+        match layout {
+            PreparationLayout::Legacy(_) => {
+                outputs.reserve(body.fund_claims.len());
+                for claim in &body.fund_claims {
+                    outputs.push(
+                        AuthorizedFundClaim::verify(
+                            claim,
+                            &parent.chain.config,
+                            &frozen,
+                            header.height,
+                        )?
+                        .debit(&mut fund)?,
+                    );
+                }
+            }
+            PreparationLayout::Windowed { authorizations, .. } => {
+                outputs.reserve(authorizations.fund_claims.len());
+                for claim in &authorizations.fund_claims {
+                    outputs.push(
+                        AuthorizedFundClaim::verify_windowed(
+                            claim,
+                            &parent.chain.config,
+                            &frozen,
+                            header.height,
+                        )?
+                        .debit(&mut fund)?,
+                    );
+                }
+            }
         }
         economics.verify_fund_entitlement(fund.total_entitlement())?;
         let previous_standard = siworld_core::v1_economics::fee_base(header.height)
@@ -414,6 +594,7 @@ impl<'a> PreparedBlock<'a> {
             body,
             binding,
             header_use,
+            slot_rule: layout.slot_rule(),
             actions,
             ledgers: CandidateLedgers {
                 economics,
@@ -453,6 +634,37 @@ impl<'a> PreparedBlock<'a> {
             body: self.body,
             binding: self.binding,
             header_use: self.header_use,
+            slot_rule: self.slot_rule,
+            actions,
+            ledgers: self.ledgers,
+        })
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn verify_transactions_diagnosed_with_receipts(
+        self,
+        verifier: &NativeVerifier,
+        receipts: Option<&super::native_pipeline::CandidateReceipts>,
+    ) -> Result<NativeTransactions<'a>, super::accept_observation::Failure> {
+        let mut actions = self
+            .actions
+            .verify_native_diagnosed_with_receipts(verifier, receipts)?;
+        for output in &self.ledgers.outputs {
+            if output.network() != self.header.network || output.height() != self.header.height {
+                return Err(precommit_failure(
+                    "debited isolated fund output context differs".into(),
+                ));
+            }
+            actions
+                .append_authorized_output(output.commitment())
+                .map_err(precommit_failure)?;
+        }
+        Ok(NativeTransactions {
+            parent: self.parent,
+            header: self.header,
+            body: self.body,
+            binding: self.binding,
+            header_use: self.header_use,
+            slot_rule: self.slot_rule,
             actions,
             ledgers: self.ledgers,
         })
@@ -501,14 +713,17 @@ impl NativeTransactions<'_> {
         }
         let mut fees = self.actions.fees().to_vec();
         fees.extend(
-            crate::state::tail_slots(
+            crate::state::tail_slots_for(
                 self.header.network,
                 self.header.height,
                 self.body.transactions.len(),
+                self.slot_rule,
             )?
             .iter()
             .map(|slot| slot.commitment),
         );
+        #[cfg(siworld_native_node)]
+        let verification_permit = crate::verification_executor::acquire();
         verifier.verify_settlement(
             &fees,
             &self.ledgers.settlement.plan,
@@ -517,6 +732,8 @@ impl NativeTransactions<'_> {
             self.actions.rewards(),
             &self.body.settlement_proof,
         )?;
+        #[cfg(siworld_native_node)]
+        drop(verification_permit);
         let identity = match self.header_use {
             HeaderUse::Mined => self
                 .header
@@ -535,6 +752,73 @@ impl NativeTransactions<'_> {
             && commitment != self.header.execution_commitment
         {
             return Err("native execution commitment differs from complete checked state".into());
+        }
+        Ok(StagedBlock {
+            network: self.header.network,
+            height: self.header.height,
+            id: identity,
+            delta,
+            ledgers: self.ledgers,
+            nullifiers,
+            commitment,
+        })
+    }
+    #[cfg(feature = "eng2-runtime")]
+    fn legacy_delta_diagnosed(
+        self,
+        verifier: &NativeVerifier,
+        limits: Limits,
+    ) -> Result<StagedBlock, super::accept_observation::Failure> {
+        if self.parent.fee_mode() != FeeMode::LegacyMiner
+            || self.body.fee_output != legacy_fee_output()
+        {
+            return Err(precommit_failure(
+                "legacy settlement is not selected by this genesis".into(),
+            ));
+        }
+        let mut fees = self.actions.fees().to_vec();
+        fees.extend(
+            crate::state::tail_slots_for(
+                self.header.network,
+                self.header.height,
+                self.body.transactions.len(),
+                self.slot_rule,
+            )
+            .map_err(precommit_failure)?
+            .iter()
+            .map(|slot| slot.commitment),
+        );
+        verifier.verify_settlement_diagnosed(
+            &fees,
+            &self.ledgers.settlement.plan,
+            self.header.network,
+            self.body.list_digest(),
+            self.actions.rewards(),
+            &self.body.settlement_proof,
+        )?;
+        let identity = match self.header_use {
+            HeaderUse::Mined => self
+                .header
+                .id()
+                .map_err(|_| precommit_failure("invalid native header identity".into()))?,
+            HeaderUse::Template => [0; 32],
+        };
+        let delta = self
+            .actions
+            .finish(identity, |height| FeeMode::LegacyMiner.base_fee(height))
+            .map_err(precommit_failure)?;
+        let (commitment, nullifiers) = delta
+            .preview(&self.parent.chain)
+            .map_err(precommit_failure)?
+            .versioned_execution(self.parent, self.ledgers.view(), self.binding, limits)
+            .map_err(precommit_failure)?
+            .into_parts();
+        if matches!(self.header_use, HeaderUse::Mined)
+            && commitment != self.header.execution_commitment
+        {
+            return Err(precommit_failure(
+                "native execution commitment differs from complete checked state".into(),
+            ));
         }
         Ok(StagedBlock {
             network: self.header.network,

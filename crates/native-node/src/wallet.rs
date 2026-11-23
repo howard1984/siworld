@@ -224,6 +224,36 @@ impl Wallet {
     pub fn receipts(&self) -> &[OwnedNote] {
         &self.receipts
     }
+    /// Predict this recipient's note identity from the original checked payment
+    /// before inclusion. This does not scan, add a receipt or authorize a spend.
+    #[cfg(all(unix, feature = "eng2-runtime", any(test, feature = "eng2-rehearsal")))]
+    pub(crate) fn planned_payment_nullifier(
+        &self,
+        public: &PublicTransaction,
+        opening: &PaymentEncryptionOpening,
+    ) -> Result<DigestBytes, String> {
+        let mut note = opening
+            .verify_payment(
+                &self.address(),
+                &public.cm[0],
+                &public.payment,
+                &EncryptionContext::new(self.keys.network),
+            )
+            .map_err(|_| "planned payment does not authenticate this recipient")?;
+        let hasher = Hasher::new();
+        let valid = note.owner == self.address().owner() && hasher.note_cm(&note) == public.cm[0];
+        let nullifier = encode_digest(&hasher.nullifier(&self.keys.spend_key(), &note.rho));
+        note.owner.fill(F::ZERO);
+        note.asset_id.0.zeroize();
+        note.value.zeroize();
+        note.unlock_height.zeroize();
+        note.rho.fill(F::ZERO);
+        note.rseed.fill(F::ZERO);
+        if !valid {
+            return Err("planned payment commitment differs".into());
+        }
+        Ok(nullifier)
+    }
     /// Replace private receipts atomically after independently replaying the
     /// complete canonical chain. The caller authenticates/selects that chain;
     /// this does not authenticate checkpoints or choose the greatest-work fork.
@@ -1037,7 +1067,7 @@ fn decode_payment(bytes: &[u8; 1313]) -> PaymentCiphertext {
         view_tag: bytes[1312],
     }
 }
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
 fn encode_payment(payment: &PaymentCiphertext) -> [u8; 1313] {
     let mut out = [0; 1313];
     out[..1088].copy_from_slice(&payment.kem_ciphertext);
@@ -1129,5 +1159,6 @@ impl WalletPayment {
 #[path = "wallet/issuance.rs"]
 pub mod issuance;
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
+#[path = "wallet/tests.rs"]
 mod tests;

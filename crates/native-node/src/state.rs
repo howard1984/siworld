@@ -1,7 +1,7 @@
 //! Deterministic native engineering-chain transition shared by production and replay.
 //! No peer-supplied verifier key, private fee opening, or local clock enters this transition.
 use crate::proofs::NativeVerifier;
-use crate::wire::{Block, DigestBytes, GROUP, Hash, MAX_SLOTS, MIN_SLOTS, Snapshot};
+use crate::wire::{Block, DigestBytes, Hash, MAX_SLOTS, SlotRule, Snapshot};
 use native::codec::{ProofContext, PublicTransaction, decode_digest, encode_digest};
 use native::confidential_fees::{FeeOpening, SettlementSlot};
 use native::multi_asset::{Digest, F, Hasher, RecentRoots, TREE_DEPTH};
@@ -322,6 +322,7 @@ impl Config {
         let mut h = blake3::Hasher::new_derive_key("siworld native engineering genesis v2");
         h.update(&self.encode_rules());
         h.update(b"asert:14400;mtp:11;sequential-blake3");
+        h.update(ORDINARY_FEE_RULES);
         h.update(native::codec::SUITE_ID);
         h.update(profile);
         *h.finalize().as_bytes()
@@ -361,6 +362,9 @@ fn verify_bounded<T: Sync>(
     // Bound simultaneous proof decoders independently of the pool size. Keep
     // errors in canonical input order and stop before starting another batch.
     for batch in values.chunks(4) {
+        #[cfg(siworld_native_node)]
+        let results = crate::verification_executor::map(batch, &verify);
+        #[cfg(not(siworld_native_node))]
         let results = crate::transaction_proof_results(batch, &verify);
         for result in results {
             result?;
@@ -419,6 +423,8 @@ impl BlockVerifier for NativeVerifier {
         })
     }
     fn issuance(&self, record: &crate::issuance::IssuanceRecord) -> Result<(), String> {
+        #[cfg(siworld_native_node)]
+        let _permit = crate::verification_executor::acquire();
         self.verify_issuance(record)
     }
     fn transaction(
@@ -429,6 +435,8 @@ impl BlockVerifier for NativeVerifier {
         root: &Digest,
         proof: &[u8],
     ) -> Result<(), String> {
+        #[cfg(siworld_native_node)]
+        let _permit = crate::verification_executor::acquire();
         self.verify_transaction(public, context, fee, root, proof)
     }
     fn settlement(
@@ -440,6 +448,8 @@ impl BlockVerifier for NativeVerifier {
         rewards: &[Digest],
         proof: &[u8],
     ) -> Result<(), String> {
+        #[cfg(siworld_native_node)]
+        let _permit = crate::verification_executor::acquire();
         self.verify_settlement(fees, plan, network, list_hash, rewards, proof)
     }
 }
@@ -788,9 +798,13 @@ impl State {
     }
 }
 
+/// Immutable fee encoding bound by native and engineering genesis identifiers.
+pub const ORDINARY_FEE_RULES: &[u8] =
+    b"ordinary-fee:v2;standard:floor(v1-base/10);priority:4x-standard;recipient:miner-note-zero";
+
 pub fn base_fee(height: u64) -> u64 {
     // The genesis snapshot has no subsidy but selects the first paid-block tier.
-    economics::fee_base(height.max(1)).expect("positive bounded subsidy schedule")
+    economics::fee_base(height.max(1)).expect("positive bounded subsidy schedule") / 10
 }
 /// Top-level miner base and independently rounded wallet credits.
 pub fn subsidy_split(height: u64, funds: &FundAllocation) -> (u64, Vec<u64>) {
@@ -837,7 +851,15 @@ pub fn satisfies_work(id: &Hash, bits: u8) -> bool {
 /// Public, deterministic zero-fee rows of the fixed-576 relation. These are
 /// internal settlement rows, never additional transactions or chain flags.
 pub fn tail_slots(network: Hash, height: u64, count: usize) -> Result<Vec<SettlementSlot>, String> {
-    if !(MIN_SLOTS..=MAX_SLOTS).contains(&count) || !count.is_multiple_of(GROUP) {
+    tail_slots_for(network, height, count, SlotRule::Legacy)
+}
+pub(crate) fn tail_slots_for(
+    network: Hash,
+    height: u64,
+    count: usize,
+    rule: SlotRule,
+) -> Result<Vec<SettlementSlot>, String> {
+    if !rule.permits(count) {
         return Err("invalid settlement position count".into());
     }
     let h = Hasher::new();
@@ -863,12 +885,51 @@ pub fn tail_slots(network: Hash, height: u64, count: usize) -> Result<Vec<Settle
     Ok(slots)
 }
 
-#[cfg(test)]
+#[cfg(all(test, siworld_native_node))]
+#[path = "state/tests.rs"]
 mod tests;
 
 #[cfg(test)]
 mod proof_profile_tests {
     use super::*;
+
+    #[test]
+    fn reduced_ordinary_fees_preserve_tiers_across_subsidy_boundaries() {
+        let tail = economics::tail_entry_height();
+        for (height, standard) in [
+            (0, 339_452),
+            (1, 339_452),
+            (economics::EPOCH_BLOCKS, 339_452),
+            (tail, 10_000),
+            (tail + 1, 10_000),
+            (u64::MAX, 10_000),
+        ] {
+            assert_eq!(base_fee(height), standard);
+            assert_eq!(crate::eng2_economics::fee_base(height).unwrap(), standard);
+            assert_eq!(
+                crate::eng2_economics::fee_priority(height).unwrap(),
+                standard * 4
+            );
+        }
+        for height in [economics::EPOCH_BLOCKS + 1, tail - 1] {
+            assert_eq!(
+                base_fee(height),
+                economics::subsidy(height).unwrap() / 10_000
+            );
+        }
+        assert_eq!(economics::INITIAL_REWARD, 3_394_524_515);
+    }
+
+    #[test]
+    fn reduced_fee_genesis_cannot_reuse_the_full_fee_identity() {
+        let config = Config::development([93; 32], 0).unwrap();
+        let mut old = blake3::Hasher::new_derive_key("siworld native engineering genesis v2");
+        old.update(&config.encode_rules());
+        old.update(b"asert:14400;mtp:11;sequential-blake3");
+        old.update(native::codec::SUITE_ID);
+        old.update(&crate::proofs::protocol_profile_fingerprint());
+        assert_ne!(config.genesis_id(), *old.finalize().as_bytes());
+    }
 
     #[test]
     fn genesis_authenticates_the_selected_proof_profile() {

@@ -36,8 +36,11 @@ pub mod state;
 pub(crate) mod storage_budget;
 pub mod storage_policy;
 pub mod store;
+#[cfg(siworld_native_node)]
+pub(crate) mod verification_executor;
 pub mod wire;
 
+#[cfg(not(siworld_native_node))]
 pub(crate) fn transaction_proof_results<T: Sync>(
     values: &[T],
     verify: &(impl Fn(&T) -> Result<(), String> + Sync),
@@ -74,3 +77,12 @@ pub mod compact;
 pub mod ranges;
 #[cfg(all(feature = "wallet-light-gateway", unix))]
 pub mod wallet_gateway;
+
+#[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
+pub use eng2::wallet_history::codec as eng2_history;
+#[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
+#[path = "../../native-wallet-engine/src/eng2_light.rs"]
+pub mod eng2_light;
+#[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
+#[path = "../../native-wallet-engine/src/paths.rs"]
+pub mod paths;

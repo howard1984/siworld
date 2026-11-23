@@ -2,10 +2,14 @@
 //!
 //! These modules do not activate a network or change the native V1 transition.
 
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod accept_observation;
 pub mod admission;
 pub mod archive;
 pub mod body;
 pub mod bootstrap;
+pub mod branches;
+pub mod candidate_registry;
 pub mod certificate;
 pub mod checkpoint_exchange;
 #[cfg(feature = "eng2-runtime")]
@@ -16,15 +20,29 @@ pub mod commitment;
 pub mod connector;
 pub mod driver;
 pub mod execution;
+pub mod fee_candidate;
+pub mod fee_child;
+pub mod fee_windowed_body;
 pub mod fund_claim;
 pub mod genesis;
 pub mod genesis_tool;
 pub mod header;
+pub mod header_relay;
+#[cfg(feature = "eng2-runtime")]
+pub mod historical;
 pub mod import;
+#[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+pub mod isolated_production;
+#[cfg(feature = "eng2-runtime")]
+pub(crate) mod native_pipeline;
 pub mod network;
 pub mod nullifiers;
+#[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
+pub(crate) mod owner_fault;
 pub mod producer;
+pub mod proof_retention;
 pub mod proof_window;
+pub mod propagation;
 #[cfg(feature = "eng2-rehearsal")]
 pub mod rehearsal;
 #[cfg(feature = "eng2-runtime")]
@@ -42,3 +60,6 @@ pub mod wallet_history;
 
 #[cfg(feature = "eng2-runtime")]
 pub(crate) mod transaction_exchange;
+
+/// Candidate authorization framing; legacy body and genesis selection are unchanged.
+pub mod windowed_authorization;

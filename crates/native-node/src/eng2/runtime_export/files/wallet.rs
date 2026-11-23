@@ -3,6 +3,12 @@ use super::*;
 use crate::{eng2::wallet_history, p2p};
 
 impl PublicExport {
+    /// Keep the last complete generation readable while current publication is
+    /// paused. This cursor is historical data, not canonical-state readiness.
+    pub fn pause_wallet_head(&self) -> Result<(), String> {
+        self.read_optional("wallet-head.json", 2048)?;
+        Ok(())
+    }
     /// Historical synthetic fixture helper. Production publication uses the
     /// complete generation publisher and commits the head last.
     #[cfg(test)]

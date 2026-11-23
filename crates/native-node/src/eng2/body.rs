@@ -9,6 +9,7 @@ const MAGIC: &[u8; 6] = b"SW2B\x01\x00";
 /// Local immutable decoding policy. No production proof profile is implied.
 #[derive(Clone, Copy)]
 pub struct Policy {
+    pub slot_rule: SlotRule,
     pub profile: Hash,
     pub max_body_bytes: usize,
     pub max_settlement_proof_bytes: usize,
@@ -44,8 +45,7 @@ impl Body {
         if self.network == [0; 32]
             || self.height == 0
             || self.profile != policy.profile
-            || !(MIN_SLOTS..=MAX_SLOTS).contains(&self.transactions.len())
-            || !self.transactions.len().is_multiple_of(GROUP)
+            || !policy.slot_rule.permits(self.transactions.len())
             || self.fund_claims.len() > MAX_FUND_SPENDS
             || self.governance.len() > crate::eng2_governance::MAX_ACTIONS_PER_BLOCK
             || self.issuances.len() > crate::issuance::RECORDS_CODEC_LIMIT
@@ -164,8 +164,7 @@ impl Body {
         let claims_count = usize::from(reader.byte()?);
         let governance_count = usize::from(reader.byte()?);
         let issuances_count = usize::from(reader.byte()?);
-        if !(MIN_SLOTS..=MAX_SLOTS).contains(&slots)
-            || !slots.is_multiple_of(GROUP)
+        if !policy.slot_rule.permits(slots)
             || rewards_count != reward_count(reward_mode)
             || claims_count > MAX_FUND_SPENDS
             || governance_count > crate::eng2_governance::MAX_ACTIONS_PER_BLOCK

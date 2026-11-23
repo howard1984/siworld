@@ -99,6 +99,7 @@ struct Operation {
     timer: Option<std::thread::JoinHandle<()>>,
     connections: u64,
     maximum_connections: u64,
+    body_scope: Option<p2p::BodyScope>,
 }
 impl Operation {
     fn new(policy: &Policy) -> Result<Self, String> {
@@ -127,6 +128,7 @@ impl Operation {
             timer: Some(timer),
             connections: 0,
             maximum_connections: policy.rounds.saturating_add(4).min(65_536),
+            body_scope: None,
         })
     }
     fn check(&self) -> Result<(), String> {
@@ -164,6 +166,9 @@ impl Operation {
 }
 impl Drop for Operation {
     fn drop(&mut self) {
+        if let Some(scope) = &self.body_scope {
+            scope.close();
+        }
         if let Some(done) = self.done.take() {
             let _ = done.send(());
         }
@@ -551,6 +556,11 @@ fn bootstrap_signed_observed(
         return Err("no authenticated checkpoint source completed header verification; retained data preserved".into());
     }
     let mut client = client::select(candidates, policy.floor)?;
+    client.bind_body_operation(
+        &budget,
+        operation.started + Duration::from_secs(operation.maximum_seconds),
+    )?;
+    operation.body_scope = Some(client.operation_body_scope()?);
     let selected = bundles
         .iter()
         .find(|(bundle, _)| *bundle == client.manifest().bundle())

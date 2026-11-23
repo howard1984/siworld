@@ -2,12 +2,34 @@
 use siworld_native_node::{
     eng2::genesis_tool::{self, Expected},
     local,
+    wire::PUBLIC_GENESIS_PROFILE,
 };
 use std::{ffi::OsString, path::Path};
 
-const HELP: &str = "siworld-eng2-genesis: offline public parameters only\n\nseal-public CONFIG_RULES.bin GOVERNANCE.bin --expected-config-sha256 C --expected-governance-sha256 G --expected-network N --expected-profile P --expected-fee-recipient-sha256 R --new-genesis NEW_FILE --json\ninspect GENESIS.bin --expected-config-sha256 C --expected-governance-sha256 G --expected-network N --expected-profile P --expected-fee-recipient-sha256 R --json\n\nEvery expected value is mandatory lowercase hexadecimal. Outputs are create-only.\nKnown builtin fixture keys are rejected; arbitrary key provenance is not established.\nNo command generates keys, initializes state, starts a service or submits data.";
+const HELP: &str = "siworld-eng2-genesis: offline public parameters only\n\nencode-public PUBLIC_PARAMETERS.json --expected-input-sha256 H --new-parameters NEW_DIRECTORY --json\nseal-public CONFIG_RULES.bin GOVERNANCE.bin --expected-config-sha256 C --expected-governance-sha256 G --expected-network N --expected-profile P --expected-fee-recipient-sha256 R [--genesis-profile pow-16-v1] --new-genesis NEW_FILE --json\ninspect GENESIS.bin --expected-config-sha256 C --expected-governance-sha256 G --expected-network N --expected-profile P --expected-fee-recipient-sha256 R --json\n\nEvery expected value is mandatory lowercase hexadecimal. Outputs are create-only.\nKnown builtin fixture keys are rejected; arbitrary key provenance is not established.\nNo command generates keys, initializes state, starts a service or submits data.";
 
 fn run(args: &[OsString]) -> Result<serde_json::Value, &'static str> {
+    if let [
+        command,
+        input,
+        expected_flag,
+        digest,
+        output_flag,
+        output,
+        json,
+    ] = args
+        && command == "encode-public"
+        && expected_flag == "--expected-input-sha256"
+        && output_flag == "--new-parameters"
+        && json == "--json"
+    {
+        let expected = genesis_tool::parse_hash(digest.to_str().ok_or("invalid_expected_hex")?)?;
+        let binary_sha256 = genesis_tool::executable_sha256()?;
+        let mut result =
+            genesis_tool::encode_public(Path::new(input), Path::new(output), expected)?;
+        result["source"]["executed_binary_sha256"] = local::hex(&binary_sha256).into();
+        return Ok(result);
+    }
     let (config, governance, existing, options) = match args {
         [command, config, governance, rest @ ..] if command == "seal-public" => {
             (Some(config), Some(governance), None, rest)
@@ -21,6 +43,7 @@ fn run(args: &[OsString]) -> Result<serde_json::Value, &'static str> {
     let mut profile = None;
     let mut recipient = None;
     let mut output = None;
+    let mut rule = None;
     let mut json = false;
     let mut index = 0;
     while index < options.len() {
@@ -36,6 +59,11 @@ fn run(args: &[OsString]) -> Result<serde_json::Value, &'static str> {
         if options[index] == "--new-genesis" {
             if output.replace(value).is_some() {
                 return Err("duplicate_argument");
+            }
+        } else if options[index] == "--genesis-profile" && existing.is_none() {
+            use siworld_native_node::wire::SlotRule;
+            if value != PUBLIC_GENESIS_PROFILE || rule.replace(SlotRule::PublicGenesis).is_some() {
+                return Err("invalid_genesis_profile");
             }
         } else {
             let slot = match options[index].to_str() {
@@ -70,11 +98,12 @@ fn run(args: &[OsString]) -> Result<serde_json::Value, &'static str> {
     // Complete executable provenance before creating any output file.
     let binary_sha256 = genesis_tool::executable_sha256()?;
     let mut result = match (config, governance, existing, output) {
-        (Some(config), Some(governance), None, Some(output)) => genesis_tool::seal_public(
+        (Some(config), Some(governance), None, Some(output)) => genesis_tool::seal_public_profile(
             Path::new(config),
             Path::new(governance),
             Path::new(output),
             expected,
+            rule.unwrap_or(siworld_native_node::wire::SlotRule::Legacy),
         )?,
         (None, None, Some(existing), None) => genesis_tool::inspect(Path::new(existing), expected)?,
         _ => return Err("invalid_arguments"),

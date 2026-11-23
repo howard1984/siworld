@@ -1,5 +1,30 @@
 use super::*;
+use crate::identity::PeerPin;
 use std::io::Write;
+
+#[test]
+fn diagnostic_size_fallback_preserves_original_status() {
+    let original = json!({"ready":true,"native_accept_observation":{"enabled":true},"payload":"x".repeat(65_400)});
+    let mut value = original.clone();
+    value["peer_round_observation"] = json!({"rounds":["x".repeat(40_000)]});
+    value["native_accept_observation"]["recent"] = json!(["x".repeat(10_000)]);
+    bound_status_observations(&mut value, &original["native_accept_observation"]);
+    assert_eq!(value, original);
+    let mut detail = json!({"rounds":["x".repeat(20_000),"y".repeat(20_000)]});
+    bound_observation(&mut detail, "rounds", 24 * 1024);
+    assert!(status_bytes(&detail) <= 24 * 1024);
+    assert_eq!(detail["omitted_by_byte_limit"], 1);
+    assert!(
+        peers::diagnostic_storage_bytes()
+            + super::super::accept_observation::diagnostic_storage_bytes()
+            <= 32 * 1024
+    );
+    eprintln!(
+        "diagnostic_layout_bytes peers={} admission_and_transport={}",
+        peers::diagnostic_storage_bytes(),
+        super::super::accept_observation::diagnostic_storage_bytes()
+    );
+}
 
 fn directory() -> PathBuf {
     let mut entropy = [0u8; 16];
@@ -141,8 +166,174 @@ fn miner_configuration_is_outbound_only_with_explicit_existing_signer_selection(
 }
 #[cfg(unix)]
 #[test]
-fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_digest() {
-    use crate::identity::PeerPin;
+fn pinned_outbound_only_miner_can_be_selected_as_lane_identity_without_checkpoint_reference() {
+    let directory = directory();
+    let miner_directory = super::tests::directory();
+    let genesis = genesis();
+    let identity = NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap();
+    let miner = NativeIdentity::initialize(&miner_directory, genesis.peer_binding()).unwrap();
+    let descriptor = miner.descriptor().unwrap();
+    let miner_path = miner_directory.join("peers.json");
+    let miner_configuration = json!({"version":2,"engineering":true,"role":"miner","listen":null,
+        "mining":false,"checkpoint_key":null,"peers":[]});
+    service::atomic_json(&miner_path, &miner_configuration).unwrap();
+    let miner_config =
+        config::Configuration::load(&miner_directory, &miner_path, &genesis, &miner).unwrap();
+    assert_eq!(miner_config.role, p2p::Role::Miner);
+    assert!(miner_config.listen.is_none());
+
+    let path = directory.join("peers.json");
+    let mut value = json!({"version":2,"engineering":true,"role":"validator","listen":null,
+    "mining":false,"checkpoint_key":null,"peers":[{
+        "endpoint":"127.0.0.1:9000","dial":false,"checkpoint_reference":false,
+        "fingerprint":crate::local::hex(&descriptor.fingerprint()),
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]});
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding())
+        .unwrap()
+        .persist(&directory)
+        .unwrap();
+    let selected = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
+    assert_eq!(selected.peers.len(), 1);
+    let peer = &selected.peers[0];
+    assert!(!peer.dial && !peer.checkpoint_reference);
+    assert!(peer.expected.independently_pinned());
+    assert_eq!(peer.expected.descriptor(), &descriptor);
+    value["peers"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("checkpoint_reference");
+    service::atomic_json(&path, &value).unwrap();
+    let original = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
+    assert!(original.peers[0].checkpoint_reference);
+    assert_ne!(selected.digest, original.digest);
+    drop(identity);
+    drop(miner);
+    fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(miner_directory).unwrap();
+}
+
+#[test]
+fn passive_fixed_miner_reference_shares_endpoint_without_becoming_an_outbound_destination() {
+    let directory = directory();
+    let genesis = genesis();
+    let identity = NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap();
+    let mut identities = Vec::new();
+    let mut identity_directories = Vec::new();
+    for _ in 0..3 {
+        let path = super::tests::directory();
+        identities.push(NativeIdentity::initialize(&path, genesis.peer_binding()).unwrap());
+        identity_directories.push(path);
+    }
+    let entry = |index: usize, endpoint: &str, dial: bool| {
+        let descriptor = identities[index].descriptor().unwrap();
+        json!({"endpoint":endpoint,"dial":dial,
+            "fingerprint":crate::local::hex(&descriptor.fingerprint()),
+            "descriptor":crate::local::hex(&descriptor.encode())})
+    };
+    let old = entry(0, "127.0.0.1:9000", true);
+    let mut miner = entry(1, "127.0.0.1:9000", false);
+    miner["fixed_relay_role"] = json!("miner");
+    miner["checkpoint_reference"] = json!(false);
+    let active = entry(2, "127.0.0.1:9001", true);
+    for index in [0, 2] {
+        PeerPin::from_trusted_descriptor(
+            &identities[index].descriptor().unwrap(),
+            &genesis.peer_binding(),
+        )
+        .unwrap()
+        .persist(&directory)
+        .unwrap();
+    }
+    let path = directory.join("peers.json");
+    let load = |role: &str, peers: Vec<Value>| {
+        service::atomic_json(
+            &path,
+            &json!({"version":2,"engineering":true,"role":role,"listen":null,
+                "mining":false,"checkpoint_key":null,"peers":peers}),
+        )
+        .unwrap();
+        config::Configuration::load(&directory, &path, &genesis, &identity)
+    };
+    assert!(
+        load(
+            "validator",
+            vec![old.clone(), miner.clone(), active.clone()]
+        )
+        .is_err()
+    );
+    PeerPin::from_trusted_descriptor(
+        &identities[1].descriptor().unwrap(),
+        &genesis.peer_binding(),
+    )
+    .unwrap()
+    .persist(&directory)
+    .unwrap();
+    for role in ["validator", "bootstrap"] {
+        for entries in [
+            vec![old.clone(), miner.clone(), active.clone()],
+            vec![miner.clone(), active.clone(), old.clone()],
+        ] {
+            let loaded = load(role, entries).unwrap();
+            assert_eq!(loaded.peers.len(), 3);
+            assert!(loaded.peers.iter().any(|peer| {
+                peer.expected.fingerprint() == identities[0].descriptor().unwrap().fingerprint()
+                    && peer.dial
+                    && peer.checkpoint_reference
+            }));
+            assert!(
+                loaded
+                    .fixed_relay_peers
+                    .contains(&identities[1].descriptor().unwrap().fingerprint())
+            );
+            // Both ordinary connections and optional header/body lanes use
+            // this exact destination iterator before constructing a dial job.
+            let outbound: std::collections::BTreeSet<_> = loaded
+                .outbound_peers()
+                .map(|peer| peer.expected.fingerprint())
+                .collect();
+            assert_eq!(
+                outbound,
+                [
+                    identities[0].descriptor().unwrap().fingerprint(),
+                    identities[2].descriptor().unwrap().fingerprint()
+                ]
+                .into_iter()
+                .collect()
+            );
+        }
+    }
+    let mut duplicate_dial = miner.clone();
+    duplicate_dial["dial"] = json!(true);
+    assert!(load("validator", vec![old.clone(), duplicate_dial]).is_err());
+    let mut ordinary = miner.clone();
+    ordinary.as_object_mut().unwrap().remove("fixed_relay_role");
+    assert!(load("validator", vec![old.clone(), ordinary.clone()]).is_err());
+    let mut service = ordinary;
+    service["fixed_relay_role"] = json!("service");
+    assert!(load("miner", vec![old.clone(), service]).is_err());
+    let mut duplicate_identity = miner.clone();
+    duplicate_identity["fingerprint"] = old["fingerprint"].clone();
+    duplicate_identity["descriptor"] = old["descriptor"].clone();
+    assert!(load("validator", vec![old.clone(), duplicate_identity]).is_err());
+    let mut mismatched_role = miner.clone();
+    mismatched_role["fixed_relay_role"] = json!("service");
+    assert!(load("validator", vec![old.clone(), mismatched_role]).is_err());
+    let mut mismatched_descriptor = miner;
+    mismatched_descriptor["descriptor"] = active["descriptor"].clone();
+    assert!(load("validator", vec![old, mismatched_descriptor]).is_err());
+    drop(identities);
+    drop(identity);
+    fs::remove_dir_all(directory).unwrap();
+    for path in identity_directories {
+        fs::remove_dir_all(path).unwrap();
+    }
+}
+#[cfg(unix)]
+#[test]
+fn legacy_checkpoint_routing_only_selects_advertisements_without_peer_admission() {
     let directory = directory();
     let remote_directory = super::tests::directory();
     let genesis = genesis();
@@ -157,32 +348,39 @@ fn legacy_checkpoint_routing_is_explicit_pinned_and_bound_to_configuration_diges
     assert!(current.legacy_checkpoint_peers.is_empty());
     value["legacy_checkpoint_peers"] = json!([fingerprint]);
     service::atomic_json(&path, &value).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    let pin = PeerPin::from_trusted_descriptor(&descriptor, &genesis.peer_binding()).unwrap();
     let pin_path = directory.join(format!("peer-{fingerprint}.pin"));
-    let mut wrong_binding = pin.encode();
-    wrong_binding[6] ^= 1;
-    fs::write(&pin_path, wrong_binding).unwrap();
-    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
-    fs::remove_file(&pin_path).unwrap();
-    pin.persist(&directory).unwrap();
+    assert!(!pin_path.exists());
     let legacy = config::Configuration::load(&directory, &path, &genesis, &identity).unwrap();
     assert!(
         legacy
             .legacy_checkpoint_peers
             .contains(&descriptor.fingerprint())
     );
+    assert!(!pin_path.exists());
     // Ingress routing must not add readiness references or outbound destinations.
     assert_eq!(legacy.peers.len(), current.peers.len());
     assert!(legacy.peers.is_empty());
     assert_ne!(legacy.digest, current.digest);
+    value["peers"] = json!([{
+        "endpoint":"127.0.0.1:9000", "dial":false, "fingerprint":fingerprint,
+        "descriptor":crate::local::hex(&descriptor.encode())
+    }]);
+    service::atomic_json(&path, &value).unwrap();
+    assert!(config::Configuration::load(&directory, &path, &genesis, &identity).is_err());
+    value["peers"] = json!([]);
     for invalid in [
         Value::Null,
         json!(true),
         json!(["bad"]),
         json!([fingerprint, fingerprint]),
-        json!([crate::local::hex(&[0; 32])]),
-        json!([crate::local::hex(&[9; 32])]),
+        json!([crate::local::hex(
+            &identity.descriptor().unwrap().fingerprint()
+        )]),
+        Value::Array(
+            (0u8..17)
+                .map(|index| json!(crate::local::hex(&[index; 32])))
+                .collect(),
+        ),
     ] {
         value["legacy_checkpoint_peers"] = invalid;
         service::atomic_json(&path, &value).unwrap();
@@ -402,9 +600,8 @@ fn private_submission_reaches_native_driver_and_rejects_synthetic_proofs() {
     drop(NativeIdentity::initialize(&path, genesis.peer_binding()).unwrap());
     initialize_store(&path, &expected).unwrap();
     let store = Store::resume_existing(&path.join("chain.redb"), genesis, limits().chain).unwrap();
-    let owner = Arc::new(Mutex::new(
-        Driver::new(store, NativeVerifier::new().unwrap(), limits()).unwrap(),
-    ));
+    let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+    let owner = Arc::new(Mutex::new(Driver::new(store, verifier, limits()).unwrap()));
     let (head, packet) = {
         let driver = owner.lock().unwrap();
         let head = driver.head().unwrap();
@@ -550,12 +747,9 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
             limits,
         )
         .unwrap();
-        let mut driver = super::super::driver::Driver::new(
-            store,
-            NativeVerifier::new().unwrap(),
-            super::limits(),
-        )
-        .unwrap();
+        let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+        let mut driver =
+            super::super::driver::Driver::new(store, verifier, super::limits()).unwrap();
         let committed = driver.accept(&header, &body).unwrap();
         assert_eq!(committed.id(), header.id().unwrap());
     }
@@ -678,4 +872,177 @@ fn actual_native_block_relays_between_residents_and_restarts_without_replay() {
         .block_size(1)
         .unwrap()
     }
+}
+
+#[test]
+fn unavailable_status_replaces_stale_ready_without_claiming_a_head() {
+    let directory = directory();
+    service::atomic_json(
+        &directory.join(service::STATUS_FILE),
+        &json!({"ready":true,"height":123}),
+    )
+    .unwrap();
+    export_unavailable_status(&directory, "test-run", Instant::now(), 2).unwrap();
+    let value: Value =
+        serde_json::from_slice(&fs::read(directory.join(service::STATUS_FILE)).unwrap()).unwrap();
+    assert_eq!(value["ready"], false);
+    assert_eq!(value["state_available"], false);
+    assert_eq!(value["height"], Value::Null);
+    assert_eq!(value["reorganization_alarm"], "canonical_state_unavailable");
+    assert_eq!(value["ready_reason_code"], "canonical_state_unavailable");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn readiness_reason_preserves_owner_and_observer_gates_ahead_of_peer_diagnostics() {
+    use super::super::checkpoint_observer::{
+        Observer,
+        tests::{synthetic_current_conflict, synthetic_pending_authorization},
+    };
+    use super::peers::PeerReadiness;
+    let healthy = Observer::default();
+    assert_eq!(
+        resident_readiness(true, "ready", &healthy, PeerReadiness::Ready),
+        (true, "ready")
+    );
+    assert_eq!(
+        resident_readiness(true, "ready", &healthy, PeerReadiness::NoConnectedPeers),
+        (false, "no_connected_peers")
+    );
+    let hard = synthetic_current_conflict();
+    assert_eq!(
+        resident_readiness(true, "ready", &hard, PeerReadiness::Ready),
+        (false, "checkpoint_current_quorum_conflict")
+    );
+    let pending = synthetic_pending_authorization();
+    assert_eq!(
+        resident_readiness(true, "ready", &pending, PeerReadiness::Ready),
+        (false, "checkpoint_authorization_pending")
+    );
+    for reason in [
+        "manual_recovery_required",
+        "applying_validated_branch",
+        "waiting_for_shared_byte_budget",
+        "resuming_best_branch",
+    ] {
+        assert_eq!(
+            resident_readiness(false, reason, &hard, PeerReadiness::NoConnectedPeers),
+            (false, reason)
+        );
+    }
+    assert_eq!(
+        resident_readiness(false, "ready", &healthy, PeerReadiness::Ready),
+        (false, "canonical_state_unavailable")
+    );
+}
+
+#[test]
+fn production_failure_retains_the_first_stable_alarm() {
+    let mut status = ProductionStatus::default();
+    assert!(status.failure.is_none());
+    assert!(status.error.is_none());
+    status.fail(production::Failure::ProductionControl);
+    status.fail(production::Failure::ProverInit);
+    assert_eq!(status.failure, Some(production::Failure::ProductionControl));
+    assert_eq!(status.error, Some("native_production_failed"));
+    assert_eq!(status.phase, "networking");
+}
+
+#[test]
+fn checkpoint_archive_admission_covers_retained_generation_overlap() {
+    use super::super::runtime_export::archive_work::ArchiveWork;
+
+    let archive_bytes = 31_881_389;
+    let retained_bytes = 287_993_906;
+    let requested_bytes = 16 * archive_bytes + 8 * 1024 * 1024;
+    let previous_maximum = 640 * 1024 * 1024;
+    let previous = p2p::Budget::new(previous_maximum);
+    let retained = previous.reserve(retained_bytes).unwrap();
+    let rejected = ArchiveWork::reserve(archive_bytes, 0, &previous);
+    assert!(rejected.is_err());
+    assert_eq!(
+        previous.available().unwrap(),
+        previous_maximum - retained_bytes
+    );
+    drop(retained);
+    assert_eq!(previous.available().unwrap(), previous_maximum);
+
+    let budget = p2p::Budget::new(MEMORY_BYTES);
+    let retained = budget.reserve(retained_bytes).unwrap();
+    let accepted = ArchiveWork::reserve(archive_bytes, 0, &budget);
+    let workspace = accepted.unwrap();
+    assert_eq!(
+        budget.available().unwrap(),
+        MEMORY_BYTES - retained_bytes - requested_bytes
+    );
+    assert!(
+        budget
+            .reserve(MEMORY_BYTES - retained_bytes - requested_bytes + 1)
+            .is_err()
+    );
+    drop(workspace);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES - retained_bytes);
+    drop(retained);
+    assert_eq!(budget.available().unwrap(), MEMORY_BYTES);
+}
+
+#[test]
+fn restart_state_digest_binds_every_complete_component_and_context() {
+    let components: [Vec<u8>; 11] = std::array::from_fn(|index| vec![index as u8; index + 1]);
+    let original = hash_restart_components([1; 32], 347, [2; 32], &components);
+    for index in 0..components.len() {
+        let mut changed = components.clone();
+        changed[index][0] ^= 1;
+        assert_ne!(
+            original,
+            hash_restart_components([1; 32], 347, [2; 32], &changed)
+        );
+    }
+    assert_ne!(
+        original,
+        hash_restart_components([3; 32], 347, [2; 32], &components)
+    );
+    assert_ne!(
+        original,
+        hash_restart_components([1; 32], 348, [2; 32], &components)
+    );
+    assert_ne!(
+        original,
+        hash_restart_components([1; 32], 347, [3; 32], &components)
+    );
+    let mut left = components.clone();
+    left[0] = vec![1];
+    left[1] = vec![2, 3];
+    let mut right = left.clone();
+    right[0] = vec![1, 2];
+    right[1] = vec![3];
+    assert_ne!(
+        hash_restart_components([1; 32], 347, [2; 32], &left),
+        hash_restart_components([1; 32], 347, [2; 32], &right)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_restart_preserves_complete_state_digest_and_existing_identity() {
+    let directory = directory();
+    let genesis = genesis();
+    let expected = crate::local::hex(&genesis.id());
+    write(&directory.join("genesis.bin"), &genesis.encode().unwrap());
+    drop(NativeIdentity::initialize(&directory, genesis.peer_binding()).unwrap());
+    initialize_store(&directory, &expected).unwrap();
+    let identity = public_identity(&directory, &expected).unwrap();
+    let first = restart_check(&directory, &expected).unwrap();
+    let second = restart_check(&directory, &expected).unwrap();
+    assert_eq!(first["state_sha256"], second["state_sha256"]);
+    assert_eq!(first["state_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(first["authenticated_restart"], "passed");
+    assert_eq!(second["historical_proof_replay"], false);
+    assert_eq!(first["pruned_through"], 0);
+    assert_eq!(
+        identity["fingerprint"],
+        public_identity(&directory, &expected).unwrap()["fingerprint"]
+    );
+    fs::remove_dir_all(directory).unwrap();
 }

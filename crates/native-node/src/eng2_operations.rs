@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 pub mod projection;
 pub mod records;
+pub mod windowed;
 
 pub const MAX_INPUT_BYTES: usize = 1_400_000;
 type Result<T> = std::result::Result<T, String>;
@@ -416,6 +417,12 @@ fn governance_wrap(value: &Value) -> Result<Value> {
 /// file writes are accepted. A bundle must enter the real shared block engine.
 pub fn execute(input: &[u8]) -> Result<Value> {
     let value = canonical(input)?;
+    if value["operation"]
+        .as_str()
+        .is_some_and(|operation| operation.starts_with("windowed-"))
+    {
+        return windowed::execute(&value);
+    }
     match value["operation"].as_str() {
         Some("claim-prepare") => claim_prepare(&value),
         Some("claim-attach") => claim_attach(&value),

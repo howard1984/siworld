@@ -1,6 +1,10 @@
 //! Immutable internal engineering genesis and explicit fee rules.
 
-use crate::{eng2_governance::GovernanceState, state::Config, wire::Hash};
+use crate::{
+    eng2_governance::GovernanceState,
+    state::Config,
+    wire::{Hash, LEGACY_GENESIS_MAGIC, PUBLIC_GENESIS_MAGIC, PUBLIC_GENESIS_RULES, SlotRule},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -13,7 +17,7 @@ impl FeeMode {
         let fee = siworld_core::v1_economics::fee_base(height.max(1))
             .map_err(|error| error.to_string())?;
         Ok(match self {
-            Self::LegacyMiner => fee,
+            Self::LegacyMiner => crate::state::base_fee(height),
             Self::ConfidentialDestination => fee / 10,
         })
     }
@@ -22,6 +26,7 @@ pub struct Genesis {
     config: Config,
     governance: GovernanceState,
     mode: FeeMode,
+    slot_rule: SlotRule,
     id: Hash,
     rules: Hash,
 }
@@ -30,6 +35,16 @@ impl Genesis {
         config: Config,
         governance: GovernanceState,
         mode: FeeMode,
+    ) -> Result<Self, String> {
+        Self::seal_with_rule(config, governance, mode, SlotRule::Legacy)
+    }
+
+    /// Seal the selected slot rule into the genesis identity and peer domain.
+    pub(crate) fn seal_with_rule(
+        config: Config,
+        governance: GovernanceState,
+        mode: FeeMode,
+        slot_rule: SlotRule,
     ) -> Result<Self, String> {
         config.validate()?;
         if mode != FeeMode::LegacyMiner {
@@ -59,12 +74,17 @@ impl Genesis {
         hash.update(&(governance_bytes.len() as u64).to_le_bytes());
         hash.update(&governance_bytes);
         hash.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
+        hash.update(crate::state::ORDINARY_FEE_RULES);
+        if slot_rule == SlotRule::PublicGenesis {
+            hash.update(PUBLIC_GENESIS_RULES);
+        }
         let rules = *hash.finalize().as_bytes();
         let id = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
         Ok(Self {
             config,
             governance,
             mode,
+            slot_rule,
             id,
             rules,
         })
@@ -87,6 +107,9 @@ impl Genesis {
             verifier: *hash.finalize().as_bytes(),
         }
     }
+    pub fn slot_rule(&self) -> SlotRule {
+        self.slot_rule
+    }
     pub fn fee_mode(&self) -> FeeMode {
         self.mode
     }
@@ -108,7 +131,12 @@ impl Genesis {
         let governance = self.governance.canonical_component_bytes()?;
         let length =
             u32::try_from(governance.len()).map_err(|_| "initial governance length overflow")?;
-        let mut bytes = b"SWE2GEN1".to_vec();
+        let mut bytes = if self.slot_rule == SlotRule::PublicGenesis {
+            PUBLIC_GENESIS_MAGIC
+        } else {
+            LEGACY_GENESIS_MAGIC
+        }
+        .to_vec();
         bytes.push(self.mode as u8);
         bytes.extend_from_slice(&crate::proofs::protocol_profile_fingerprint());
         bytes.extend_from_slice(&self.config.encode_rules());
@@ -120,12 +148,16 @@ impl Genesis {
         let prefix = 8 + 1 + 32 + crate::state::CONFIG_RULE_BYTES + 4;
         if bytes.len() < prefix
             || bytes.len() > prefix + 131_072
-            || &bytes[..8] != b"SWE2GEN1"
             || bytes[8] != FeeMode::LegacyMiner as u8
             || bytes[9..41] != crate::proofs::protocol_profile_fingerprint()
         {
             return Err("unsupported internal genesis encoding, fee mode or proof profile".into());
         }
+        let slot_rule = match &bytes[..8] {
+            magic if magic == LEGACY_GENESIS_MAGIC => SlotRule::Legacy,
+            magic if magic == PUBLIC_GENESIS_MAGIC => SlotRule::PublicGenesis,
+            _ => return Err("unsupported genesis version".into()),
+        };
         let config_end = 41 + crate::state::CONFIG_RULE_BYTES;
         let config = Config::decode_rules(&bytes[41..config_end])?;
         let length = u32::from_le_bytes(
@@ -137,7 +169,7 @@ impl Genesis {
             return Err("internal genesis governance length differs".into());
         }
         let governance = GovernanceState::decode_component(&bytes[prefix..], config.network)?;
-        let genesis = Self::seal(config, governance, FeeMode::LegacyMiner)?;
+        let genesis = Self::seal_with_rule(config, governance, FeeMode::LegacyMiner, slot_rule)?;
         if genesis.encode()? != bytes {
             return Err("noncanonical internal genesis encoding".into());
         }
@@ -148,6 +180,48 @@ impl Genesis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wallet_context_accepts_native_genesis_and_rejects_the_previous_fee_identity() {
+        let parent = crate::eng2::snapshot::tests::bootstrap();
+        let genesis = Genesis::seal(
+            parent.chain.config.clone(),
+            parent.governance.clone(),
+            FeeMode::LegacyMiner,
+        )
+        .unwrap();
+        let bytes = genesis.encode().unwrap();
+        use crate::eng2::wallet_history::codec::Context;
+        let context = Context::from_genesis(&bytes, genesis.id()).unwrap();
+        assert_eq!(context.config(), genesis.config());
+        assert_eq!(context.genesis(), genesis.id());
+        assert_eq!(context.rules(), genesis.rules_commitment());
+        assert_eq!(
+            context.profile(),
+            crate::proofs::protocol_profile_fingerprint()
+        );
+        assert_eq!(context.fee_mode(), FeeMode::LegacyMiner as u8);
+
+        let governance = parent.governance.canonical_component_bytes().unwrap();
+        let mut old = blake3::Hasher::new_derive_key("siworld eng2 internal immutable rules v1");
+        old.update(&[FeeMode::LegacyMiner as u8]);
+        old.update(&genesis.config().encode_rules());
+        old.update(&crate::proofs::protocol_profile_fingerprint());
+        old.update(&(governance.len() as u64).to_le_bytes());
+        old.update(&governance);
+        old.update(b"native-header:2;execution-components:2;fund:direct24-month8766x48;governance:4032-roster24;issuance-fee:public-governed-destination-v1");
+        let old_id = blake3::derive_key(
+            "siworld eng2 internal genesis v1",
+            old.finalize().as_bytes(),
+        );
+        assert_ne!(old_id, genesis.id());
+        assert!(Context::from_genesis(&bytes, old_id).is_err());
+        let mut old_encoding = bytes;
+        old_encoding[..8].copy_from_slice(b"SWE2GEN1");
+        assert!(Context::from_genesis(&old_encoding, old_id).is_err());
+        assert!(Context::from_genesis(&old_encoding, genesis.id()).is_err());
+    }
+
     #[test]
     fn explicit_internal_genesis_binds_native_rules_and_governance_and_refuses_candidate_fallback()
     {
@@ -185,7 +259,7 @@ mod tests {
             crate::state::base_fee(0)
         );
         assert_eq!(
-            FeeMode::LegacyMiner.base_fee(1).unwrap() / 10,
+            FeeMode::LegacyMiner.base_fee(1).unwrap(),
             FeeMode::ConfidentialDestination.base_fee(1).unwrap()
         );
     }
@@ -248,7 +322,7 @@ mod tests {
                 SnapshotTip::Materialized(state.tip()),
                 limits
             )
-            .is_err()
+            .is_ok()
         );
         assert!(state.canonical_components(binding, limits).is_ok());
     }
@@ -262,6 +336,9 @@ mod tests {
         )
         .unwrap();
         let bytes = genesis.encode().unwrap();
+        let mut old = bytes.clone();
+        old[..8].copy_from_slice(b"SWE2GEN1");
+        assert!(Genesis::decode(&old).is_err());
         assert_eq!(Genesis::decode(&bytes).unwrap().id(), genesis.id());
         assert_eq!(
             Genesis::decode(&bytes).unwrap().rules_commitment(),

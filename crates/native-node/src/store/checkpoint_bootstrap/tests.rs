@@ -1,7 +1,6 @@
 use super::*;
 use crate::engineering_checkpoint::{self as auth, Vote};
 use libcrux_ml_dsa::ml_dsa_65;
-use siworld_core::pow;
 use std::sync::{
     OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -521,13 +520,7 @@ fn reconstructed_holder_rewards_pool_and_unlocks_match_the_common_transition() {
                     reward
                 })
                 .collect();
-            let seed = block.pow_seed().unwrap();
-            while !pow::meets_target(
-                &pow::pow_hash(&seed, block.nonce, verified.config.pow_iterations),
-                &block.target,
-            ) {
-                block.nonce += 1;
-            }
+            crate::fixtures::find_test_nonce(&mut block, verified.config.pow_iterations, true);
         }
         let compact = CompactBlock::decode(&CompactBlock::export(&block).unwrap()).unwrap();
         reconstruct_public_effects(&mut reconstructed, &compact).unwrap();

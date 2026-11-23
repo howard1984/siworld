@@ -7,6 +7,10 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Finite, low-difficulty fixture searches; not for production block builders.
+test-utils = []
+
 [dependencies]
 blake3.workspace = true
 primitive-types.workspace = true

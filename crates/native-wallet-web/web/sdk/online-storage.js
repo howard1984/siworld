@@ -1,3 +1,4 @@
+import {failureContext} from './diagnostics.js';
 // Private values are encrypted by WASM before entering this store.
 const NAME = 'siworld-engineering-light-v1';
 function database() { return new Promise((resolve,reject)=>{const r=indexedDB.open(NAME,1);r.onupgradeneeded=()=>{r.result.createObjectStore('private');r.result.createObjectStore('compact');};r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(new Error('Light wallet storage is unavailable.'));}); }
@@ -46,7 +47,7 @@ export async function fetchLimited(url,{limit=8388656,method='GET',body,headers=
   if(!response.ok)throw Object.assign(new Error(`Engineering service returned HTTP ${response.status}.`),{status:response.status});
   const declared=Number(response.headers.get('content-length'));if(declared>limit)throw new Error('Response exceeds its byte limit.');
   const reader=response.body.getReader();const parts=[];let size=0;
-  try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit)throw new Error('Response exceeds its byte limit.');parts.push(value);}}catch(error){await reader.cancel();throw error;}
+  try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>limit)throw new Error('Response exceeds its byte limit.');parts.push(value);}}catch(error){const failure=failureContext(error,'response-read');try{await reader.cancel();}catch(related){failureContext(failure,'response-cancel',{related});}throw failure;}
   const bytes=new Uint8Array(size);let at=0;for(const part of parts){bytes.set(part,at);at+=part.length;}return {bytes,headers:response.headers};
 }
-export async function readJSON(url,options={}) {const {bytes}=await fetchLimited(url,{...options,limit:options.limit||100000});try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch{throw new Error('Malformed engineering service response.');}}
+export async function readJSON(url,options={}) {const {bytes}=await fetchLimited(url,{...options,limit:options.limit||100000});try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));}catch(cause){throw failureContext(new Error('Malformed engineering service response.',{cause}),'json-decode');}}
