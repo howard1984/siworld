@@ -4,6 +4,8 @@
 //! checkpoint for best-effort restore detection. The calling protocol is
 //! responsible for authentication and credential evaluation.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod enrollment;
 pub mod ipc;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod journal;

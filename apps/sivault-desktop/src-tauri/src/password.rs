@@ -176,6 +176,54 @@ fn unavailable() -> BridgeError {
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn backup_prompt(
+    app: &AppHandle,
+    title: &'static str,
+    positions: [usize; 3],
+    words: Zeroizing<String>,
+) -> Result<Option<Zeroizing<String>>> {
+    use crate::locale as l;
+    on_main(app, move || {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn};
+        use objc2_foundation::NSString;
+
+        let mtm = MainThreadMarker::new().ok_or_else(unavailable)?;
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(&words));
+        alert.addButtonWithTitle(&NSString::from_str(l::CONTINUE));
+        alert.addButtonWithTitle(&NSString::from_str(l::CANCEL));
+        let accepted = alert.runModal() == NSAlertFirstButtonReturn;
+        alert.setInformativeText(&NSString::from_str(""));
+        drop(words);
+        if !accepted {
+            return Ok(None);
+        }
+        native_secret(l::WALLET_BACKUP_CONFIRM, &l::wallet_backup_positions(positions), false)
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn backup_prompt(
+    app: &AppHandle,
+    title: &'static str,
+    positions: [usize; 3],
+    words: Zeroizing<String>,
+) -> Result<Option<Zeroizing<String>>> {
+    use crate::locale as l;
+    let mut message = Zeroizing::new(String::with_capacity(words.len() + 160));
+    message.push_str(title);
+    message.push_str("\n\n");
+    message.push_str(&words);
+    message.push_str("\n\n");
+    message.push_str(l::WALLET_BACKUP_CONFIRM);
+    message.push_str(": ");
+    message.push_str(&l::wallet_backup_positions(positions));
+    windows_prompt(app, message, false)
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn native_secret(
     title: &str,
     label: &str,

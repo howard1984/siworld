@@ -471,25 +471,7 @@ fn broker_prompt(
         }),
         b'B' => {
             let (positions, words) = read_backup(input)?;
-            on_main(app, move || {
-                use objc2::MainThreadMarker;
-                use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn};
-                use objc2_foundation::NSString;
-                let mtm = MainThreadMarker::new().ok_or_else(unavailable)?;
-                let alert = NSAlert::new(mtm);
-                alert.setMessageText(&NSString::from_str(l::WALLET_BACKUP));
-                alert.setInformativeText(&NSString::from_str(&words));
-                alert.addButtonWithTitle(&NSString::from_str(l::CONTINUE));
-                alert.addButtonWithTitle(&NSString::from_str(l::CANCEL));
-                let accepted = alert.runModal() == NSAlertFirstButtonReturn;
-                alert.setInformativeText(&NSString::from_str(""));
-                drop(words);
-                if !accepted {
-                    return Ok(None);
-                }
-                let label = l::wallet_backup_positions(positions);
-                native_secret(l::WALLET_BACKUP_CONFIRM, &label, false)
-            })
+            crate::password::backup_prompt(app, l::WALLET_BACKUP, positions, words)
         }
         _ => Err(unavailable()),
     }
@@ -508,15 +490,7 @@ fn broker_prompt(
         b'R' => (Zeroizing::new(l::WALLET_WINDOWS_RESTORE.into()), false),
         b'B' => {
             let (positions, words) = read_backup(input)?;
-            let mut title = Zeroizing::new(String::with_capacity(words.len() + 160));
-            title.push_str(l::WALLET_BACKUP);
-            title.push_str("\n\n");
-            title.push_str(&words);
-            title.push_str("\n\n");
-            title.push_str(l::WALLET_BACKUP_CONFIRM);
-            title.push_str(": ");
-            title.push_str(&l::wallet_backup_positions(positions));
-            (title, false)
+            return crate::password::backup_prompt(app, l::WALLET_BACKUP, positions, words);
         }
         _ => return Err(unavailable()),
     };
@@ -759,16 +733,18 @@ fn confirm_backup(
     let Some(answer) = read_secret(input).map_err(|_| "unavailable")? else {
         return Ok(false);
     };
-    let supplied: Vec<_> = answer.split(' ').collect();
-    if supplied.len() != positions.len()
-        || positions
-            .iter()
-            .zip(supplied)
-            .any(|(p, word)| words.split(' ').nth(p - 1) != Some(word))
-    {
+    if !backup_matches(&words, positions, &answer) {
         return Err("back_up");
     }
     Ok(true)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn backup_matches(words: &str, positions: [usize; 3], answer: &str) -> bool {
+    let mut supplied = answer.split(' ');
+    positions.into_iter().all(|position| {
+        supplied.next().is_some_and(|word| words.split(' ').nth(position - 1) == Some(word))
+    }) && supplied.next().is_none()
 }
 
 #[cfg(test)]

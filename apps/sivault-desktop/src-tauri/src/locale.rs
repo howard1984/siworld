@@ -49,3 +49,13 @@ pub fn wallet_payment_details(address: &str, amount: u64, fee: u64) -> String {
 pub fn wallet_backup_positions(positions: [usize; 3]) -> String {
     format!("Words {}, {}, {}", positions[0], positions[1], positions[2])
 }
+pub const OWNER_IDENTITY: &str = "Controlled safe owner identity";
+pub const OWNER_CHOOSE: &str =
+    "Create an owner recovery phrase or restore an existing 24-word phrase.";
+pub const OWNER_CREATE: &str = "Create phrase";
+pub const OWNER_RESTORE: &str = "Restore phrase";
+pub const OWNER_BACKUP: &str = "Write down your owner recovery phrase";
+pub const OWNER_ENTER_WORDS: &str = "Enter the 24 owner recovery words";
+pub const OWNER_BAD_BACKUP: &str = "The recovery words did not match the requested positions.";
+pub const OWNER_WRONG_IDENTITY: &str = "That phrase does not match this installation's owner.";
+pub const OWNER_UNAVAILABLE: &str = "The owner identity is unavailable.";

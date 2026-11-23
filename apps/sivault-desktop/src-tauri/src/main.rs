@@ -3,6 +3,7 @@
 mod adapter;
 mod commands;
 mod locale;
+mod owner;
 mod password;
 mod releaser;
 mod wallet;
@@ -22,6 +23,7 @@ fn main() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::Bridge::default())
+        .manage(owner::OwnerState::default())
         .manage(releaser::ReleaserState::default())
         .manage(wallet::Worker::default())
         .invoke_handler(tauri::generate_handler![
@@ -33,6 +35,7 @@ fn main() {
             commands::safe_export,
             commands::safe_create_directory,
             commands::safe_lock,
+            owner::owner_prepare,
             releaser::releaser_status,
             releaser::releaser_set_running,
             releaser::releaser_verify,
@@ -49,13 +52,17 @@ fn main() {
         .expect("desktop application failed to start")
         .run(|app, event| match event {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                app.state::<owner::OwnerState>().clear(true);
                 app.state::<releaser::ReleaserState>().stop(true);
             }
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { .. },
                 ..
-            } if label == "main" => app.state::<releaser::ReleaserState>().stop(false),
+            } if label == "main" => {
+                app.state::<owner::OwnerState>().clear(false);
+                app.state::<releaser::ReleaserState>().stop(false);
+            }
             _ => {}
         });
 }

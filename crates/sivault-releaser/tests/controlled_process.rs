@@ -22,10 +22,9 @@ mod fixture {
     use sha2::{Digest, Sha256};
     use sivault_core::{
         controlled_channel::{PendingClient, ReleaserIdentity, stream::Session},
-        controlled_credential::{
-            ClientCredential, ReleaserVerifier, sign_possession, verify_possession,
-        },
+        controlled_credential::{ClientCredential, ReleaserVerifier},
         crypto::{Secret, random},
+        owner::{OwnerIdentity, verify_command},
     };
     use sivault_releaser::{
         journal::{Checkpoint, MarkerStore},
@@ -93,6 +92,10 @@ mod fixture {
         ReleaserIdentity::from_seeds(&Zeroizing::new([72; 64]), &Secret::new([73; 32]))
     }
 
+    fn owner_identity() -> OwnerIdentity {
+        OwnerIdentity::derive(&Secret::new([75; 32]))
+    }
+
     fn digest(bytes: &[u8]) -> Id {
         Id(Sha256::digest(bytes).into())
     }
@@ -125,7 +128,7 @@ mod fixture {
         key: &MLDSA65VerificationKey,
     ) -> &'a [u8] {
         let (body, signature) = bytes.split_at(bytes.len() - MLDSA65Signature::len());
-        verify_possession(
+        verify_command(
             key,
             &signed_bytes(session, kind, body),
             &MLDSA65Signature::new(signature.try_into().unwrap()),
@@ -136,7 +139,7 @@ mod fixture {
 
     fn enroll(path: &Path) {
         let identity = identity();
-        let owner = ml_dsa_65::generate_key_pair([75; 32]).verification_key;
+        let owner = owner_identity().verification_key().clone();
         let folder = ml_dsa_65::generate_key_pair([76; 32]).verification_key;
         let mut input = io::stdin().lock();
         let mut output = io::stdout().lock();
@@ -249,7 +252,7 @@ mod fixture {
         mut output: W,
         restarted: impl FnOnce() -> (R, W),
     ) {
-        let owner = ml_dsa_65::generate_key_pair([75; 32]);
+        let owner = owner_identity();
         let folder = ml_dsa_65::generate_key_pair([76; 32]);
         let folder_id = opening::folder_key_id(&folder.verification_key).0;
         let pins = identity().pins();
@@ -282,8 +285,9 @@ mod fixture {
         body.extend_from_slice(verifier.server_key.as_ref());
         body.extend_from_slice(share.as_ref());
         let mut session = Session::connect(&mut input, &mut output, pending()).unwrap();
-        let signature =
-            sign_possession(&owner.signing_key, &signed_bytes(&session, ENROLL, &body)).unwrap();
+        let signature = owner
+            .sign_command(&signed_bytes(&session, ENROLL, &body))
+            .unwrap();
         body.extend_from_slice(signature.as_slice());
         session.send(ENROLL, &body).unwrap();
         assert_eq!(&**session.receive(RESULT).unwrap(), &[OK]);
@@ -325,9 +329,9 @@ mod fixture {
             let mut session = Session::connect(&mut input, &mut output, pending()).unwrap();
             if let Some(message) = command {
                 let mut bytes = message.encode().unwrap();
-                let signature =
-                    sign_possession(&owner.signing_key, &signed_bytes(&session, OWNER, &bytes))
-                        .unwrap();
+                let signature = owner
+                    .sign_command(&signed_bytes(&session, OWNER, &bytes))
+                    .unwrap();
                 bytes.extend_from_slice(signature.as_slice());
                 session.send(OWNER, &bytes).unwrap();
                 assert_eq!(&**session.receive(RESULT).unwrap(), &[OK]);

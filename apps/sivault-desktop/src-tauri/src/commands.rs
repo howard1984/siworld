@@ -166,6 +166,7 @@ pub async fn safe_create_directory(
 pub async fn safe_lock(app: AppHandle, session_id: String) -> Result<()> {
     blocking(app, move |app, state| {
         state.lock(&session_id)?;
+        app.state::<crate::owner::OwnerState>().clear(false);
         app.state::<crate::releaser::ReleaserState>().stop(false);
         Ok(())
     })

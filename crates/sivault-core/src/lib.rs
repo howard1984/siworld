@@ -3,6 +3,8 @@
 pub mod controlled_channel;
 pub mod controlled_credential;
 pub mod crypto;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod owner;
 pub mod standard;
 
 use std::{fmt, io};
