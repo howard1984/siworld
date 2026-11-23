@@ -1,9 +1,12 @@
 //! Bounded production diagnostics. No underlying error text is retained.
 
+use crate::eng2::driver::PrepareBlockError;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Failure {
     Budget,
     WorkerPool,
+    SearchPool,
     ProverInit,
     RehearsalControl,
     ProductionControl,
@@ -15,7 +18,7 @@ pub(in super::super) enum Failure {
     PaddingInsert,
     PrepareClock,
     PrepareHead,
-    PrepareBlock,
+    PrepareBlock(PrepareBlockError),
     ProveBlock,
     WorkHead,
     WorkPrepare,
@@ -32,14 +35,14 @@ impl Failure {
     pub(in super::super) fn stage(self) -> &'static str {
         match self {
             Self::Budget => "budget",
-            Self::WorkerPool | Self::ProverInit => "initialization",
+            Self::WorkerPool | Self::SearchPool | Self::ProverInit => "initialization",
             Self::RehearsalControl
             | Self::ProductionControl
             | Self::Readiness
             | Self::OwnerAccess => "control",
             Self::StatusUpdate => "status",
             Self::PaddingPrepare | Self::PaddingProve | Self::PaddingInsert => "padding",
-            Self::PrepareClock | Self::PrepareHead | Self::PrepareBlock => "prepare",
+            Self::PrepareClock | Self::PrepareHead | Self::PrepareBlock(_) => "prepare",
             Self::ProveBlock => "prove",
             Self::WorkHead | Self::WorkPrepare | Self::WorkSearch | Self::WorkProgress => "work",
             Self::HeaderPublish => "header",
@@ -48,10 +51,34 @@ impl Failure {
             Self::Unknown => "unknown",
         }
     }
+    pub(super) fn permits_watchdog_retry(self) -> bool {
+        use crate::eng2::producer::PrepareError;
+        use crate::pool::FillError;
+        use crate::producer::CandidateError;
+        // No automatic retry after an ambiguous publication, commit or receipt
+        // write, or an invariant/setup failure that cannot be fixed by a new round.
+        matches!(
+            self,
+            Self::PrepareBlock(PrepareBlockError::Candidate(PrepareError::Candidate(
+                CandidateError::Timestamp
+                    | CandidateError::Snapshot(_)
+                    | CandidateError::NullifierCollision
+                    | CandidateError::OutputCollision
+                    | CandidateError::IdentityCollision
+                    | CandidateError::RewardEntropy
+            ))) | Self::PrepareBlock(PrepareBlockError::Padding(FillError::Insufficient { .. }))
+                | Self::PaddingProve
+                | Self::ProveBlock
+                | Self::WorkPrepare
+                | Self::WorkSearch
+        )
+    }
+
     pub(in super::super) fn code(self) -> &'static str {
         match self {
             Self::Budget => "budget_reservation_failed",
             Self::WorkerPool => "worker_pool_initialization_failed",
+            Self::SearchPool => "pow_worker_pool_initialization_failed",
             Self::ProverInit => "prover_initialization_failed",
             Self::RehearsalControl => "rehearsal_budget_control_failed",
             Self::ProductionControl => "production_control_failed",
@@ -63,7 +90,7 @@ impl Failure {
             Self::PaddingInsert => "padding_insertion_failed",
             Self::PrepareClock => "block_timestamp_failed",
             Self::PrepareHead => "preparation_head_failed",
-            Self::PrepareBlock => "block_preparation_failed",
+            Self::PrepareBlock(cause) => cause.code(),
             Self::ProveBlock => "block_proof_failed",
             Self::WorkHead => "work_head_failed",
             Self::WorkPrepare => "work_preparation_failed",
@@ -88,24 +115,6 @@ impl From<String> for Failure {
 impl From<&str> for Failure {
     fn from(_: &str) -> Self {
         Self::Unknown
-    }
-}
-
-// The producer is invoked once. After a returned error, the caller keeps the
-// validation service alive until cancellation without retrying production.
-// Panics are not caught or reported as returned failures.
-pub(super) fn run_once(
-    produce: impl FnOnce() -> Result<(), Failure>,
-    alarm: impl FnOnce(Failure),
-    wait_for_cancel: impl FnOnce(),
-) -> Result<(), String> {
-    match produce() {
-        Ok(()) => Ok(()),
-        Err(failure) => {
-            alarm(failure);
-            wait_for_cancel();
-            Err("native_production_failed".into())
-        }
     }
 }
 

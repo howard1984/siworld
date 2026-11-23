@@ -8,9 +8,45 @@ Authenticated sessions negotiate exact-identity header exchange through a backwa
 
 The resident seeds accepted header order before admitting competitors. An ordinary successful append retains its complete raw material using indexed lookups. A raw-archive failure after the canonical commit pauses production and records an alarm; it does not relabel the committed block as rejected. Switching clears the local pending-transaction and padding pools. A wallet can rebroadcast an original still-valid signed packet after authenticated synchronization; automatic orphan-transaction reinsertion remains outside this scope. Candidate selection is cached between header or invalidity changes. A selection revision still requires a bounded scan of the retained header tree; selection is not a constant-time operation.
 
-## Restore and append
+## Checkpoint fork choice
 
-For a preferred branch with at most 24 removed blocks:
+Networks that activate checkpoint fork choice keep the latest durably accepted
+quorum checkpoint as the rollback boundary. Above that boundary a candidate
+must have strictly greater verified cumulative work. Missing material defers
+that candidate. A branch proven incompatible with the checkpoint cannot
+change the selected chain. If checkpoint issuance stops, the last accepted
+checkpoint remains binding. Two incompatible valid certificates suspend new
+signing and wallet finality while the node continues following work above the
+first accepted checkpoint.
+
+Replay executes in a separate database while the selected chain remains
+available. Only a fully verified generation enters the owner publication
+barrier. The selector publishes the new generation and preserves the
+checkpoint in one durable transaction. Reopen authenticates the named store
+and verifies that it still contains the selected publication head and accepted
+checkpoint.
+
+The resident implementation of this profile requires Unix generation storage.
+Windows rejects initialization, checkpoint import, and restart for this profile
+until equivalent durable selection and replay are available.
+
+The discovery window admits up to eight concurrent candidates, eight active
+peers, 2,048 tracked headers, 256 headers per candidate and 4 GiB of body
+traffic. A discovery candidate expires after 15 minutes. The replay scheduler
+runs one replay at a time and may retain one resource-deferred replay. It
+retries a retained replay after one minute and drops it after five minutes in
+resource deferral or a selector change. Active replay requests cancellation
+after five minutes without a progress boundary; the current native operation
+must return before its resources can be reclaimed. Each scratch file has a
+64 GiB limit, and planned writes preserve 20 GiB of free space plus the next
+operation's estimate. Shared memory reservations cover staged bytes and replay
+workspace; they do not measure process RSS or RandomX datasets. These limits
+are local scheduling policies. Superseded and crash-left database files may
+remain on disk and are not made canonical by their presence.
+
+## Legacy restore and append
+
+For a legacy profile and a preferred branch with at most 24 removed blocks:
 
 1. Fix the common ancestor and complete original and replacement raw material. Missing original material or a missing retained savepoint requires manual recovery.
 2. Execute the entire fixed replacement from the authenticated ancestor in an in-memory engine before restoring durable state. Bind the result to the Store instance, canonical revision, old head, exact header identities and body commitments.

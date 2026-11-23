@@ -4,11 +4,17 @@ use crate::{issuance::AssetRegistry, state::CommitmentTree};
 use native::multi_asset::TREE_DEPTH;
 
 pub const MAX_CACHE: usize = 64 * 1024 * 1024;
-const MAGIC: &[u8; 8] = b"SWE2LC01";
+const MAGIC: &[u8; 8] = b"SWE2LC02";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"SWE2LC03";
+const LEGACY_MAGIC: &[u8; 8] = b"SWE2LC01";
 impl Eng2LightState {
     /// Private notes and membership paths; never publish or send to a service.
     pub fn local_cache(&self) -> Result<Zeroizing<Vec<u8>>, String> {
-        let mut out = Zeroizing::new(MAGIC.to_vec());
+        let magic = match self.header_validation {
+            HeaderValidation::FullWork => MAGIC,
+            HeaderValidation::CheckpointAuthenticated => CHECKPOINT_MAGIC,
+        };
+        let mut out = Zeroizing::new(magic.to_vec());
         out.extend(binding(&self.context));
         let address = self.wallet.address();
         out.extend_from_slice(&encode_digest(&address.owner()));
@@ -41,6 +47,14 @@ impl Eng2LightState {
         part(&mut out, &assets)?;
         part(&mut out, &self.wallet.local_receipt_cache()?)?;
         part(&mut out, &self.paths.cache_owned())?;
+        let governance = self
+            .checkpoint_governance
+            .as_ref()
+            .map(GovernanceState::canonical_component_bytes)
+            .transpose()?
+            .unwrap_or_default();
+        part(&mut out, &governance)?;
+        out.push(u8::from(self.checkpoint_replay_required));
         let checksum = *blake3::hash(&out).as_bytes();
         if out
             .len()
@@ -70,7 +84,11 @@ impl Eng2LightState {
         {
             return Err("eng2 cached candidate is not a retained accepted prefix".into());
         }
-        let candidate = Self::open_local(genesis, expected, seed, account, bytes)?;
+        let (context, governance) = Self::wallet_genesis(genesis, expected)?;
+        let candidate = Self::open_local_with_state(
+            Self::from_context(context, governance, seed, account, self.header_validation)?,
+            bytes,
+        )?;
         if binding(candidate.context()) != binding(self.context())
             || candidate.wallet().address() != self.wallet().address()
             || candidate.height() != checkpoint.height
@@ -91,6 +109,25 @@ impl Eng2LightState {
         account: u32,
         bytes: &[u8],
     ) -> Result<Self, String> {
+        Self::open_local_with_state(Self::new(genesis, expected, seed, account)?, bytes)
+    }
+
+    /// Reopen an authenticated browser cache without upgrading provisional
+    /// headers into proof-of-work evidence.
+    pub fn open_local_for_browser(
+        genesis: &[u8],
+        expected: Hash,
+        seed: Zeroizing<[u8; 32]>,
+        account: u32,
+        bytes: &[u8],
+    ) -> Result<Self, String> {
+        Self::open_local_with_state(
+            Self::new_for_browser(genesis, expected, seed, account)?,
+            bytes,
+        )
+    }
+
+    fn open_local_with_state(mut result: Self, bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() < 32 || bytes.len() > MAX_CACHE {
             return Err("eng2 cache byte limit rejected".into());
         }
@@ -99,8 +136,12 @@ impl Eng2LightState {
             return Err("eng2 cache checksum rejected".into());
         }
         let mut input = body;
-        let mut result = Self::new(genesis, expected, seed, account)?;
-        if take(&mut input, 8)? != MAGIC || take(&mut input, 129)? != binding(&result.context) {
+        let magic = take(&mut input, 8)?;
+        let compatible = match result.header_validation {
+            HeaderValidation::FullWork => magic == MAGIC || magic == LEGACY_MAGIC,
+            HeaderValidation::CheckpointAuthenticated => magic == CHECKPOINT_MAGIC,
+        };
+        if !compatible || take(&mut input, 129)? != binding(&result.context) {
             return Err("eng2 cache network, genesis, rules, profile or fee mode differs".into());
         }
         let address = result.wallet.address();
@@ -117,8 +158,14 @@ impl Eng2LightState {
         for raw in headers.as_chunks::<HEADER_BYTES>().0 {
             let header = Header::decode(raw, &result.context.config().network)
                 .map_err(|_| "eng2 cached header rejected")?;
-            verify_header(&result.state, &header)?;
-            advance_header(&mut result.state, &header)?;
+            verify_header(
+                &result.context,
+                &result.state,
+                &result.headers,
+                &header,
+                result.header_validation,
+            )?;
+            advance_header(&mut result.state, &header, result.header_validation)?;
             result.headers.push(header);
         }
         let count = u64::from_le_bytes(take(&mut input, 8)?.try_into().expect("fixed leaf count"));
@@ -212,6 +259,29 @@ impl Eng2LightState {
             .filter(|row| !row.spent && row.note().value > 0)
             .map(|row| row.commitment)
             .collect::<BTreeSet<_>>();
+        if magic != LEGACY_MAGIC {
+            let raw = section(&mut input)?;
+            result.checkpoint_governance = if raw.is_empty() {
+                None
+            } else {
+                let governance =
+                    GovernanceState::decode_component(raw, result.context.config().network)?;
+                if governance.height() != result.height() {
+                    return Err("eng2 cached checkpoint governance height differs".into());
+                }
+                Some(governance)
+            };
+            result.checkpoint_replay_required = match take(&mut input, 1)? {
+                [0] => false,
+                [1] if result.checkpoint_governance.is_none() => true,
+                _ => return Err("eng2 cached checkpoint replay flag rejected".into()),
+            };
+        } else if result.height() != 0 {
+            // Older caches did not authenticate roster history. A full receipt
+            // replay is required before accepting a new checkpoint from them.
+            result.checkpoint_governance = None;
+            result.checkpoint_replay_required = true;
+        }
         if expected_paths != result.paths.all_paths().into_keys().collect() || !input.is_empty() {
             return Err("eng2 cache paths or trailing bytes differ".into());
         }

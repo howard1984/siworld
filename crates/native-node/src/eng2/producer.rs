@@ -3,11 +3,19 @@
 use super::{body::Body, execution::Engine, genesis::FeeMode, header::Header};
 use crate::{
     pool::Padding,
-    producer::{MiningSettings, PreparedCandidate, prepare_candidate_with_plan, prove_candidate},
+    producer::{
+        CandidateError, MiningSettings, PreparedCandidate, prepare_candidate_with_plan,
+        prove_candidate,
+    },
     proofs::{NativeProver, NativeVerifier},
     wire::Hash,
 };
 use zeroize::Zeroizing;
+
+#[cfg(feature = "eng2-runtime")]
+mod parallel;
+#[cfg(feature = "eng2-runtime")]
+pub(crate) use parallel::Batch;
 
 pub struct ProducedBlock {
     pub header: Header,
@@ -84,11 +92,32 @@ pub struct Work {
     header: Header,
     body: Body,
     pow_iterations: u64,
+    randomx: Option<super::proof_of_work::MiningKeys>,
     reward_secret: Zeroizing<Vec<u8>>,
 }
 pub enum Search {
     Found(ProducedBlock),
     Pending(Work),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepareError {
+    FeeMode,
+    Height,
+    FundAllocation,
+    Economics,
+    Candidate(CandidateError),
+}
+impl PrepareError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::FeeMode => "production_requires_legacy_fee_mode",
+            Self::Height => "production_height_overflow",
+            Self::FundAllocation => "production_fund_allocation_missing",
+            Self::Economics => "production_reward_plan_rejected",
+            Self::Candidate(error) => error.code(),
+        }
+    }
 }
 
 /// Prepare against the current state while the owner is briefly borrowed.
@@ -101,23 +130,35 @@ pub fn prepare(
     operations: Option<crate::eng2_operations::PendingOperations>,
     issuances: Vec<crate::issuance::IssuanceRecord>,
 ) -> Result<PreparedBlock, String> {
+    prepare_checked(
+        engine, positions, timestamp, settings, operations, issuances,
+    )
+    .map_err(|error| error.code().into())
+}
+
+pub(crate) fn prepare_checked(
+    engine: &Engine,
+    positions: Vec<Padding>,
+    timestamp: u64,
+    settings: &MiningSettings,
+    operations: Option<crate::eng2_operations::PendingOperations>,
+    issuances: Vec<crate::issuance::IssuanceRecord>,
+) -> Result<PreparedBlock, PrepareError> {
     let state = engine.state();
     if state.fee_mode() != FeeMode::LegacyMiner {
-        return Err("production requires sealed legacy fee mode".into());
+        return Err(PrepareError::FeeMode);
     }
-    let height = state
-        .height()
-        .checked_add(1)
-        .ok_or("production height overflow")?;
+    let height = state.height().checked_add(1).ok_or(PrepareError::Height)?;
     let allocation = state
         .chain()
         .config
         .fund_allocation
         .as_ref()
-        .ok_or("missing fund allocation")?;
+        .ok_or(PrepareError::FundAllocation)?;
     let (_, reward) = state
         .economics()
-        .prepare(height, settings.mode, allocation)?;
+        .prepare(height, settings.mode, allocation)
+        .map_err(|_| PrepareError::Economics)?;
     let candidate = prepare_candidate_with_plan(
         state.chain(),
         positions,
@@ -125,7 +166,8 @@ pub fn prepare(
         settings,
         crate::state::plan_from_allocation(&reward),
         engine.genesis().slot_rule(),
-    )?;
+    )
+    .map_err(PrepareError::Candidate)?;
     Ok(PreparedBlock {
         parent: state.tip(),
         timestamp,
@@ -176,10 +218,21 @@ impl ProvedBlock {
             return Err("proved candidate parent changed".into());
         }
         let header = engine.prepare_header(&self.body, self.timestamp, verifier)?;
+        let config = &engine.state().chain().config;
+        let randomx = if config.pow_algorithm() == siworld_core::pow::Algorithm::SiworldRandomX {
+            Some(super::proof_of_work::MiningKeys::for_template(
+                engine.genesis().id(),
+                &header,
+                engine.state().chain(),
+            )?)
+        } else {
+            None
+        };
         Ok(Work {
             header,
             body: self.body,
-            pow_iterations: engine.state().chain().config.pow_iterations,
+            pow_iterations: config.pow_iterations,
+            randomx,
             reward_secret: self.reward_secret,
         })
     }
@@ -222,15 +275,26 @@ impl Work {
             .header
             .pow_seed()
             .map_err(|_| "invalid production header")?;
+        let dataset = if let Some(keys) = self.randomx {
+            let Some(dataset) = super::proof_of_work::fast_dataset(keys, 1)? else {
+                return Ok(Search::Pending(self));
+            };
+            Some(dataset)
+        } else {
+            None
+        };
+        let mut vm = dataset.as_ref().map(|dataset| dataset.vm()).transpose()?;
         for _ in 0..max_attempts {
             if stopped() {
                 return Ok(Search::Pending(self));
             }
             let nonce = self.header.nonce;
-            if siworld_core::pow::meets_target(
-                &siworld_core::pow::pow_hash(&seed, nonce, self.pow_iterations),
-                &self.header.target,
-            ) {
+            let digest = if let Some(vm) = &mut vm {
+                vm.hash_header(seed, nonce)
+            } else {
+                siworld_core::pow::pow_hash(&seed, nonce, self.pow_iterations)
+            };
+            if siworld_core::pow::meets_target(&digest, &self.header.target) {
                 self.header.nonce = nonce;
                 return Ok(Search::Found(ProducedBlock {
                     header: self.header,
@@ -264,6 +328,7 @@ mod cancellation_tests {
             },
             body,
             pow_iterations: 0,
+            randomx: None,
             reward_secret: Zeroizing::new(Vec::new()),
         };
         let mut polls = 0;

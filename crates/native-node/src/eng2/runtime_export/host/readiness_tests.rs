@@ -87,7 +87,7 @@ fn checkpoint_signing_uses_local_context_with_divergent_or_missing_peer_heads() 
 #[test]
 fn checkpoint_quorum_conflict_blocks_new_signing_but_keeps_public_exports() {
     let dir = Directory::new();
-    let store = dir.store();
+    let mut store = dir.store();
     let root = dir.private("conflict-export");
     let network = Arc::new(NetworkStatus::new([[1; 32], [2; 32]]));
     let _connection = network.connected([1; 32]).unwrap();
@@ -108,7 +108,7 @@ fn checkpoint_quorum_conflict_blocks_new_signing_but_keeps_public_exports() {
     )
     .unwrap();
     let tick = host
-        .tick_resident(&store, 100_000, &[], &network, &observer)
+        .tick_resident(&mut store, 100_000, &[], &network, &observer)
         .unwrap();
     assert!(tick.exported_current);
     assert_eq!(tick.status.alarm, Some(Alarm::CurrentQuorumConflict));
@@ -165,6 +165,8 @@ fn checkpoint_replacement_authority_changes_only_at_the_executed_activation_boun
             slot: 0,
             public: *pair.verification_key.as_ref(),
             key: pair.signing_key,
+            #[cfg(feature = "eng2-runtime")]
+            history: std::cell::RefCell::new(None),
         }
     };
     let old = signer(3);

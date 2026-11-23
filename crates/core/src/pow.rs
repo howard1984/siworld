@@ -24,7 +24,80 @@ pub fn meets_target(work: &[u8; 32], target: &[u8; 32]) -> bool {
     work < target
 }
 
-/// ASERT anchored at the immutable genesis target/time and network interval.
+/// Work algorithms selected by the immutable engineering genesis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Algorithm {
+    #[default]
+    SequentialBlake3,
+    SiworldRandomX,
+}
+
+pub const RANDOMX_ALGORITHM: &str = "randomx-v1.2.1-siworld-v1";
+pub const RANDOMX_ARGON_SALT: &[u8; 28] = b"SIWORLD/RandomX/ArgonSalt/v1";
+pub const RANDOMX_KEY_INTERVAL: u64 = 2048;
+pub const RANDOMX_KEY_DELAY: u64 = 64;
+pub const RANDOMX_KEY_DOMAIN: &str = "siworld eng2 randomx epoch key v1";
+pub const RANDOMX_INPUT_DOMAIN: &[u8; 23] = b"SIWORLD/RandomX/PoW/v1\0";
+
+/// Include this extension only in the RandomX genesis rules. BLAKE3 genesis
+/// encodings and identifiers are preserved byte for byte.
+pub fn bind_randomx(hasher: &mut blake3::Hasher) {
+    hasher.update(RANDOMX_ALGORITHM.as_bytes());
+    hasher.update(RANDOMX_ARGON_SALT);
+    hasher.update(&RANDOMX_KEY_INTERVAL.to_le_bytes());
+    hasher.update(&RANDOMX_KEY_DELAY.to_le_bytes());
+    hasher.update(RANDOMX_KEY_DOMAIN.as_bytes());
+    hasher.update(RANDOMX_INPUT_DOMAIN);
+}
+
+pub const fn randomx_key_height(candidate_height: u64) -> u64 {
+    candidate_height.saturating_sub(RANDOMX_KEY_DELAY) / RANDOMX_KEY_INTERVAL * RANDOMX_KEY_INTERVAL
+}
+
+/// The caller must provide the key block from the candidate's verified parent
+/// path. The first epoch is bound to the actual sealed genesis identifier.
+pub fn randomx_epoch_key(
+    genesis: [u8; 32],
+    candidate_height: u64,
+    mut ancestor: impl FnMut(u64) -> Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    if candidate_height == 0 || genesis == [0; 32] {
+        return None;
+    }
+    let height = randomx_key_height(candidate_height);
+    let id = if height == 0 {
+        genesis
+    } else {
+        ancestor(height)?
+    };
+    if id == [0; 32] {
+        return None;
+    }
+    let mut preimage = [0; 72];
+    preimage[..32].copy_from_slice(&genesis);
+    preimage[32..40].copy_from_slice(&height.to_le_bytes());
+    preimage[40..].copy_from_slice(&id);
+    Some(blake3::derive_key(RANDOMX_KEY_DOMAIN, &preimage))
+}
+
+/// The accepted ASERT schedules. These are selected by immutable chain rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AsertHalfLife {
+    #[default]
+    FourHours,
+    OneHour,
+}
+
+impl AsertHalfLife {
+    pub const fn seconds(self) -> u64 {
+        match self {
+            Self::FourHours => ASERT_HALF_LIFE as u64,
+            Self::OneHour => 3_600,
+        }
+    }
+}
+
+/// The existing four-hour ASERT schedule.
 pub fn asert_target(
     genesis_target: &[u8; 32],
     genesis_timestamp: u64,
@@ -32,12 +105,31 @@ pub fn asert_target(
     parent_height: u64,
     parent_timestamp: u64,
 ) -> [u8; 32] {
+    asert_target_with_half_life(
+        genesis_target,
+        genesis_timestamp,
+        target_interval,
+        parent_height,
+        parent_timestamp,
+        AsertHalfLife::FourHours,
+    )
+}
+
+/// ASERT anchored at the immutable genesis target, time, interval and half-life.
+pub fn asert_target_with_half_life(
+    genesis_target: &[u8; 32],
+    genesis_timestamp: u64,
+    target_interval: u64,
+    parent_height: u64,
+    parent_timestamp: u64,
+    half_life: AsertHalfLife,
+) -> [u8; 32] {
     if parent_height == 0 {
         return *genesis_target;
     }
     let ideal = i128::from(parent_height) * i128::from(target_interval);
     let actual = i128::from(parent_timestamp) - i128::from(genesis_timestamp);
-    let exponent = (actual - ideal) * 65536 / i128::from(ASERT_HALF_LIFE);
+    let exponent = (actual - ideal) * 65536 / i128::from(half_life.seconds());
     let shifts = exponent >> 16;
     let frac = exponent & 0xFFFF;
     let factor = 65536
@@ -124,6 +216,36 @@ mod tests {
         floor[31] = 1;
         assert_eq!(asert_target(&initial, genesis, 300, u64::MAX, 0), floor);
     }
+    #[test]
+    fn one_hour_drift_doubles_or_halves_the_target() {
+        let mut initial = [0; 32];
+        initial[0] = 0x20;
+        let base = Work::from_big_endian(&initial);
+        let genesis = 1000;
+        for (elapsed, expected) in [(0, base >> 1), (3600, base), (7200, base << 1)] {
+            let target = asert_target_with_half_life(
+                &initial,
+                genesis,
+                300,
+                12,
+                genesis + elapsed,
+                AsertHalfLife::OneHour,
+            );
+            assert_eq!(Work::from_big_endian(&target), expected);
+        }
+        assert_ne!(
+            asert_target(&initial, genesis, 300, 12, genesis + 7200),
+            asert_target_with_half_life(
+                &initial,
+                genesis,
+                300,
+                12,
+                genesis + 7200,
+                AsertHalfLife::OneHour
+            ),
+        );
+    }
+
     #[test]
     fn sequential_work_and_strict_big_endian_comparison() {
         let seed = [9; 32];

@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "siworld-randomx-pow"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-only"
+
+[dependencies]
+siworld-core = { path = "../core" }
+
+[build-dependencies]
+cmake = "=0.1.58"

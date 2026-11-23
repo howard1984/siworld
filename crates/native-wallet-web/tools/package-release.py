@@ -72,6 +72,7 @@ def wallet_connection_origins(source):
         return []
     if (type(value.get('version')) is not int or value['version'] != 2
             or type(value.get('fee_mode')) is not int or value['fee_mode'] != 0 or value.get('read_only') is not True
+            or type(value.get('checkpoint_finality', False)) is not bool
             or any(not isinstance(value.get(key), str) or not re.fullmatch('[0-9a-f]{64}', value[key])
                    or set(value[key]) == {'0'} for key in ('network', 'genesis', 'rules', 'profile'))):
         raise ValueError('Pinned engineering-v2 runtime configuration differs.')

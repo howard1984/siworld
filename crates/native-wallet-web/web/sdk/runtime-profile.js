@@ -11,7 +11,7 @@ export function sessionConfiguration(requested, pinned) {
     return requested;
   }
   const context = eng2ReadOnlyProfile(pinned), request = eng2ReadOnlyProfile(requested);
-  if (!sameEng2Context(request,context) || request.api !== context.api || JSON.stringify(request.apis) !== JSON.stringify(context.apis) || JSON.stringify(request.submission_apis) !== JSON.stringify(context.submission_apis)) throw new Error('Engineering-v2 session differs from the immutable build configuration.');
+  if (!sameEng2Context(request,context) || request.api !== context.api || request.checkpoint_finality !== context.checkpoint_finality || JSON.stringify(request.apis) !== JSON.stringify(context.apis) || JSON.stringify(request.submission_apis) !== JSON.stringify(context.submission_apis)) throw new Error('Engineering-v2 session differs from the immutable build configuration.');
   return context;
 }
 export function assertWalletOperation(action, pinned) {

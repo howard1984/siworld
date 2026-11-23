@@ -903,23 +903,46 @@ fn readiness_reason_preserves_owner_and_observer_gates_ahead_of_peer_diagnostics
     use super::peers::PeerReadiness;
     let healthy = Observer::default();
     assert_eq!(
-        resident_readiness(true, "ready", &healthy, PeerReadiness::Ready),
+        resident_readiness(true, "ready", &healthy, false, PeerReadiness::Ready),
         (true, "ready")
     );
     assert_eq!(
-        resident_readiness(true, "ready", &healthy, PeerReadiness::NoConnectedPeers),
+        resident_readiness(
+            true,
+            "ready",
+            &healthy,
+            false,
+            PeerReadiness::NoConnectedPeers
+        ),
         (false, "no_connected_peers")
     );
     let hard = synthetic_current_conflict();
     assert_eq!(
-        resident_readiness(true, "ready", &hard, PeerReadiness::Ready),
+        resident_readiness(true, "ready", &hard, false, PeerReadiness::Ready),
         (false, "checkpoint_current_quorum_conflict")
     );
     let pending = synthetic_pending_authorization();
     assert_eq!(
-        resident_readiness(true, "ready", &pending, PeerReadiness::Ready),
+        resident_readiness(true, "ready", &pending, false, PeerReadiness::Ready),
         (false, "checkpoint_authorization_pending")
     );
+    for observer in [&hard, &pending] {
+        assert!(observer.conflicted());
+        assert_eq!(
+            resident_readiness(true, "ready", observer, true, PeerReadiness::Ready),
+            (true, "ready"),
+        );
+        assert_eq!(
+            resident_readiness(
+                true,
+                "ready",
+                observer,
+                true,
+                PeerReadiness::NoConnectedPeers
+            ),
+            (false, "no_connected_peers"),
+        );
+    }
     for reason in [
         "manual_recovery_required",
         "applying_validated_branch",
@@ -927,12 +950,12 @@ fn readiness_reason_preserves_owner_and_observer_gates_ahead_of_peer_diagnostics
         "resuming_best_branch",
     ] {
         assert_eq!(
-            resident_readiness(false, reason, &hard, PeerReadiness::NoConnectedPeers),
+            resident_readiness(false, reason, &hard, false, PeerReadiness::NoConnectedPeers),
             (false, reason)
         );
     }
     assert_eq!(
-        resident_readiness(false, "ready", &healthy, PeerReadiness::Ready),
+        resident_readiness(false, "ready", &healthy, false, PeerReadiness::Ready),
         (false, "canonical_state_unavailable")
     );
 }

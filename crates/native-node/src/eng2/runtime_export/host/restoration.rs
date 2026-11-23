@@ -19,7 +19,7 @@ impl Host {
         let mut value = Self {
             export: PublicExport::open_unrestored(root, store)?,
             signer: existing_key
-                .map(|path| ExistingSigner::load(path, store))
+                .map(|path| ExistingSigner::load_for_host(path, root, store))
                 .transpose()?,
             limits,
             pending: None,

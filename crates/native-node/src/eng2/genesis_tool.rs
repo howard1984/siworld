@@ -168,7 +168,8 @@ fn guard(genesis: &Genesis, expected: Expected) -> Result<()> {
         || config.genesis_timestamp == 0
         || config.genesis_target == [0; 32]
         || config.target_interval != crate::state::TARGET_INTERVAL
-        || !(1..=crate::state::MAX_POW_ITERATIONS).contains(&config.pow_iterations)
+        || (config.pow_algorithm() == siworld_core::pow::Algorithm::SequentialBlake3
+            && !(1..=crate::state::MAX_POW_ITERATIONS).contains(&config.pow_iterations))
         || config.economics != siworld_core::v1_economics::EconomicsParams::production()
     {
         return Err("fixture_or_nonproduction_rules");
@@ -297,7 +298,7 @@ fn report(genesis: &Genesis, bytes: &[u8], expected: Expected) -> Result<Value> 
         "source":{"config_rules_sha256":hex(&expected.config_sha256),"governance_component_sha256":hex(&expected.governance_sha256),"source_commit_verified":false},
         "parameters":{"fixture":false,"work_bits":config.work_bits,
             "genesis_timestamp":config.genesis_timestamp.to_string(),"genesis_target":hex(&config.genesis_target),
-            "target_interval_seconds":config.target_interval.to_string(),"pow_iterations":config.pow_iterations.to_string(),
+            "target_interval_seconds":config.target_interval.to_string(),"asert_half_life_seconds":config.asert_half_life().seconds(),"pow_iterations":config.pow_iterations.to_string(),
             "economic_rule_version":siworld_core::v1_economics::ECONOMICS_RULE_VERSION,"economic_timing":"production",
             "fund_team_index":allocation.team_index(),"fund_members":members,
             "founder_public_key_sha256":hex(&digest(founder)),"revocation_public_key_sha256":hex(&digest(revocation)),
@@ -312,7 +313,20 @@ fn report(genesis: &Genesis, bytes: &[u8], expected: Expected) -> Result<Value> 
         result["genesis_profile"] = crate::wire::PUBLIC_GENESIS_PROFILE.into();
         result["parameters"]["minimum_transaction_slots"] = genesis.slot_rule().minimum().into();
     }
+    if config.pow_algorithm() == siworld_core::pow::Algorithm::SiworldRandomX {
+        result["parameters"]["proof_of_work"] = randomx_parameters();
+    }
     Ok(result)
+}
+
+fn randomx_parameters() -> Value {
+    use siworld_core::pow;
+    json!({
+        "algorithm": pow::RANDOMX_ALGORITHM,
+        "argon_salt_hex": hex(pow::RANDOMX_ARGON_SALT),
+        "seed_interval_blocks": pow::RANDOMX_KEY_INTERVAL,
+        "seed_delay_blocks": pow::RANDOMX_KEY_DELAY,
+    })
 }
 
 /// Create one absent public genesis file after all public preflight checks pass.

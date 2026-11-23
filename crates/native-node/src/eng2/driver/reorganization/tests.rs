@@ -42,7 +42,9 @@ fn load_at(directory: &Path, source: &Path, count: usize) -> Fixture {
         genesis_timestamp: config.genesis_timestamp,
         genesis_target: config.genesis_target,
         target_interval: config.target_interval,
+        asert_half_life: config.asert_half_life(),
         pow_iterations: config.pow_iterations,
+        pow_algorithm: config.pow_algorithm(),
         max_headers: 1000,
     };
     let limits = Limits {
@@ -157,6 +159,204 @@ fn check_fingerprint(driver: &Driver, header: &Header) {
     );
     driver.store().ensure_exportable().unwrap();
 }
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+#[ignore = "owner-local replay of three closed, same-genesis minimum-work fixture corpora"]
+fn real_signed_checkpoint_fences_native_deep_replay() {
+    use crate::eng2::runtime_export::{
+        PreparedCheckpoint,
+        host::{initialize_fixture_custody, vote_with_fixture_custody},
+    };
+    use libcrux_ml_dsa::ml_dsa_65;
+    use redb::ReadableDatabase;
+    use std::{thread, time::Duration};
+
+    const BODY_TABLE: redb::TableDefinition<u64, &[u8]> =
+        redb::TableDefinition::new("eng2-canonical-blocks-v1");
+    const FLOOR: u64 = 12;
+    const OLD: u64 = 38;
+    const NEW: u64 = 39;
+    assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+    let [old, eligible, conflict, destination] = [
+        "SIWORLD_SIGNED_REORG_CANONICAL",
+        "SIWORLD_SIGNED_REORG_ELIGIBLE",
+        "SIWORLD_SIGNED_REORG_CONFLICT",
+        "SIWORLD_SIGNED_REORG_DESTINATION",
+    ]
+    .map(|name| PathBuf::from(std::env::var_os(name).expect("explicit local fixture path")));
+    assert!(destination.is_absolute() && !destination.exists());
+    let raw = fs::read(old.join("genesis.bin")).unwrap();
+    for source in [&old, &eligible, &conflict] {
+        assert!(source.is_absolute() && source.join("disposable-fixture").is_file());
+        assert!(!destination.starts_with(source));
+        assert_eq!(fs::read(source.join("genesis.bin")).unwrap(), raw);
+    }
+    let genesis = || Genesis::decode(&raw).unwrap();
+    let parsed = genesis();
+    let cfg = parsed.config();
+    assert!(cfg.fixture && parsed.checkpoint_fork_choice());
+    assert_eq!(cfg.genesis_target, [255; 32]);
+    let keys = [3, 4, 5].map(|seed| {
+        *ml_dsa_65::generate_key_pair([seed; 32])
+            .verification_key
+            .as_ref()
+    });
+    assert_eq!(parsed.initial_governance().active_roster().keys(), &keys);
+    let rules = HeaderRules {
+        network: cfg.network,
+        genesis: parsed.id(),
+        genesis_timestamp: cfg.genesis_timestamp,
+        genesis_target: cfg.genesis_target,
+        target_interval: cfg.target_interval,
+        asert_half_life: cfg.asert_half_life(),
+        pow_iterations: cfg.pow_iterations,
+        pow_algorithm: cfg.pow_algorithm(),
+        max_headers: NEW as usize,
+    };
+    let imports = crate::eng2::resident::limits();
+    let temp = |path: &Path| {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    };
+    temp(&destination);
+    let node = destination.join("node");
+    let exports = destination.join("exports");
+    temp(&node);
+    temp(&exports);
+    let owner = crate::identity::NativeIdentity::initialize(&node, parsed.peer_binding()).unwrap();
+    let store = Store::initialize_selected(&node, parsed, imports.chain, owner).unwrap();
+    let policy = store.engine().body_policy();
+    let verifier = NativeVerifier::for_genesis(store.engine().genesis()).unwrap();
+    let signers = [0, 1].map(|slot| {
+        let path = destination.join(format!("signer-{slot}.bin"));
+        initialize_fixture_custody(&path, &exports, &store, slot);
+        path
+    });
+    let mut driver = Driver::new(store, verifier, imports).unwrap();
+    let branches =
+        BranchStore::create(&node.join("branches.redb"), rules.clone(), branch_limits()).unwrap();
+    driver.enable_reorganization(branches).unwrap();
+
+    let read = |source: &Path, end, visit: &mut dyn FnMut(Header, &[u8])| {
+        let db = redb::ReadOnlyDatabase::open(source.join("chain.redb")).unwrap();
+        let txn = db.begin_read().unwrap();
+        let blocks = txn.open_table(BODY_TABLE).unwrap();
+        for height in 1..=end {
+            let row = blocks.get(height).unwrap().unwrap();
+            let (prefix, body) = row.value().split_at(HEADER_BYTES);
+            let header = Header::decode(prefix, &rules.network).unwrap();
+            assert_eq!(header.height, height);
+            visit(header, body);
+        }
+    };
+    let decode_body = |header: &Header, raw: &[u8]| {
+        Body::decode(raw, rules.network, header.height, policy).unwrap()
+    };
+    read(&old, OLD - 1, &mut |header, raw| {
+        driver.accept(&header, &decode_body(&header, raw)).unwrap();
+    });
+    let prepared = PreparedCheckpoint::prepare_from_archive(driver.store(), imports)
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.statement().checkpoint_height, FLOOR);
+    let votes = [
+        vote_with_fixture_custody(&signers[0], &exports, driver.store(), &prepared, true),
+        vote_with_fixture_custody(&signers[1], &exports, driver.store(), &prepared, false),
+    ];
+    let certified = prepared
+        .certify(
+            driver.store(),
+            votes,
+            driver.header(OLD - 1).unwrap().timestamp,
+        )
+        .unwrap();
+    driver.retain_finalized_checkpoint(&certified).unwrap();
+    let before_rejection = driver.head().unwrap();
+    let selected = driver.store().generation_record().unwrap();
+
+    let qualify = |source: &Path| {
+        let mut headers = Vec::new();
+        read(source, NEW, &mut |header, _| headers.push(header));
+        let root = headers[FLOOR as usize - 1].id().unwrap();
+        let next = headers[FLOOR as usize].id().unwrap();
+        let tip = headers.last().unwrap().id().unwrap();
+        let qualified = VerifiedHeaders::verify(rules.clone(), headers).unwrap();
+        (qualified, root, next, tip)
+    };
+    let (blocked, blocked_floor, _, _) = qualify(&conflict);
+    assert!(blocked.cumulative_work() > driver.engine().state().chain().cumulative_work);
+    assert_ne!(
+        blocked_floor,
+        certified.certificate().statement.checkpoint_block
+    );
+    driver.retain_competing_headers(&blocked).unwrap();
+    driver
+        .reorganization_tick(|_| panic!("conflicting checkpoint ancestry must never publish"))
+        .unwrap();
+    assert_eq!(driver.head().unwrap().id, before_rejection.id);
+    assert!(driver.activities_allowed());
+    assert_eq!(
+        driver.reorganization_alarm(),
+        Some("reorganization_checkpoint_conflict")
+    );
+    read(&old, OLD, &mut |header, raw| {
+        if header.height == OLD {
+            driver.accept(&header, &decode_body(&header, raw)).unwrap();
+        }
+    });
+    let before = driver.head().unwrap();
+    assert_eq!(before.height, OLD);
+    assert_eq!(driver.store().generation_record().unwrap(), selected);
+
+    let (candidate, floor, first_new, final_tip) = qualify(&eligible);
+    assert!(candidate.cumulative_work() > driver.engine().state().chain().cumulative_work);
+    assert_eq!(floor, certified.certificate().statement.checkpoint_block);
+    assert_ne!(first_new, driver.header(FLOOR + 1).unwrap().id().unwrap());
+    driver.retain_competing_headers(&candidate).unwrap();
+    read(&eligible, NEW, &mut |header, raw| {
+        if header.height > FLOOR {
+            driver
+                .retain_competing_body(&header, &decode_body(&header, raw))
+                .unwrap();
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut published = 0;
+    while driver.head().unwrap().id != final_tip {
+        assert!(
+            Instant::now() < deadline,
+            "native shadow replay did not publish"
+        );
+        assert_eq!(driver.head().unwrap().id, before.id);
+        assert!(driver.activities_allowed());
+        driver
+            .reorganization_tick(|ancestor| {
+                assert_eq!(ancestor, FLOOR);
+                published += 1;
+                Ok(())
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(published, 1);
+    assert_eq!(
+        driver.last_reorganization().unwrap().depth,
+        (OLD - FLOOR) as usize
+    );
+    assert_ne!(driver.store().generation_record().unwrap(), selected);
+    assert_eq!(
+        driver.store().finalized_checkpoint().unwrap().as_ref(),
+        Some(certified.certificate())
+    );
+    drop(driver);
+    let reopened = Store::resume_selected(&node, genesis(), imports.chain).unwrap();
+    assert_eq!(reopened.engine().state().tip(), final_tip);
+    assert_eq!(
+        reopened.finalized_checkpoint().unwrap().as_ref(),
+        Some(certified.certificate())
+    );
+}
+
 #[test]
 #[ignore = "owner-only complete native fixture and fresh disposable destination"]
 fn real_native_driver_switch_pause_invalid_and_restart() {

@@ -79,6 +79,8 @@ pub mod ranges;
 pub mod wallet_gateway;
 
 #[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
+pub(crate) use eng2::certificate as eng2_certificate;
+#[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
 pub use eng2::wallet_history::codec as eng2_history;
 #[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
 #[path = "../../native-wallet-engine/src/eng2_light.rs"]

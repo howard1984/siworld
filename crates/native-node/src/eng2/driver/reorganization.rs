@@ -7,6 +7,8 @@ use crate::eng2::{
     store::{ReplacementBudget, ReplacementFailure, ReplacementReplay},
 };
 use std::{collections::VecDeque, time::Instant};
+#[cfg(all(unix, feature = "eng2-runtime"))]
+mod shadow;
 mod shared_memory;
 use shared_memory::MemoryAdmission;
 
@@ -35,11 +37,15 @@ pub(super) struct Reorganization {
     memory: crate::p2p::Budget,
     memory_admission: MemoryAdmission,
     active: Option<Active>,
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    shadow: shadow::Scheduler,
     pending_restart: bool,
     #[cfg(feature = "eng2-runtime")]
     depth_warning: Option<ForkDepthWarning>,
     cached_candidate: Option<Hash>,
     cached_revision: u64,
+    cached_fence: Option<(u64, Hash)>,
+    cached_checkpoint_conflict: Option<Hash>,
     pub(super) stopped: Option<&'static str>,
     recent: VecDeque<Instant>,
     last: Option<SwitchEvent>,
@@ -148,6 +154,18 @@ fn current_alarm_at(
     })
 }
 
+fn checkpoint_fence(store: &Store) -> Option<(u64, Hash)> {
+    #[cfg(feature = "eng2-runtime")]
+    {
+        store.finality_fence()
+    }
+    #[cfg(not(feature = "eng2-runtime"))]
+    {
+        let _ = store;
+        None
+    }
+}
+
 impl Reorganization {
     fn invalidate_progress(&self) {
         #[cfg(feature = "eng2-runtime")]
@@ -164,11 +182,15 @@ impl Reorganization {
         self.stopped = Some(reason);
     }
 
-    fn best_candidate(&mut self) -> Result<Option<Hash>, String> {
+    fn best_candidate(&mut self, store: &Store) -> Result<Option<Hash>, String> {
         let revision = self.branches.selection_revision();
-        if revision != self.cached_revision {
-            self.cached_candidate = self.branches.best_candidate()?;
+        let fence = checkpoint_fence(store);
+        if revision != self.cached_revision || fence != self.cached_fence {
+            let (best, conflict) = self.branches.select_candidate(fence)?;
+            self.cached_candidate = best;
+            self.cached_checkpoint_conflict = conflict;
             self.cached_revision = revision;
+            self.cached_fence = fence;
         }
         Ok(self.cached_candidate)
     }
@@ -222,7 +244,8 @@ impl Driver {
             return Err("body lifecycle budget differs from original discovery owner".into());
         }
         let height = self.store.engine().state().height();
-        let refused = branches.has_deep_refusal(height, self.store.engine().state().tip())?;
+        let refused = !self.store.engine().genesis().checkpoint_fork_choice()
+            && branches.has_deep_refusal(height, self.store.engine().state().tip())?;
         branches.archive_canonical_suffix(&self.store, height)?;
         self.archive_reorganization_boundary()?;
         let discovery = match self.forward_discovery.take() {
@@ -236,10 +259,13 @@ impl Driver {
             )
             .map_err(|e| e.to_string())?,
         };
-        let cached_candidate = branches.best_candidate()?;
+        let cached_fence = checkpoint_fence(&self.store);
+        let (cached_candidate, cached_checkpoint_conflict) =
+            branches.select_candidate(cached_fence)?;
         let cached_revision = branches.selection_revision();
-        let pending_restart = cached_candidate
-            .is_some_and(|candidate| candidate != self.store.engine().state().tip());
+        let pending_restart = !self.store.engine().genesis().checkpoint_fork_choice()
+            && cached_candidate
+                .is_some_and(|candidate| candidate != self.store.engine().state().tip());
         self.reorganization = Some(Reorganization {
             #[cfg(feature = "eng2-runtime")]
             progress_hub: self.header_hub.as_ref().map(std::sync::Arc::downgrade),
@@ -248,11 +274,15 @@ impl Driver {
             memory,
             memory_admission: MemoryAdmission::default(),
             active: None,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            shadow: shadow::Scheduler::default(),
             pending_restart,
             #[cfg(feature = "eng2-runtime")]
             depth_warning: None,
             cached_candidate,
             cached_revision,
+            cached_fence,
+            cached_checkpoint_conflict,
             stopped: refused.then_some(DEEP_REFUSAL),
             recent: VecDeque::new(),
             last: None,
@@ -276,6 +306,8 @@ impl Driver {
         match &self.reorganization {
             Some(state) if state.stopped.is_some() => "manual_recovery_required",
             Some(state) if state.active.is_some() => "applying_validated_branch",
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            Some(state) if state.shadow.active() => "verifying_shadow_branch",
             Some(state) if state.memory_admission.is_waiting() => "waiting_for_shared_byte_budget",
             Some(state) if state.pending_restart => "resuming_best_branch",
             Some(_) => "ready",
@@ -285,6 +317,10 @@ impl Driver {
 
     pub fn reorganization_alarm(&self) -> Option<&'static str> {
         self.reorganization.as_ref().and_then(|state| {
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            if let Some(alarm) = state.shadow.alarm() {
+                return Some(alarm);
+            }
             current_alarm_at(
                 state.stopped,
                 state.memory_admission.is_waiting(),
@@ -292,6 +328,11 @@ impl Driver {
                 &state.recent,
                 Instant::now(),
             )
+            .or_else(|| {
+                state
+                    .cached_checkpoint_conflict
+                    .map(|_| "reorganization_checkpoint_conflict")
+            })
         })
     }
 
@@ -324,6 +365,25 @@ impl Driver {
             .ok_or("independent branch archive unavailable")?
             .branches
             .retain_verified_headers(headers)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn admit_fast_competitor(
+        &mut self,
+        header: &Header,
+        peer: Hash,
+    ) -> Result<bool, String> {
+        if !self.store.engine().genesis().checkpoint_fork_choice() {
+            return Ok(true);
+        }
+        let Some(state) = &mut self.reorganization else {
+            return Ok(false);
+        };
+        state.discovery.admit_fast_competitor(
+            header,
+            peer,
+            crate::eng2::network::discovery_now_ms(),
+        )
     }
 
     #[cfg(feature = "eng2-runtime")]
@@ -454,6 +514,20 @@ impl Driver {
             }
         }
         let path = state.branches.candidate_path(current, candidate)?;
+        if self.store.engine().genesis().checkpoint_fork_choice() {
+            if checkpoint_fence(&self.store).is_some_and(|(height, id)| {
+                path.ancestor_height < height
+                    || (path.ancestor_height == height && path.ancestor_id != id)
+            }) {
+                state.cached_checkpoint_conflict = Some(candidate);
+                state.pending_restart = false;
+                return Ok(false);
+            }
+            if path.cumulative_work <= self.store.engine().state().chain().cumulative_work {
+                state.pending_restart = false;
+                return Ok(false);
+            }
+        }
         #[cfg(feature = "eng2-runtime")]
         if let Some(warning) = ForkDepthWarning::from_path(&path, Instant::now()) {
             state.depth_warning = Some(warning);
@@ -562,7 +636,7 @@ impl Driver {
                     return Err(error);
                 }
                 state.pending_restart = state
-                    .best_candidate()?
+                    .best_candidate(&self.store)?
                     .is_some_and(|candidate| candidate != current);
                 return Ok(false);
             }
@@ -723,7 +797,7 @@ impl Driver {
             .reconcile(now, |provider| provider.check_current(&self.store).is_ok());
         self.bootstrap_receipt_height = 0;
         state.pending_restart = state
-            .best_candidate()?
+            .best_candidate(&self.store)?
             .is_some_and(|candidate| candidate != self.store.engine().state().tip());
         Ok(true)
     }
@@ -739,6 +813,15 @@ impl Driver {
                 .discovery
                 .renew_body_window(crate::eng2::network::discovery_now_ms())?;
         }
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        if self.store.engine().genesis().checkpoint_fork_choice() {
+            let Some(mut state) = self.reorganization.take() else {
+                return Ok(());
+            };
+            let result = self.shadow_tick(&mut state, before_restore);
+            self.reorganization = Some(state);
+            return result;
+        }
         if self
             .reorganization
             .as_ref()
@@ -750,7 +833,7 @@ impl Driver {
         let candidate = match self
             .reorganization
             .as_mut()
-            .map(|state| state.best_candidate())
+            .map(|state| state.best_candidate(&self.store))
             .transpose()
         {
             Ok(candidate) => candidate.flatten(),
@@ -798,7 +881,9 @@ mod memory_gate_tests {
             genesis_timestamp: 1,
             genesis_target: [255; 32],
             target_interval: 300,
+            asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
             pow_iterations: 0,
+            pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
             max_headers: 128,
         };
         let branches = BranchStore::create(
@@ -836,11 +921,15 @@ mod memory_gate_tests {
             memory: crate::p2p::Budget::new(65540),
             memory_admission: MemoryAdmission::default(),
             active: None,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            shadow: shadow::Scheduler::default(),
             pending_restart: false,
             #[cfg(feature = "eng2-runtime")]
             depth_warning: None,
             cached_candidate: None,
             cached_revision: 0,
+            cached_fence: None,
+            cached_checkpoint_conflict: None,
             stopped: None,
             recent: VecDeque::new(),
             last: None,

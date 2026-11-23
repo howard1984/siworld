@@ -10,7 +10,7 @@ use std::{
 
 mod lanes;
 use lanes::lane_session;
-const MAX_WORKERS: usize = 8;
+pub(super) const MAX_WORKERS: usize = 8;
 const MAX_TOTAL_WORKERS: usize = 3 * MAX_WORKERS;
 use super::super::transport::lanes::Lane;
 const WORKER_BYTES: usize = 2 * 1024 * 1024 + 65536;
@@ -784,17 +784,25 @@ fn checkpoint_phase(
         .reserve(3 * (maximum + 4096))
         .map_err(|_| "checkpoint control phase budget exhausted")?;
     let _legacy_checkpoints = shared.legacy_checkpoint_peers.contains(&peer.peer());
-    let (network, outgoing) = {
+    let (network, outgoing, checkpoint_fork_choice) = {
         let owner = owner_before(shared, &deadline)?;
+        let checkpoint_fork_choice = owner.engine().genesis().checkpoint_fork_choice();
         #[cfg(unix)]
-        let outgoing = if owner.activities_allowed() {
+        let outgoing = if owner.activities_allowed()
+            && (!checkpoint_fork_choice
+                || !shared
+                    .checkpoint_observer
+                    .lock()
+                    .map_err(|_| "checkpoint observer lock poisoned")?
+                    .conflicted())
+        {
             shared.mailbox.outgoing(_legacy_checkpoints)?
         } else {
             Vec::new()
         };
         #[cfg(not(unix))]
         let outgoing = Vec::new();
-        (owner.head()?.network, outgoing)
+        (owner.head()?.network, outgoing, checkpoint_fork_choice)
     };
     let incoming = if initiator {
         checkpoint_exchange::initiate_before(peer, &outgoing, network, &deadline)
@@ -829,14 +837,14 @@ fn checkpoint_phase(
                         .map_err(|_| super::super::checkpoint_observer::Error::Unavailable)
                 },
             );
-            if was_conflicted && !observer.conflicted() {
+            if !checkpoint_fork_choice && was_conflicted && !observer.conflicted() {
                 // Recovery must await an actual newly completed block →
                 // checkpoint → transaction round at this exact canonical head.
                 shared.network.invalidate_head_evidence()?;
             }
             outcome
         };
-        if checkpoint_mailbox_admission(outcome)? {
+        if checkpoint_mailbox_admission(outcome, checkpoint_fork_choice)? {
             #[cfg(unix)]
             shared.mailbox.enqueue(item.message, item.reservation)?;
         }
@@ -855,6 +863,7 @@ fn checkpoint_mailbox_admission(
         super::super::checkpoint_observer::Outcome,
         super::super::checkpoint_observer::Error,
     >,
+    checkpoint_fork_choice: bool,
 ) -> Result<bool, String> {
     use super::super::checkpoint_observer::{Error, Outcome};
     match outcome {
@@ -863,6 +872,7 @@ fn checkpoint_mailbox_admission(
         )
         | Err(Error::Unavailable) => Ok(false),
         Ok(_) => Ok(true),
+        Err(Error::Conflict | Error::EvidenceUnavailable) if checkpoint_fork_choice => Ok(false),
         Err(error) => Err(error.code().into()),
     }
 }
@@ -1351,11 +1361,11 @@ mod tests {
         let head = (50, [2; 32]);
         status.round([1; 32], 0, Some(head)).unwrap();
         assert!(status.ready_at(head).unwrap());
-        assert!(!checkpoint_mailbox_admission(Ok(Outcome::PendingAuthorization)).unwrap());
+        assert!(!checkpoint_mailbox_admission(Ok(Outcome::PendingAuthorization), false).unwrap());
         // Actual rounds can still finish while the observer independently gates
         // mining/signing. A pending certificate creates no round by itself.
         status.round([1; 32], 0, Some(head)).unwrap();
-        assert!(checkpoint_mailbox_admission(Ok(Outcome::CurrentCertificate(12))).unwrap());
+        assert!(checkpoint_mailbox_admission(Ok(Outcome::CurrentCertificate(12)), false).unwrap());
         status.invalidate_head_evidence().unwrap();
         assert!(!status.ready_at(head).unwrap());
         assert!(status.checkpoint_ready(head).is_err());
@@ -1365,9 +1375,18 @@ mod tests {
         assert!(status.ready_at(head).unwrap());
         assert!(status.checkpoint_ready(head).is_ok());
         for error in [Error::Rejected, Error::Conflict, Error::EvidenceUnavailable] {
-            assert!(checkpoint_mailbox_admission(Err(error)).is_err());
+            assert!(checkpoint_mailbox_admission(Err(error), false).is_err());
         }
     }
+    #[test]
+    fn checkpoint_conflict_does_not_interrupt_peer_round_for_bounded_fork_choice() {
+        use super::super::super::checkpoint_observer::Error;
+        for error in [Error::Conflict, Error::EvidenceUnavailable] {
+            assert!(!checkpoint_mailbox_admission(Err(error), true).unwrap());
+        }
+        assert!(checkpoint_mailbox_admission(Err(Error::Rejected), true).is_err());
+    }
+
     #[test]
     fn worker_admission_defers_capacity_without_starting_or_releasing_other_owners() {
         let budget = p2p::Budget::new(WORKER_BYTES + 9);

@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod branches;
 pub mod candidate_registry;
 pub mod certificate;
+mod certificate_wire;
 pub mod checkpoint_exchange;
 #[cfg(feature = "eng2-runtime")]
 pub(crate) mod checkpoint_observer;
@@ -40,6 +41,7 @@ pub mod nullifiers;
 #[cfg(all(unix, feature = "eng2-runtime", feature = "eng2-rehearsal"))]
 pub(crate) mod owner_fault;
 pub mod producer;
+mod proof_of_work;
 pub mod proof_retention;
 pub mod proof_window;
 pub mod propagation;

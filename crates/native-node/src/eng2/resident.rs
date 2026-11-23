@@ -42,6 +42,7 @@ pub use historical::{
 #[cfg(unix)]
 pub use operations::{result as operations_result, submit as submit_operations};
 pub(crate) mod peers;
+mod pow_watchdog;
 mod production;
 mod progress_checkpoint;
 mod progress_clock;
@@ -113,8 +114,16 @@ pub fn initialize_store(directory: &Path, expected: &str) -> Result<Value, Strin
     let genesis = load_genesis(directory, expected)?;
     let identity = NativeIdentity::load(directory, &genesis.peer_binding())
         .map_err(|_| "existing versioned identity required; initialization is separate")?;
-    let mut store = Store::create(&directory.join("chain.redb"), genesis, limits().chain)?;
-    store.enable_authenticated_restart(identity)?;
+    #[cfg(unix)]
+    Store::initialize_selected(directory, genesis, limits().chain, identity)?;
+    #[cfg(not(unix))]
+    {
+        if genesis.checkpoint_fork_choice() {
+            return Err("checkpoint fork choice requires durable generation selection".into());
+        }
+        let mut store = Store::create(&directory.join("chain.redb"), genesis, limits().chain)?;
+        store.enable_authenticated_restart(identity)?;
+    }
     Ok(
         json!({"version":2,"genesis":expected,"height":0,"authenticated_restart":"enabled","identity_created":false}),
     )
@@ -122,6 +131,9 @@ pub fn initialize_store(directory: &Path, expected: &str) -> Result<Value, Strin
 pub fn qualify_restart(directory: &Path, expected: &str) -> Result<Value, String> {
     let _lease = service::Lease::acquire(directory)?;
     let genesis = load_genesis(directory, expected)?;
+    if genesis.checkpoint_fork_choice() {
+        return Err("checkpoint fork choice requires authenticated generation recovery".into());
+    }
     let identity = NativeIdentity::load(directory, &genesis.peer_binding())
         .map_err(|_| "existing versioned identity required")?;
     let verifier = NativeVerifier::for_genesis(&genesis)?;
@@ -136,14 +148,40 @@ pub fn qualify_restart(directory: &Path, expected: &str) -> Result<Value, String
         json!({"version":2,"genesis":expected,"height":store.engine().state().height(),"explicit_native_audit":"passed","authenticated_restart":"enabled","identity_created":false}),
     )
 }
+#[cfg(unix)]
+pub fn initialize_checkpoint_vote_history(
+    directory: &Path,
+    key: &Path,
+    expected: &str,
+) -> Result<(), String> {
+    let _lease = service::Lease::acquire(directory)?;
+    let genesis = load_genesis(directory, expected)?;
+    let store = resume_store(directory, genesis)?;
+    super::runtime_export::host::ExistingSigner::initialize_vote_history(
+        key,
+        &directory.join("eng2-public"),
+        &store,
+    )
+}
+
+fn resume_store(directory: &Path, genesis: Genesis) -> Result<Store, String> {
+    #[cfg(unix)]
+    {
+        Store::resume_selected(directory, genesis, limits().chain)
+    }
+    #[cfg(not(unix))]
+    {
+        if genesis.checkpoint_fork_choice() {
+            return Err("checkpoint fork choice requires durable generation selection".into());
+        }
+        Store::resume_existing(&directory.join("chain.redb"), genesis, limits().chain)
+    }
+}
+
 pub fn restart_check(directory: &Path, expected: &str) -> Result<Value, String> {
     let _lease = service::Lease::acquire(directory)?;
     let started = Instant::now();
-    let store = Store::resume_existing(
-        &directory.join("chain.redb"),
-        load_genesis(directory, expected)?,
-        limits().chain,
-    )?;
+    let store = resume_store(directory, load_genesis(directory, expected)?)?;
     let state_sha256 = restart_state_sha256(&store)?;
     let pruned_through = store.proof_retention_floor()?;
     Ok(
@@ -277,8 +315,19 @@ struct ProductionStatus {
     last_pow: Option<Instant>,
     error: Option<&'static str>,
     failure: Option<production::Failure>,
+    deferred_preparation: Option<super::driver::PrepareBlockError>,
+    deferred_preparation_count: u64,
+    pow_search_threads: Option<usize>,
+    pow_watchdog: pow_watchdog::Watchdog,
+    pow_expected: bool,
+    last_preparation_failure: Option<super::driver::PrepareBlockError>,
 }
 impl ProductionStatus {
+    fn prepared_deferred(&mut self, cause: super::driver::PrepareBlockError) {
+        self.deferred_preparation = Some(cause);
+        self.deferred_preparation_count = self.deferred_preparation_count.saturating_add(1);
+    }
+
     fn fail(&mut self, failure: production::Failure) {
         // Preserve the first returned failure until this resident is stopped.
         if self.failure.is_none() {
@@ -338,7 +387,10 @@ impl Shared {
         Ok(())
     }
 
-    fn checkpoint_conflict(&self) -> Result<bool, String> {
+    fn checkpoint_blocks_chain(&self, owner: &Driver) -> Result<bool, String> {
+        if owner.engine().genesis().checkpoint_fork_choice() {
+            return Ok(false);
+        }
         Ok(self
             .checkpoint_observer
             .lock()
@@ -354,7 +406,7 @@ impl Shared {
         Ok(!self.headers.waiting()
             && owner.activities_allowed()
             && self.network.ready_at((head.height, head.id))?
-            && !self.checkpoint_conflict()?)
+            && !self.checkpoint_blocks_chain(&owner)?)
     }
     fn phase(&self, phase: &'static str) -> Result<(), String> {
         self.production
@@ -398,18 +450,19 @@ fn export_status(
         Ok(head) => head,
         Err(_) => {
             shared.headers.invalidate_progress_context();
+            if let Ok(mut production) = shared.production.lock() {
+                production.pow_expected = false;
+            }
+            drop(owner);
             return export_unavailable_status(directory, run_id, started, sequence);
         }
     };
-    let production = shared
-        .production
-        .lock()
-        .map_err(|_| "resident status lock poisoned")?;
     let connections = shared.network.snapshot()?;
     let observer = shared
         .checkpoint_observer
         .lock()
         .map_err(|_| "checkpoint observer lock poisoned")?;
+    let checkpoint_fork_choice = owner.engine().genesis().checkpoint_fork_choice();
     let conflict = observer.conflicted();
     let activities_allowed = owner.activities_allowed();
     let (peer_readiness, peer_observation) = shared
@@ -419,6 +472,7 @@ fn export_status(
         activities_allowed,
         owner.reorganization_status(),
         &observer,
+        checkpoint_fork_choice,
         peer_readiness,
     );
     let (ready, ready_reason_code) = if let Some(error) = shared.headers.error() {
@@ -428,23 +482,55 @@ fn export_status(
     } else {
         (ready, ready_reason_code)
     };
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    let isolated_status = shared
+        .isolated_production
+        .lock()
+        .map_err(|_| "isolated production control lock poisoned")?
+        .as_ref()
+        .map(|control| control.status(head.height))
+        .unwrap_or(Value::Null);
+    #[cfg(all(unix, feature = "eng2-rehearsal"))]
+    let operator_paused = isolated_status.get("paused").and_then(Value::as_bool) == Some(true)
+        || isolated_status
+            .get("stop_height")
+            .and_then(Value::as_u64)
+            .is_some_and(|height| head.height >= height);
+    #[cfg(not(all(unix, feature = "eng2-rehearsal")))]
+    let operator_paused = false;
     let event = owner.last_reorganization();
     let (sync_progress, sync_progress_clock) =
         progress_clock::snapshot(|| shared.headers.sync_progress());
+    let (header_waiting, header_deferred, header_error, body_leases, piece_jobs, progress_runs) = (
+        shared.headers.waiting(),
+        shared.headers.local_deferred(),
+        shared.headers.error(),
+        shared.headers.active_downloads(),
+        shared.transfers.diagnostic(),
+        shared.headers.sync_progress_runs(),
+    );
+    let mut production = shared
+        .production
+        .lock()
+        .map_err(|_| "resident status lock poisoned")?;
+    // Ordinary catch-up can interrupt READY on every peer block. It must
+    // not hide a miner whose counter never advances across those intervals.
+    production.pow_expected = mining && !operator_paused;
+    let stall = production.pow_watchdog.stalled();
     let mut status = json!({
         "schema_version":2,"run_id":run_id,"process_id":std::process::id(),"sequence":sequence,
         "phase":production.phase,"network_id":crate::local::hex(&head.network),"genesis_id":crate::local::hex(&head.genesis),
         "height":head.height,"tip":crate::local::hex(&head.id),"cumulative_work":head.work.to_string(),
-        "state_available":true,"ready":ready,"sync_status":if !owner.activities_allowed() { owner.reorganization_status() } else if conflict {observer.gate_reason().map(super::checkpoint_observer::Error::code).unwrap_or("checkpoint_current_quorum_conflict")} else if shared.headers.error().is_some() {"header_relay_unavailable"} else if shared.headers.waiting() {"awaiting_validated_parent_state"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
+        "state_available":true,"ready":ready,"sync_status":if !activities_allowed { owner.reorganization_status() } else if conflict && !checkpoint_fork_choice {observer.gate_reason().map(super::checkpoint_observer::Error::code).unwrap_or("checkpoint_current_quorum_conflict")} else if header_error.is_some() {"header_relay_unavailable"} else if header_waiting {"awaiting_validated_parent_state"} else if ready {"caught_up"} else {"waiting_for_current_peer_tip"},
         "header_lanes":connections.header_lanes,"body_lanes":connections.body_lanes,
-        "awaiting_validated_parent_state":shared.headers.waiting(),
-        "header_publication_deferred":shared.headers.local_deferred(),
-        "header_relay_error":shared.headers.error(),
-        "body_download_leases":shared.headers.active_downloads(),
-        "piece_jobs":shared.transfers.diagnostic(),
+        "awaiting_validated_parent_state":header_waiting,
+        "header_publication_deferred":header_deferred,
+        "header_relay_error":header_error,
+        "body_download_leases":body_leases,
+        "piece_jobs":piece_jobs,
         "sync_progress":sync_progress,
         "sync_progress_clock":sync_progress_clock,
-        "sync_progress_runs":shared.headers.sync_progress_runs(),
+        "sync_progress_runs":progress_runs,
         "connections":connections.connections,"last_completed_round_age_ms":connections.last_round_age_ms,
         "ready_reason_code":ready_reason_code,
         "completed_rounds":connections.rounds,"inbound_listener":listening,"mining_enabled":mining,
@@ -456,6 +542,26 @@ fn export_status(
         "error_code":production.error,"updated_unix_ms":unix_ms()?,"elapsed_monotonic_ms":started.elapsed().as_millis().to_string(),
         "historical_proof_replay":false
     });
+    status["pow_search_threads"] = json!(production.pow_search_threads);
+    status["pow_stall"] = json!(stall.map(|_| "mining_pow_counter_stalled"));
+    status["pow_stall_age_ms"] = json!(stall.map(|(age, _)| age));
+    status["pow_stall_episode"] = json!(stall.map(|(_, episode)| episode));
+    status["pow_restart_waiting_for_worker"] = json!(production.pow_watchdog.restart_waiting());
+    status["pow_restarts"] = json!(production.pow_watchdog.restarts());
+    status["production_last_preparation_failure_code"] = json!(
+        production
+            .last_preparation_failure
+            .map(super::driver::PrepareBlockError::code)
+    );
+    status["production_deferred_preparation_code"] = json!(
+        production
+            .deferred_preparation
+            .map(super::driver::PrepareBlockError::code)
+    );
+    status["production_deferred_preparation_count"] = json!(production.deferred_preparation_count);
+    // A slow status projection or fsync must not hold up native PoW progress
+    // counters or the watchdog's five-minute stall decision.
+    drop(production);
     status["body_registry_decision"] = shared.budget.body_registry_diagnostic();
     let (retained_failure, retained_budget_failures, retained_budget) = retained_diagnostic
         .map(|(failure, count, budget)| (failure, Some(count), budget))
@@ -489,13 +595,7 @@ fn export_status(
     status["checkpoint_conflict"] = json!(conflict);
     #[cfg(all(unix, feature = "eng2-rehearsal"))]
     {
-        status["isolated_production_control"] = shared
-            .isolated_production
-            .lock()
-            .map_err(|_| "isolated production control lock poisoned")?
-            .as_ref()
-            .map(|control| control.status(head.height))
-            .unwrap_or(Value::Null);
+        status["isolated_production_control"] = isolated_status;
     }
     status["operations_error"] = json!(operations_error(shared));
     status["native_block_events"] = shared.block_events.diagnostic();
@@ -515,6 +615,8 @@ fn export_status(
         "activities_allowed":activities_allowed,"reorganization_status":owner.reorganization_status(),
         "checkpoint_conflict":conflict,"peer_reason":peer_readiness.code(),
     });
+    drop(observer);
+    drop(owner);
     bound_status_observations(&mut status, &original_accept);
     service::atomic_json(&directory.join(service::STATUS_FILE), &status)
 }
@@ -561,9 +663,11 @@ fn resident_readiness(
     activities_allowed: bool,
     reorganization_status: &'static str,
     observer: &super::checkpoint_observer::Observer,
+    checkpoint_fork_choice: bool,
     peer: peers::PeerReadiness,
 ) -> (bool, &'static str) {
-    let ready = activities_allowed && peer.is_ready() && !observer.conflicted();
+    let checkpoint_blocks_chain = !checkpoint_fork_choice && observer.conflicted();
+    let ready = activities_allowed && peer.is_ready() && !checkpoint_blocks_chain;
     let reason = if !activities_allowed {
         match reorganization_status {
             // With no reorganization pause, only the exportability check can
@@ -571,7 +675,7 @@ fn resident_readiness(
             "ready" | "unconfigured" => "canonical_state_unavailable",
             other => other,
         }
-    } else if observer.conflicted() {
+    } else if checkpoint_blocks_chain {
         observer
             .gate_reason()
             .map(super::checkpoint_observer::Error::code)
@@ -598,6 +702,7 @@ fn export_unavailable_status(
             "reorganization_status":"manual_recovery_required", "reorganization_alarm":"canonical_state_unavailable",
             "wallet_export_paused":true, "signed_bootstrap_available":false,
             "production_failure_stage":null,"production_failure_code":null,
+            "pow_stall":null,"pow_stall_age_ms":null,"pow_stall_episode":null,
             "error_code":"canonical_state_unavailable", "updated_unix_ms":unix_ms()?,
             "elapsed_monotonic_ms":started.elapsed().as_millis().to_string(), "historical_proof_replay":false,
         }),
@@ -671,7 +776,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     {
         return Err("native resident execution requires an owner-operated environment".into());
     }
-    if !cfg!(any(unix, windows)) {
+    if !cfg!(unix) {
         return Err(
             "versioned resident checkpoint transport is not available on this platform".into(),
         );
@@ -720,11 +825,7 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     let settings = mining
         .then(|| crate::mining::load(directory, genesis.config().network))
         .transpose()?;
-    let store = Store::resume_existing(
-        &directory.join("chain.redb"),
-        Genesis::decode(&genesis.encode()?)?,
-        limits().chain,
-    )?;
+    let store = resume_store(directory, Genesis::decode(&genesis.encode()?)?)?;
     check_windows_admission(cfg!(windows), store.imported_checkpoint_height())?;
     let budget = p2p::Budget::new(MEMORY_BYTES);
     #[cfg(unix)]
@@ -749,7 +850,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         genesis_timestamp: genesis.config().genesis_timestamp,
         genesis_target: genesis.config().genesis_target,
         target_interval: genesis.config().target_interval,
+        asert_half_life: genesis.config().asert_half_life(),
         pow_iterations: genesis.config().pow_iterations,
+        pow_algorithm: genesis.config().pow_algorithm(),
         max_headers: 1_000_000,
     };
     let branch_limits = super::branches::Limits {
@@ -842,8 +945,11 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
     )?);
     driver.observe_headers(headers.clone());
     let mut checkpoint_observer = super::checkpoint_observer::Observer::new(&budget)?;
-    checkpoint_observer.observe_progress(&headers);
+    if !genesis.checkpoint_fork_choice() {
+        checkpoint_observer.observe_progress(&headers);
+    }
     let relay = relay::Relay::new(&config, driver.engine().body_policy(), &budget)?;
+    let pow_search_threads = config.pow_search_threads;
     let shared = Arc::new(Shared {
         transfers: transfers::Transfers::new(&config, &budget)?,
         relay,
@@ -861,7 +967,9 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                 .map(|peer| (peer.expected.fingerprint(), peer.checkpoint_reference)),
         )),
         production: Mutex::new(ProductionStatus {
+            pow_expected: mining,
             phase: "starting",
+            pow_search_threads,
             ..Default::default()
         }),
         checkpoint_observer: Mutex::new(checkpoint_observer),
@@ -955,12 +1063,15 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
         .map_err(|_| "resident network worker creation failed")?;
     let mut producer = match settings {
         Some(settings) => {
+            let search_threads = pow_search_threads.ok_or("configured PoW worker count missing")?;
             let producer_shared = shared.clone();
             let directory = directory.to_owned();
             Some(
                 std::thread::Builder::new()
                     .name("eng2-native-producer".into())
-                    .spawn(move || production::run(&directory, settings, producer_shared))
+                    .spawn(move || {
+                        production::run(&directory, settings, search_threads, producer_shared)
+                    })
                     .map_err(|_| "resident producer creation failed")?,
             )
         }
@@ -1039,7 +1150,10 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                             .map(Option::flatten)
                             .map_err(|_| super::checkpoint_observer::Error::Unavailable)
                     });
-                    if was_conflicted && !observer.conflicted() {
+                    if !owner.engine().genesis().checkpoint_fork_choice()
+                        && was_conflicted
+                        && !observer.conflicted()
+                    {
                         shared.network.invalidate_head_evidence()?;
                     }
                 }
@@ -1079,20 +1193,41 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                                 });
                             checkpoint_tick_reason = Some("retained_restoration");
                         } else {
+                            // Persist the authenticated restored floor before allowing a new
+                            // checkpoint tick. Failure must not grant signing or export authority.
+                            let restored_floor = {
+                                let observer = shared
+                                    .checkpoint_observer
+                                    .lock()
+                                    .map_err(|_| "checkpoint observer lock poisoned")?;
+                                if owner.engine().genesis().checkpoint_fork_choice()
+                                    && let Some(reason) = observer.gate_reason()
+                                {
+                                    Err(reason.code().to_owned())
+                                } else {
+                                    checkpoint_host
+                                        .latest_checkpoint()
+                                        .map(|checkpoint| {
+                                            owner.retain_finalized_checkpoint(checkpoint)
+                                        })
+                                        .transpose()
+                                }
+                            };
+                            let restored_floor_failed = restored_floor.is_err();
                             let incoming = shared.mailbox.drain()?;
-                            let tick = {
+                            let tick = restored_floor.and_then(|_| {
                                 let observer = shared
                                     .checkpoint_observer
                                     .lock()
                                     .map_err(|_| "checkpoint observer lock poisoned")?;
                                 checkpoint_host.tick_resident(
-                                    owner.store(),
+                                    owner.store_for_checkpoint(),
                                     unix_ms()? / 1000,
                                     &incoming.messages,
                                     &shared.network,
                                     &observer,
                                 )
-                            };
+                            });
                             match tick {
                                 Ok(tick) => {
                                     shared.mailbox.acknowledge(&incoming)?;
@@ -1114,9 +1249,13 @@ pub fn run(directory: &Path, configuration: &Path, expected: &str) -> Result<(),
                                     }
                                 }
                                 Err(_) => {
+                                    shared.mailbox.publish(&[])?;
                                     checkpoint_progress.failed(&shared.headers);
-                                    checkpoint_error =
-                                        Some("checkpoint_tick_rejected_or_unavailable");
+                                    checkpoint_error = Some(if restored_floor_failed {
+                                        "checkpoint_restored_finality_unavailable"
+                                    } else {
+                                        "checkpoint_tick_rejected_or_unavailable"
+                                    });
                                     checkpoint_tick_reason = checkpoint_host
                                         .tick_failure_reason()
                                         .map(super::runtime_export::host::TickFailureReason::code);

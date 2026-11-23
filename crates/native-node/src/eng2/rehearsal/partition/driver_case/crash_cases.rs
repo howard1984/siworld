@@ -250,7 +250,9 @@ fn resume_case() -> Result<(), String> {
         genesis_timestamp: config.genesis_timestamp,
         genesis_target: config.genesis_target,
         target_interval: config.target_interval,
+        asert_half_life: config.asert_half_life(),
         pow_iterations: config.pow_iterations,
+        pow_algorithm: config.pow_algorithm(),
         max_headers: 96,
     };
     let mut reference_b = Engine::new(Genesis::decode(&b.genesis)?, limits)?;

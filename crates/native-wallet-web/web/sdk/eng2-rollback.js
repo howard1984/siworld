@@ -69,7 +69,7 @@ export function advanceEng2Rollback(window,rows,cache=null,{budget=ENG2_ROLLBACK
 
 // Remote header pages are branch-selection hints. Even a matching prefix never
 // authorizes adoption: replay all receipts to the selected head, then require
-// native context, work and complete-candidate checks before atomic persistence.
+// native context, header-policy and complete-candidate checks before persistence.
 export function selectEng2Rollback(window,remote) {
   const config=validate(window);
   if(!remote||!height(remote.height)||!hex(remote.tip)||remote.height===0&&remote.tip!==config.genesis)fail();

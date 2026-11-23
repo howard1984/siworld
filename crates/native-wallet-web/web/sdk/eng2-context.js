@@ -16,9 +16,10 @@ function origins(value,first) {
 }
 export function eng2Context(value) {
   if (!value || value.version !== 2 || value.name !== 'siworld-eng-2' || value.fee_mode !== 0 || !fields.every(field => id(value[field]))) throw new Error('Pin the exact engineering-v2 network, genesis, rules, native profile and LegacyMiner fee mode.');
+  if(value.checkpoint_finality!==undefined && typeof value.checkpoint_finality!=='boolean')throw new Error('Invalid engineering-v2 checkpoint finality pin.');
   const api=origin(value.api),apis=origins(value.apis === undefined ? [api] : value.apis,api);
   const submission_apis=origins(value.submission_apis === undefined ? apis : value.submission_apis);
-  return Object.freeze({version:2,name:'siworld-eng-2',...Object.fromEntries(fields.map(field => [field,value[field]])),fee_mode:0,api,apis,submission_apis});
+  return Object.freeze({version:2,name:'siworld-eng-2',...Object.fromEntries(fields.map(field => [field,value[field]])),fee_mode:0,api,apis,submission_apis,checkpoint_finality:value.checkpoint_finality===true});
 }
 export function eng2Namespace(value) {
   const context = eng2Context(value);

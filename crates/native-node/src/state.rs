@@ -25,6 +25,8 @@ const FUND_WALLET_BYTES: usize = 2 + crate::fund_spend::VERIFYING_KEY_BYTES;
 const ISSUANCE_CONFIG_OFFSET: usize = FUND_CONFIG_OFFSET + 2 + MAX_FUND_WALLETS * FUND_WALLET_BYTES;
 const CONFIG_REVISION_OFFSET: usize = ISSUANCE_CONFIG_OFFSET + 52;
 const CONFIG_REVISION: u32 = 5;
+const ONE_HOUR_CONFIG_REVISION: u32 = 6;
+const RANDOMX_CONFIG_REVISION: u32 = 7;
 pub const CONFIG_RULE_BYTES: usize = CONFIG_REVISION_OFFSET + 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +38,8 @@ pub struct Config {
     pub genesis_target: Hash,
     pub target_interval: u64,
     pub pow_iterations: u64,
+    pub(crate) asert_half_life: pow::AsertHalfLife,
+    pub(crate) pow_algorithm: pow::Algorithm,
     pub fixture: bool,
     pub economics: EconomicsParams,
     pub fund_allocation: Option<FundAllocation>,
@@ -57,6 +61,8 @@ impl Config {
             genesis_timestamp: 1,
             genesis_target: target[32..].try_into().expect("256-bit target"),
             target_interval: TARGET_INTERVAL,
+            asert_half_life: pow::AsertHalfLife::FourHours,
+            pow_algorithm: pow::Algorithm::SequentialBlake3,
             pow_iterations: 0,
             fixture: true,
             economics: EconomicsParams::production(),
@@ -88,6 +94,8 @@ impl Config {
             genesis_timestamp,
             genesis_target,
             target_interval: TARGET_INTERVAL,
+            asert_half_life: pow::AsertHalfLife::FourHours,
+            pow_algorithm: pow::Algorithm::SequentialBlake3,
             pow_iterations,
             fixture: false,
             economics: EconomicsParams::production(),
@@ -95,6 +103,26 @@ impl Config {
             fund_verifying_keys: Vec::new(),
             issuance: None,
         })
+    }
+    /// Select the one-hour schedule before sealing a new genesis.
+    pub fn with_one_hour_asert(mut self) -> Result<Self, String> {
+        self.asert_half_life = pow::AsertHalfLife::OneHour;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Select the fixed RandomX profile. It cannot be used by the V1 engine.
+    pub fn with_siworld_randomx(mut self) -> Result<Self, String> {
+        self.pow_algorithm = pow::Algorithm::SiworldRandomX;
+        self.asert_half_life = pow::AsertHalfLife::OneHour;
+        self.pow_iterations = 0;
+        self.validate()?;
+        Ok(self)
+    }
+    pub fn pow_algorithm(&self) -> pow::Algorithm {
+        self.pow_algorithm
+    }
+    pub fn asert_half_life(&self) -> pow::AsertHalfLife {
+        self.asert_half_life
     }
     /// Compressed timings are confined to explicit disposable fixture networks.
     pub fn with_economics(mut self, params: EconomicsParams) -> Result<Self, String> {
@@ -167,6 +195,14 @@ impl Config {
         if !self.fixture && self.economics != EconomicsParams::production() {
             return Err("compressed economic timings require an engineering fixture".into());
         }
+        let randomx = self.pow_algorithm == pow::Algorithm::SiworldRandomX;
+        if randomx
+            && (self.fixture
+                || self.pow_iterations != 0
+                || self.asert_half_life != pow::AsertHalfLife::OneHour)
+        {
+            return Err("noncanonical RandomX engineering rules".into());
+        }
         let mut expected = if self.fixture {
             Self::development(self.network, self.work_bits)?
         } else {
@@ -174,9 +210,14 @@ impl Config {
                 self.network,
                 self.genesis_timestamp,
                 self.genesis_target,
-                self.pow_iterations,
+                if randomx { 1 } else { self.pow_iterations },
             )?
         };
+        expected.asert_half_life = self.asert_half_life;
+        if randomx {
+            expected.pow_iterations = 0;
+            expected.pow_algorithm = pow::Algorithm::SiworldRandomX;
+        }
         expected.economics = self.economics.clone();
         expected.fund_allocation = self.fund_allocation.clone();
         expected.fund_verifying_keys = self.fund_verifying_keys.clone();
@@ -219,8 +260,13 @@ impl Config {
                 .copy_from_slice(&policy.max_metadata_bytes.to_le_bytes());
             bytes[offset + 51] = policy.max_per_block;
         }
+        let revision = match (self.pow_algorithm, self.asert_half_life) {
+            (pow::Algorithm::SiworldRandomX, _) => RANDOMX_CONFIG_REVISION,
+            (_, pow::AsertHalfLife::FourHours) => CONFIG_REVISION,
+            (_, pow::AsertHalfLife::OneHour) => ONE_HOUR_CONFIG_REVISION,
+        };
         bytes[CONFIG_REVISION_OFFSET..CONFIG_REVISION_OFFSET + 4]
-            .copy_from_slice(&CONFIG_REVISION.to_le_bytes());
+            .copy_from_slice(&revision.to_le_bytes());
         bytes[CONFIG_REVISION_OFFSET + 4..]
             .copy_from_slice(&u32::from(economics::ECONOMICS_RULE_VERSION).to_le_bytes());
         bytes
@@ -228,13 +274,21 @@ impl Config {
     pub fn decode_rules(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() != CONFIG_RULE_BYTES
             || bytes[33] > 1
-            || bytes[CONFIG_REVISION_OFFSET..CONFIG_REVISION_OFFSET + 4]
-                != CONFIG_REVISION.to_le_bytes()
             || bytes[CONFIG_REVISION_OFFSET + 4..]
                 != u32::from(economics::ECONOMICS_RULE_VERSION).to_le_bytes()
         {
             return Err("invalid engineering rule encoding".into());
         }
+        let revision = u32::from_le_bytes(
+            bytes[CONFIG_REVISION_OFFSET..CONFIG_REVISION_OFFSET + 4]
+                .try_into()
+                .expect("fixed rules revision"),
+        );
+        let asert_half_life = match revision {
+            CONFIG_REVISION => pow::AsertHalfLife::FourHours,
+            ONE_HOUR_CONFIG_REVISION | RANDOMX_CONFIG_REVISION => pow::AsertHalfLife::OneHour,
+            _ => return Err("invalid engineering rule revision".into()),
+        };
         let count = usize::from(bytes[FUND_CONFIG_OFFSET]);
         let team = usize::from(bytes[FUND_CONFIG_OFFSET + 1]);
         let policy_offset = ISSUANCE_CONFIG_OFFSET;
@@ -274,6 +328,12 @@ impl Config {
             genesis_target: bytes[42..74].try_into().expect("fixed target"),
             target_interval: u64::from_le_bytes(bytes[74..82].try_into().expect("fixed interval")),
             pow_iterations: u64::from_le_bytes(bytes[82..90].try_into().expect("fixed iterations")),
+            asert_half_life,
+            pow_algorithm: if revision == RANDOMX_CONFIG_REVISION {
+                pow::Algorithm::SiworldRandomX
+            } else {
+                pow::Algorithm::SequentialBlake3
+            },
             fund_allocation: if count == 0 {
                 None
             } else {
@@ -643,26 +703,37 @@ impl State {
         pow::median_time_past(&timestamps).expect("genesis timestamp retained")
     }
     pub fn next_target(&self) -> Hash {
-        pow::asert_target(
+        pow::asert_target_with_half_life(
             &self.config.genesis_target,
             self.config.genesis_timestamp,
             self.config.target_interval,
             self.height,
             self.timestamp(),
+            self.config.asert_half_life(),
         )
     }
     pub fn tip_snapshot(&self) -> &CanonicalSnapshot {
         self.snapshots.back().expect("genesis snapshot retained")
     }
     pub fn snapshot(&self, selector: Snapshot) -> Result<&CanonicalSnapshot, String> {
+        self.snapshot_checked(selector)
+            .map_err(|error| match error {
+                SnapshotError::OutOfRange => "expired or future canonical snapshot".into(),
+                SnapshotError::NotCanonical => "unknown or removed canonical snapshot".into(),
+            })
+    }
+    pub(crate) fn snapshot_checked(
+        &self,
+        selector: Snapshot,
+    ) -> Result<&CanonicalSnapshot, SnapshotError> {
         if selector.height > self.height || self.height - selector.height >= SNAPSHOT_WINDOW as u64
         {
-            return Err("expired or future canonical snapshot".into());
+            return Err(SnapshotError::OutOfRange);
         }
         self.snapshots
             .iter()
             .find(|s| s.selector == selector)
-            .ok_or_else(|| "unknown or removed canonical snapshot".into())
+            .ok_or(SnapshotError::NotCanonical)
     }
     pub fn recent_roots(&self) -> Result<RecentRoots, String> {
         let h = Hasher::new();
@@ -681,6 +752,9 @@ impl State {
     /// before any accepted-state field changes. Durable callers commit the block
     /// and resulting fingerprint together before exposing this state.
     pub fn apply(&mut self, block: &Block, verifier: &impl BlockVerifier) -> Result<(), String> {
+        if self.config.pow_algorithm() != pow::Algorithm::SequentialBlake3 {
+            return Err("RandomX requires the engineering-v2 execution engine".into());
+        }
         block.validate_shape()?;
         if block.network != self.config.network {
             return Err("block network mismatch".into());
@@ -796,6 +870,12 @@ impl State {
         }
         *h.finalize().as_bytes()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotError {
+    OutOfRange,
+    NotCanonical,
 }
 
 /// Immutable fee encoding bound by native and engineering genesis identifiers.
