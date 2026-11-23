@@ -22,6 +22,10 @@ pub const REQUEST_WIRE_BYTES: u64 = 128;
 pub const RESPONSE_OVERHEAD: u64 = 128;
 const MAX_PEERS: usize = 8;
 const MAX_ATTEMPTS: usize = 4;
+// Leave a healthy fast push alone; hedge both zero progress and a stream
+// that advances too slowly to finish within the normal propagation path.
+const STREAM_IDLE_HEDGE: Duration = Duration::from_secs(2);
+const STREAM_ELAPSED_HEDGE: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -54,6 +58,7 @@ pub struct SourceBytes {
     /// Actual application queries, including the descriptor continuation.
     pub queries: u64,
     pub received: u64,
+    pub authenticated_body_bytes: u64,
     pub sent: u64,
     pub reserved_wire: u64,
     pub bad_pieces: u64,
@@ -351,6 +356,12 @@ struct Piece {
     pending: Option<u64>,
 }
 
+struct Stream {
+    peer: Hash,
+    started: Instant,
+    progress: Instant,
+}
+
 /// The same instance must remain retained for the candidate's entire lifetime.
 /// Reconnection does not create another deadline or reset cumulative usage.
 pub struct Transfer {
@@ -366,7 +377,9 @@ pub struct Transfer {
     queries: u64,
     reserved_wire: u64,
     cancelled: bool,
-    streaming: Option<Hash>,
+    streaming: Option<Stream>,
+    #[cfg(feature = "eng2-runtime")]
+    reads_finished: p2p::Cancellation,
     cancellation: p2p::Cancellation,
     binding: Option<p2p::Binding>,
     original_deadline: Option<p2p::Deadline>,
@@ -402,7 +415,6 @@ impl Transfer {
         {
             return Err(Error::Bounds);
         }
-        #[cfg(feature = "eng2-runtime")]
         let descriptor_peer = ledger
             .sources
             .values()
@@ -473,6 +485,8 @@ impl Transfer {
             reserved_wire,
             cancelled: false,
             streaming: None,
+            #[cfg(feature = "eng2-runtime")]
+            reads_finished: p2p::Cancellation::default(),
             cancellation,
             binding,
             original_deadline,
@@ -490,7 +504,7 @@ impl Transfer {
             decode_reservation: Some(decode_reservation),
         };
         transfer.check(Instant::now())?;
-        transfer.install(first)?;
+        transfer.install_from(first, descriptor_peer)?;
         Ok(transfer)
     }
 
@@ -711,9 +725,17 @@ impl Transfer {
         now: Instant,
     ) -> Result<Vec<Request>, Error> {
         self.check(now)?;
-        if self.streaming.is_some() {
-            return Ok(vec![]);
-        }
+        let hedge = if let Some(stream) = &self.streaming {
+            if stream.peer == peer
+                || (now.saturating_duration_since(stream.progress) < STREAM_IDLE_HEDGE
+                    && now.saturating_duration_since(stream.started) < STREAM_ELAPSED_HEDGE)
+            {
+                return Ok(vec![]);
+            }
+            true
+        } else {
+            false
+        };
         if self
             .confirmation_pending
             .is_some_and(|attempt| attempt.peer == peer || self.limits.parallel == 1)
@@ -732,7 +754,7 @@ impl Transfer {
             .values()
             .map(|request| request.peer)
             .collect::<std::collections::BTreeSet<_>>();
-        if active.len() >= self.limits.parallel || active.contains(&peer) {
+        if active.len() + usize::from(hedge) >= self.limits.parallel || active.contains(&peer) {
             return Ok(vec![]);
         }
         let eligible = |piece: &Piece| {
@@ -742,15 +764,31 @@ impl Transfer {
                 && !piece.attempts.contains(&peer)
         };
         let mut selected = Vec::with_capacity(maximum_pieces.min(self.pieces.len()));
-        if let Some(piece) = preferred_piece.filter(|&i| self.pieces.get(i).is_some_and(eligible)) {
-            selected.push(piece);
-        }
-        for (index, piece) in self.pieces.iter().enumerate() {
-            if selected.len() >= maximum_pieces {
-                break;
+        if hedge {
+            // The push reads in order. Pull the tail first to minimize
+            // overlap; alternate pulls still get mutually disjoint ranges.
+            selected.extend(
+                self.pieces
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, piece)| eligible(piece))
+                    .take(maximum_pieces)
+                    .map(|(index, _)| index),
+            );
+        } else {
+            if let Some(piece) =
+                preferred_piece.filter(|&i| self.pieces.get(i).is_some_and(eligible))
+            {
+                selected.push(piece);
             }
-            if Some(index) != preferred_piece && eligible(piece) {
-                selected.push(index);
+            for (index, piece) in self.pieces.iter().enumerate() {
+                if selected.len() >= maximum_pieces {
+                    break;
+                }
+                if Some(index) != preferred_piece && eligible(piece) {
+                    selected.push(index);
+                }
             }
         }
         if selected.is_empty() {
@@ -908,7 +946,7 @@ impl Transfer {
                 return Err(Error::Authentication(error));
             }
         };
-        self.install(piece)
+        self.install_from(piece, request.peer)
     }
 
     /// A disconnected or timed-out source keeps all cumulative charges. Other
@@ -919,6 +957,16 @@ impl Transfer {
         peer: Hash,
         partial_wire_bytes: u64,
         now: Instant,
+    ) -> Result<(), Error> {
+        self.end_batch(peer, partial_wire_bytes, now, false)
+    }
+
+    pub(crate) fn end_batch(
+        &mut self,
+        peer: Hash,
+        partial_wire_bytes: u64,
+        now: Instant,
+        completed_elsewhere: bool,
     ) -> Result<(), Error> {
         self.check(now)?;
         let source = self.sources.get_mut(&peer).ok_or(Error::Peer)?;
@@ -936,8 +984,10 @@ impl Transfer {
             .received
             .checked_add(partial_wire_bytes)
             .ok_or(Error::Bounds)?;
-        source.bytes.failures += 1;
-        source.connected = false;
+        if !completed_elsewhere {
+            source.bytes.failures += 1;
+            source.connected = false;
+        }
         self.pending.retain(|_, request| {
             if request.peer == peer {
                 self.pieces[request.piece].pending = None;
@@ -960,6 +1010,23 @@ impl Transfer {
         }
     }
 
+    /// The stream and a hedge may race for the same bytes. Match the
+    /// request and authenticate each copy before accepting a benign overlap.
+    fn install_from(&mut self, piece: VerifiedPiece, peer: Hash) -> Result<(), Error> {
+        let state = self.pieces.get(piece.index()).ok_or(Error::Request)?;
+        if state.complete {
+            return Ok(());
+        }
+        let length = piece.bytes().len() as u64;
+        self.install(piece)?;
+        self.sources
+            .get_mut(&peer)
+            .ok_or(Error::Peer)?
+            .bytes
+            .authenticated_body_bytes += length;
+        Ok(())
+    }
+
     fn install(&mut self, piece: VerifiedPiece) -> Result<(), Error> {
         if piece.block() != self.authenticated.block() || piece.index() >= self.pieces.len() {
             return Err(Error::Request);
@@ -974,6 +1041,7 @@ impl Transfer {
         #[cfg(feature = "eng2-runtime")]
         if self.verified_bytes == self.encoded.len() {
             self.body_complete = Some(Instant::now());
+            self.reads_finished.cancel();
         }
         Ok(())
     }
@@ -997,7 +1065,8 @@ impl Transfer {
 
     /// Continue the credited descriptor exchange without a second body query.
     pub(crate) fn begin_stream(&mut self, peer: Hash) -> Result<(), Error> {
-        self.check(Instant::now())?;
+        let now = Instant::now();
+        self.check(now)?;
         let source = self.sources.get(&peer).ok_or(Error::Peer)?;
         if self.streaming.is_some()
             || !self.pending.is_empty()
@@ -1007,7 +1076,11 @@ impl Transfer {
         {
             return Err(Error::Request);
         }
-        self.streaming = Some(peer);
+        self.streaming = Some(Stream {
+            peer,
+            started: now,
+            progress: now,
+        });
         Ok(())
     }
 
@@ -1020,7 +1093,11 @@ impl Transfer {
         wire: u64,
     ) -> Result<(), Error> {
         self.check(Instant::now())?;
-        if self.streaming != Some(peer) {
+        if self
+            .streaming
+            .as_ref()
+            .is_none_or(|stream| stream.peer != peer)
+        {
             return Err(Error::Request);
         }
         let source = self.sources.get_mut(&peer).ok_or(Error::Peer)?;
@@ -1044,12 +1121,26 @@ impl Transfer {
             source.bytes.bad_pieces += 1;
             Error::Authentication(error)
         })?;
-        self.install(piece)
+        // A valid duplicate still contributes progress for this stream,
+        // but contributes zero unique authenticated bytes for this source.
+        if let Some(stream) = &mut self.streaming {
+            stream.progress = Instant::now();
+        }
+        self.install_from(piece, peer)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn reads_finished(&self) -> p2p::Cancellation {
+        self.reads_finished.clone()
     }
 
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn end_stream(&mut self, peer: Hash, succeeded: bool, partial_wire: u64) {
-        if self.streaming != Some(peer) {
+        if self
+            .streaming
+            .as_ref()
+            .is_none_or(|stream| stream.peer != peer)
+        {
             return;
         }
         self.streaming = None;
@@ -1061,6 +1152,12 @@ impl Transfer {
                 source.bytes.failures += 1;
             }
         }
+    }
+
+    #[cfg(all(test, feature = "eng2-runtime", unix))]
+    pub(crate) fn age_stream_progress_for_test(&mut self) {
+        self.streaming.as_mut().unwrap().progress =
+            Instant::now().checked_sub(STREAM_IDLE_HEDGE).unwrap();
     }
 
     #[cfg(feature = "eng2-runtime")]
@@ -1193,7 +1290,13 @@ impl Transfer {
             .sources
             .iter()
             .filter(|(peer, source)| {
-                source.connected && !source.body_batch_used && eligible(peer, source)
+                source.connected
+                    && !source.body_batch_used
+                    && self
+                        .streaming
+                        .as_ref()
+                        .is_none_or(|stream| stream.peer != **peer)
+                    && eligible(peer, source)
             })
             .count();
         let queries = queries.min(self.limits.requests.saturating_sub(self.queries) as usize);
@@ -2302,6 +2405,138 @@ mod tests {
                 .received(request, bytes, wire, Instant::now())
                 .unwrap();
         }
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn stalled_primary_hedges_disjoint_tail_ranges_and_accounts_for_authenticated_overlap() {
+        let (mut transfer, owner, header, body, policy) = source_confirmation_fixture();
+        let primary = [1; 32];
+        let alternate = [2; 32];
+        let other = [3; 32];
+        let connected = std::collections::BTreeSet::from([primary, alternate, other]);
+        let holders = std::collections::BTreeSet::from([alternate, other]);
+        let deadline = transfer.io_deadline().expires_at();
+        assert!(deadline <= owner.deadline().expires_at());
+        transfer.begin_stream(primary).unwrap();
+        let start = transfer.streaming.as_ref().unwrap().started;
+        assert!(
+            transfer
+                .next_batch(alternate, None, 1, start)
+                .unwrap()
+                .is_empty()
+        );
+        let stale = start + STREAM_IDLE_HEDGE;
+        assert!(
+            transfer
+                .next_batch(primary, None, 1, stale)
+                .unwrap()
+                .is_empty()
+        );
+        let size = transfer.qualified_batch_capacity(alternate, &connected, &holders, &owner);
+        let a = transfer.next_batch(alternate, None, size, stale).unwrap();
+        assert_eq!(a[0].piece, transfer.piece_count() - 1);
+        owner.begin_query(alternate).unwrap();
+        let size = transfer.qualified_batch_capacity(other, &connected, &holders, &owner);
+        let b = transfer.next_batch(other, None, size, stale).unwrap();
+        assert!(!b.is_empty());
+        assert!(b.iter().all(|r| !a.iter().any(|s| s.piece == r.piece)));
+        owner.begin_query(other).unwrap();
+
+        let overlap = b[0].piece;
+        let bytes = encoded_piece(&body, overlap).unwrap();
+        let wire = bytes.len() as u64 + RESPONSE_OVERHEAD;
+        transfer
+            .streamed_piece(primary, overlap, bytes, wire)
+            .unwrap();
+        source_confirmation_receive(&mut transfer, a, &body);
+        source_confirmation_receive(&mut transfer, b, &body);
+        assert!(transfer.reads_finished().is_cancelled());
+        assert_eq!(transfer.verified_bytes(), body.len());
+        assert_eq!(transfer.queries, 3);
+        assert_eq!(transfer.io_deadline().expires_at(), deadline);
+        let sources = transfer.sources();
+        assert!(
+            sources
+                .iter()
+                .all(|src| src.queries > 0 && src.failures == 0)
+        );
+        assert!(
+            sources
+                .iter()
+                .filter(|src| src.authenticated_body_bytes > 0)
+                .count()
+                >= 2
+        );
+        assert_eq!(
+            sources
+                .iter()
+                .map(|src| src.authenticated_body_bytes)
+                .sum::<u64>(),
+            body.len() as u64
+        );
+        transfer.end_stream(primary, true, 0);
+        let finished = transfer
+            .finish(&header, policy, Instant::now(), owner)
+            .unwrap();
+        assert_eq!(finished.body.encode(policy).unwrap(), body);
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn continuously_advancing_but_slow_stream_can_hedge_and_completion_only_cancels_reads() {
+        let (mut transfer, owner, _, body, _) = source_confirmation_fixture();
+        let primary = [1; 32];
+        let alternate = [2; 32];
+        transfer.begin_stream(primary).unwrap();
+        let now = Instant::now();
+        let stream = transfer.streaming.as_mut().unwrap();
+        stream.started = now.checked_sub(STREAM_ELAPSED_HEDGE).unwrap();
+        stream.progress = now;
+        let deadline = transfer
+            .io_deadline()
+            .until_body_read_complete(transfer.reads_finished());
+        assert!(deadline.check_at(now).is_ok());
+        let batch = transfer
+            .next_batch(alternate, None, usize::MAX, now)
+            .unwrap();
+        assert_eq!(batch.len(), transfer.piece_count() - 1);
+        source_confirmation_receive(&mut transfer, batch, &body);
+        assert!(deadline.check().is_err());
+        assert!(transfer.io_deadline().check().is_ok());
+        assert!(owner.check_active().is_ok());
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    #[test]
+    fn an_overlap_that_fails_authentication_is_not_a_benign_duplicate() {
+        let (mut transfer, _, _, body, _) = source_confirmation_fixture();
+        let primary = [1; 32];
+        let alternate = [2; 32];
+        transfer.begin_stream(primary).unwrap();
+        let stale = transfer.streaming.as_ref().unwrap().started + STREAM_IDLE_HEDGE;
+        let request = transfer.next_batch(alternate, None, 1, stale).unwrap()[0];
+        let bytes = encoded_piece(&body, request.piece).unwrap();
+        let wire = bytes.len() as u64 + RESPONSE_OVERHEAD;
+        transfer
+            .received(request, bytes.clone(), wire, Instant::now())
+            .unwrap();
+        let mut corrupt = bytes;
+        corrupt[0] ^= 1;
+        assert!(matches!(
+            transfer.streamed_piece(primary, request.piece, corrupt, wire),
+            Err(Error::Authentication(_)),
+        ));
+        assert_eq!(
+            transfer
+                .sources()
+                .iter()
+                .find(|s| s.peer == primary)
+                .unwrap()
+                .bad_pieces,
+            1,
+        );
+        assert!(!transfer.reads_finished().is_cancelled());
     }
 
     #[cfg(feature = "eng2-runtime")]

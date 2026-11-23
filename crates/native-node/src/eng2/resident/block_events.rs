@@ -37,6 +37,12 @@ enum Kind {
         timing: FetchTiming,
         outcome: &'static str,
     },
+    DirectPush {
+        peer: Hash,
+        outcome: &'static str,
+        body_bytes: usize,
+        sent_application_bytes: u64,
+    },
     TemplateReady {
         micros: u64,
         parent: Hash,
@@ -53,6 +59,7 @@ impl Kind {
             Self::BodyFetch { .. } => "native-body-fetch-observed",
             Self::TemplateReady { .. } => "native-template-ready",
             Self::PieceSource { .. } => "native-piece-source-observed",
+            Self::DirectPush { .. } => "native-miner-direct-push",
         }
     }
 }
@@ -192,6 +199,25 @@ impl Recorder {
             header,
         );
     }
+    pub(super) fn direct_push(
+        &self,
+        header: &Header,
+        peer: Hash,
+        outcome: &'static str,
+        body_bytes: usize,
+        sent_application_bytes: u64,
+    ) {
+        self.header(
+            Kind::DirectPush {
+                peer,
+                outcome,
+                body_bytes,
+                sent_application_bytes,
+            },
+            header,
+        );
+    }
+
     pub(super) fn accept_binding_unavailable(&self) {
         if let Ok(mut state) = self.state.lock() {
             self.disable(&mut state, "native_rejection_binding_unavailable");
@@ -375,6 +401,7 @@ impl Recorder {
                 value["source_counters"] = json!({
                     "attempts":source.requested,"queries":source.queries,
                     "received_application_bytes":source.received,"sent_application_bytes":source.sent,
+                    "unique_body_bytes":source.authenticated_body_bytes,
                     "reserved_wire_bytes":source.reserved_wire,"bad_pieces":source.bad_pieces,"failures":source.failures,
                 });
                 value["transfer_times_ns"] = json!({
@@ -395,6 +422,21 @@ impl Recorder {
                     timing.attempt,
                     outcome,
                 ]);
+            }
+            Kind::DirectPush {
+                peer,
+                outcome,
+                body_bytes,
+                sent_application_bytes,
+            } => {
+                let peer_id = crate::local::hex(&peer);
+                value["peer_id"] = json!(peer_id);
+                value["outcome"] = json!(outcome);
+                value["declared_body_bytes"] = json!(body_bytes);
+                value["sent_application_bytes"] = json!(sent_application_bytes);
+                value["native_acceptance_implied"] = json!(false);
+                value["deduplication_key"] =
+                    json!([kind.name(), node_id, self.binding.run, block_id, peer_id,]);
             }
             Kind::TemplateReady {
                 micros,

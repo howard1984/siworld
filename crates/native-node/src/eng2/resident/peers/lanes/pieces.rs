@@ -129,6 +129,10 @@ pub(super) fn offer<S: std::io::Read + std::io::Write>(
     let Some((body, deadline)) = shared.headers.relay_body(peer.peer())? else {
         return Ok(false);
     };
+    let now = Instant::now();
+    let Some(lifetime) = deadline.expires_at().checked_duration_since(now) else {
+        return Ok(false);
+    };
     let permit = match shared.relay.open(
         peer.peer(),
         peer.propagation_session_id(),
@@ -140,12 +144,12 @@ pub(super) fn offer<S: std::io::Read + std::io::Write>(
         Ok(permit) => permit,
         Err(_) => return Ok(false),
     };
-    shared.headers.relay_offered(body.header(), peer.peer())?;
-    let now = Instant::now();
-    let lifetime = deadline
-        .expires_at()
-        .checked_duration_since(now)
-        .ok_or("relay body expired")?;
+    if let Err(error) = shared.headers.relay_offered(body.header(), peer.peer()) {
+        shared.relay.close(permit)?;
+        return Err(error);
+    }
+    let before = peer.application_totals().sent;
+    let streaming = peer.propagation_streaming();
     let result = peer.with_wire_fence(permit.clone(), |peer| {
         peer.offer_propagation(
             request,
@@ -162,7 +166,19 @@ pub(super) fn offer<S: std::io::Read + std::io::Write>(
             None => Ok(false),
         })
     });
-    if matches!(result, Ok(true)) && !peer.propagation_streaming() {
+    shared.block_events.direct_push(
+        body.header(),
+        peer.peer(),
+        match result {
+            Ok(true) if streaming => "body_sent",
+            Ok(true) => "metadata_sent",
+            Ok(false) => "credit_declined",
+            Err(_) => "interrupted",
+        },
+        body.length(),
+        peer.application_totals().sent - before,
+    );
+    if matches!(result, Ok(true)) && !streaming {
         shared.relay.save(
             peer.peer(),
             peer.propagation_session_id(),

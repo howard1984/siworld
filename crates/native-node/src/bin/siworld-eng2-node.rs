@@ -3,7 +3,7 @@
 use siworld_native_node::{eng2::resident, service};
 use std::path::Path;
 
-const HELP: &str = "siworld-eng2-node: explicitly selected engineering network\n\ngenesis-id DIRECTORY\nidentity-init DIRECTORY --expected-genesis ID\nidentity-public DIRECTORY --expected-genesis ID\ninit-store DIRECTORY --expected-genesis ID\nqualify-restart DIRECTORY --expected-genesis ID\nrestart-check DIRECTORY --expected-genesis ID\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT --expected-genesis ID\nconfigure-miner DIRECTORY holder|voyager ADDRESS_FILE --expected-genesis ID\nbootstrap-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID\nresume-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID\nrun DIRECTORY PEER_CONFIG --expected-genesis ID\nstatus DIRECTORY\nhistorical-submit DIRECTORY REQUEST_FILE\nhistorical-result DIRECTORY SEQUENCE\nhistorical-exchange DIRECTORY REQUEST_FILE MAXIMUM_WAIT_MS\nhistorical-verify DISPOSABLE_DIRECTORY\nsubmit-operations DIRECTORY PUBLIC_BUNDLE_FILE RUN_ID PARENT NEXT_HEIGHT --expected-genesis ID\noperations-result DIRECTORY RUN_ID\nstop DIRECTORY EXPECTED_RUN_ID\n\nEvery start loads an existing versioned identity and authenticated committed state.\nOnly identity-init explicitly creates a fresh peer identity. No command regenerates keys, migrates V1 state, changes genesis, or falls back to historical replay.\nSigned bootstrap is outbound-only, requires existing independent service pins and explicit resource/work policy, and never starts mining.\nWindows run requires a durable signed import and no listener or checkpoint signing key.\nqualify-restart is a separate explicit native audit of an existing unqualified store.\nProduction requires RAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2.\nThe eng2-runtime feature is an owner-operated build and is excluded from CI build features.";
+const HELP: &str = "siworld-eng2-node: explicitly selected engineering network\n\ngenesis-id DIRECTORY\nidentity-init DIRECTORY --expected-genesis ID\nidentity-public DIRECTORY --expected-genesis ID\ncheckpoint-votes-init DIRECTORY KEY_FILE --expected-genesis ID\ninit-store DIRECTORY --expected-genesis ID\nqualify-restart DIRECTORY --expected-genesis ID\nrestart-check DIRECTORY --expected-genesis ID\npeer-pin DIRECTORY DESCRIPTOR_FILE FINGERPRINT --expected-genesis ID\nconfigure-miner DIRECTORY holder|voyager ADDRESS_FILE --expected-genesis ID\nbootstrap-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID\nresume-signed DIRECTORY PEER_CONFIG POLICY_FILE --expected-genesis ID\nrun DIRECTORY PEER_CONFIG --expected-genesis ID\nstatus DIRECTORY\nhistorical-submit DIRECTORY REQUEST_FILE\nhistorical-result DIRECTORY SEQUENCE\nhistorical-exchange DIRECTORY REQUEST_FILE MAXIMUM_WAIT_MS\nhistorical-verify DISPOSABLE_DIRECTORY\nsubmit-operations DIRECTORY PUBLIC_BUNDLE_FILE RUN_ID PARENT NEXT_HEIGHT --expected-genesis ID\noperations-result DIRECTORY RUN_ID\nstop DIRECTORY EXPECTED_RUN_ID\n\nEvery start loads an existing versioned identity and authenticated committed state.\nOnly identity-init explicitly creates a fresh peer identity. No command regenerates keys, migrates V1 state, changes genesis, or falls back to historical replay.\nSigned bootstrap is outbound-only, requires existing independent service pins and explicit resource/work policy, and never starts mining.\nWindows run requires a durable signed import and no listener or checkpoint signing key.\nqualify-restart is a separate explicit native audit of an existing unqualified store.\nProduction requires RAYON_NUM_THREADS=4 and SIWORLD_COMPOSITION_HIDING_WORKERS=2.\nThe eng2-runtime feature is an owner-operated build and is excluded from CI build features.";
 
 fn run(args: &[String]) -> Result<(), String> {
     let result = match args {
@@ -95,6 +95,17 @@ fn run(args: &[String]) -> Result<(), String> {
                 "identity-public" => resident::public_identity(Path::new(directory), expected)?,
                 _ => return Err("unknown explicit engineering operation; use --help".into()),
             }
+        }
+        #[cfg(unix)]
+        [command, directory, key, flag, expected]
+            if command == "checkpoint-votes-init" && flag == "--expected-genesis" =>
+        {
+            resident::initialize_checkpoint_vote_history(
+                Path::new(directory),
+                Path::new(key),
+                expected,
+            )?;
+            return Ok(());
         }
         [command, directory, configuration, flag, expected]
             if command == "run" && flag == "--expected-genesis" =>

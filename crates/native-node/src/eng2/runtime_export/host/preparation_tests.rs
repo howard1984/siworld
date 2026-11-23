@@ -61,9 +61,9 @@ fn wait_prepared(host: &mut Host, owner: &Mutex<Store>, network: &NetworkStatus,
     let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         *now += 1;
-        let store = owner.lock().unwrap();
+        let mut store = owner.lock().unwrap();
         host.tick_resident(
-            &store,
+            &mut store,
             *now,
             &[],
             network,
@@ -118,11 +118,11 @@ fn resident_ticks_progress_during_delayed_full_component_validation_and_reject_u
     let network = NetworkStatus::new([[1; 32]]);
     let observer = crate::eng2::checkpoint_observer::Observer::default();
     for now in 100_000..100_003 {
-        let store = owner
+        let mut store = owner
             .try_lock()
             .expect("keyless preparation must not retain owner");
         let tick = host
-            .tick_resident(&store, now, &[], &network, &observer)
+            .tick_resident(&mut store, now, &[], &network, &observer)
             .unwrap();
         assert_eq!(tick.status.height, 0);
         assert_eq!(public_projection(&store, now, None).unwrap()["height"], 0);
@@ -134,9 +134,9 @@ fn resident_ticks_progress_during_delayed_full_component_validation_and_reject_u
     let mut now = 100_003;
     while host.preparation.as_ref().unwrap().worker.is_busy() {
         now += 1;
-        let store = owner.lock().unwrap();
+        let mut store = owner.lock().unwrap();
         assert!(
-            host.tick_resident(&store, now, &[], &network, &observer)
+            host.tick_resident(&mut store, now, &[], &network, &observer)
                 .unwrap()
                 .vote
                 .is_none()
@@ -228,13 +228,13 @@ fn delayed_native_preparation_signs_after_append_with_an_old_peer_head() {
     // Exercise the real owner projection while full validation is delayed.
     for _ in 0..3 {
         now += 1;
-        let store = owner
+        let mut store = owner
             .try_lock()
             .expect("checkpoint worker must not hold canonical owner");
         assert_eq!(public_projection(&store, now, None).unwrap()["height"], 36);
         assert!(
             host.tick_resident(
-                &store,
+                &mut store,
                 now,
                 &[],
                 &network,
@@ -261,7 +261,7 @@ fn delayed_native_preparation_signs_after_append_with_an_old_peer_head() {
     network.round([1; 32], 0, Some((36, [9; 32]))).unwrap();
     release_tx.send(()).unwrap();
     wait_prepared(&mut host, &owner, &network, &mut now);
-    let store = owner.lock().unwrap();
+    let mut store = owner.lock().unwrap();
     assert!(host.journaled_vote.is_some());
     let pending = host.pending.as_ref().unwrap();
     assert_eq!(pending.statement(), &statement);
@@ -283,7 +283,7 @@ fn delayed_native_preparation_signs_after_append_with_an_old_peer_head() {
     now += 1;
     assert!(
         host.tick_resident(
-            &store,
+            &mut store,
             now,
             &[duplicate],
             &network,
@@ -295,7 +295,7 @@ fn delayed_native_preparation_signs_after_append_with_an_old_peer_head() {
     assert_eq!(journals(&root, "vote-"), first_vote);
     now += 1;
     host.tick_resident(
-        &store,
+        &mut store,
         now,
         &[],
         &network,

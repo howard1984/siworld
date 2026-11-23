@@ -385,7 +385,9 @@ impl Control {
             genesis_timestamp: c.genesis_timestamp,
             genesis_target: c.genesis_target,
             target_interval: c.target_interval,
+            asert_half_life: c.asert_half_life(),
             pow_iterations: c.pow_iterations,
+            pow_algorithm: c.pow_algorithm(),
             max_headers: maximum.headers,
         };
         let active = {

@@ -1,48 +1,62 @@
 use super::*;
-use std::cell::{Cell, RefCell};
 
 #[test]
-fn injected_operation_failures_stop_the_pipeline_and_never_leak_error_text() {
+fn watchdog_retries_only_work_that_cannot_have_published_a_template() {
+    use crate::eng2::producer::PrepareError;
+    use crate::pool::FillError;
+    use crate::producer::CandidateError;
+
+    for failure in [
+        Failure::PrepareBlock(PrepareBlockError::Candidate(PrepareError::Candidate(
+            CandidateError::NullifierCollision,
+        ))),
+        Failure::PrepareBlock(PrepareBlockError::Padding(FillError::Insufficient {
+            required: 4,
+        })),
+        Failure::PaddingProve,
+        Failure::ProveBlock,
+        Failure::WorkPrepare,
+        Failure::WorkSearch,
+    ] {
+        assert!(failure.permits_watchdog_retry(), "{failure:?}");
+    }
     for failure in [
         Failure::WorkerPool,
         Failure::ProverInit,
         Failure::PaddingPrepare,
-        Failure::PaddingProve,
-        Failure::PrepareBlock,
-        Failure::ProveBlock,
-        Failure::WorkSearch,
+        Failure::PrepareBlock(PrepareBlockError::Pending),
+        Failure::PrepareBlock(PrepareBlockError::Candidate(PrepareError::Candidate(
+            CandidateError::OpeningMismatch,
+        ))),
+        Failure::PrepareBlock(PrepareBlockError::Candidate(PrepareError::FeeMode)),
+        Failure::PrepareBlock(PrepareBlockError::Padding(FillError::PrivateTemplateActive)),
         Failure::HeaderPublish,
         Failure::CommitBlock,
         Failure::RewardWrite,
+        Failure::Unknown,
     ] {
-        let calls = Cell::new(0);
-        let events = RefCell::new(Vec::new());
-        let result = run_once(
-            || {
-                calls.set(calls.get() + 1);
-                let injected: Result<(), String> =
-                    Err("private-path/key-material/provider-detail".into());
-                injected.map_err(|_| failure)?;
-                panic!("production continued after failure")
-            },
-            |value| events.borrow_mut().push((value.stage(), value.code())),
-            || {
-                assert_eq!(events.borrow().len(), 1);
-                // The service may continue validation while the failed producer
-                // waits. This callback cannot invoke the consumed producer.
-                events
-                    .borrow_mut()
-                    .push(("validation", "continued_until_cancel"));
-            },
-        );
-        assert_eq!(calls.get(), 1);
-        assert_eq!(events.borrow().len(), 2);
-        assert_eq!(events.borrow()[0], (failure.stage(), failure.code()));
-        assert_eq!(result.unwrap_err(), "native_production_failed");
-        assert!(!format!("{failure:?}").contains("private-path"));
+        assert!(!failure.permits_watchdog_retry(), "{failure:?}");
     }
-    assert_ne!(Failure::WorkerPool.code(), Failure::ProverInit.code());
-    assert_ne!(Failure::PaddingProve.code(), Failure::ProveBlock.code());
+}
+
+#[test]
+fn preparation_diagnostic_keeps_the_typed_underlying_failure() {
+    use crate::eng2::producer::PrepareError;
+    use crate::pool::FillError;
+    use crate::producer::CandidateError;
+
+    let failure =
+        Failure::PrepareBlock(PrepareBlockError::Padding(FillError::ReservationsExhausted));
+    assert_eq!(failure.stage(), "prepare");
+    assert_eq!(failure.code(), "production_padding_reservations_exhausted");
+    assert_ne!(
+        failure.code(),
+        Failure::PrepareBlock(PrepareBlockError::Pending).code()
+    );
+    let failure = Failure::PrepareBlock(PrepareBlockError::Candidate(PrepareError::Candidate(
+        CandidateError::NullifierCollision,
+    )));
+    assert_eq!(failure.code(), "production_candidate_nullifier_collision");
 }
 
 #[test]
@@ -57,26 +71,4 @@ fn unannotated_error_is_unknown_independent_of_sensitive_contents() {
         assert_eq!(mapped.stage(), "unknown");
         assert_eq!(mapped.code(), "unknown_production_failure");
     }
-}
-
-#[test]
-fn successful_or_cancelled_producer_does_not_alarm_or_wait() {
-    assert!(
-        run_once(
-            || Ok(()),
-            |_| panic!("unexpected alarm"),
-            || panic!("unexpected wait")
-        )
-        .is_ok()
-    );
-}
-
-#[test]
-#[should_panic(expected = "injected producer panic")]
-fn panic_is_not_reported_as_a_returned_failure() {
-    let _ = run_once(
-        || panic!("injected producer panic"),
-        |_| panic!("panic mislabeled"),
-        || panic!("panic waited"),
-    );
 }

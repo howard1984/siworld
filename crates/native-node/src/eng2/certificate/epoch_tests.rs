@@ -110,7 +110,9 @@ fn fixture(skew_authorization_height: bool) -> Fixture {
         genesis_timestamp: 1,
         genesis_target: [0xff; 32],
         target_interval: 300,
+        asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
         pow_iterations: 0,
+        pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
         max_headers: 1000,
     };
     let mut parent = rules.genesis;
@@ -186,7 +188,7 @@ fn signed(
         signature: *ml_dsa_65::sign(
             &keys[usize::from(slot)].signing_key,
             &statement.encode().unwrap(),
-            DOMAIN,
+            Statement::signing_context(),
             [32 + slot; 32],
         )
         .unwrap()

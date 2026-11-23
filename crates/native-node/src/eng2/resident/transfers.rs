@@ -58,8 +58,16 @@ impl Transfers {
         let configured = config
             .peers
             .iter()
-            .take(8)
             .map(|p| p.expected.fingerprint())
+            .filter(|peer| config.fixed_relay_peers.contains(peer))
+            .chain(
+                config
+                    .peers
+                    .iter()
+                    .map(|p| p.expected.fingerprint())
+                    .filter(|peer| !config.fixed_relay_peers.contains(peer)),
+            )
+            .take(8)
             .collect();
         Ok(Self {
             jobs: Mutex::new(Vec::with_capacity(CAPACITY)),

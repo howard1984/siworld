@@ -24,6 +24,10 @@ pub const MAX_SETTLEMENT_PROOF: usize = 655_360;
 pub const MIN_SLOTS: usize = 64;
 pub const PUBLIC_GENESIS_MIN_SLOTS: usize = 16;
 pub const PUBLIC_GENESIS_MAGIC: &[u8; 8] = b"SWE2POW3";
+pub const RANDOMX_GENESIS_MAGIC: &[u8; 8] = b"SWE2POW5";
+pub const CHECKPOINT_FORK_GENESIS_MAGIC: &[u8; 8] = b"SWE2POW4";
+pub const CHECKPOINT_FORK_GENESIS_RULES: &[u8] =
+    b"fork-choice:highest-executed-work-after-certified-checkpoint-v1";
 pub const LEGACY_GENESIS_MAGIC: &[u8; 8] = b"SWE2GEN2";
 pub const PUBLIC_GENESIS_RULES: &[u8] = b"slots:min16-step16-max576";
 pub const PUBLIC_GENESIS_PROFILE: &str = "pow-16-v1";

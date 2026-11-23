@@ -633,6 +633,8 @@ pub(crate) struct Deadline {
     cancellation: Cancellation,
     body_cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(feature = "eng2-runtime")]
+    read_completion: Option<Cancellation>,
+    #[cfg(feature = "eng2-runtime")]
     forwarding: Option<ForwardingGuard>,
     #[cfg(test)]
     elapsed: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -648,6 +650,8 @@ impl Deadline {
             limit,
             cancellation,
             body_cancellation: None,
+            #[cfg(feature = "eng2-runtime")]
+            read_completion: None,
             #[cfg(feature = "eng2-runtime")]
             forwarding: None,
             #[cfg(test)]
@@ -701,6 +705,13 @@ impl Deadline {
         });
         self
     }
+    /// A sibling lane completed this exact body. Cancel only redundant reads;
+    /// the owner deadline and downstream forwarding remain unchanged.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn until_body_read_complete(mut self, completion: Cancellation) -> Self {
+        self.read_completion = Some(completion);
+        self
+    }
     pub(crate) fn capped_at(mut self, expires: Instant) -> Self {
         self.limit = self
             .limit
@@ -714,6 +725,17 @@ impl Deadline {
         self.check_at(Instant::now())
     }
     pub(crate) fn check_at(&self, now: Instant) -> io::Result<()> {
+        #[cfg(feature = "eng2-runtime")]
+        if self
+            .read_completion
+            .as_ref()
+            .is_some_and(Cancellation::is_cancelled)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "body already received",
+            ));
+        }
         // Read lease retirement before the admission outcome. Successful
         // admission publishes the outcome before retiring the exact lease.
         let lease_cancelled = self.cancellation.is_cancelled()

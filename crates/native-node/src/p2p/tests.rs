@@ -296,6 +296,8 @@ fn operation_deadline_covers_header_and_body_without_resetting() {
     let deadline = Deadline {
         body_cancellation: None,
         #[cfg(feature = "eng2-runtime")]
+        read_completion: None,
+        #[cfg(feature = "eng2-runtime")]
         forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
@@ -318,6 +320,8 @@ fn expired_deadlines_fail_before_touching_the_channel() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        read_completion: None,
         #[cfg(feature = "eng2-runtime")]
         forwarding: None,
         started: Instant::now(),
@@ -367,6 +371,8 @@ fn reused_exchange_deadline_does_not_reset_between_missing_proof_frames() {
     let deadline = Deadline {
         body_cancellation: None,
         #[cfg(feature = "eng2-runtime")]
+        read_completion: None,
+        #[cfg(feature = "eng2-runtime")]
         forwarding: None,
         started: Instant::now(),
         limit: CONTROL_TIMEOUT,
@@ -414,6 +420,8 @@ fn paired_request_header_can_arrive_after_the_ordinary_control_deadline() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        read_completion: None,
         #[cfg(feature = "eng2-runtime")]
         forwarding: None,
         started: Instant::now(),
@@ -467,6 +475,8 @@ fn paired_request_header_deadline_is_absolute_under_fragmentation() {
     );
     let deadline = Deadline {
         body_cancellation: None,
+        #[cfg(feature = "eng2-runtime")]
+        read_completion: None,
         #[cfg(feature = "eng2-runtime")]
         forwarding: None,
         started: Instant::now(),

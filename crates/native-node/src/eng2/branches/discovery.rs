@@ -15,6 +15,7 @@ pub mod runtime;
 static NEXT_LEDGER: AtomicU64 = AtomicU64::new(1);
 const BODY_HEDGE_DELAY_MS: u64 = 30_000;
 const MAXIMUM_PENDING_BODIES: usize = 2;
+const MAXIMUM_SPONSORED_CANDIDATES: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -86,6 +87,9 @@ pub struct Cursor {
 #[derive(Debug)]
 struct Candidate {
     cursor: Cursor,
+    sponsor: Option<Hash>,
+    qualified: bool,
+    complete: bool,
     expires_ms: u64,
     descending: Vec<Header>,
     seen: BTreeSet<Hash>,
@@ -236,7 +240,31 @@ impl Ledger {
     }
     /// Duplicate advertisements preserve the original lifetime and accounting.
     pub fn begin(&mut self, height: u64, id: Hash, now_ms: u64) -> Result<Cursor, Error> {
+        self.begin_with_sponsor(height, id, None, now_ms)
+    }
+    /// Resident candidate slots are shared across connections but capped per
+    /// authenticated sponsor. Other peers may still supply the same material.
+    fn begin_for_peer(
+        &mut self,
+        height: u64,
+        id: Hash,
+        peer: Hash,
+        now_ms: u64,
+    ) -> Result<Cursor, Error> {
+        self.begin_with_sponsor(height, id, Some(peer), now_ms)
+    }
+    fn begin_with_sponsor(
+        &mut self,
+        height: u64,
+        id: Hash,
+        sponsor: Option<Hash>,
+        now_ms: u64,
+    ) -> Result<Cursor, Error> {
         self.time(now_ms)?;
+        if sponsor.is_some() {
+            self.candidates
+                .retain(|_, candidate| now_ms < candidate.expires_ms);
+        }
         if height == 0 || id == self.genesis || id == [0; 32] {
             return Err(Error::Configuration);
         }
@@ -253,6 +281,26 @@ impl Ledger {
             }
             return Ok(candidate.cursor);
         }
+        if sponsor.is_some_and(|peer| {
+            self.candidates
+                .values()
+                .filter(|candidate| !candidate.complete && candidate.sponsor == Some(peer))
+                .count()
+                >= MAXIMUM_SPONSORED_CANDIDATES
+        }) {
+            return Err(Error::Capacity);
+        }
+        if sponsor.is_some()
+            && self.candidates.len() == self.limits.maximum_candidates
+            && let Some(id) = self
+                .candidates
+                .iter()
+                .filter(|(_, candidate)| candidate.complete)
+                .min_by_key(|(_, candidate)| candidate.expires_ms)
+                .map(|(&id, _)| id)
+        {
+            self.candidates.remove(&id);
+        }
         if self.candidates.len() >= self.limits.maximum_candidates {
             return Err(Error::Capacity);
         }
@@ -268,6 +316,9 @@ impl Ledger {
             id,
             Candidate {
                 cursor,
+                sponsor,
+                qualified: false,
+                complete: false,
                 expires_ms,
                 descending: Vec::new(),
                 seen: BTreeSet::new(),
@@ -527,6 +578,21 @@ impl Ledger {
         encoded_bytes: usize,
         now_ms: u64,
     ) -> Result<(), Error> {
+        self.retain_body_with(request, encoded_bytes, now_ms, || {
+            Ok::<_, std::convert::Infallible>(())
+        })?
+        .unwrap_or_else(|err| match err {});
+        Ok(())
+    }
+    /// Consume and validate the live ticket before allowing the persistent
+    /// write. A failed write does not claim the candidate has the body.
+    fn retain_body_with<E>(
+        &mut self,
+        request: HeaderRequest,
+        encoded_bytes: usize,
+        now_ms: u64,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<(), E>, Error> {
         if !request.body {
             return Err(Error::StaleRequest);
         }
@@ -539,13 +605,16 @@ impl Ledger {
         if encoded_bytes == 0 || total > self.limits.maximum_body_bytes {
             return Err(Error::Capacity);
         }
+        if let Err(error) = persist() {
+            return Ok(Err(error));
+        }
         self.body_bytes = total;
         self.candidates
             .get_mut(&candidate)
             .unwrap()
             .received_bodies
             .insert(id);
-        Ok(())
+        Ok(Ok(()))
     }
     pub fn receive(
         &mut self,

@@ -113,6 +113,61 @@ impl PublicExport {
         Self::open_unrestored(root, store)
     }
 
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn write_accepted_conflict(
+        &self,
+        store: &Store,
+        accepted: &Certificate,
+        competing: &Certificate,
+    ) -> Result<(), String> {
+        self.check_store(store)?;
+        if store.finalized_checkpoint()?.as_ref() != Some(accepted) {
+            return Err("checkpoint conflict does not bind the accepted floor".into());
+        }
+        let mut bytes = accepted
+            .encode()
+            .map_err(|_| "accepted conflict certificate malformed")?
+            .to_vec();
+        bytes.extend_from_slice(
+            &competing
+                .encode()
+                .map_err(|_| "competing conflict certificate malformed")?,
+        );
+        let seal = store.bind_conflict_evidence(&bytes)?;
+        self.write_once(
+            "checkpoint-accepted-conflict-eng2.bin",
+            &[bytes.as_slice(), &seal].concat(),
+        )
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn accepted_conflict(&self, store: &Store) -> Result<bool, String> {
+        use crate::{
+            eng2::certificate::CERTIFICATE_BYTES, identity::storage_checkpoint::SEAL_BYTES,
+        };
+        self.check_store(store)?;
+        let payload = 2 * CERTIFICATE_BYTES;
+        let Some(bytes) = self.read_optional(
+            "checkpoint-accepted-conflict-eng2.bin",
+            payload + SEAL_BYTES,
+        )?
+        else {
+            return Ok(false);
+        };
+        if bytes.len() != payload + SEAL_BYTES {
+            return Err("checkpoint conflict record length invalid".into());
+        }
+        store.verify_conflict_evidence(&bytes[..payload], &bytes[payload..])?;
+        let accepted = Certificate::decode(&bytes[..CERTIFICATE_BYTES], self.network)
+            .map_err(|_| "accepted conflict certificate malformed")?;
+        Certificate::decode(&bytes[CERTIFICATE_BYTES..payload], self.network)
+            .map_err(|_| "competing conflict certificate malformed")?;
+        if store.finalized_checkpoint()?.as_ref() != Some(&accepted) {
+            return Err("retained checkpoint conflict floor differs".into());
+        }
+        Ok(true)
+    }
+
     /// Preserve the first independently verified quorum for an epoch and anchor.
     /// The caller has already checked the incoming current-roster signatures.
     /// A different statement is retained separately before reporting conflict.
@@ -398,6 +453,9 @@ impl PublicExport {
         randomness: [u8; 32],
         limits: ImportLimits,
     ) -> Result<Vote, String> {
+        if store.engine().genesis().checkpoint_fork_choice() {
+            return Err("bounded fork choice requires independent signer custody".into());
+        }
         self.check_store(store)?;
         prepared.check_current(store)?;
         self.write_candidate(

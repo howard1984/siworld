@@ -124,6 +124,9 @@ libp2p-core = { version = "=0.44.0", default-features = false, optional = true }
 rcgen = { version = "=0.13.2", default-features = false, features = ["crypto", "aws_lc_rs"], optional = true }
 x509-parser = { version = "=0.18.1", default-features = false, optional = true }
 
+[target.'cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), any(target_os = "linux", target_os = "macos", all(target_os = "windows", target_env = "msvc"))))'.dependencies]
+siworld-randomx-pow = { path = "../randomx-pow" }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "=1.1.5", features = ["fs", "process", "time"] }
 

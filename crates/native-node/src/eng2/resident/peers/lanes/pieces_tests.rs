@@ -76,7 +76,9 @@ fn fixture_with_profile(
         genesis_timestamp: genesis.config().genesis_timestamp,
         genesis_target: genesis.config().genesis_target,
         target_interval: genesis.config().target_interval,
+        asert_half_life: genesis.config().asert_half_life(),
         pow_iterations: genesis.config().pow_iterations,
+        pow_algorithm: genesis.config().pow_algorithm(),
         max_headers: 128,
     };
     let branches = crate::eng2::branches::BranchStore::create(
@@ -121,6 +123,7 @@ fn fixture_with_profile(
         checkpoint_worker_budget_bytes: None,
         listen: None,
         mining: false,
+        pow_search_threads: None,
         peers: peers
             .into_iter()
             .map(|expected| config::Destination {
@@ -421,6 +424,81 @@ fn credited_stream_decodes_without_a_followup_query() {
     std::fs::remove_dir_all(receiver.directory).unwrap();
 }
 
+#[test]
+fn a_produced_body_is_pushed_independently_to_three_pinned_services() {
+    let source = fixture_with_profile(
+        p2p::Role::Miner,
+        p2p::Role::Validator,
+        2,
+        None,
+        &[3, 4],
+        true,
+    );
+    let receivers: Vec<_> = (0..3)
+        .map(|_| fixture_with_profile(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[], true))
+        .collect();
+    let header = produced(&source, 39);
+    let id = header.id().unwrap();
+    thread::scope(|scope| {
+        for (receiver, seed) in receivers.iter().zip(2..5) {
+            let destination =
+                p2p::test_support::expected(source.genesis.peer_binding(), [seed; 32])
+                    .fingerprint();
+            let (a, b) = UnixStream::pair().unwrap();
+            a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut sender = Peer::new(
+                p2p::Session::from_test_peer_channel(
+                    a,
+                    source.genesis.peer_binding(),
+                    source.shared.budget.clone(),
+                    destination,
+                    p2p::Role::Validator,
+                ),
+                &source.genesis,
+                source.shared.headers.body_policy(),
+            )
+            .unwrap();
+            let mut receiver_peer = peer(b, receiver, p2p::Role::Miner);
+            let source_shared = source.shared.clone();
+            scope.spawn(move || {
+                assert!(sender.probe_propagation(2).unwrap());
+                sender.finish_round(2).unwrap();
+                assert!(offer(&mut sender, &source_shared, 3).unwrap());
+                sender.finish_round(3).unwrap();
+                assert!(!offer(&mut sender, &source_shared, 4).unwrap());
+            });
+            scope.spawn(move || {
+                let mut incoming = 1;
+                super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming)
+                    .unwrap();
+                super::super::serve_turn(&mut receiver_peer, &receiver.shared, &mut incoming)
+                    .unwrap();
+                let job = receiver.shared.transfers.test_job(id);
+                let transfer = job.transfer.lock().unwrap();
+                assert_eq!(transfer.verified_bytes(), transfer.body_bytes());
+                assert_eq!(
+                    transfer
+                        .sources()
+                        .iter()
+                        .map(|src| src.queries)
+                        .sum::<u64>(),
+                    1
+                );
+            });
+        }
+    });
+    for receiver in receivers {
+        receiver.shared.transfers.reap(&receiver.shared).unwrap();
+        assert_eq!(receiver.shared.transfers.diagnostic()["decoded"], 1);
+        receiver.shared.bodies.clear().unwrap();
+        drop(receiver.shared);
+        std::fs::remove_dir_all(receiver.directory).unwrap();
+    }
+    drop(source.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+}
+
 struct StreamTailGate {
     socket: UnixStream,
     blocked: std::sync::mpsc::SyncSender<()>,
@@ -452,6 +530,161 @@ impl std::io::Write for StreamTailGate {
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::Write::flush(&mut self.socket)
     }
+}
+
+// Mirror the native TLS channel's bounded polling slices on a local socket.
+struct PollingReceiver(UnixStream);
+impl std::io::Read for PollingReceiver {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(bytes).map_err(|error| match error.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                std::io::ErrorKind::Interrupted.into()
+            }
+            _ => error,
+        })
+    }
+}
+impl std::io::Write for PollingReceiver {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[test]
+fn qualified_alternate_completes_a_stalled_push_without_waiting_for_its_tail() {
+    let source = fixture_with_profile(p2p::Role::Miner, p2p::Role::Validator, 2, None, &[], true);
+    let receiver =
+        fixture_with_profile(p2p::Role::Validator, p2p::Role::Miner, 1, None, &[3], true);
+    let header = produced(&source, 37);
+    let id = header.id().unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    b.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    b.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    let (blocked, reached) = std::sync::mpsc::sync_channel(1);
+    let (release, resume) = std::sync::mpsc::sync_channel(1);
+    let mut sender = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            StreamTailGate {
+                socket: a,
+                blocked,
+                release: resume,
+                fired: false,
+            },
+            source.genesis.peer_binding(),
+            source.shared.budget.clone(),
+            source.remote,
+            p2p::Role::Validator,
+        ),
+        &source.genesis,
+        source.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let mut input = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            PollingReceiver(b),
+            receiver.genesis.peer_binding(),
+            receiver.shared.budget.clone(),
+            receiver.remote,
+            p2p::Role::Miner,
+        ),
+        &receiver.genesis,
+        receiver.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let source_shared = source.shared.clone();
+    let upstream = thread::spawn(move || {
+        assert!(sender.probe_propagation(2).unwrap());
+        sender.finish_round(2).unwrap();
+        assert!(offer(&mut sender, &source_shared, 3).is_err());
+    });
+    let receiver_shared = receiver.shared.clone();
+    let (finished, wait_finished) = std::sync::mpsc::sync_channel(1);
+    let primary = thread::spawn(move || {
+        let mut incoming = 1;
+        super::super::serve_turn(&mut input, &receiver_shared, &mut incoming).unwrap();
+        assert!(super::super::serve_turn(&mut input, &receiver_shared, &mut incoming).is_err());
+        finished.send(()).unwrap();
+    });
+    reached.recv_timeout(Duration::from_secs(3)).unwrap();
+    let alternate =
+        p2p::test_support::expected(receiver.genesis.peer_binding(), [3; 32]).fingerprint();
+    let _connection = receiver.shared.network.connected(alternate).unwrap();
+    receiver
+        .shared
+        .network
+        .admit_lane(alternate, Lane::Bodies)
+        .unwrap();
+
+    let (a, b) = UnixStream::pair().unwrap();
+    a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    a.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut alternate_input = Peer::new(
+        p2p::Session::from_test_peer_channel(
+            a,
+            receiver.genesis.peer_binding(),
+            receiver.shared.budget.clone(),
+            alternate,
+            p2p::Role::Validator,
+        ),
+        &receiver.genesis,
+        receiver.shared.headers.body_policy(),
+    )
+    .unwrap();
+    let mut alternate_sender = peer(b, &source, p2p::Role::Validator);
+    let source_shared = source.shared.clone();
+    let alt = thread::spawn(move || {
+        let mut incoming = 1;
+        super::super::serve_turn(&mut alternate_sender, &source_shared, &mut incoming).unwrap();
+        super::super::serve_turn(&mut alternate_sender, &source_shared, &mut incoming).unwrap();
+    });
+    assert!(alternate_input.probe_propagation(2).unwrap());
+    alternate_input.finish_round(2).unwrap();
+    receiver
+        .shared
+        .headers
+        .observe_body_lane_tip(
+            alternate,
+            alternate_input.propagation_session_id(),
+            header.height,
+            id,
+            true,
+        )
+        .unwrap();
+    let wait = Instant::now() + Duration::from_secs(2);
+    loop {
+        if receiver.shared.transfers.diagnostic()["active"] == 1 {
+            let job = receiver.shared.transfers.test_job(id);
+            let mut transfer = job.transfer.lock().unwrap();
+            if transfer.forwarding_piece(1).unwrap().is_some() {
+                transfer.age_stream_progress_for_test();
+                break;
+            }
+        }
+        assert!(Instant::now() < wait);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(pull_batch(&mut alternate_input, &receiver.shared, 3).unwrap());
+    alternate_input.finish_round(3).unwrap();
+    wait_finished.recv_timeout(Duration::from_secs(2)).unwrap();
+    primary.join().unwrap();
+    alt.join().unwrap();
+
+    // The sender's artificial tail gate is still closed. Local decode can
+    // proceed because the primary input released the transfer and ownership.
+    receiver.shared.transfers.reap(&receiver.shared).unwrap();
+    assert_eq!(receiver.shared.transfers.diagnostic()["decoded"], 1);
+    let _ = release.send(());
+    upstream.join().unwrap();
+    receiver.shared.bodies.clear().unwrap();
+    drop(source.shared);
+    drop(receiver.shared);
+    std::fs::remove_dir_all(source.directory).unwrap();
+    std::fs::remove_dir_all(receiver.directory).unwrap();
 }
 
 #[test]

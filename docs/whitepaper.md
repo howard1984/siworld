@@ -291,10 +291,25 @@ SIWORLD is published on 31 October 2026, the eighteenth anniversary of the Bitco
 The engineering genesis keeps its original 64-slot minimum. The public test
 network seals the 16-slot minimum into a distinct genesis. Settlement keeps the
 same fixed 576-row relation, and the step, maximum capacity and 300-second work
-target are unchanged.
+target are unchanged. The public test network seals a 3,600-second ASERT
+half-life into its genesis; Section 5 describes a 14,400-second half-life.
+The new proof-of-work profile selects RandomX 1.2.1 with a SIWORLD-specific
+Argon2 salt and epoch-key domain; Section 5 describes sequential BLAKE3 work.
+Block identifiers retain their separate BLAKE3 construction. The RandomX key is
+derived from the genesis and a block in the candidate chain, at 2,048-block
+intervals with a 64-block activation delay.
 
 Bootstrap from pruned history relies on the existing checkpoint authority:
 clients must trust that two of the three authorized checkpoint signers do not
 attest to invalid history. A checkpoint is not a signature on each block.
-Payments are evaluated by confirmation count on the accepted chain. Wait for
-at least 24 confirmations for high-value payments.
+The checkpoint-fenced profile follows the greatest verified cumulative work
+above the last accepted checkpoint. A valid branch that conflicts with that
+checkpoint is rejected without stopping the chain. If checkpoint issuance
+stalls, the same checkpoint remains the floor. Incompatible valid certificates
+suspend signing and wallet finality while ordinary chain processing continues
+above the first accepted checkpoint.
+
+Payments are final once covered by a checkpoint, under the stated signer
+assumptions. Before that, a payment can still be reversed. The wallet shows
+confirmation count for included payments and verifies a checkpoint certificate
+and the payment receipt's membership before showing finality.

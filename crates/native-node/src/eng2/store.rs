@@ -26,9 +26,17 @@ use std::path::Path;
 #[cfg(all(test, unix, feature = "eng2-rehearsal"))]
 mod commitment_tests;
 #[cfg(feature = "eng2-runtime")]
+mod finality;
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(super) mod generations;
+#[cfg(feature = "eng2-runtime")]
 pub(crate) mod history;
 mod imported;
 mod observation;
+#[cfg(all(unix, feature = "eng2-runtime"))]
+mod selected_generation;
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(super) mod shadow_prefix;
 #[cfg(feature = "eng2-rehearsal")]
 pub use observation::Observation;
 mod receipts;
@@ -76,10 +84,16 @@ pub(crate) trait CommitObserver: Send + Sync {
 
 pub struct Store {
     database: Database,
+    #[cfg(feature = "eng2-runtime")]
+    finalized: Option<finality::Floor>,
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    generation_control: Option<generations::GenerationControl>,
     #[cfg(windows)]
     _directory: siworld_miner_platform::Directory,
     #[cfg(windows)]
     file_identity: (u32, u64),
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    owner_file_identity: (u64, u64),
     engine: Engine,
     usable: bool,
     restart: Option<super::restart::Context>,
@@ -592,7 +606,26 @@ impl Store {
         }
         Ok(())
     }
-    /// Initialize only a new absent file. Existing state is never overwritten.
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    fn owner_file_identity(file: &std::fs::File) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "canonical database descriptor unavailable")?;
+        if !metadata.is_file() {
+            return Err("canonical database descriptor is not a regular file".into());
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn matches_owner_path(&self, path: &Path) -> Result<bool, String> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|_| "canonical database path unavailable")?;
+        Ok(metadata.is_file() && self.owner_file_identity == (metadata.dev(), metadata.ino()))
+    }
+
     pub fn create(path: &Path, genesis: Genesis, limits: Limits) -> Result<Self, String> {
         #[cfg(windows)]
         let directory = siworld_miner_platform::Directory::open(
@@ -618,6 +651,8 @@ impl Store {
                 .open(path)
                 .map_err(|_| "new versioned database is unavailable or exists")?
         };
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        let owner_file_identity = Self::owner_file_identity(&file)?;
         let backend = redb::backends::FileBackend::new(file)
             .map_err(|_| "versioned database backend unavailable")?;
         let database = Database::builder()
@@ -650,10 +685,16 @@ impl Store {
         crate::store::sync_parent(path)?;
         Ok(Self {
             database,
+            #[cfg(feature = "eng2-runtime")]
+            finalized: None,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            generation_control: None,
             #[cfg(windows)]
             _directory: directory,
             #[cfg(windows)]
             file_identity,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            owner_file_identity,
             engine,
             usable: true,
             restart: None,
@@ -715,6 +756,8 @@ impl Store {
         {
             return Err("existing versioned database is empty".into());
         }
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        let owner_file_identity = Self::owner_file_identity(&file)?;
         let backend = redb::backends::FileBackend::new(file)
             .map_err(|_| "versioned database backend unavailable")?;
         let mut builder = Database::builder();
@@ -786,10 +829,16 @@ impl Store {
             .map_err(|_| "versioned audit compact index durable commit failed")?;
         Ok(Self {
             database,
+            #[cfg(feature = "eng2-runtime")]
+            finalized: None,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            generation_control: None,
             #[cfg(windows)]
             _directory: directory,
             #[cfg(windows)]
             file_identity,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            owner_file_identity,
             engine,
             usable: true,
             restart: None,
@@ -881,6 +930,8 @@ impl Store {
         {
             return Err("existing versioned restart database is empty".into());
         }
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        let owner_file_identity = Self::owner_file_identity(&file)?;
         let backend = redb::backends::FileBackend::new(file)
             .map_err(|_| "versioned restart backend unavailable")?;
         let mut builder = Database::builder();
@@ -900,12 +951,19 @@ impl Store {
             import_seed,
         } = observation::authenticate(&txn, genesis, limits, &identity)?;
         drop(txn);
-        let result = Self {
+        #[allow(unused_mut)]
+        let mut result = Self {
             database,
+            #[cfg(feature = "eng2-runtime")]
+            finalized: None,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            generation_control: None,
             #[cfg(windows)]
             _directory: directory,
             #[cfg(windows)]
             file_identity,
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            owner_file_identity,
             engine,
             usable: true,
             restart: Some(super::restart::Context {
@@ -923,6 +981,8 @@ impl Store {
             owner_fault: None,
         };
         result.ensure_exportable()?;
+        #[cfg(feature = "eng2-runtime")]
+        result.load_finalized_floor()?;
         result.remember_rollback_state()?;
         Ok(result)
     }
@@ -1521,7 +1581,13 @@ impl Store {
     /// branch change. Subsequent blocks use the ordinary fully verified append.
     /// Original branch bytes must already be retained outside this database.
     pub fn restore_ancestor(&mut self, height: u64, block_id: Hash) -> Result<(), String> {
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        if self.generation_control.is_some() {
+            return Err("selected generation requires atomic shadow replay".into());
+        }
         self.check_readable()?;
+        #[cfg(feature = "eng2-runtime")]
+        self.check_finalized_ancestor(height)?;
         let depth = self
             .engine
             .state()
@@ -1562,6 +1628,12 @@ impl Store {
             self.imported_prefix,
             self.import_seed,
         )?;
+        // Savepoints include user tables. Carry the current floor forward in
+        // the *same transaction* before restoring any externally visible head.
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(floor) = &self.finalized {
+            floor.carry(&transaction)?;
+        }
         // A verification failure above aborts the whole restore transaction.
         // Ambiguous commit failures below require verified reopen, never reuse.
         self.usable = false;
@@ -1628,6 +1700,10 @@ impl Store {
         rollback::read(&self.database)
     }
     fn remember_rollback_state(&self) -> Result<(), String> {
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        if self.engine.genesis().checkpoint_fork_choice() {
+            return Ok(());
+        }
         let height = self.engine.state().height();
         let commitment = if height == 0 {
             [0; 32]

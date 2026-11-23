@@ -45,3 +45,24 @@ test('history rendering shows confirmation counts in summary and detail and remo
     history.set({height:11,received_records:[]});assert.equal(list.children.length,1);assert.equal(list.children[0].tag,'p');assert.match(list.children[0].textContent,/No transactions/);
   }finally{globalThis.document=original;}
 });
+
+test('checkpoint settlement stays provisional at any confirmation count without verified coverage',()=>{
+  const rows=transactionRows({height:150,checkpoint_finality:true,received_records:[note({confirmations:140})],
+    payments:[
+      {id:'a',phase:'included',confirmed_height:80,confirmations:71,checkpoint_covered:true,amount_atoms:'1'},
+      {id:'b',phase:'uncertain',checkpoint_covered:true,confirmations:0,amount_atoms:'1'},
+    ]});
+  assert.equal(rows.find(row=>row.direction==='received').status,'Included · Awaiting final confirmation');
+  assert.equal(rows.find(row=>row.id==='payment:a').status,'Checkpoint covered (final)');
+  assert.equal(rows.find(row=>row.id==='payment:b').status,'Unconfirmed');
+  assert.equal(transactionRows({height:150,received_records:[note({confirmations:140,checkpoint_covered:true})]})[0].status,'Confirmed');
+});
+
+
+test('suspension preserves already verified receipt history and labels included payments without finality',()=>{
+  const rows=transactionRows({height:12,checkpoint_finality:true,finality_suspended:true,
+    received_records:[note({checkpoint_covered:true})],
+    payments:[{id:'a',phase:'included',confirmed_height:12,confirmations:1,amount_atoms:'1'}]});
+  assert.equal(rows.find(row=>row.direction==='received').status,'Checkpoint covered (final)');
+  assert.equal(rows.find(row=>row.id==='payment:a').status,'Included · Finality suspended');
+});

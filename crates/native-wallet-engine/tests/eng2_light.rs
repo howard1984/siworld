@@ -19,7 +19,9 @@ fn genesis(config: &Config) -> (Vec<u8>, Hash) {
     genesis_with_slots(config, SlotRule::Legacy)
 }
 fn genesis_with_slots(config: &Config, slot_rule: SlotRule) -> (Vec<u8>, Hash) {
-    let governance = b"SWG2GOV2";
+    encode_genesis(config, slot_rule, b"SWG2GOV2")
+}
+fn encode_genesis(config: &Config, slot_rule: SlotRule, governance: &[u8]) -> (Vec<u8>, Hash) {
     let profile = native_profile();
     let mut rules = blake3::Hasher::new_derive_key("siworld eng2 internal immutable rules v1");
     rules.update(&[0]);
@@ -32,13 +34,19 @@ fn genesis_with_slots(config: &Config, slot_rule: SlotRule) -> (Vec<u8>, Hash) {
     if slot_rule == SlotRule::PublicGenesis {
         rules.update(PUBLIC_GENESIS_RULES);
     }
+    let randomx = config.pow_algorithm() == pow::Algorithm::SiworldRandomX;
+    if randomx {
+        rules.update(CHECKPOINT_FORK_GENESIS_RULES);
+        pow::bind_randomx(&mut rules);
+    }
     let id = blake3::derive_key(
         "siworld eng2 internal genesis v1",
         rules.finalize().as_bytes(),
     );
-    let mut bytes = match slot_rule {
-        SlotRule::Legacy => LEGACY_GENESIS_MAGIC,
-        SlotRule::PublicGenesis => PUBLIC_GENESIS_MAGIC,
+    let mut bytes = match (slot_rule, randomx) {
+        (SlotRule::Legacy, _) => LEGACY_GENESIS_MAGIC,
+        (SlotRule::PublicGenesis, false) => PUBLIC_GENESIS_MAGIC,
+        (SlotRule::PublicGenesis, true) => RANDOMX_GENESIS_MAGIC,
     }
     .to_vec();
     bytes.push(0);
@@ -57,10 +65,29 @@ fn fixture() -> (Config, Vec<u8>, Hash, Block) {
 fn qualified_block(
     config: &Config,
     context: &Context,
+    block: Block,
+    height: u64,
+    parent: Hash,
+    parent_timestamp: u64,
+) -> (Header, Vec<u8>) {
+    qualified_block_with_commitment(
+        config,
+        context,
+        block,
+        height,
+        parent,
+        parent_timestamp,
+        [9; 32],
+    )
+}
+fn qualified_block_with_commitment(
+    config: &Config,
+    context: &Context,
     mut block: Block,
     height: u64,
     parent: Hash,
     parent_timestamp: u64,
+    execution_commitment: Hash,
 ) -> (Header, Vec<u8>) {
     block.height = height;
     block.parent = parent;
@@ -116,25 +143,28 @@ fn qualified_block(
         height,
         parent,
         timestamp: block.timestamp,
-        target: pow::asert_target(
+        target: pow::asert_target_with_half_life(
             &config.genesis_target,
             config.genesis_timestamp,
             config.target_interval,
             height - 1,
             parent_timestamp,
+            config.asert_half_life(),
         ),
-        execution_commitment: [9; 32],
+        execution_commitment,
         body_commitment: blake3::derive_key(BODY_DOMAIN, &raw),
         nonce: 0,
     };
-    header.nonce = (0..4096)
-        .find(|nonce| {
-            pow::meets_target(
-                &pow::pow_hash(&header.pow_seed().unwrap(), *nonce, config.pow_iterations),
-                &header.target,
-            )
-        })
-        .expect("bounded minimum-difficulty synthetic work");
+    if config.pow_algorithm() == pow::Algorithm::SequentialBlake3 {
+        header.nonce = (0..4096)
+            .find(|nonce| {
+                pow::meets_target(
+                    &pow::pow_hash(&header.pow_seed().unwrap(), *nonce, config.pow_iterations),
+                    &header.target,
+                )
+            })
+            .expect("bounded minimum-difficulty synthetic work");
+    }
     let mut bytes = b"SWE2WLT1".to_vec();
     for value in [
         config.network,
@@ -851,5 +881,267 @@ fn cached_candidate_bounds_include_24_blocks_plus_seven_prefix_replay_blocks() {
     assert_eq!(
         accepted.local_cache().unwrap().as_slice(),
         before.as_slice()
+    );
+}
+
+#[test]
+fn receipt_scanned_checkpoint_requires_current_quorum_and_survives_suffix_rollback() {
+    verify_checkpoint_history(false);
+}
+
+#[test]
+fn browser_randomx_authenticates_checkpoint_and_receipts_without_crediting_work() {
+    verify_checkpoint_history(true);
+}
+
+fn verify_checkpoint_history(browser_randomx: bool) {
+    use libcrux_ml_dsa::ml_dsa_65;
+    use siworld_native_wallet_engine::{
+        eng2_certificate::{Certificate, Statement, Vote},
+        eng2_governance::GovernanceState,
+        wallet::Wallet,
+    };
+    let (config, block) = common::fixture_slots(16);
+    let config = if browser_randomx {
+        let mut target = [0xff; 32];
+        target[..3].fill(0);
+        Config::asert_development(config.network, config.genesis_timestamp, target, 1)
+            .unwrap()
+            .with_siworld_randomx()
+            .unwrap()
+    } else {
+        config
+    };
+    let seed = || Zeroizing::new([41; 32]);
+    let destination = Wallet::from_seed(config.network, seed(), 0)
+        .unwrap()
+        .address();
+    let signers = [1, 2, 3].map(|n| ml_dsa_65::generate_key_pair([n; 32]));
+    let roster_keys = core::array::from_fn(|slot| *signers[slot].verification_key.as_ref());
+    let governance = GovernanceState::new(
+        config.network,
+        [9; 1952],
+        [10; 1952],
+        roster_keys,
+        destination.clone(),
+        vec![destination],
+    )
+    .unwrap();
+    let (genesis, id) = encode_genesis(
+        &config,
+        SlotRule::PublicGenesis,
+        &governance.canonical_component_bytes().unwrap(),
+    );
+    let context = Context::from_genesis(&genesis, id).unwrap();
+    let new = if browser_randomx {
+        Eng2LightState::new_for_browser
+    } else {
+        Eng2LightState::new
+    };
+    let open = if browser_randomx {
+        Eng2LightState::open_local_for_browser
+    } else {
+        Eng2LightState::open_local
+    };
+    let mut wallet = new(&genesis, id, seed(), 0).unwrap();
+    let mut provisional_receipts = Vec::new();
+    let mut parent_stamp = config.genesis_timestamp;
+    let mut prefix = None;
+    for height in 1..=36 {
+        let (header, receipt) = qualified_block(
+            &config,
+            &context,
+            block.clone(),
+            height,
+            wallet.tip(),
+            parent_stamp,
+        );
+        if browser_randomx && height == 1 {
+            let mut desktop = Eng2LightState::new(&genesis, id, seed(), 0).unwrap();
+            assert_eq!(
+                desktop
+                    .append(&header.encode().unwrap(), &receipt)
+                    .unwrap_err(),
+                "eng2 wallet header work rejected"
+            );
+            let mut broken = header.clone();
+            broken.parent = [42; 32];
+            assert!(wallet.append(&broken.encode().unwrap(), &receipt).is_err());
+            let mut broken = header.clone();
+            broken.target = [0xff; 32];
+            assert!(wallet.append(&broken.encode().unwrap(), &receipt).is_err());
+        }
+        if browser_randomx && matches!(height, 12 | 13) {
+            provisional_receipts.push((header.clone(), receipt.clone()));
+        }
+        wallet.append(&header.encode().unwrap(), &receipt).unwrap();
+        parent_stamp = header.timestamp;
+        if height == 12 {
+            prefix = Some(wallet.fork(seed(), 0).unwrap());
+        }
+    }
+    let block_at = |height| wallet.header(height).unwrap().id().unwrap();
+    let signed = |statement: Statement| {
+        let frame = statement.encode().unwrap();
+        let votes = [0, 2].map(|slot: u8| Vote {
+            slot,
+            signature: *ml_dsa_65::sign(
+                &signers[slot as usize].signing_key,
+                &frame,
+                Statement::signing_context(),
+                [11 + slot; 32],
+            )
+            .unwrap()
+            .as_ref(),
+        });
+        Certificate { statement, votes }
+    };
+    let statement = Statement {
+        network: config.network,
+        checkpoint_height: 12,
+        checkpoint_block: block_at(12),
+        authorization_height: 36,
+        authorization_block: block_at(36),
+        roster_sequence: 0,
+        roster_digest: governance.active_roster().digest(config.network),
+    };
+    let proof = signed(statement.clone()).encode().unwrap();
+    let floor = wallet.verify_checkpoint(&proof).unwrap();
+    if browser_randomx {
+        let prefix = prefix.as_ref().unwrap();
+        let cached_prefix = prefix.local_cache().unwrap();
+        let rolled_back = wallet
+            .fork_local_cache(&genesis, id, seed(), 0, &cached_prefix, floor.anchor())
+            .unwrap();
+        assert!(!rolled_back.header_pow_verified());
+        assert!(rolled_back.preserves_checkpoint(floor));
+        assert!(
+            rolled_back
+                .check_head(rolled_back.height(), rolled_back.tip(), Some(&wallet))
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        floor.anchor(),
+        Snapshot {
+            height: 12,
+            block_id: block_at(12)
+        }
+    );
+    let cached = wallet.local_cache().unwrap();
+    let reopened = open(&genesis, id, seed(), 0, &cached).unwrap();
+    assert_eq!(reopened.verify_checkpoint(&proof).unwrap(), floor);
+    if browser_randomx {
+        use serde_json::Value;
+        let metadata: Value = serde_json::from_str(&reopened.balance_json().unwrap()).unwrap();
+        assert_eq!(metadata["header_pow_verified"], false);
+        assert_eq!(
+            reopened.cumulative_work(),
+            wallet.fresh(seed(), 0).unwrap().cumulative_work()
+        );
+        assert!(Eng2LightState::open_local(&genesis, id, seed(), 0, &cached).is_err());
+        for (header, mut bytes) in provisional_receipts {
+            let frame = ReceiptBlock::decode(&context, &header.encode().unwrap(), &bytes).unwrap();
+            let statement = frame.transactions()[0].statement_id(&config.network);
+            let inclusion = reopened
+                .authenticated_payment_receipt(header.height, &bytes, statement)
+                .unwrap();
+            assert_eq!(
+                reopened.checkpoint_covers_inclusion(floor, inclusion),
+                header.height == 12
+            );
+            assert!(
+                reopened
+                    .authenticated_payment_receipt(header.height, &bytes, [7; 32])
+                    .is_err()
+            );
+            *bytes.last_mut().unwrap() ^= 1;
+            assert!(
+                reopened
+                    .authenticated_payment_receipt(header.height, &bytes, statement)
+                    .is_err()
+            );
+        }
+    }
+    let mut rival = new(&genesis, id, seed(), 0).unwrap();
+    let mut rival_stamp = config.genesis_timestamp;
+    for height in 1..=36 {
+        let (header, receipt) = qualified_block_with_commitment(
+            &config,
+            &context,
+            block.clone(),
+            height,
+            rival.tip(),
+            rival_stamp,
+            [10; 32],
+        );
+        rival.append(&header.encode().unwrap(), &receipt).unwrap();
+        rival_stamp = header.timestamp;
+    }
+    let conflict = signed(Statement {
+        checkpoint_block: rival.header(12).unwrap().id().unwrap(),
+        authorization_block: rival.header(36).unwrap().id().unwrap(),
+        ..statement.clone()
+    })
+    .encode()
+    .unwrap();
+    assert!(
+        !wallet
+            .checkpoint_conflicts(floor, &reopened, &proof)
+            .unwrap()
+    );
+    assert!(
+        wallet
+            .checkpoint_conflicts(floor, &rival, &conflict)
+            .unwrap()
+    );
+    assert!(wallet.checkpoint_conflicts(floor, &rival, &proof).is_err());
+    assert!(wallet.verify_checkpoint(&conflict).is_err());
+    assert!(!rival.preserves_checkpoint(floor));
+    let mut unable_to_verify = proof;
+    unable_to_verify[159] ^= 1;
+    assert!(wallet.verify_checkpoint(&unable_to_verify).is_err());
+    for altered in [
+        Statement {
+            authorization_block: [5; 32],
+            ..statement.clone()
+        },
+        Statement {
+            checkpoint_block: [5; 32],
+            ..statement.clone()
+        },
+        Statement {
+            roster_sequence: 1,
+            ..statement.clone()
+        },
+        Statement {
+            authorization_height: 35,
+            authorization_block: block_at(35),
+            ..statement
+        },
+    ] {
+        assert!(
+            wallet
+                .verify_checkpoint(&signed(altered).encode().unwrap())
+                .is_err()
+        );
+    }
+    // The origin certificate no longer has a local authorization header in
+    // this view; a previously verified, locally authenticated floor survives.
+    let prefix = prefix.unwrap();
+    assert!(prefix.verify_checkpoint(&proof).is_err());
+    assert!(prefix.preserves_checkpoint(floor));
+    assert_eq!(
+        prefix
+            .restore_local_checkpoint(&floor.local_record())
+            .unwrap(),
+        floor
+    );
+    let fresh = Eng2LightState::new(&genesis, id, seed(), 0).unwrap();
+    assert!(!fresh.preserves_checkpoint(floor));
+    assert!(
+        fresh
+            .restore_local_checkpoint(&floor.local_record())
+            .is_err()
     );
 }

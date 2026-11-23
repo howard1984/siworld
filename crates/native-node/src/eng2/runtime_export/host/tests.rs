@@ -29,6 +29,59 @@ pub(super) fn key_fixture(path: &Path, store: &Store, slot: u8, seed: u8) {
     file.write_all(&bytes).unwrap();
     file.sync_all().unwrap();
 }
+
+#[cfg(feature = "eng2-runtime")]
+pub(crate) fn initialize_fixture_custody(key: &Path, export: &Path, store: &Store, slot: u8) {
+    key_fixture(key, store, slot, 3 + slot);
+    ExistingSigner::initialize_vote_history(key, export, store).unwrap();
+}
+
+#[cfg(feature = "eng2-runtime")]
+pub(crate) fn vote_with_fixture_custody(
+    key: &Path,
+    export: &Path,
+    store: &Store,
+    prepared: &PreparedCheckpoint,
+    check_restore: bool,
+) -> Vote {
+    let votes = key.with_file_name(format!(
+        "{}.votes",
+        key.file_name().unwrap().to_str().unwrap()
+    ));
+    let before = fs::metadata(&votes).unwrap().len();
+    let signer = ExistingSigner::load_for_host(key, export, store).unwrap();
+    let proof = signer
+        .history
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .sign(&signer, store, prepared, [7 + signer.slot; 32])
+        .unwrap()
+        .expect("fresh fixture custody must vote");
+    drop(signer);
+    if check_restore {
+        // Restore the ordinary journal's pre-vote length in place. The
+        // separately durable high-water record still contains the real vote.
+        let file = OpenOptions::new().write(true).open(votes).unwrap();
+        assert!(file.metadata().unwrap().len() > before);
+        file.set_len(before).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let reopened = ExistingSigner::load_for_host(key, export, store).unwrap();
+        assert!(
+            reopened
+                .history
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .sign(&reopened, store, prepared, [8; 32])
+                .unwrap()
+                .is_none(),
+            "restored signer must abstain while only the high-water vote is present"
+        );
+    }
+    proof
+}
 #[test]
 fn existing_signer_requires_exact_context_authorized_slot_and_owner_only_file() {
     let dir = Directory::new();
@@ -78,12 +131,12 @@ fn existing_signer_requires_exact_context_authorized_slot_and_owner_only_file() 
 #[test]
 fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating_checkpoint() {
     let dir = Directory::new();
-    let store = dir.store();
+    let mut store = dir.store();
     let root = dir.private("export");
     let key = dir.0.join("signer.bin");
     key_fixture(&key, &store, 0, 3);
     let mut host = Host::open(&root, &store, limits(), Some(&key)).unwrap();
-    let first = host.tick(&store, 100_000, &[]).unwrap();
+    let first = host.tick(&mut store, 100_000, &[]).unwrap();
     assert!(first.exported_current);
     assert!(!first.newly_published);
     assert_eq!(first.status.height, 0);
@@ -96,23 +149,28 @@ fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating
     let state_before = store.engine().state().tip();
     let current = fs::read(root.join("explorer.json")).unwrap();
     let status = fs::read(root.join("checkpoint-status-eng2.json")).unwrap();
-    assert!(!host.tick(&store, 100_001, &[]).unwrap().exported_current);
+    assert!(
+        !host
+            .tick(&mut store, 100_001, &[])
+            .unwrap()
+            .exported_current
+    );
     assert_eq!(fs::read(root.join("explorer.json")).unwrap(), current);
     assert_eq!(
         fs::read(root.join("checkpoint-status-eng2.json")).unwrap(),
         status
     );
-    assert!(host.tick(&store, 100_000, &[]).is_err());
+    assert!(host.tick(&mut store, 100_000, &[]).is_err());
     assert_eq!(
         host.tick_failure_reason(),
         Some(TickFailureReason::InputBounds)
     );
-    assert!(host.tick(&store, 1u64 << 53, &[]).is_err());
+    assert!(host.tick(&mut store, 1u64 << 53, &[]).is_err());
     assert_eq!(
         host.tick_failure_reason(),
         Some(TickFailureReason::InputBounds)
     );
-    assert!(host.tick(&store, 100_002, &[]).is_ok());
+    assert!(host.tick(&mut store, 100_002, &[]).is_ok());
     assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(store.engine().state().tip(), state_before);
     assert!(!fs::read_dir(&root).unwrap().any(|entry| {
@@ -126,7 +184,7 @@ fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating
     let mut reopened = Host::open(&root, &store, limits(), Some(&key)).unwrap();
     assert!(
         reopened
-            .tick(&store, 100_002, &[])
+            .tick(&mut store, 100_002, &[])
             .unwrap()
             .exported_current
     );
@@ -134,7 +192,7 @@ fn explicit_genesis_host_emits_unavailable_status_without_signing_or_fabricating
 #[test]
 fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     let dir = Directory::new();
-    let store = dir.store();
+    let mut store = dir.store();
     let root = dir.private("export");
     let mut host = Host::open(&root, &store, limits(), None).unwrap();
     let candidate = synthetic_candidate();
@@ -144,7 +202,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     });
     assert!(
         host.tick(
-            &store,
+            &mut store,
             100_000,
             &vec![proposal.clone(); MAX_MESSAGES_PER_TICK + 1]
         )
@@ -154,7 +212,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         host.tick_failure_reason(),
         Some(TickFailureReason::InputBounds)
     );
-    assert!(host.tick(&store, 100_001, &[proposal]).is_err());
+    assert!(host.tick(&mut store, 100_001, &[proposal]).is_err());
     assert_eq!(
         host.tick_failure_reason(),
         Some(TickFailureReason::Proposal)
@@ -166,7 +224,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
             signature: [0; super::super::super::certificate::SIGNATURE_BYTES],
         }),
     };
-    assert!(host.tick(&store, 100_002, &[vote]).is_err());
+    assert!(host.tick(&mut store, 100_002, &[vote]).is_err());
     assert_eq!(
         host.tick_failure_reason(),
         Some(TickFailureReason::VoteWithoutCandidate)
@@ -175,7 +233,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
     witness.governance = vec![0; limits().chain.max_component_bytes + 1];
     assert!(
         host.tick(
-            &store,
+            &mut store,
             100_003,
             &[Incoming::Proposal(Proposal {
                 statement: candidate.statement,
@@ -185,7 +243,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
         .is_err()
     );
     assert_eq!(store.engine().state().height(), 0);
-    let result = host.tick(&store, 100_004, &[]).unwrap();
+    let result = host.tick(&mut store, 100_004, &[]).unwrap();
     assert_eq!(host.tick_failure_reason(), None);
     assert_eq!(result.status.signer_slot, None);
     assert!(result.status.pruning_paused);
@@ -196,7 +254,7 @@ fn observer_rejects_unmatched_bounded_peer_inputs_without_chain_mutation() {
 #[test]
 fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint_tick() {
     let dir = Directory::new();
-    let store = dir.store();
+    let mut store = dir.store();
     let root = dir.private("wallet-owner");
     let mut host = Host::open(&root, &store, limits(), None).unwrap();
     let budget = crate::p2p::Budget::new(2 * 1024 * 1024);
@@ -218,7 +276,7 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
     );
     assert_eq!(host.wallet_export_state(), Some(true));
     assert!(host.tick_wallet_export(&store, 1000, &budget).is_err());
-    assert!(host.tick(&store, 1000, &[]).is_ok());
+    assert!(host.tick(&mut store, 1000, &[]).is_ok());
     assert!(!root.join("wallet-head.json").exists());
     drop(host);
     let mut host = Host::open(&root, &store, limits(), None).unwrap();
@@ -231,7 +289,7 @@ fn wallet_export_is_disabled_by_default_and_its_failure_does_not_stop_checkpoint
     assert!(progress.published);
     assert_eq!(progress.published_height, Some(0));
     assert_eq!(host.wallet_export_state(), Some(false));
-    assert!(host.tick(&store, 1001, &[]).is_ok());
+    assert!(host.tick(&mut store, 1001, &[]).is_ok());
 }
 
 #[test]
@@ -398,7 +456,7 @@ fn wallet_open_and_restart_stay_paused_until_a_new_complete_publication() {
 #[test]
 fn wallet_publication_diagnostic_survives_successful_checkpoint_tick() {
     let dir = Directory::new();
-    let store = dir.store();
+    let mut store = dir.store();
     let root = dir.private("wallet-error-origin");
     let mut host = Host::open(&root, &store, limits(), None).unwrap();
     let budget = crate::p2p::Budget::new(2 * 1024 * 1024);
@@ -417,7 +475,7 @@ fn wallet_publication_diagnostic_survives_successful_checkpoint_tick() {
     assert!(host.tick_wallet_export(&store, 1000, &budget).is_err());
     let before = host.wallet_export_diagnostic().1.unwrap().to_owned();
     assert_eq!(host.wallet_export_diagnostic().0, "publication_error");
-    host.tick(&store, 1000, &[]).unwrap();
+    host.tick(&mut store, 1000, &[]).unwrap();
     assert_eq!(
         host.wallet_export_diagnostic(),
         ("publication_error", Some(before.as_str()))

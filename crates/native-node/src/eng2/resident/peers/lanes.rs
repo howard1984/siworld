@@ -162,10 +162,14 @@ fn pull_one(
     }
     shared.transfers.reap(shared)?;
     if peer.propagation_supported() {
+        let miner = shared.relay.sender();
+        if miner && pieces::offer(peer, shared, *sequence)? {
+            return Ok(());
+        }
         if pieces::pull_batch(peer, shared, *sequence)? {
             return Ok(());
         }
-        if pieces::offer(peer, shared, *sequence)? {
+        if !miner && pieces::offer(peer, shared, *sequence)? {
             return Ok(());
         }
         if let Some(download) = shared.headers.download_preferred(

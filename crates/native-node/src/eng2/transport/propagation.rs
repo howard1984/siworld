@@ -587,7 +587,7 @@ impl<S: Read + Write> Peer<S> {
         if !self.propagation_streaming() || request == 0 {
             return Err(p2p::Error::InvalidProtocol);
         }
-        let (block, count, deadline) = {
+        let (block, count, deadline, completion) = {
             let transfer = lock(transfer)?;
             if !ownership.matches(
                 &self.session.shared_budget(),
@@ -601,6 +601,7 @@ impl<S: Read + Write> Peer<S> {
                 transfer.block(),
                 transfer.piece_count(),
                 transfer.io_deadline().for_body_claim(ownership),
+                transfer.reads_finished(),
             )
         };
         let mut accounted = self.session.io_totals().received;
@@ -608,6 +609,7 @@ impl<S: Read + Write> Peer<S> {
             for index in 1..count {
                 let per_piece = deadline
                     .clone()
+                    .until_body_read_complete(completion.clone())
                     .capped_at(Instant::now() + Duration::from_secs(10));
                 let (response, frame, _charge) =
                     peer.receive_application_before(&per_piece, PIECE_BYTES + 38)?;
@@ -629,7 +631,7 @@ impl<S: Read + Write> Peer<S> {
         });
         lock(transfer)?.end_stream(
             self.peer(),
-            result.is_ok(),
+            result.is_ok() || (result == Err(p2p::Error::Unavailable) && completion.is_cancelled()),
             self.session.io_totals().received - accounted,
         );
         result
@@ -935,6 +937,8 @@ impl<S: Read + Write> Peer<S> {
             let (deadline, count, height) = lock(transfer)?
                 .prepare_io(requests, ownership)
                 .map_err(resource)?;
+            #[cfg(feature = "eng2-runtime")]
+            let completion = lock(transfer)?.reads_finished();
             // indices (4 each), a geometrically grown run vector (at most 16
             // each), and final run encoding (at most 8 each) coexist briefly.
             // Keep their original global-budget charge through the whole I/O.
@@ -968,6 +972,9 @@ impl<S: Read + Write> Peer<S> {
                     let frame_deadline = deadline
                         .clone()
                         .capped_at(Instant::now() + Duration::from_secs(10));
+                    #[cfg(feature = "eng2-runtime")]
+                    let frame_deadline =
+                        frame_deadline.until_body_read_complete(completion.clone());
                     let (response, frame, _charge) =
                         peer.receive_application_before(&frame_deadline, PIECE_BYTES + 38)?;
                     let piece = codec::decode_piece(&frame, count).map_err(invalid)?;
@@ -993,7 +1000,17 @@ impl<S: Read + Write> Peer<S> {
             })();
             if result.is_err() {
                 let partial = peer.session.io_totals().received - before.received - accounted;
-                let _ = lock(transfer)?.disconnected(peer.peer(), partial, Instant::now());
+                #[cfg(feature = "eng2-runtime")]
+                let completed_elsewhere =
+                    result == Err(p2p::Error::Unavailable) && completion.is_cancelled();
+                #[cfg(not(feature = "eng2-runtime"))]
+                let completed_elsewhere = false;
+                let _ = lock(transfer)?.end_batch(
+                    peer.peer(),
+                    partial,
+                    Instant::now(),
+                    completed_elsewhere,
+                );
             }
             result
         })

@@ -31,6 +31,14 @@ class EngineeringBuild(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 build.engineering_v2_manifest({**self.pin, **changes})
 
+    def test_checkpoint_finality_requires_an_explicit_boolean_build_pin(self):
+        self.assertNotIn('checkpoint_finality', build.engineering_v2_manifest(self.pin))
+        for enabled in (True, False):
+            self.assertIs(build.engineering_v2_manifest({**self.pin, 'checkpoint_finality': enabled})['checkpoint_finality'], enabled)
+        for value in (None, 1, 'true'):
+            with self.assertRaises(ValueError):
+                build.engineering_v2_manifest({**self.pin, 'checkpoint_finality': value})
+
     def test_engineering_page_labels_match_the_selected_runtime(self):
         template = (Path(__file__).resolve().parents[1] / 'web/wallet.html').read_text()
         page = build.engineering_v2_html(template)

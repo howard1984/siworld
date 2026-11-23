@@ -12,3 +12,7 @@ copyright and license notices must be retained when incorporating code.
 Plonky3, Plonky3-recursion, libcrux, libp2p, redb, and other dependencies
 retain their respective licenses. Their exact versions and source revisions
 are recorded in Cargo.lock and the benchmark workspace lockfiles.
+
+RandomX 1.2.1 is vendored under the upstream BSD 3-Clause terms in
+crates/randomx-pow/vendor/randomx/LICENSE. The vendored code carries the
+upstream copyright notices and identifies the SIWORLD parameter changes.

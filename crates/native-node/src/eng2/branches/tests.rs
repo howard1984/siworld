@@ -32,7 +32,9 @@ fn rules() -> HeaderRules {
         genesis_timestamp: 1,
         genesis_target: [255; 32],
         target_interval: 300,
+        asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
         pow_iterations: 0,
+        pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
         max_headers: 128,
     }
 }
@@ -65,6 +67,103 @@ fn chain(prefix: &[Header], count: u64, tag: u8) -> VerifiedHeaders {
         headers.push(h);
     }
     VerifiedHeaders::verify(rules, headers).unwrap()
+}
+
+#[cfg(all(unix, feature = "eng2-runtime"))]
+#[test]
+fn shadow_scheduling_defers_missing_material_without_hiding_an_eligible_sibling() {
+    use crate::eng2::{
+        genesis::{FeeMode, Genesis},
+        state_components,
+    };
+    let fixture = Fixture::new();
+    let genesis_state = crate::eng2::snapshot::tests::bootstrap();
+    let genesis = Genesis::seal(
+        genesis_state.chain.config.clone(),
+        genesis_state.governance.clone(),
+        FeeMode::LegacyMiner,
+    )
+    .unwrap();
+    let mut rules = rules();
+    rules.network = genesis.config().network;
+    rules.genesis = genesis.id();
+    let state = Store::create(
+        &fixture.0.join("canonical.redb"),
+        genesis,
+        state_components::Limits {
+            max_leaves: 1_000_000,
+            max_nullifiers: 1_000_000,
+            max_component_bytes: 64 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let policy = state.engine().body_policy();
+    let mut body = crate::eng2::body::tests::body();
+    body.network = rules.network;
+    body.profile = policy.profile;
+    body.height = 2;
+    body.governance.clear();
+    body.fund_claims.clear();
+    body.transactions
+        .sort_by_key(|tx| tx.record.statement_id(&body.network));
+    let header = |height, parent, nonce| Header {
+        network: rules.network,
+        height,
+        parent,
+        timestamp: rules.genesis_timestamp + height * rules.target_interval,
+        target: rules.genesis_target,
+        execution_commitment: [11; 32],
+        body_commitment: body.commitment(policy).unwrap(),
+        nonce,
+    };
+    let floor = header(1, rules.genesis, 0);
+    let floor_id = floor.id().unwrap();
+    let ready = header(2, floor_id, 1);
+    let ready_id = ready.id().unwrap();
+    let missing = header(2, floor_id, 2);
+    let above_missing = header(3, missing.id().unwrap(), 0);
+    let mut branches = BranchStore::create(&fixture.path(), rules.clone(), limits()).unwrap();
+    for headers in [
+        vec![floor.clone(), missing, above_missing],
+        vec![floor, ready.clone()],
+    ] {
+        branches
+            .retain_verified_headers(&VerifiedHeaders::verify(rules.clone(), headers).unwrap())
+            .unwrap();
+    }
+    let fence = Some((1, floor_id));
+    let budget = crate::p2p::Budget::new(1024 * 1024);
+    assert_eq!(
+        branches
+            .select_shadow_candidate(&state, fence, &budget, |_| false)
+            .unwrap(),
+        None
+    );
+    branches.retain_body(&ready, &body, policy).unwrap();
+    assert_eq!(
+        branches
+            .select_shadow_candidate(&state, fence, &budget, |_| false)
+            .unwrap(),
+        Some(ready_id)
+    );
+    assert_eq!(
+        branches
+            .select_shadow_candidate(&state, fence, &budget, |_| true)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        branches
+            .select_shadow_candidate(&state, Some((1, [93; 32])), &budget, |_| false)
+            .unwrap(),
+        None
+    );
+    assert!(
+        branches
+            .select_shadow_candidate(&state, fence, &crate::p2p::Budget::new(1), |_| false)
+            .is_err()
+    );
+    assert_eq!(state.engine().state().height(), 0);
 }
 
 #[test]
@@ -403,7 +502,9 @@ fn empty_canonical_archive_uses_actual_store_context_without_fabricating_bodies(
         genesis_timestamp: config.genesis_timestamp,
         genesis_target: config.genesis_target,
         target_interval: config.target_interval,
+        asert_half_life: config.asert_half_life(),
         pow_iterations: config.pow_iterations,
+        pow_algorithm: config.pow_algorithm(),
         max_headers: 128,
     };
     let id = genesis.id();
@@ -441,7 +542,9 @@ fn retain_committed_requires_actual_native_capability_and_preserves_raw_records(
         genesis_timestamp: genesis.config().genesis_timestamp,
         genesis_target: genesis.config().genesis_target,
         target_interval: genesis.config().target_interval,
+        asert_half_life: genesis.config().asert_half_life(),
         pow_iterations: 0,
+        pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
         max_headers: 128,
     };
     let fixture = Fixture::new();

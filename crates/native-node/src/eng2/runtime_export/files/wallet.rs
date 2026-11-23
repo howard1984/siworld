@@ -29,6 +29,35 @@ impl PublicExport {
         self.replace("wallet-head.json", &bytes)?;
         Ok(head)
     }
+    /// Export only the durable floor. Readers still authenticate the
+    /// certificate and its ancestry against their exact selected generation.
+    #[cfg(feature = "eng2-runtime")]
+    pub(in super::super) fn publish_wallet_checkpoint(&self, store: &Store) -> Result<(), String> {
+        use super::super::super::certificate::CERTIFICATE_BYTES;
+        const NAME: &str = "wallet-checkpoint-eng2.bin";
+        self.check_store(store)?;
+        let result = store.finalized_checkpoint().and_then(|certificate| {
+            certificate
+                .map(|value| {
+                    value
+                        .encode()
+                        .map_err(|_| "wallet checkpoint encoding rejected".into())
+                })
+                .transpose()
+        });
+        let wanted = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.as_ref())
+            .map_or(&[][..], |value| value.as_slice());
+        let current = self.read_optional(NAME, CERTIFICATE_BYTES);
+        if !matches!(current, Ok(value) if value.as_deref().unwrap_or_default() == wanted) {
+            // A broken export file can be replaced by the canonical artifact;
+            // this never changes either the accepted floor or receipt export.
+            self.replace(NAME, wanted)?;
+        }
+        result.map(|_| ())
+    }
     /// Stage a receipt dependency without advertising a complete generation.
     pub fn publish_wallet_receipts(
         &self,

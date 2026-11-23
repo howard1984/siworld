@@ -17,6 +17,9 @@ pub struct CommitmentHistory {
 }
 impl CommitmentHistory {
     pub fn new(config: Config) -> Result<Self, String> {
+        if config.pow_algorithm() != pow::Algorithm::SequentialBlake3 {
+            return Err("RandomX requires the engineering-v2 wallet".into());
+        }
         Ok(Self {
             state: State::new(config)?,
         })

@@ -9,6 +9,7 @@ use super::{PERMANENT_RECEIPT_IDS as RECEIPT_IDS, PERMANENT_RECEIPTS as RECEIPTS
 const ARTIFACTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("eng2-imported-checkpoint-artifacts-v1");
 const MARKER: &str = "signed-checkpoint-import";
+const ARTIFACT_KEYS: [&str; 3] = ["certificate", "witness", "snapshot"];
 
 fn receipt_hash(previous: Hash, height: u64, digest: Hash) -> Hash {
     let mut hash = blake3::Hasher::new_derive_key("siworld eng2 imported receipt index v1");
@@ -19,6 +20,67 @@ fn receipt_hash(previous: Hash, height: u64, digest: Hash) -> Hash {
 }
 fn marker_seed(marker: &[u8]) -> Hash {
     blake3::derive_key("siworld eng2 signed import local index seed v1", marker)
+}
+
+/// Read the original import provenance from the already authenticated source.
+/// Copy or account for one artifact at a time without materializing its bytes.
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(super) fn shadow_provenance(
+    source: &redb::ReadTransaction,
+    expected_prefix: u64,
+    expected_seed: Hash,
+    destination: Option<&redb::WriteTransaction>,
+) -> Result<usize, String> {
+    let meta = source
+        .open_table(META)
+        .map_err(|_| "shadow import metadata unavailable")?;
+    let marker = meta
+        .get(MARKER)
+        .map_err(|_| "shadow import marker unavailable")?
+        .ok_or("shadow import marker missing")?;
+    let bytes = marker.value();
+    if bytes.len() != 176
+        || &bytes[..8] != b"SW2IMP01"
+        || bytes[8..16] != expected_prefix.to_le_bytes()
+        || marker_seed(bytes) != expected_seed
+    {
+        return Err("shadow import marker differs".into());
+    }
+    let artifacts = source
+        .open_table(ARTIFACTS)
+        .map_err(|_| "shadow import artifacts unavailable")?;
+    let mut size = bytes.len();
+    for (key, digest) in ARTIFACT_KEYS
+        .into_iter()
+        .zip(bytes[48..144].as_chunks::<32>().0)
+    {
+        let value = artifacts
+            .get(key)
+            .map_err(|_| "shadow import artifact unavailable")?
+            .ok_or("shadow import artifact missing")?;
+        let value = value.value();
+        size = size
+            .checked_add(value.len())
+            .ok_or("shadow import artifact size overflow")?;
+        if let Some(destination) = destination {
+            if blake3::hash(value).as_bytes().as_slice() != digest {
+                return Err("shadow import artifact digest differs".into());
+            }
+            destination
+                .open_table(ARTIFACTS)
+                .map_err(|_| "shadow import artifact table unavailable")?
+                .insert(key, value)
+                .map_err(|_| "shadow import artifact write failed")?;
+        }
+    }
+    if let Some(destination) = destination {
+        destination
+            .open_table(META)
+            .map_err(|_| "shadow import metadata unavailable")?
+            .insert(MARKER, bytes)
+            .map_err(|_| "shadow import marker write failed")?;
+    }
+    Ok(size)
 }
 #[cfg(test)]
 pub(super) fn resume_context(
@@ -179,6 +241,10 @@ impl VerifiedImport {
                 Ok(())
             }
         };
+        let selected_import = self.engine.genesis().checkpoint_fork_choice();
+        if selected_import && !cfg!(all(unix, feature = "eng2-runtime")) {
+            return Err("checkpoint fork choice import requires a durable selection record".into());
+        }
         check()?;
         #[cfg(unix)]
         {
@@ -207,6 +273,19 @@ impl VerifiedImport {
         if std::fs::symlink_metadata(&target).is_ok() {
             return Err("checkpoint import will not replace an existing database".into());
         }
+        #[cfg(all(unix, feature = "eng2-runtime"))]
+        let selected_certificate = if selected_import {
+            super::generations::GenerationControl::ensure_new(directory)?;
+            Some(
+                super::super::certificate::Certificate::decode(
+                    &self.certificate,
+                    self.engine.state().network(),
+                )
+                .map_err(|_| "verified import certificate framing rejected")?,
+            )
+        } else {
+            None
+        };
         let encoded = self.engine.genesis().encode()?;
         let mut file =
             crate::local::regular_read(&directory.join("genesis.bin"), false, 1024 * 1024)?;
@@ -294,11 +373,11 @@ impl VerifiedImport {
             marker.extend_from_slice(blake3::hash(bytes).as_bytes());
         }
         marker.extend_from_slice(&digest);
-        for (key, bytes) in [
-            ("certificate", &self.certificate),
-            ("witness", &self.witness),
-            ("snapshot", &self.snapshot),
-        ] {
+        for (key, bytes) in
+            ARTIFACT_KEYS
+                .into_iter()
+                .zip([&self.certificate, &self.witness, &self.snapshot])
+        {
             transaction
                 .open_table(ARTIFACTS)
                 .map_err(|_| "import checkpoint artifacts unavailable")?
@@ -405,6 +484,14 @@ impl VerifiedImport {
                 store.usable = false;
                 return Ok(Installation::DurabilityUnconfirmed);
             }
+            #[cfg(all(unix, feature = "eng2-runtime"))]
+            if let Some(certificate) = selected_certificate
+                && store
+                    .attach_imported_selector(directory, certificate)
+                    .is_err()
+            {
+                return Ok(Installation::DurabilityUnconfirmed);
+            }
             Ok(Installation::Durable(Box::new(store)))
         }
         #[cfg(not(any(
@@ -460,6 +547,55 @@ mod tests {
             .unwrap();
         txn.commit().unwrap();
         database
+    }
+
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    #[test]
+    fn shadow_provenance_carries_exact_artifacts_and_rejects_mutation() {
+        let source = fixture();
+        let txn = source.begin_write().unwrap();
+        let mut marker = [0; 176];
+        marker[..8].copy_from_slice(b"SW2IMP01");
+        marker[8..16].copy_from_slice(&72u64.to_le_bytes());
+        for (key, digest) in ARTIFACT_KEYS
+            .iter()
+            .zip(marker[48..144].as_chunks_mut::<32>().0)
+        {
+            digest.copy_from_slice(blake3::hash(key.as_bytes()).as_bytes());
+            txn.open_table(ARTIFACTS)
+                .unwrap()
+                .insert(*key, key.as_bytes())
+                .unwrap();
+        }
+        txn.open_table(META)
+            .unwrap()
+            .insert(MARKER, marker.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        let seed = marker_seed(&marker);
+        let target = fixture();
+        let txn = target.begin_write().unwrap();
+        let read = source.begin_read().unwrap();
+        let bytes = marker.len() + ARTIFACT_KEYS.iter().map(|key| key.len()).sum::<usize>();
+        assert_eq!(shadow_provenance(&read, 72, seed, None).unwrap(), bytes);
+        assert_eq!(
+            shadow_provenance(&read, 72, seed, Some(&txn)).unwrap(),
+            bytes
+        );
+        txn.commit().unwrap();
+        assert_eq!(
+            shadow_provenance(&target.begin_read().unwrap(), 72, seed, None).unwrap(),
+            bytes
+        );
+        assert!(shadow_provenance(&read, 60, seed, None).is_err());
+        let txn = source.begin_write().unwrap();
+        txn.open_table(ARTIFACTS)
+            .unwrap()
+            .insert("snapshot", b"altered".as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        let txn = target.begin_write().unwrap();
+        assert!(shadow_provenance(&source.begin_read().unwrap(), 72, seed, Some(&txn)).is_err());
     }
 
     #[test]

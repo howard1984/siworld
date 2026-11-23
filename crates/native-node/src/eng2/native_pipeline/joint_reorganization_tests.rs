@@ -203,7 +203,9 @@ fn joint_native_real_reorganization_invalidates_completed_and_late_candidate_rec
         genesis_timestamp: config.genesis_timestamp,
         genesis_target: config.genesis_target,
         target_interval: config.target_interval,
+        asert_half_life: config.asert_half_life(),
         pow_iterations: config.pow_iterations,
+        pow_algorithm: config.pow_algorithm(),
         max_headers: 1000,
     };
     let archive = BranchStore::create(

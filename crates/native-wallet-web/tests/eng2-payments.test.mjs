@@ -4,7 +4,7 @@ import {Eng2Payments} from '../web/sdk/eng2-payments.js';
 const pin={version:2,name:'siworld-eng-2',network:'1'.repeat(64),genesis:'2'.repeat(64),rules:'3'.repeat(64),profile:'4'.repeat(64),fee_mode:0,api:'http://127.0.0.1:8890'};
 const id='5'.repeat(64),tip='6'.repeat(64),input='7'.repeat(96),enc=value=>new TextEncoder().encode(JSON.stringify(value)),dec=bytes=>JSON.parse(new TextDecoder().decode(bytes));
 const packet=new Uint8Array([1,2,3,4]);
-function fixture(admission) {
+function fixture(admission, checkpoint_finality=false) {
   const data=new Map(),events=[],packets=[];
   let fail=false,proofFail=false,anchorExpired=false,canonical=true,signatureBad=false,prepared=false,nextId=id,nextInput=input,clock=1000;
   const protect=bytes=>new Uint8Array([192,...bytes.map(value=>value^165)]),open=bytes=>bytes.slice(1).map(value=>value^165);
@@ -24,7 +24,7 @@ function fixture(admission) {
     eng2_payment_inclusion_valid:()=>canonical,
   };
   const storage={read:async key=>data.get(key)?.slice(),pair:async(a,av,b,bv)=>{events.push('persist');if(fail)throw new Error('Synthetic atomic write failed.');data.set(a,av.slice());data.set(b,bv.slice());}};
-  const session={wallet,config:pin,metadata:{height:9,tip},ready:true,syncing:false,invalidated:false,lockKey:'same-session-lock',fresh:async()=>{}};
+  const session={wallet,config:{...pin,checkpoint_finality},metadata:{height:9,tip},ready:true,syncing:false,invalidated:false,lockKey:'same-session-lock',fresh:async()=>{}};
   const locks={request:async(key,fn)=>{assert.equal(key,'same-session-lock');return fn();}};
   const io={storage,hash:async()=>'opaque',locks,now:()=>clock};
   if(admission)io.admit=async(bytes,context)=>{events.push('admit');assert.equal(dec(open(data.get('payments:opaque:'+id))).phase,'uncertain');return admission(bytes,context);};
@@ -158,4 +158,23 @@ test('automatic replay requires an explicit current owner gate and rechecks it a
   let allowed=true;const pair=f.io.storage.pair;
   f.io.storage.pair=async(...args)=>{await pair(...args);allowed=false;};
   await f.payments.rebroadcastPending(()=>allowed);assert.equal(sends,1);assert.equal(f.payments.summary().reserved_count,1);
+});
+
+test('outgoing coverage requires the exact native receipt token in addition to canonical inclusion',async()=>{
+  const f=fixture(undefined,true);
+  let proof=false;
+  const token='ab'.repeat(152), nativeReceipt=f.wallet.eng2_payment_receipt;
+  f.wallet.eng2_payment_receipt=(...args)=>JSON.stringify({...JSON.parse(nativeReceipt(...args)),...(proof?{receipt_token:token}:{})});
+  f.wallet.eng2_checkpoint_payment_covered=(height,block,statement,value)=>
+    height==='7'&&block===tip&&statement===id&&value===token;
+  await finalized(f);
+  await f.payments.confirm(id,7,new Uint8Array([1]));
+  assert.equal((await f.payments.displaySummary()).payments[0].checkpoint_covered,false);
+  proof=true;
+  await f.payments.confirm(id,7,new Uint8Array([1]));
+  const row=(await f.payments.displaySummary()).payments[0];
+  assert.equal(row.checkpoint_covered,true);
+  assert.equal('receipt_token' in row,false);
+  const reopened=new Eng2Payments(f.session,f.io);await reopened.initialize();
+  assert.equal((await reopened.displaySummary()).payments[0].checkpoint_covered,true);
 });

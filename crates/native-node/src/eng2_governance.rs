@@ -21,8 +21,11 @@ pub const MAXIMUM_ISSUANCE_FEE_ATOMS: u64 = 1_000_000_000_000;
 pub const SIGNATURE_CONTEXT: &[u8] = b"siworld eng2 governance v1";
 pub type PublicKey = [u8; PUBLIC_KEY_BYTES];
 pub type AddressBytes = [u8; ADDRESS_BYTES];
+#[path = "eng2_governance/codec.rs"]
 mod codec;
+#[path = "eng2_governance/windowed.rs"]
 mod windowed;
+#[cfg(siworld_native_node)]
 pub(crate) use windowed::MIN_VALIDITY_BLOCKS as WINDOWED_MIN_VALIDITY_BLOCKS;
 pub use windowed::WindowedSignedAction;
 
@@ -772,4 +775,5 @@ pub fn decode_address(bytes: &[u8]) -> Result<PaymentAddress, String> {
     .map_err(|_| "governance address ML-KEM key invalid".into())
 }
 #[cfg(test)]
+#[path = "eng2_governance/tests.rs"]
 mod tests;

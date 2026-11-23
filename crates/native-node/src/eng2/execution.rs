@@ -481,16 +481,20 @@ impl<'a> PreparedBlock<'a> {
         {
             return Err("isolated block binding or complete body commitment differs".into());
         }
-        let seed = header.pow_seed().map_err(|_| "invalid isolated header")?;
+        let config = &parent.chain.config;
         if matches!(header_use, HeaderUse::Mined)
-            && !siworld_core::pow::meets_target(
-                &siworld_core::pow::pow_hash(
-                    &seed,
-                    header.nonce,
-                    parent.chain.config.pow_iterations,
-                ),
-                &header.target,
-            )
+            && !super::proof_of_work::verify(
+                config.pow_algorithm(),
+                config.pow_iterations,
+                header,
+                || {
+                    super::proof_of_work::epoch_from_state(
+                        binding.genesis,
+                        header.height,
+                        &parent.chain,
+                    )
+                },
+            )?
         {
             return Err("isolated header has insufficient work".into());
         }

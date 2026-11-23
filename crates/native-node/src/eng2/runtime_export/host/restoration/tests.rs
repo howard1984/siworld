@@ -67,14 +67,14 @@ fn delayed_cold_restoration_releases_owner_and_keeps_exports_unavailable() {
     assert!(!host.restoration_stalled(running));
     assert!(host.restoration_stalled(running + Duration::from_secs(1)));
     for now in 1..=3 {
-        let store = owner
+        let mut store = owner
             .try_lock()
             .expect("retained reader must not retain the canonical owner");
         assert!(!host.reconcile_retained_async(&store, || Ok(None)).unwrap());
         assert_eq!(public_projection(&store, now, None).unwrap()["height"], 0);
         assert!(host.latest_checkpoint().is_none());
         assert!(host.pruning_checkpoint(&store).is_none());
-        assert!(host.tick(&store, now, &[]).is_err());
+        assert!(host.tick(&mut store, now, &[]).is_err());
         assert!(host.tick_wallet_export(&store, now, &budget).is_err());
         assert_eq!(
             std::fs::read(root.join("wallet-head.json")).unwrap(),
@@ -237,7 +237,7 @@ fn warm_pending_reuse_preserves_collected_votes_and_original_snapshot_guard() {
 #[test]
 fn authenticated_retirement_discards_old_pending_without_granting_new_authority() {
     let directory = Directory::new();
-    let store = directory.store();
+    let mut store = directory.store();
     let root = directory.private("installed-retirement");
     let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
     let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
@@ -261,7 +261,7 @@ fn authenticated_retirement_discards_old_pending_without_granting_new_authority(
     assert!(!host.anchor_retired(24));
     assert!(host.latest_checkpoint().is_none());
     assert!(host.signer.is_none());
-    assert!(host.tick(&store, 10, &[]).is_err());
+    assert!(host.tick(&mut store, 10, &[]).is_err());
     host.stop_preparation().unwrap();
     assert_eq!(budget.available().unwrap(), 64 * 1024 * 1024);
 }
@@ -346,7 +346,7 @@ fn obsolete_retained_success_stays_pending_and_authentication_errors_remain_hard
         assert!(!host.retained_ready);
         assert!(host.latest_checkpoint().is_none());
         assert_eq!(
-            host.tick(&store, 1, &[]).err().as_deref(),
+            host.tick(&mut store, 1, &[]).err().as_deref(),
             Some("checkpoint retained restoration unavailable")
         );
         if !host.preparation.as_ref().unwrap().retained_request {
@@ -375,7 +375,7 @@ fn obsolete_retained_success_stays_pending_and_authentication_errors_remain_hard
     }
     assert!(!host.retained_ready && host.latest_checkpoint().is_none());
     assert_eq!(
-        host.tick(&store, 2, &[]).err().as_deref(),
+        host.tick(&mut store, 2, &[]).err().as_deref(),
         Some("checkpoint retained restoration unavailable")
     );
     let other_directory = Directory::new();
@@ -391,7 +391,7 @@ fn obsolete_retained_success_stays_pending_and_authentication_errors_remain_hard
 #[test]
 fn header_capture_error_is_observed_without_granting_authority_or_exporting_text() {
     let directory = Directory::new();
-    let store = directory.store();
+    let mut store = directory.store();
     let root = directory.private("header-error-diagnostic");
     let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
     let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
@@ -407,13 +407,13 @@ fn header_capture_error_is_observed_without_granting_authority_or_exporting_text
     assert!(!d.to_string().contains(text));
     assert!(!host.retained_ready);
     assert!(host.latest_checkpoint().is_none());
-    assert!(host.tick(&store, 1, &[]).is_err());
+    assert!(host.tick(&mut store, 1, &[]).is_err());
     host.stop_preparation().unwrap();
 }
 #[test]
 fn actual_successful_worker_with_wrong_generation_stays_hard_and_records_installation() {
     let directory = Directory::new();
-    let store = directory.store();
+    let mut store = directory.store();
     let root = directory.private("generation-error-diagnostic");
     let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
     let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
@@ -457,7 +457,7 @@ fn actual_successful_worker_with_wrong_generation_stays_hard_and_records_install
     assert_eq!(d["retirement_changed"], false);
     assert!(!host.retained_ready);
     assert!(host.latest_checkpoint().is_none());
-    assert!(host.tick(&store, 1, &[]).is_err());
+    assert!(host.tick(&mut store, 1, &[]).is_err());
     host.stop_preparation().unwrap();
 }
 

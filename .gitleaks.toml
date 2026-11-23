@@ -9,3 +9,11 @@ condition = "AND"
 paths = ['''(^|/)Cargo\.lock$''']
 regexTarget = "match"
 regexes = ['''^libcrux-secrets",(?:\s|\\n)*"libcrux-sha3"$''']
+
+[[allowlists]]
+description = "Public deterministic SIVault wrap-key vector at its historical introduction"
+condition = "AND"
+commits = ['d0e14999be6d951e216a30ec4191d207873626fa']
+paths = ['''^crates/sivault-core/vectors/independent\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"wrap_key": "[0-9a-f]{64}",?\s*$''']

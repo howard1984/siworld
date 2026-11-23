@@ -52,6 +52,44 @@ fn body_hedge_fixture(count: u64) -> (Ledger, Vec<Header>, Hash) {
     }
     (ledger, headers, tip)
 }
+
+#[test]
+fn resident_candidate_slots_are_per_peer_and_expire_without_refunding_requests() {
+    let mut ledger = ledger();
+    let a = [20; 32];
+    let b = [21; 32];
+    let missing = [30; 32];
+    ledger.begin_for_peer(3, missing, a, 10).unwrap();
+    let late = ledger.request(missing, a, 11).unwrap();
+    ledger.begin_for_peer(3, [31; 32], a, 12).unwrap();
+    assert_eq!(
+        ledger.begin_for_peer(3, [32; 32], a, 13),
+        Err(Error::Capacity)
+    );
+    ledger.begin_for_peer(3, [32; 32], b, 14).unwrap();
+    // A second source can help an existing candidate without sponsoring it.
+    ledger.begin_for_peer(3, [32; 32], a, 15).unwrap();
+    ledger.begin_for_peer(3, missing, a, 1_010).unwrap();
+    let new = ledger.request(missing, a, 1_011).unwrap();
+    assert_eq!(ledger.defer(late, 1_012), Err(Error::StaleRequest));
+    ledger.defer(new, 1_013).unwrap();
+    assert_eq!(ledger.usage().requests, 2);
+}
+
+#[test]
+fn expired_body_ticket_cannot_write_and_failed_retention_allows_retry() {
+    let (mut ledger, _, tip) = body_hedge_fixture(1);
+    let request = ledger.request_body(tip, tip, [10; 32], 20).unwrap();
+    let result = ledger.retain_body_with(request, 100, 21, || Err("write failed"));
+    assert_eq!(result, Ok(Err("write failed")));
+    assert_eq!(ledger.usage().body_bytes, 0);
+    let request = ledger.request_body(tip, tip, [10; 32], 22).unwrap();
+    let result = ledger.retain_body_with::<()>(request, 100, 120_010, || {
+        panic!("cannot write a body with an expired ticket")
+    });
+    assert_eq!(result, Err(Error::Expired));
+    assert_eq!(ledger.usage().body_bytes, 0);
+}
 #[test]
 fn body_hedge_allows_a_second_source_after_bounded_primary_wait() {
     let (mut ledger, _, tip) = body_hedge_fixture(1);

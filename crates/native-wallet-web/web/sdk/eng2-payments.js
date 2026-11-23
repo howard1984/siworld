@@ -89,6 +89,10 @@ export class Eng2Payments {
           recipient:typeof row.recipient==='string'?row.recipient:'Recipient unavailable',
           created_at:Number.isSafeInteger(row.created_at)&&row.created_at>=0?row.created_at:null,
           confirmed_height:row.phase==='included'?row.inclusion?.height??null:null,
+          block_id:row.phase==='included'?row.inclusion?.block_id??null:null,
+          checkpoint_covered:this.config.checkpoint_finality && row.phase==='included' && !!row.inclusion
+            && this.wallet.eng2_checkpoint_payment_covered(String(row.inclusion.height),row.inclusion.block_id,
+              row.statement_id,row.inclusion.receipt_token ?? '')===true,
           ...(row.phase==='included' && row.inclusion ? eng2Confirmations(row.inclusion.height,this.session.metadata.height) : {confirmations:0,confirmation_status:'pending'})});
       }
       return {send_supported:false,payments,reserved_atoms:reserved.toString(),reserved_count:this.summary().reserved_count};

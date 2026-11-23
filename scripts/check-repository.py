@@ -13,7 +13,7 @@ ROOT_FILES = {
     "SECURITY.md", ".gitleaks.toml",
 }
 DOCUMENTS = {
-    "eng2-proof-retention.md",
+    "eng2-proof-retention.md", "checkpoint-payment-integration.md", "hashrate-alerts.md",
     "independent-receipt-scan.md",
     "native-block-events.md",
     "native-hiding-proof-v2.md",
@@ -66,7 +66,7 @@ CRATES = {
     "core", "crypto", "poseidon2", "state", "circuits", "consensus",
     "storage", "prover", "node", "native-node", "bench-stark", "bench-d8", "bench-multi-asset", "fund-keytool",
     "native-wallet-core", "native-wallet-web", "native-wallet-engine",
-    "miner-cli", "miner-launcher", "miner-platform",
+    "miner-cli", "miner-launcher", "miner-platform", "randomx-pow",
 }
 EXPLORER_FILES = {
     "tools/explorer/README.md",
@@ -204,6 +204,16 @@ def allowed(path):
         return True
     if path.parts[0] == ".github":
         return path.suffix in {".yml", ".yaml", ".md"} or path.name == "CODEOWNERS"
+    if path.parts[:4] == ("crates", "randomx-pow", "vendor", "randomx"):
+        return (
+            name in {
+                "crates/randomx-pow/vendor/randomx/LICENSE",
+                "crates/randomx-pow/vendor/randomx/CMakeLists.txt",
+                "crates/randomx-pow/vendor/randomx/PROVENANCE.md",
+            }
+            or (path.parts[:5] == ("crates", "randomx-pow", "vendor", "randomx", "src")
+                and path.suffix in {".c", ".cpp", ".h", ".hpp", ".S", ".s", ".asm", ".inc"})
+        )
     if path.parts[0] == "crates" and path.parts[1] in CRATES:
         return (
             name in PUBLIC_ARTIFACTS or name in PUBLIC_TEXT_ASSETS

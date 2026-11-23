@@ -393,3 +393,80 @@ test('a durable adoption failure retains its original cause while requiring a re
   });
   assert.equal(f.session.invalidated,true);assert.equal(f.commits(),0);assert.equal(f.current().height,0);
 });
+
+test('checkpoint display waits for durable native verification and retains coverage when a source loses evidence', async()=>{
+  const f=fixture(); let floor=false, available=true, checkpointReq=null, accepted=0;
+  f.wallet.eng2_checkpoint_replay_required=()=>false;
+  f.wallet.eng2_history=()=>JSON.stringify(f.current().height?[{height:1,block_id:id(1),checkpoint_covered:floor}]:[]);
+  f.wallet.eng2_checkpoint_suspended=()=>false;
+  f.wallet.eng2_candidate_conflicts_with_checkpoint=()=>false;
+  f.wallet.stage_eng2_checkpoint=bytes=>{
+    assert.equal(bytes.length,6778);
+    if(!available)throw new Error('Signature declined by WASM.');
+    return floor?new Uint8Array():new Uint8Array([42]);
+  };
+  f.wallet.restore_eng2_checkpoint=bytes=>{assert.deepEqual([...bytes],[42]);floor=true;accepted++;};
+  const original=f.session.get;
+  const make=()=>new Eng2Session(f.wallet,{...pin,checkpoint_finality:true},{
+    storage:f.storage,now:()=>1000,hash:async ()=>'opaque-wallet-hash',locks:f.session.locks,json:async()=>head(),
+    binary:async (route,settings)=>{
+      if(route.includes('/checkpoint?')){checkpointReq=route;return {bytes:new Uint8Array(6778)};}
+      return original(route,settings);
+    }
+  });
+  const session=make();
+  await session.initialize();
+  f.setWriteHook(()=>{if(f.current().height===1&&!floor)throw new Error('Checkpoint save failed.');});
+  await assert.rejects(session.sync(),/Checkpoint save failed/);
+  assert.equal(accepted,0);assert.equal(session.summary().received_records[0].checkpoint_covered,false);
+  f.setWriteHook(null);
+  assert.equal((await session.sync()).received_records[0].checkpoint_covered,true);
+  assert.equal(checkpointReq,`${pin.api}/api/v2/wallet/checkpoint?height=1&tip=${id(1)}`);
+  available=false;floor=false;
+  const reopened=make();
+  assert.equal((await reopened.initialize()).received_records[0].checkpoint_covered,true);
+  assert.equal((await reopened.sync()).received_records[0].checkpoint_covered,true);
+});
+
+
+test('only a durably recorded native quorum conflict suspends finality without adopting a rival head',async()=>{
+  const f=fixture();let rival=false,verified=false,suspended=false;
+  f.wallet.eng2_checkpoint_replay_required=()=>false;
+  f.wallet.eng2_checkpoint_suspended=()=>suspended;
+  f.wallet.eng2_candidate_conflicts_with_checkpoint=()=>rival;
+  f.wallet.stage_eng2_checkpoint=()=>new Uint8Array([1]);
+  f.wallet.stage_eng2_checkpoint_conflict=()=>{
+    if(!verified)throw new Error('Unproven conflict');
+    return new Uint8Array([2]);
+  };
+  f.wallet.restore_eng2_checkpoint=bytes=>{suspended=bytes[0]===2;};
+  const original=f.session.get, make=()=>new Eng2Session(f.wallet,{...pin,checkpoint_finality:true},{
+    storage:f.storage,now:()=>1000,hash:async()=>'opaque-wallet-hash',locks:f.session.locks,
+    json:async()=>head(rival?2:1),
+    binary:async(route,settings)=>route.includes('/checkpoint?')?{bytes:new Uint8Array(6778)}:original(route,settings)
+  });
+  const session=make();
+  await session.initialize();await session.sync();
+  rival=true;
+  assert.equal((await session.sync()).finality_suspended,false);
+  assert.equal(f.commits(),1);
+  verified=true;
+  f.setWriteHook(()=>{throw new Error('Conflict save failed.');});
+  await assert.rejects(session.sync(),/Conflict save failed/);
+  assert.equal(suspended,false);
+  f.setWriteHook(null);
+  const result=await session.sync();
+  assert.equal(result.finality_suspended,true);assert.equal(result.ready,false);
+  assert.equal(result.height,1);assert.equal(f.commits(),1);
+  suspended=false;
+  const reopened=make();
+  assert.equal((await reopened.initialize()).finality_suspended,true);
+});
+
+test('a browser view without verified work requires checkpoint settlement',()=>{
+  const f=fixture();
+  const balance={...pin,height:0,tip:pin.genesis,send_supported:false,full_node_consensus_verified:false,header_pow_verified:false};
+  assert.throws(()=>f.session.checkBalance(balance),/requires checkpoint settlement/);
+  const session=new Eng2Session(f.wallet,{...pin,checkpoint_finality:true},{storage:f.storage,locks:f.session.locks});
+  assert.equal(session.checkBalance(balance).header_pow_verified,false);
+});

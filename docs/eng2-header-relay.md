@@ -212,9 +212,40 @@ Re-proving or re-salting the same public nullifiers or commitments would still b
 linkable and is not stock replenishment.
 
 The consumed table is a bounded in-memory API defense rather than a persistent
-global disclosure registry. The resident's move-only preparation, allocation and
-failure paths provide its no-requeue lifecycle. Neither unused padding stock nor
+global disclosure registry. When an undisclosed template is abandoned and all
+its workers have returned, the resident releases only its reservation metadata.
+Proofs and witnesses removed from stock are never reinserted. At the first
+publication attempt, including an uncertain outcome, its reservations become
+permanent until canonical spends absorb them. Neither unused padding stock nor
 allocated-proof replay is restored on resident restart.
+
+A stock shortfall identified during pruning can be deferred at most three times
+for the same head. The producer refills the reported shortfall before trying
+again, even if the pending transaction count suggests the candidate is full.
+A consumed reservation limit, invalid slot count or other preparation invariant
+fails closed without retrying the producer. The validating node remains
+available.
+
+A mining-enabled resident can set `pow_search_threads` in the local configuration.
+The value is an integer from 1 through 256. If omitted, it is one fewer than the
+OS-provided available parallelism, with a minimum of one and maximum of 256.
+The worker pool does not alter process affinity or CPU quota. Workers search
+disjoint bounded ranges of the same immutable header seed. A winner cancels the
+other lanes; progress includes every actual attempt, including work cancelled
+after starting. The coordinator retains one body and checks the parent and local
+production policy again before publishing or committing a result.
+
+Native status reports `pow_stall` as `mining_pow_counter_stalled` when an eligible
+miner has made no PoW progress for five minutes. The age and episode allow an
+observer to deduplicate repeated samples of the same incident. Ordinary sync
+and assembly can account for a stall; readiness and the production phase remain
+separate observations. Intended pauses, unavailable owner state, and shutdown
+reset the observation interval. An independent watchdog logs the incident and
+requests cancellation once per episode. The producer retries only after the old
+round and its background refill worker have exited and the unpublished template
+has been released. It does not retry ambiguous publication or commit failures.
+`pow_restart_waiting_for_worker` identifies cancellation that has not finished;
+a proof already in progress can delay recovery.
 
 ## Measurements
 

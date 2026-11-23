@@ -953,6 +953,13 @@ fn binding(
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     bytes.extend_from_slice(&plan.headers().rules().genesis_target);
+    let half_life = plan.headers().rules().asert_half_life;
+    if half_life != siworld_core::pow::AsertHalfLife::FourHours {
+        bytes.extend_from_slice(&half_life.seconds().to_le_bytes());
+    }
+    if plan.headers().rules().pow_algorithm == siworld_core::pow::Algorithm::SiworldRandomX {
+        bytes.extend_from_slice(siworld_core::pow::RANDOMX_ALGORITHM.as_bytes());
+    }
     for value in [pin.cumulative_work, pin.tail_work, pin.local_work_floor] {
         bytes.extend_from_slice(&value.to_little_endian());
     }

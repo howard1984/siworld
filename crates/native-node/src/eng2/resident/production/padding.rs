@@ -51,17 +51,15 @@ impl<T> Drop for Task<T> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum RefillStage {
-    WaitingForPositions,
+pub(super) enum RefillStage<'a> {
+    WaitingForPositions(&'a PreparationRetry),
     NonceSearch,
 }
 fn dispatch_refill(
-    stage: RefillStage,
-    ready_positions: usize,
-    minimum_positions: usize,
+    positions_sufficient: bool,
     refill: impl FnOnce() -> Result<(), Failure>,
 ) -> Result<(), Failure> {
-    if matches!(stage, RefillStage::WaitingForPositions) && ready_positions >= minimum_positions {
+    if positions_sufficient {
         return Ok(());
     }
     refill()
@@ -80,15 +78,17 @@ impl Pipeline {
     pub(super) fn maintain(
         &mut self,
         shared: &Shared,
+        round: &p2p::Cancellation,
         prover: &Arc<Mutex<NativeProver>>,
         workers: &Arc<rayon::ThreadPool>,
         policy_revision: u64,
-        stage: RefillStage,
+        stage: RefillStage<'_>,
     ) -> Result<(), Failure> {
         if let Some(completed) = self.task.poll()? {
             let completed = completed?;
             let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
             if !shared.cancel.is_cancelled()
+                && !round.is_cancelled()
                 && owner.activities_allowed()
                 && owner.template_generation() == completed.generation
                 && isolated_permission(shared, &owner, Some(completed.policy_revision))
@@ -108,12 +108,14 @@ impl Pipeline {
         }
         if self.task.busy()
             || shared.cancel.is_cancelled()
+            || round.is_cancelled()
             || !shared.mining_ready().map_err(|_| Failure::Readiness)?
         {
             return Ok(());
         }
         let mut owner = shared.owner.lock().map_err(|_| Failure::OwnerAccess)?;
-        if !owner.activities_allowed()
+        if round.is_cancelled()
+            || !owner.activities_allowed()
             || !isolated_permission(shared, &owner, Some(policy_revision))
                 .map_err(|_| Failure::ProductionControl)?
                 .0
@@ -123,7 +125,11 @@ impl Pipeline {
         // Polling above always consumes completed output first. Ready stock
         // gives foreground assembly priority over starting any new proof.
         let minimum = owner.engine().genesis().slot_rule().minimum();
-        dispatch_refill(stage, owner.ready_positions(), minimum, || {
+        let positions_sufficient = match stage {
+            RefillStage::WaitingForPositions(retry) => retry.can_prepare(&owner, minimum),
+            RefillStage::NonceSearch => false,
+        };
+        dispatch_refill(positions_sufficient, || {
             let generation = owner.template_generation();
             let Some(task) = owner
                 .prepare_padding()
@@ -191,31 +197,23 @@ mod tests {
         let prover = Arc::new(Mutex::new(Vec::new()));
         let mut task = Task::default();
         // This closure would start a competing non-preemptible workspace user.
-        dispatch_refill(
-            RefillStage::WaitingForPositions,
-            crate::pool::MIN_READY,
-            crate::pool::MIN_READY,
-            || task.start(|| panic!("ready assembly must not dispatch refill")),
-        )
+        dispatch_refill(true, || {
+            task.start(|| panic!("ready assembly must not dispatch refill"))
+        })
         .unwrap();
         assert!(!task.busy());
         prover.try_lock().unwrap().push("assembly");
         let (entered, receive) = mpsc::sync_channel(1);
         let (release, wait) = mpsc::sync_channel(1);
         let background = prover.clone();
-        dispatch_refill(
-            RefillStage::NonceSearch,
-            crate::pool::MIN_READY,
-            crate::pool::MIN_READY,
-            || {
-                task.start(move || {
-                    let mut guard = background.lock().unwrap();
-                    guard.push("refill");
-                    entered.send(()).unwrap();
-                    wait.recv_timeout(Duration::from_secs(1)).unwrap();
-                })
-            },
-        )
+        dispatch_refill(false, || {
+            task.start(move || {
+                let mut guard = background.lock().unwrap();
+                guard.push("refill");
+                entered.send(()).unwrap();
+                wait.recv_timeout(Duration::from_secs(1)).unwrap();
+            })
+        })
         .unwrap();
         receive.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(task.busy());
@@ -224,15 +222,10 @@ mod tests {
         drop(task);
         assert_eq!(*prover.lock().unwrap(), vec!["assembly", "refill"]);
         let mut prepared = false;
-        dispatch_refill(
-            RefillStage::WaitingForPositions,
-            crate::pool::MIN_READY - 1,
-            crate::pool::MIN_READY,
-            || {
-                prepared = true;
-                Ok(())
-            },
-        )
+        dispatch_refill(false, || {
+            prepared = true;
+            Ok(())
+        })
         .unwrap();
         assert!(prepared);
     }
