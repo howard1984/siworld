@@ -53,6 +53,14 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml --features desktop-e2e 
 ```
 
 On Windows, also enable `dev-windows-write` for synthetic tests of safe creation.
+Run the releaser under the signed-in Windows desktop user, whose Credential
+Manager store holds the local instance marker. A public-key-only SSH session
+can build the executable but can lack access to that credential store. A
+missing or inaccessible marker must not be worked around with a test marker
+when validating the native store. Cargo may need registry index entries for
+target-specific dependencies while resolving the locked workspace, even when
+those dependencies are not compiled for Windows.
+
 The test starts two native processes without opening their windows and uses
 separate temporary data directories.
 
