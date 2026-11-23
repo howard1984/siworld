@@ -1,0 +1,49 @@
+[package]
+name = "sivault-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+dev-windows-write = ["sivault-core/dev-windows-write"]
+dev-wallet-chain = ["dep:siworld-native-wallet-engine", "reqwest/blocking"]
+desktop-e2e = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+ico = "0.6"
+png = "0.18"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false }
+sivault-core = { path = "../../../crates/sivault-core" }
+sivault-releaser = { path = "../../../crates/sivault-releaser" }
+siworld-native-wallet-core = { path = "../../../crates/native-wallet-core" }
+siworld-native-wallet-engine = { path = "../../../crates/native-wallet-engine", optional = true }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAccessibilityProtocols", "NSAlert", "NSApplication", "NSButton", "NSCell", "NSControl", "NSResponder", "NSSecureTextField", "NSTextField", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSGeometry", "NSString"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[profile.wallet-demo]
+inherits = "release"
+debug-assertions = true

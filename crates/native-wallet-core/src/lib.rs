@@ -7,6 +7,7 @@ pub mod identity;
 #[allow(dead_code)]
 #[path = "../../bench-multi-asset/src/multi_asset.rs"]
 mod native_hash;
+pub mod recipient;
 pub mod vault;
 
 pub fn network(text: &str) -> Result<[u8; 32], String> {

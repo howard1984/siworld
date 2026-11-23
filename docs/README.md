@@ -29,6 +29,11 @@ non-replacing admission. [Public history receipts](eng2-wallet-history.md) retai
 header-authenticated public records without claiming historical proof replay or
 completed browser-wallet synchronization.
 
+## SIVault
+
+- [Offline standard format](../crates/sivault-core/README.md): prototype API, chunk authentication and independent vectors.
+- [Security boundaries](sivault-security-model.md): local storage, controlled-mode prerequisites and known limitations.
+
 ## Proof implementation and measurement
 
 - [Native proof workspace](../crates/bench-multi-asset/README.md): transaction, issuance and settlement relations and reproducible checks.

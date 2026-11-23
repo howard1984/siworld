@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Local safe and wallet operations initiated by the main window.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "allow-safe-create", "allow-safe-open", "allow-safe-unlock", "allow-safe-list",
+    "allow-safe-import", "allow-safe-export", "allow-safe-create-directory", "allow-safe-lock",
+    "allow-safe-create-controlled", "allow-safe-manage-controlled", "allow-safe-update-decoy",
+    "allow-owner-prepare", "allow-owner-identifier", "allow-owner-show-recovery",
+    "allow-releaser-status", "allow-releaser-authorize", "allow-releaser-set-running", "allow-releaser-verify",
+    "allow-wallet-status", "allow-wallet-access", "allow-wallet-endpoint",
+    "allow-wallet-set-endpoint", "allow-wallet-probe-endpoint",
+    "allow-wallet-refresh-directory", "allow-wallet-send", "allow-wallet-retry-payment"
+  ]
+}

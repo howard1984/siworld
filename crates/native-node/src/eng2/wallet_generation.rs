@@ -1,6 +1,9 @@
 //! Immutable public wallet artifact codecs. These do not select a chain.
-use super::header::{HEADER_BYTES, Header};
-use crate::{eng2::wallet_history::codec::MAX_RECEIPT_BYTES, wire::Hash};
+use super::{
+    header::{HEADER_BYTES, Header},
+    wallet_history::codec::MAX_RECEIPT_BYTES,
+};
+use crate::wire::Hash;
 use sha2::{Digest as _, Sha256};
 
 pub const CHUNK_HEADERS: usize = 128;
@@ -293,4 +296,5 @@ impl Manifest {
     }
 }
 #[cfg(test)]
+#[path = "wallet_generation/tests.rs"]
 mod tests;

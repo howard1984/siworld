@@ -45,6 +45,12 @@ pub mod light;
 pub mod ranges;
 #[path = "../../native-node/src/eng2/header.rs"]
 mod wallet_eng2_header;
+use wallet_eng2_header as header;
+mod wallet_history {
+    pub(crate) use crate::eng2_history as codec;
+}
+#[path = "../../native-node/src/eng2/wallet_generation.rs"]
+pub mod wallet_generation;
 
 pub mod paths;
 

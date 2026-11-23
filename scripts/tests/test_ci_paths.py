@@ -27,6 +27,13 @@ class PathSelectionTests(unittest.TestCase):
         self.assertTrue(jobs['wallet'])
         self.assertFalse(jobs['offline-fund-keys'])
 
+    def test_sivault_sources_select_only_sivault(self):
+        for path in ('crates/sivault-core/src/lib.rs', 'crates/sivault-releaser/Cargo.lock',
+                     'apps/sivault-desktop/src/App.tsx'):
+            with self.subTest(path=path):
+                self.assertEqual({name for name, active in PATHS.select([path]).items() if active},
+                                 {'sivault'})
+
     def test_invalid_or_unavailable_diff_runs_all_jobs(self):
         for error in (ValueError('invalid metadata'), subprocess.CalledProcessError(1, ['git'])):
             with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:

@@ -1,0 +1,40 @@
+[package]
+name = "sivault-releaser"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "Portable SIVault releaser library"
+
+[workspace]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["mldsa65"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "=0.10.9"
+sivault-core = { path = "../sivault-core" }
+zeroize = "=1.9.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "=3.7.0"
+security-framework-sys = "=2.17.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[[test]]
+name = "controlled_process"
+harness = false
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[lints.rust]
+unsafe_code = "deny"

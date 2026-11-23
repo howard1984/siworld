@@ -102,7 +102,8 @@ RULES = {'native-economic-accounting': ('crates/core/**',
             'crates/native-*/**',
             'crates/bench-d8/**',
             'crates/bench-multi-asset/**',
-            'crates/bench-stark/patches/**')}
+            'crates/bench-stark/patches/**'),
+ 'sivault': ('crates/sivault-core/**', 'crates/sivault-releaser/**', 'apps/sivault-desktop/**')}
 
 
 def select(paths):
