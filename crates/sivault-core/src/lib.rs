@@ -3,6 +3,7 @@
 pub mod controlled_channel;
 pub mod controlled_credential;
 pub mod crypto;
+pub mod fixed;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod owner;
 pub mod standard;
