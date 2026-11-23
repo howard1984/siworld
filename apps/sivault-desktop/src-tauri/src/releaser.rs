@@ -1,16 +1,25 @@
-use std::{net::SocketAddr, sync::Mutex};
+use std::{
+    io::{Read, Write},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream},
+    sync::Mutex,
+    time::Duration,
+};
 
 use serde::Serialize;
-use sivault_core::controlled_channel::{ReleaserIdentity, stream::Session};
+use sivault_core::controlled_channel::{
+    PendingClient, ReleaserIdentity, ReleaserPins, stream::Session,
+};
 use sivault_releaser::transport::Worker;
 use tauri::State;
 
 use crate::adapter::{BridgeError, Result};
 
 const LOOPBACK_DEPLOYMENT: [u8; 32] = *b"sivault/local-controlled-safe/v1";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct Listening {
     address: SocketAddr,
+    identifier: [u8; 32],
     worker: Worker,
 }
 
@@ -27,6 +36,7 @@ pub struct ReleaserState(Mutex<Lifecycle>);
 #[serde(rename_all = "camelCase")]
 pub struct ReleaserStatus {
     address: Option<String>,
+    identifier: Option<String>,
 }
 
 impl ReleaserState {
@@ -41,19 +51,26 @@ impl ReleaserState {
         }
         if enabled && state.listener.is_none() {
             let identity = ReleaserIdentity::generate().map_err(|_| unavailable())?;
+            let pins = identity.pins();
+            let identifier = pins.identifier();
+            let advertised = pins.encode();
             let (address, worker) = Worker::loopback(move |mut stream| {
-                if let Ok(reader) = stream.try_clone() {
+                if stream.write_all(&advertised).is_ok()
+                    && let Ok(reader) = stream.try_clone()
+                {
                     // No slot has been enrolled in this process. Do not accept
                     // requests or issue any reply that appears to approve one.
                     let _ = Session::accept(reader, &mut stream, &LOOPBACK_DEPLOYMENT, &identity);
                 }
             })
             .map_err(|_| unavailable())?;
-            state.listener = Some(Listening { address, worker });
+            state.listener = Some(Listening {
+                address,
+                identifier,
+                worker,
+            });
         }
-        Ok(ReleaserStatus {
-            address: address(&state).map(|addr| addr.to_string()),
-        })
+        Ok(status(&state))
     }
 
     pub fn stop(&self, exiting: bool) {
@@ -64,11 +81,93 @@ impl ReleaserState {
 }
 
 fn address(state: &Lifecycle) -> Option<SocketAddr> {
+    listening(state).map(|listener| listener.address)
+}
+
+fn listening(state: &Lifecycle) -> Option<&Listening> {
     state
         .listener
         .as_ref()
         .filter(|listener| listener.worker.is_running())
-        .map(|listener| listener.address)
+}
+
+fn status(state: &Lifecycle) -> ReleaserStatus {
+    ReleaserStatus {
+        address: address(state).map(|addr| addr.to_string()),
+        identifier: listening(state).map(|listener| {
+            let mut value = String::with_capacity(64);
+            for byte in listener.identifier {
+                use std::fmt::Write;
+                let _ = write!(value, "{byte:02x}");
+            }
+            value
+        }),
+    }
+}
+
+fn invalid_peer() -> BridgeError {
+    BridgeError::new(
+        "RELEASER_INVALID_PEER",
+        "Enter a releaser identifier and a local address.",
+    )
+}
+
+struct LocalPeer {
+    address: SocketAddrV4,
+    identifier: [u8; 32],
+}
+
+impl LocalPeer {
+    fn parse(address: &str, identifier: &str) -> Result<Self> {
+        let address: SocketAddrV4 = address.trim().parse().map_err(|_| invalid_peer())?;
+        let value = identifier.trim();
+        if *address.ip() != Ipv4Addr::LOCALHOST
+            || address.port() == 0
+            || value.len() != 64
+            || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(invalid_peer());
+        }
+        let mut identifier = [0; 32];
+        for (byte, pair) in identifier.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+            let hex = std::str::from_utf8(pair).map_err(|_| invalid_peer())?;
+            *byte = u8::from_str_radix(hex, 16).map_err(|_| invalid_peer())?;
+        }
+        Ok(Self {
+            address,
+            identifier,
+        })
+    }
+
+    fn connect(&self, folder: [u8; 32]) -> Result<Session<TcpStream, TcpStream>> {
+        let mut stream = TcpStream::connect_timeout(&self.address.into(), CONNECT_TIMEOUT)
+            .map_err(|_| unavailable())?;
+        stream
+            .set_read_timeout(Some(CONNECT_TIMEOUT))
+            .map_err(|_| unavailable())?;
+        stream
+            .set_write_timeout(Some(CONNECT_TIMEOUT))
+            .map_err(|_| unavailable())?;
+        let mut advertised = [0; ReleaserPins::ENCODED_LEN];
+        stream
+            .read_exact(&mut advertised)
+            .map_err(|_| unavailable())?;
+        let pins = ReleaserPins::decode_pinned(&advertised, &self.identifier).map_err(|_| {
+            BridgeError::new(
+                "RELEASER_IDENTITY",
+                "The address did not provide the expected releaser identity.",
+            )
+        })?;
+        let pending =
+            PendingClient::start(pins, &LOOPBACK_DEPLOYMENT, folder).map_err(|_| unavailable())?;
+        let reader = stream.try_clone().map_err(|_| unavailable())?;
+        Session::connect(reader, stream, pending).map_err(|_| {
+            BridgeError::new(
+                "RELEASER_IDENTITY",
+                "The address did not prove the expected releaser identity.",
+            )
+        })
+    }
 }
 
 fn unavailable() -> BridgeError {
@@ -78,9 +177,15 @@ fn unavailable() -> BridgeError {
 #[tauri::command]
 pub fn releaser_status(state: State<'_, ReleaserState>) -> Result<ReleaserStatus> {
     let state = state.0.lock().map_err(|_| unavailable())?;
-    Ok(ReleaserStatus {
-        address: address(&state).map(|addr| addr.to_string()),
-    })
+    Ok(status(&state))
+}
+
+#[tauri::command]
+pub async fn releaser_verify(address: String, identifier: String) -> Result<()> {
+    let peer = LocalPeer::parse(&address, &identifier)?;
+    tauri::async_runtime::spawn_blocking(move || peer.connect([0; 32]).map(drop))
+        .await
+        .map_err(|_| unavailable())?
 }
 
 #[tauri::command]
@@ -114,5 +219,29 @@ mod tests {
         state.stop(true);
         assert!(TcpStream::connect(&second).is_err());
         assert!(state.set_running(true).is_err());
+    }
+
+    #[test]
+    fn peer_input_only_accepts_loopback_and_a_full_identifier() {
+        let identifier = "10".repeat(32);
+        assert!(LocalPeer::parse("127.0.0.1:31337", &identifier).is_ok());
+        assert!(LocalPeer::parse("127.0.0.1:0", &identifier).is_err());
+        assert!(LocalPeer::parse("0.0.0.0:31337", &identifier).is_err());
+        assert!(LocalPeer::parse("localhost:31337", &identifier).is_err());
+        assert!(LocalPeer::parse("127.0.0.1:31337", "10").is_err());
+        assert!(LocalPeer::parse("127.0.0.1:31337", &"GG".repeat(32)).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires permission to bind a loopback TCP socket"]
+    fn owner_checks_the_pin_and_authenticated_handshake() {
+        let releaser = ReleaserState::default();
+        let status = releaser.set_running(true).unwrap();
+        let address = status.address.unwrap();
+        let identifier = status.identifier.unwrap();
+        let wrong = LocalPeer::parse(&address, &"00".repeat(32)).unwrap();
+        assert!(wrong.connect([0; 32]).is_err());
+        let peer = LocalPeer::parse(&address, &identifier).unwrap();
+        assert!(peer.connect([1; 32]).is_ok());
     }
 }

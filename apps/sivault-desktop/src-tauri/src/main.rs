@@ -35,6 +35,7 @@ fn main() {
             commands::safe_lock,
             releaser::releaser_status,
             releaser::releaser_set_running,
+            releaser::releaser_verify,
             wallet::wallet_status,
             wallet::wallet_access,
             wallet::wallet_send,

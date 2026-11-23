@@ -23,6 +23,8 @@ const SERVER_LEN: usize = SERVER.len() + 4 * 32 + 1088;
 const MAX_PAYLOAD: usize = 8192;
 const RECORD_OVERHEAD: usize = 26;
 const LIFETIME: Duration = Duration::from_secs(120);
+const PIN_MAGIC: &[u8; 8] = b"SVPIN001";
+const KEM_KEY_LEN: usize = 1184;
 
 struct KemPrivate(MlKem768PrivateKey);
 impl Drop for KemPrivate {
@@ -44,6 +46,43 @@ pub struct ReleaserPins {
 }
 
 impl ReleaserPins {
+    pub const ENCODED_LEN: usize = PIN_MAGIC.len() + KEM_KEY_LEN + MLDSA65VerificationKey::len();
+
+    /// The identifier is checked out of band, independently of the address.
+    pub fn identifier(&self) -> Word {
+        let (kem, signing) = self.ids();
+        hash(b"releaser-pin-set-id", &[PIN_MAGIC, &kem, &signing])
+    }
+
+    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+        let mut bytes = [0; Self::ENCODED_LEN];
+        let (header, keys) = bytes.split_at_mut(PIN_MAGIC.len());
+        header.copy_from_slice(PIN_MAGIC);
+        let (kem, signing) = keys.split_at_mut(KEM_KEY_LEN);
+        kem.copy_from_slice(self.kem.as_slice());
+        signing.copy_from_slice(self.verification.as_slice());
+        bytes
+    }
+
+    pub fn decode_pinned(bytes: &[u8], expected: &Word) -> Result<Self> {
+        if bytes.len() != Self::ENCODED_LEN || !bytes.starts_with(PIN_MAGIC) {
+            return Err(Error::InvalidFormat);
+        }
+        let (kem, signing) = bytes[PIN_MAGIC.len()..].split_at(KEM_KEY_LEN);
+        let pins = Self {
+            kem: MlKem768PublicKey::from(
+                <&[u8; KEM_KEY_LEN]>::try_from(kem).map_err(|_| Error::InvalidFormat)?,
+            ),
+            verification: MLDSA65VerificationKey::new(
+                signing.try_into().map_err(|_| Error::InvalidFormat)?,
+            ),
+        };
+        if &pins.identifier() != expected || !mlkem768::validate_public_key(&pins.kem) {
+            return Err(Error::Authentication);
+        }
+        Ok(pins)
+    }
+
     fn ids(&self) -> (Word, Word) {
         (
             hash(b"kem-id", &[self.kem.as_slice()]),
@@ -434,6 +473,24 @@ mod tests {
         let (mut hello, _) = releaser.accept(&DEPLOYMENT, pending.hello()).unwrap();
         hello[SERVER_LEN] ^= 1;
         assert!(pending.finish(&hello).is_err());
+    }
+
+    #[test]
+    fn published_pin_sets_require_the_expected_identifier() {
+        let pins = identity(3).pins();
+        let expected = pins.identifier();
+        let mut bytes = pins.encode();
+        assert_eq!(
+            ReleaserPins::decode_pinned(&bytes, &expected)
+                .unwrap()
+                .encode(),
+            bytes
+        );
+        assert!(ReleaserPins::decode_pinned(&bytes[..bytes.len() - 1], &expected).is_err());
+        assert!(ReleaserPins::decode_pinned(&identity(4).pins().encode(), &expected).is_err());
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        assert!(ReleaserPins::decode_pinned(&bytes, &expected).is_err());
     }
 
     #[test]

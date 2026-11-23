@@ -261,3 +261,5 @@ tbody tr.selected { background: var(--selected); }
 @media (prefers-reduced-motion: reduce) {
   button { transition: none; }
 }
+.releaser-form { max-width: 420px; }
+.releaser-identifier { overflow-wrap: anywhere; }

@@ -19,10 +19,12 @@ export type SafeInfo = {
 export const native = isTauri();
 export const demoAvailable = import.meta.env.DEV && !native;
 
-export type ReleaserStatus = { address: string | null };
+export type ReleaserStatus = { address: string | null; identifier: string | null };
 export const releaserStatus = () => invoke<ReleaserStatus>('releaser_status');
 export const setReleaserRunning = (enabled: boolean) =>
   invoke<ReleaserStatus>('releaser_set_running', { enabled });
+export const verifyReleaser = (address: string, identifier: string) =>
+  invoke<void>('releaser_verify', { address, identifier });
 
 export interface SafeBridge {
   create(name: string): Promise<SafeInfo | null>;

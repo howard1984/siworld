@@ -27,6 +27,10 @@ copied folder.
 The controlled channel derives traffic keys from two ML-KEM shared secrets.
 It does not promise forward secrecy against later releaser key compromise for
 captures that also expose the other KEM secret or endpoint state.
+The desktop loopback identity check compares an identifier obtained separately
+from the address, then verifies the channel handshake. The current listener
+generates a new identity on each start and does not accept enrollment or
+release shares.
 
 The releaser journal commits a charge before allowing credential evaluation.
 The slot is unavailable when its attempt history cannot be verified against
