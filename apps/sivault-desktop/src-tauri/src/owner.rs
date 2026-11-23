@@ -3,6 +3,10 @@ use sivault_core::owner::OwnerIdentity;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
+#[cfg(any(target_os = "macos", windows))]
+#[path = "owner_recovery.rs"]
+mod recovery;
+
 #[derive(Default)]
 struct Lifecycle {
     identity: Option<OwnerIdentity>,
@@ -25,9 +29,16 @@ impl OwnerState {
         state.exiting |= exiting;
     }
 
-    pub(crate) fn with_identity<T>(&self, action: impl FnOnce(&OwnerIdentity) -> Result<T>) -> Result<T> {
+    pub(crate) fn with_identity<T>(
+        &self,
+        action: impl FnOnce(&OwnerIdentity) -> Result<T>,
+    ) -> Result<T> {
         let state = self.lifecycle.lock().map_err(|_| unavailable())?;
-        let identity = state.identity.as_ref().filter(|_| !state.exiting).ok_or_else(unavailable)?;
+        let identity = state
+            .identity
+            .as_ref()
+            .filter(|_| !state.exiting)
+            .ok_or_else(unavailable)?;
         action(identity)
     }
 }
@@ -53,6 +64,21 @@ pub fn owner_identifier(state: tauri::State<'_, OwnerState>) -> Result<String> {
         }
         Ok(value)
     })
+}
+
+#[tauri::command]
+pub async fn owner_show_recovery(app: AppHandle) -> Result<bool> {
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        tauri::async_runtime::spawn_blocking(move || recovery::show(&app))
+            .await
+            .map_err(|_| unavailable())?
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = app;
+        Err(unavailable())
+    }
 }
 
 impl OwnerState {
@@ -90,9 +116,10 @@ impl OwnerState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(unavailable()),
         };
-        let Some(identity) = prompt_identity(app, pinned.is_none())? else {
+        let Some(material) = prompt_material(app, pinned.is_none())? else {
             return Ok(false);
         };
+        let identity = OwnerIdentity::derive(&material.entropy);
         let identifier = identity.identifier();
         let mut state = self.lifecycle.lock().map_err(|_| unavailable())?;
         if state.exiting || state.epoch != epoch {
@@ -118,7 +145,10 @@ impl OwnerState {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn prompt_identity(app: &AppHandle, first: bool) -> Result<Option<OwnerIdentity>> {
+fn prompt_material(
+    app: &AppHandle,
+    first: bool,
+) -> Result<Option<siworld_native_wallet_core::vault::Material>> {
     use crate::{locale as l, password};
     use siworld_native_wallet_core::vault::{Material, challenge};
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogResult};
@@ -176,5 +206,5 @@ fn prompt_identity(app: &AppHandle, first: bool) -> Result<Option<OwnerIdentity>
             return Err(BridgeError::new("OWNER_BAD_BACKUP", l::OWNER_BAD_BACKUP));
         }
     }
-    Ok(Some(OwnerIdentity::derive(&material.entropy)))
+    Ok(Some(material))
 }

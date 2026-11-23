@@ -16,13 +16,21 @@ pub fn prompt_releaser(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
 #[cfg(target_os = "macos")]
 pub fn set_releaser_storage_password(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
     on_main(app, || {
-        native_secret(crate::locale::RELEASER_SET_PASSWORD, crate::locale::PASSWORD, true)
+        native_secret(
+            crate::locale::RELEASER_SET_PASSWORD,
+            crate::locale::PASSWORD,
+            true,
+        )
     })
 }
 
 #[cfg(windows)]
 pub fn set_releaser_storage_password(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
-    windows_prompt(app, Zeroizing::new(crate::locale::RELEASER_SET_PASSWORD.into()), true)
+    windows_prompt(
+        app,
+        Zeroizing::new(crate::locale::RELEASER_SET_PASSWORD.into()),
+        true,
+    )
 }
 
 #[cfg(windows)]
@@ -178,6 +186,29 @@ mod windows_dialog {
             _ => Err(unavailable()),
         }
     }
+
+    pub(super) fn show_words(owner: HWND, text: &str) -> Result<()> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+        let body = Zeroizing::new(text.encode_utf16().chain([0]).collect::<Vec<_>>());
+        let caption: Vec<_> = crate::locale::OWNER_RECOVERY_TITLE
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // The owned UTF-16 buffers are valid until the modal native dialog returns.
+        let status = unsafe {
+            MessageBoxW(
+                owner,
+                body.as_ptr(),
+                caption.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            )
+        };
+        if status == 0 {
+            Err(unavailable())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn unavailable() -> BridgeError {
@@ -185,6 +216,55 @@ fn unavailable() -> BridgeError {
         "NATIVE_PASSWORD_UNAVAILABLE",
         "Native password entry is not available.",
     )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn show_recovery_words(
+    app: &AppHandle,
+    body: Zeroizing<String>,
+    still_unlocked: impl FnOnce(&AppHandle) -> bool + Send + 'static,
+) -> Result<bool> {
+    let root = app.clone();
+    on_main(app, move || {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSAlert;
+        use objc2_foundation::NSString;
+        if !still_unlocked(&root) {
+            return Ok(false);
+        }
+        let alert = NSAlert::new(MainThreadMarker::new().ok_or_else(unavailable)?);
+        alert.setMessageText(&NSString::from_str(crate::locale::OWNER_RECOVERY_TITLE));
+        alert.setInformativeText(&NSString::from_str(&body));
+        drop(body);
+        alert.runModal();
+        alert.setInformativeText(&NSString::from_str(""));
+        Ok(true)
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn show_recovery_words(
+    app: &AppHandle,
+    body: Zeroizing<String>,
+    still_unlocked: impl FnOnce(&AppHandle) -> bool + Send + 'static,
+) -> Result<bool> {
+    use tauri::Manager;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let root = app.clone();
+    app.run_on_main_thread(move || {
+        let result = (|| {
+            if !still_unlocked(&root) {
+                return Ok(false);
+            }
+            let window = root.get_webview_window("main").ok_or_else(unavailable)?;
+            let owner = window.hwnd().map_err(|_| unavailable())?.0;
+            windows_dialog::show_words(owner, &body)?;
+            Ok(true)
+        })();
+        let _ = tx.send(result);
+    })
+    .map_err(|_| unavailable())?;
+    rx.recv().map_err(|_| unavailable())?
 }
 
 #[cfg(target_os = "macos")]
@@ -212,7 +292,11 @@ pub(crate) fn backup_prompt(
         if !accepted {
             return Ok(None);
         }
-        native_secret(l::WALLET_BACKUP_CONFIRM, &l::wallet_backup_positions(positions), false)
+        native_secret(
+            l::WALLET_BACKUP_CONFIRM,
+            &l::wallet_backup_positions(positions),
+            false,
+        )
     })
 }
 

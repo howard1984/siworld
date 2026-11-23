@@ -2,7 +2,7 @@ import { en } from './locale/en';
 import { WalletNodeStatus, WalletView } from './WalletView';
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, Check, ChevronRight, Download, FileText, Folder, FolderOpen, FolderPlus, HardDrive, Info, KeyRound, LockKeyhole, Plus, Search, ShieldCheck, Upload, Wallet, X } from 'lucide-react';
-import { authorizeReleaser, createControlled, demoAvailable, manageControlled, message, native, nativeBridge, prepareOwner, releaserStatus, setReleaserRunning, verifyReleaser, type Entry, type ReleaserStatus, type SafeBridge, type SafeInfo } from './bridge';
+import { authorizeReleaser, createControlled, demoAvailable, manageControlled, message, native, nativeBridge, prepareOwner, releaserStatus, setReleaserRunning, showOwnerRecovery, verifyReleaser, type Entry, type ReleaserStatus, type SafeBridge, type SafeInfo } from './bridge';
 
 const brandMark = Object.values(import.meta.glob<string>('./branding.local/siworld-icon.svg', {
   eager: true,
@@ -33,6 +33,7 @@ export default function App() {
   const [controlled, setControlled] = useState(false);
   const [controlledName, setControlledName] = useState('');
   const [setupOwner, setSetupOwner] = useState<string | null>(null);
+  const [showingRecovery, setShowingRecovery] = useState(false);
   const [demo, setDemo] = useState(false);
   const [recent, setRecent] = useState<Recent[]>([]);
   const [safe, setSafe] = useState<SafeInfo | null>(null);
@@ -305,6 +306,10 @@ export default function App() {
       {modal === 'create' && controlled && <p className="limit-note">{en.controlledLimits}</p>}
       {modal === 'create' && setupOwner && <div className="controlled-fields">
         <p>{en.ownerIdentifier}: <code className="releaser-identifier">{setupOwner}</code></p>
+        <button className="button" type="button" disabled={busy} onClick={() => void run(async () => {
+          setShowingRecovery(true);
+          try { await showOwnerRecovery(); } finally { setShowingRecovery(false); }
+        })}><KeyRound size={16} />{en.showOwnerRecovery}</button>
         <label className="field">{en.releaserAddress}<input name="address" required maxLength={21} autoComplete="off" /></label>
         <label className="field">{en.releaserIdentifier}<input name="identifier" required minLength={64} maxLength={64} autoComplete="off" spellCheck={false} /></label>
         <label className="field">{en.attemptAllowance}<input name="allowance" type="number" required min={1} max={1000} defaultValue={2} /></label>
@@ -315,7 +320,7 @@ export default function App() {
       {(modal === 'open' || modal === 'unlock') && <label className="checkbox-field"><input type="checkbox" name="readOnly" />{en.openReadOnly}</label>}
       {modal === 'export' && <><p className="export-name"><FileText size={18} />{selected?.name}</p><p className="export-notice">{en.exportWarning}</p></>}
       {error && <div className="form-error" role="alert">{error}</div>}
-      {busy && <p className="operation-status" role="status">{modal === 'open' || modal === 'unlock' ? en.openingSafe : setupOwner ? en.enrollingSafe : en.working}</p>}
+      {busy && <p className="operation-status" role="status">{showingRecovery ? en.recoveryDialog : modal === 'open' || modal === 'unlock' ? en.openingSafe : setupOwner ? en.enrollingSafe : en.working}</p>}
       <div className="modal-actions"><button className="button" type="button" disabled={busy} onClick={() => { if (setupOwner) setSetupOwner(null); else setModal(null); }}>{setupOwner ? en.back : en.cancel}</button><button className="button primary" type="submit" disabled={busy}>{modal === 'create' ? (controlled && !setupOwner ? en.continue : en.createSafe) : modal === 'folder' ? en.createFolder : modal === 'export' ? en.chooseDestination : modal === 'open' && !demo ? en.chooseSafe : en.openSafe}</button></div>
     </form></dialog>
   </div>;

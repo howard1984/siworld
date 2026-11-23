@@ -32,6 +32,7 @@ export const verifyReleaser = (address: string, identifier: string) =>
   invoke<void>('releaser_verify', { address, identifier });
 export const prepareOwner = async () => await invoke<boolean>('owner_prepare')
   ? invoke<string>('owner_identifier') : null;
+export const showOwnerRecovery = () => invoke<boolean>('owner_show_recovery');
 export const authorizeReleaser = (owner: string, allowance: number) =>
   invoke<boolean>('releaser_authorize', { owner, allowance });
 export const createControlled = (name: string, address: string, identifier: string, allowance: number) =>

@@ -51,6 +51,7 @@ fn main() {
             commands::safe_lock,
             owner::owner_prepare,
             owner::owner_identifier,
+            owner::owner_show_recovery,
             releaser::releaser_status,
             releaser::releaser_authorize,
             releaser::releaser_set_running,

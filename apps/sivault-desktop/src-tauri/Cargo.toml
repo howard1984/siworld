@@ -39,7 +39,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAc
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSGeometry", "NSString"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Credentials", "Win32_UI_WindowsAndMessaging"] }
 
 [lints.rust]
 unsafe_code = "deny"

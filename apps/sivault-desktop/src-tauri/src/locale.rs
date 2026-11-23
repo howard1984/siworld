@@ -77,3 +77,14 @@ pub const OWNER_ENTER_WORDS: &str = "Enter the 24 owner recovery words";
 pub const OWNER_BAD_BACKUP: &str = "The recovery words did not match the requested positions.";
 pub const OWNER_WRONG_IDENTITY: &str = "That phrase does not match this installation's owner.";
 pub const OWNER_UNAVAILABLE: &str = "The owner identity is unavailable.";
+#[cfg(any(target_os = "macos", windows))]
+pub const OWNER_RECOVERY_TITLE: &str = "Your three assigned recovery words";
+#[cfg(any(target_os = "macos", windows))]
+pub const OWNER_RECOVERY_LIMITS: &str = concat!(
+    "Recovery is not enabled in this build. Offline safes have no password recovery.\n\n",
+    "Three assigned words from the 2,048-word list have at most 33 bits of strength. ",
+    "An attacker with the safe folder and a matching releaser's retained records and keys ",
+    "can search offline without the attempt limit. This is feasible for a funded attacker. ",
+    "These words are not a strong standalone secret. Compromise can also expose these ",
+    "three words of your owner phrase."
+);

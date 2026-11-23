@@ -40,6 +40,11 @@ material on that releaser; it does not recall data already disclosed or prove
 erasure of backups. An unconfirmed command does not establish that an
 unreachable releaser enforced it.
 
+The controlled-safe setup dialog can show the owner's three assigned recovery
+words after native phrase reentry. The local owner profile encrypts the
+positions and does not store the words. It is not a portable recovery record.
+This build does not support opening or resetting a safe with those words.
+
 The releaser binds IPv4 loopback by default. A non-distributable debug
 build with `desktop-e2e` can instead bind one Tailscale IPv4 address and
 port named by `SIVAULT_TEST_RELEASER_BIND` and accept only the single Tailscale

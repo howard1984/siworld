@@ -3,6 +3,8 @@ export const en = {
   offlineSafe: "Offline",
   controlledSafe: "Controlled",
   controlledDetails: "Add releaser",
+  showOwnerRecovery: "View assigned recovery words",
+  recoveryDialog: "Waiting for the native recovery dialog…",
   continue: "Continue",
   back: "Back",
   controlledLimits: "Every opening needs a fresh approval from the enrolled releaser. To open files without a connection, use an offline safe.",
