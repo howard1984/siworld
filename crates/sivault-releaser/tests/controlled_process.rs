@@ -1,5 +1,5 @@
 //! Synthetic integration fixture. This is not the desktop wire protocol or a
-//! platform marker-store adapter. No filesystem payload is opened by the test.
+//! platform marker-store adapter.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -33,6 +33,9 @@ mod fixture {
         opening::{self, OpeningRecord, ReleaseMaterial},
     };
     use zeroize::Zeroizing;
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    use sivault_releaser::registration::{Registration, StoredRegistration};
 
     use super::support::*;
 
@@ -196,11 +199,26 @@ mod fixture {
         let share = Secret::new(random().unwrap());
         let generation_key = Secret::new(random().unwrap());
         let scope = scope();
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        let (payload_directory, payload_id, payload) = {
+            let directory = tempfile::tempdir().unwrap();
+            let id = scope.slot.safe.0[..16].try_into().unwrap();
+            let mut safe = sivault_core::standard::Safe::create_controlled(
+                directory.path().join("safe"),
+                id,
+                generation_key.clone(),
+            )
+            .unwrap();
+            safe.create_directory("Synthetic files", None).unwrap();
+            (directory, id, safe)
+        };
         let context = scope.context();
         let correct = ClientCredential::new(PASSWORD, &folder_secret, &context).unwrap();
         let envelope = correct.wrap(&context, &share, &generation_key).unwrap();
         let verifier = correct.enrollment_verifier();
         let mut body = Zeroizing::new(digest(&context.encode()).0.to_vec());
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        let enroll_digest = digest(&body);
         body.extend_from_slice(&verifier.stored_key);
         body.extend_from_slice(verifier.server_key.as_ref());
         body.extend_from_slice(share.as_ref());
@@ -211,6 +229,21 @@ mod fixture {
         session.send(ENROLL, &body).unwrap();
         assert_eq!(&**session.receive(RESULT).unwrap(), &[OK]);
         drop(session);
+        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+        {
+            Registration {
+                peer: Id(identity().pins().identifier()),
+                port: 31337,
+                scope,
+                allowance: 2,
+                enrollment_ack: enroll_digest,
+                nonce: envelope.nonce,
+                wrapped_key: envelope.ciphertext.to_vec(),
+            }
+            .publish(&payload, &generation_key)
+            .unwrap();
+            drop(payload);
+        }
 
         let cases = [
             (OK, None),
@@ -238,10 +271,39 @@ mod fixture {
             } else {
                 PASSWORD
             };
-            let credential = ClientCredential::new(password, &folder_secret, &context).unwrap();
+            #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+            let (persisted, scope, envelope) = {
+                let persisted =
+                    StoredRegistration::read(&payload_directory.path().join("safe")).unwrap();
+                let scope = persisted.untrusted().scope.clone();
+                let envelope = persisted.untrusted().envelope().unwrap();
+                assert_eq!(persisted.untrusted().allowance, 2);
+                assert_eq!(persisted.untrusted().peer.0, identity().pins().identifier());
+                (persisted, scope, envelope)
+            };
+            let credential =
+                ClientCredential::new(password, &folder_secret, &scope.context()).unwrap();
             let result = opening::open(session, &scope, credential, &folder.signing_key, &envelope);
             if expected == OK {
-                assert_eq!(*result.unwrap(), *generation_key);
+                let key = result.unwrap();
+                assert_eq!(*key, *generation_key);
+                #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+                {
+                    assert!(
+                        persisted
+                            .authenticate(&Secret::new(random().unwrap()))
+                            .is_err()
+                    );
+                    persisted.authenticate(&key).unwrap();
+                    let safe = sivault_core::standard::Safe::open_controlled(
+                        payload_directory.path().join("safe"),
+                        payload_id,
+                        key,
+                        true,
+                    )
+                    .unwrap();
+                    assert_eq!(safe.entries()[0].name, "Synthetic files");
+                }
             } else {
                 assert!(matches!(result, Err(opening::Error::Denied)));
             }

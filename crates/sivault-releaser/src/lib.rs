@@ -11,6 +11,8 @@ pub mod ledger;
 pub mod message;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod opening;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod registration;
 pub mod scheduler;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod transport;

@@ -18,6 +18,9 @@ use zeroize::Zeroizing;
 mod crash_test;
 
 const MAGIC: &[u8; 8] = b"SVST0001";
+const CONTROLLED_MAGIC: &[u8; 8] = b"SVCT0001";
+const CONTROLLED_REGISTRATION: &str = "registration-v1";
+pub const MAX_CONTROLLED_REGISTRATION: usize = 8192;
 const HEADER: usize = 224;
 const MAX_INDEX: usize = 128 << 20;
 const MAX_ENTRIES: usize = 100_000;
@@ -154,7 +157,9 @@ impl Directory {
         let temporary = format!(".pending-{}", hex(&crypto::random::<16>()?));
         self.write(&temporary, bytes)?;
         #[cfg(test)]
-        crash_test::pause("before");
+        if name.starts_with("g-") {
+            crash_test::pause("before");
+        }
         #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         rustix::fs::renameat_with(
             &self.handle,
@@ -178,7 +183,9 @@ impl Directory {
             return Err(Error::Unsupported);
         }
         #[cfg(test)]
-        crash_test::pause("after");
+        if name.starts_with("g-") {
+            crash_test::pause("after");
+        }
         #[allow(unreachable_code)]
         self.sync()
     }
@@ -208,6 +215,7 @@ pub struct Safe {
     safe_id: [u8; 16],
     generation: u64,
     slot: [u8; 88],
+    magic: &'static [u8; 8],
     content_key: Secret,
     entries: Vec<Entry>,
     read_only: bool,
@@ -219,10 +227,6 @@ impl Safe {
         mutation_supported()?;
         // Validate before creating anything, so a rejected password leaves no safe.
         drop(crypto::password_bytes(password)?);
-        fs::create_dir(path.as_ref())?;
-        let directory = Directory::open(path.as_ref())?;
-        let lock = directory.file(".sivault-lock", true)?;
-        lock.try_lock().map_err(|_| Error::Busy)?;
         let safe_id = crypto::random()?;
         let content_key = Zeroizing::new(crypto::random()?);
         let salt = crypto::random()?;
@@ -236,12 +240,68 @@ impl Safe {
         slot[..16].copy_from_slice(&salt);
         slot[16..40].copy_from_slice(&nonce);
         slot[40..].copy_from_slice(&wrapped);
+        Self::create_payload(path.as_ref(), safe_id, content_key, slot, MAGIC)
+    }
+
+    /// Create a payload whose key is managed by the controlled-open protocol.
+    /// No password slot or offline password-opening route is installed.
+    pub fn create_controlled(
+        path: impl AsRef<Path>,
+        safe_id: [u8; 16],
+        content_key: Secret,
+    ) -> Result<Self> {
+        Self::create_payload(
+            path.as_ref(),
+            safe_id,
+            content_key,
+            [0; 88],
+            CONTROLLED_MAGIC,
+        )
+    }
+
+    /// Publish the owner's acknowledged registration without replacement.
+    /// The protocol layer defines and authenticates the registration bytes.
+    pub fn publish_controlled_registration(&self, bytes: &[u8]) -> Result<()> {
+        self.writable()?;
+        if self.magic != CONTROLLED_MAGIC || bytes.is_empty() {
+            return Err(Error::InvalidFormat);
+        }
+        if bytes.len() > MAX_CONTROLLED_REGISTRATION {
+            return Err(Error::Limit);
+        }
+        self.directory
+            .publish_generation(CONTROLLED_REGISTRATION, bytes)
+    }
+
+    /// Read bounded, untrusted registration bytes before contacting a peer.
+    pub fn read_controlled_registration(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let bytes = Directory::open(path.as_ref())?
+            .bytes(CONTROLLED_REGISTRATION, MAX_CONTROLLED_REGISTRATION)?;
+        if bytes.is_empty() {
+            return Err(Error::InvalidFormat);
+        }
+        Ok(bytes)
+    }
+
+    fn create_payload(
+        path: &Path,
+        safe_id: [u8; 16],
+        content_key: Secret,
+        slot: [u8; 88],
+        magic: &'static [u8; 8],
+    ) -> Result<Self> {
+        mutation_supported()?;
+        fs::create_dir(path)?;
+        let directory = Directory::open(path)?;
+        let lock = directory.file(".sivault-lock", true)?;
+        lock.try_lock().map_err(|_| Error::Busy)?;
         let mut safe = Self {
             directory,
             _lock: lock,
             safe_id,
             generation: 0,
             slot,
+            magic,
             content_key,
             entries: vec![],
             read_only: false,
@@ -252,7 +312,43 @@ impl Safe {
     }
 
     pub fn open(path: impl AsRef<Path>, password: &str, read_only: bool) -> Result<Self> {
-        let directory = Directory::open(path.as_ref())?;
+        Self::open_payload(path.as_ref(), MAGIC, read_only, |safe_id, slot| {
+            let stretched = crypto::stretch(password, &array(&slot[..16]))?;
+            let wrap = crypto::derive(&stretched, safe_id, b"SVST0001/wrap");
+            let mut ad = b"SVST0001/wrap".to_vec();
+            ad.extend(safe_id);
+            let plain_key = crypto::unseal(&wrap, &array(&slot[16..40]), &ad, &slot[40..])?;
+            Ok(Zeroizing::new(array(&plain_key)))
+        })
+    }
+
+    /// Open only a controlled payload after fresh approval and key unwrap.
+    pub fn open_controlled(
+        path: impl AsRef<Path>,
+        expected_safe_id: [u8; 16],
+        content_key: Secret,
+        read_only: bool,
+    ) -> Result<Self> {
+        Self::open_payload(
+            path.as_ref(),
+            CONTROLLED_MAGIC,
+            read_only,
+            |safe_id, slot| {
+                if *safe_id != expected_safe_id || *slot != [0; 88] {
+                    return Err(Error::Authentication);
+                }
+                Ok(content_key)
+            },
+        )
+    }
+
+    fn open_payload(
+        path: &Path,
+        magic: &'static [u8; 8],
+        read_only: bool,
+        resolve_key: impl FnOnce(&[u8; 16], &[u8; 88]) -> Result<Secret>,
+    ) -> Result<Self> {
+        let directory = Directory::open(path)?;
         let lock = directory.file(".sivault-lock", false)?;
         if read_only {
             lock.try_lock_shared().map_err(|_| Error::Busy)?;
@@ -280,7 +376,7 @@ impl Safe {
         let generation = *generations.last().ok_or(Error::InvalidFormat)?;
         let header = directory.bytes(&format!("g-{generation:016x}"), HEADER)?;
         if header.len() != HEADER
-            || &header[..8] != MAGIC
+            || &header[..8] != magic
             || header[8..16] != [1, 0, 224, 0, 0, 0, 0, 0]
             || header[184..192] != [0; 8]
             || integer(&header[32..40]) != generation
@@ -289,12 +385,7 @@ impl Safe {
         }
         let safe_id = array(&header[16..32]);
         let slot: [u8; 88] = array(&header[96..184]);
-        let stretched = crypto::stretch(password, &array(&slot[..16]))?;
-        let wrap = crypto::derive(&stretched, &safe_id, b"SVST0001/wrap");
-        let mut ad = b"SVST0001/wrap".to_vec();
-        ad.extend(safe_id);
-        let plain_key = crypto::unseal(&wrap, &array(&slot[16..40]), &ad, &slot[40..])?;
-        let content_key = Zeroizing::new(array(&plain_key));
+        let content_key = resolve_key(&safe_id, &slot)?;
         let commit = crypto::derive(&content_key, &safe_id, b"SVST0001/commit");
         crypto::verify_mac(&commit, &header[..192], &header[192..])?;
         let index_id = array(&header[40..56]);
@@ -316,6 +407,7 @@ impl Safe {
             safe_id,
             generation,
             slot,
+            magic,
             content_key,
             entries,
             read_only,
@@ -571,7 +663,7 @@ impl Safe {
             &plain,
         )?);
         let mut header = [0; HEADER];
-        header[..8].copy_from_slice(MAGIC);
+        header[..8].copy_from_slice(self.magic);
         header[8..12].copy_from_slice(&[1, 0, 224, 0]);
         header[16..32].copy_from_slice(&self.safe_id);
         header[32..40].copy_from_slice(&generation.to_le_bytes());

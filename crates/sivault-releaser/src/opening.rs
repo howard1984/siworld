@@ -26,6 +26,8 @@ use crate::{
 };
 
 /// The record and its keys are installed through owner-authenticated enrollment.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpeningRecord {
     pub slot: SlotIdentity,
     pub record: Record,

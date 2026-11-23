@@ -31,6 +31,12 @@ The desktop loopback identity check compares an identifier obtained separately
 from the address, then verifies the channel handshake. The current listener
 generates a new identity on each start and does not accept enrollment or
 release shares.
+The provisional controlled payload has no offline password slot. Its
+single-slot registration record stores the pinned releaser identifier,
+assigned allowance, record scope, and encrypted key envelope. Opening code
+must authenticate the saved record with the freshly recovered key before
+exposing files. The persistence test uses synthetic enrollment messages;
+desktop enrollment and restart recovery are not implemented.
 
 The releaser journal commits a charge before allowing credential evaluation.
 The slot is unavailable when its attempt history cannot be verified against
