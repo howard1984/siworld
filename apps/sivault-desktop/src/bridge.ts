@@ -19,6 +19,11 @@ export type SafeInfo = {
 export const native = isTauri();
 export const demoAvailable = import.meta.env.DEV && !native;
 
+export type ReleaserStatus = { address: string | null };
+export const releaserStatus = () => invoke<ReleaserStatus>('releaser_status');
+export const setReleaserRunning = (enabled: boolean) =>
+  invoke<ReleaserStatus>('releaser_set_running', { enabled });
+
 export interface SafeBridge {
   create(name: string): Promise<SafeInfo | null>;
   open(readOnly: boolean): Promise<SafeInfo | null>;

@@ -4,10 +4,13 @@ mod adapter;
 mod commands;
 mod locale;
 mod password;
+mod releaser;
 mod wallet;
 #[cfg(feature = "dev-wallet-chain")]
 mod wallet_chain;
 mod wallet_endpoint;
+
+use tauri::Manager;
 
 fn main() {
     if wallet::dispatch_worker() {
@@ -19,6 +22,7 @@ fn main() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::Bridge::default())
+        .manage(releaser::ReleaserState::default())
         .manage(wallet::Worker::default())
         .invoke_handler(tauri::generate_handler![
             commands::safe_create,
@@ -29,6 +33,8 @@ fn main() {
             commands::safe_export,
             commands::safe_create_directory,
             commands::safe_lock,
+            releaser::releaser_status,
+            releaser::releaser_set_running,
             wallet::wallet_status,
             wallet::wallet_access,
             wallet::wallet_send,
@@ -38,6 +44,17 @@ fn main() {
             wallet_endpoint::wallet_probe_endpoint,
             wallet_endpoint::wallet_refresh_directory,
         ])
-        .run(tauri::generate_context!())
-        .expect("desktop application failed to start");
+        .build(tauri::generate_context!())
+        .expect("desktop application failed to start")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                app.state::<releaser::ReleaserState>().stop(true);
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { .. },
+                ..
+            } if label == "main" => app.state::<releaser::ReleaserState>().stop(false),
+            _ => {}
+        });
 }

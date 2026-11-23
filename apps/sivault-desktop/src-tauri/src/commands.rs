@@ -164,5 +164,10 @@ pub async fn safe_create_directory(
 
 #[tauri::command]
 pub async fn safe_lock(app: AppHandle, session_id: String) -> Result<()> {
-    blocking(app, move |_, state| state.lock(&session_id)).await
+    blocking(app, move |app, state| {
+        state.lock(&session_id)?;
+        app.state::<crate::releaser::ReleaserState>().stop(false);
+        Ok(())
+    })
+    .await
 }

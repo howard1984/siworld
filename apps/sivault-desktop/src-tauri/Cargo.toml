@@ -24,6 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false }
 sivault-core = { path = "../../../crates/sivault-core" }
+sivault-releaser = { path = "../../../crates/sivault-releaser" }
 siworld-native-wallet-core = { path = "../../../crates/native-wallet-core" }
 siworld-native-wallet-engine = { path = "../../../crates/native-wallet-engine", optional = true }
 tempfile = "3"

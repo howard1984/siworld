@@ -1,8 +1,8 @@
 import { en } from './locale/en';
 import { WalletNodeStatus, WalletView } from './WalletView';
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, Check, ChevronRight, Download, FileText, Folder, FolderOpen, FolderPlus, HardDrive, Info, LockKeyhole, Plus, Search, ShieldCheck, Upload, Wallet, X } from 'lucide-react';
-import { demoAvailable, message, native, nativeBridge, type Entry, type SafeBridge, type SafeInfo } from './bridge';
+import { ArrowDown, ArrowUp, Check, ChevronRight, Download, FileText, Folder, FolderOpen, FolderPlus, HardDrive, Info, KeyRound, LockKeyhole, Plus, Search, ShieldCheck, Upload, Wallet, X } from 'lucide-react';
+import { demoAvailable, message, native, nativeBridge, releaserStatus, setReleaserRunning, type Entry, type SafeBridge, type SafeInfo } from './bridge';
 
 const brandMark = Object.values(import.meta.glob<string>('./branding.local/siworld-icon.svg', {
   eager: true,
@@ -27,7 +27,8 @@ function bytes(size: number): string {
 
 export default function App() {
   const [bridge, setBridge] = useState<SafeBridge | null>(native ? nativeBridge : null);
-  const [section, setSection] = useState<'vault' | 'wallet'>('vault');
+  const [section, setSection] = useState<'vault' | 'wallet' | 'releaser'>('vault');
+  const [releaserAddress, setReleaserAddress] = useState<string | null>(null);
   const [demo, setDemo] = useState(false);
   const [recent, setRecent] = useState<Recent[]>([]);
   const [safe, setSafe] = useState<SafeInfo | null>(null);
@@ -72,6 +73,7 @@ export default function App() {
   async function lock() {
     if (!safe || !bridge) return;
     await bridge.lock(safe.sessionId);
+    setReleaserAddress(null);
     setSafe(null);
     setEntries([]);
     setSelectedId(null);
@@ -152,15 +154,25 @@ export default function App() {
   }
 
   return <div className="app-shell" aria-busy={busy}>
-    <a className="skip-link" href={section === 'vault' ? '#files' : '#wallet'}>{section === 'vault' ? en.skip : en.skipWallet}</a>
+    <a className="skip-link" href={section === 'vault' ? '#files' : '#' + section}>{section === 'vault' ? en.skip : section === 'wallet' ? en.skipWallet : en.skipReleaser}</a>
     {demoAvailable && <div className="dev-banner"><span><Info size={14} />{demo ? en.demoActive : en.browserPreview}</span>{!demo && <button disabled={busy} onClick={enableDemo}>{en.openDemo}</button>}</div>}
     {!native && !demoAvailable && <div className="dev-banner">{en.nativeRequired}</div>}
     {native && <div className="dev-banner">{en.development}</div>}
     <header className="app-header"><div className="brand">{brandMark && <img className="brand-icon" src={brandMark} width={24} height={24} alt={en.brandName} />}<span>{en.appName}</span></div><nav className="section-nav" aria-label={en.sectionNavigation}>
       <button type="button" aria-current={section === 'vault' ? 'page' : undefined} onClick={() => setSection('vault')}><ShieldCheck size={15} aria-hidden="true" />{en.vaultTab}</button>
       <button type="button" aria-current={section === 'wallet' ? 'page' : undefined} disabled={busy || modal !== null} onClick={() => run(async () => { await lock(); setSection('wallet'); })}><Wallet size={15} aria-hidden="true" />{en.walletTab}</button>
+      {native && <button type="button" aria-current={section === 'releaser' ? 'page' : undefined} disabled={busy || modal !== null} onClick={() => run(async () => { setSection('releaser'); setReleaserAddress((await releaserStatus()).address); })}><KeyRound size={15} aria-hidden="true" />{en.releaserTab}</button>}
     </nav>{section === 'wallet' && native && <WalletNodeStatus />}</header>
-    {section === 'wallet' ? <WalletView /> : <div className="workspace">
+    {section === 'wallet' ? <WalletView /> : section === 'releaser' ? <main className="main" id="releaser" tabIndex={-1}>
+      <div className="view-heading"><h1>{en.releaserTab}</h1></div>
+      {error && <div role="alert" className="notification error">{error}</div>}
+      <label className="check-field"><input type="checkbox" role="switch" checked={releaserAddress !== null} disabled={busy} onChange={(event) => {
+        const enabled = event.currentTarget.checked;
+        void run(async () => setReleaserAddress((await setReleaserRunning(enabled)).address));
+      }} />{en.runReleaser}</label>
+      {releaserAddress && <p>{en.releaserAddress}: <code>{releaserAddress}</code></p>}
+      <p>{en.noReleaserEnrollment}</p>
+    </main> : <div className="workspace">
       <aside className="sidebar" aria-label={en.safeNavigation}>
         <div className="sidebar-heading"><span>{en.safesUpper}</span><IconButton label={en.createSafe} disabled={!bridge || busy} onClick={() => showModal('create')}><Plus size={17} /></IconButton></div>
         <nav className="safe-list" aria-label={en.safes}>{recent.map((item) => <button key={item.id} className={`safe-item ${chosenId === item.id ? 'active' : ''}`} disabled={busy} onClick={() => run(async () => { if (safe?.id !== item.id) { if (safe) await lock(); setChosenId(item.id); } })}><HardDrive size={19} /><span><strong>{item.name}</strong><small>{safe?.id === item.id ? en.open : en.locked}</small></span>{safe?.id !== item.id && <LockKeyhole size={13} />}</button>)}{recent.length === 0 && <p className="sidebar-empty">{en.noSafes}</p>}</nav>

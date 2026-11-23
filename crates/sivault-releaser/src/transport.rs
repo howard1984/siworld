@@ -83,18 +83,7 @@ impl TailnetListener {
     /// Nonblocking. Rejected peers are dropped before any protocol bytes are
     /// received. The caller may keep exactly one live exchange at a time.
     pub fn poll(&self) -> io::Result<Option<TcpStream>> {
-        let (stream, source) = match self.listener.accept() {
-            Ok(pair) => pair,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        if !matches!(source, SocketAddr::V4(address) if *address.ip() == self.peer) {
-            return Ok(None);
-        }
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
-        stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        Ok(Some(stream))
+        accept_from(&self.listener, self.peer)
     }
 
     /// Own the listener and execute at most one authenticated exchange at a
@@ -103,6 +92,21 @@ impl TailnetListener {
     pub fn run(self, exchange: impl FnMut(TcpStream) + Send + 'static) -> io::Result<Worker> {
         Worker::spawn(move || self.poll(), exchange)
     }
+}
+
+fn accept_from(listener: &TcpListener, peer: Ipv4Addr) -> io::Result<Option<TcpStream>> {
+    let (stream, source) = match listener.accept() {
+        Ok(pair) => pair,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !matches!(source, SocketAddr::V4(address) if *address.ip() == peer) {
+        return Ok(None);
+    }
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(Some(stream))
 }
 
 #[derive(Default)]
@@ -117,6 +121,26 @@ pub struct Worker {
 }
 
 impl Worker {
+    /// Listen only on IPv4 loopback, using an ephemeral local port.
+    pub fn loopback(
+        exchange: impl FnMut(TcpStream) + Send + 'static,
+    ) -> io::Result<(SocketAddr, Self)> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let worker = Self::spawn(
+            move || accept_from(&listener, Ipv4Addr::LOCALHOST),
+            exchange,
+        )?;
+        Ok((address, worker))
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
+
     fn spawn(
         mut accept: impl FnMut() -> io::Result<Option<TcpStream>> + Send + 'static,
         mut exchange: impl FnMut(TcpStream) + Send + 'static,
@@ -196,27 +220,14 @@ mod tests {
 
     #[test]
     fn stopping_closes_an_inflight_exchange_and_the_listener() {
-        // Use loopback to exercise the worker without relaxing tailnet binding.
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
         let (entered, ready) = mpsc::sync_channel(1);
-        let worker = Worker::spawn(
-            move || match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-                    Ok(Some(stream))
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-                Err(error) => Err(error),
-            },
-            move |mut stream| {
-                entered.send(()).unwrap();
-                let _ = stream.read_exact(&mut [0]);
-            },
-        )
+        let (address, worker) = Worker::loopback(move |mut stream| {
+            entered.send(()).unwrap();
+            let _ = stream.read_exact(&mut [0]);
+        })
         .unwrap();
+        assert_eq!(address.ip(), Ipv4Addr::LOCALHOST);
+        assert!(worker.is_running());
         let mut client = TcpStream::connect(address).unwrap();
         client.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         ready.recv_timeout(IO_TIMEOUT).unwrap();
