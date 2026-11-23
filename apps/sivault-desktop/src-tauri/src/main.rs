@@ -2,6 +2,7 @@
 
 mod adapter;
 mod commands;
+mod controlled;
 mod locale;
 mod owner;
 mod password;
@@ -11,9 +12,20 @@ mod wallet;
 mod wallet_chain;
 mod wallet_endpoint;
 
+#[cfg(all(feature = "desktop-e2e", not(debug_assertions)))]
+compile_error!("desktop-e2e requires debug assertions");
+
+#[cfg(all(feature = "desktop-e2e", debug_assertions, any(target_os = "macos", windows)))]
+#[path = "../tests/support/controlled_driver.rs"]
+mod controlled_driver;
+
 use tauri::Manager;
 
 fn main() {
+    #[cfg(all(feature = "desktop-e2e", debug_assertions, any(target_os = "macos", windows)))]
+    if controlled_driver::dispatch() {
+        return;
+    }
     if wallet::dispatch_worker() {
         return;
     }
@@ -28,6 +40,8 @@ fn main() {
         .manage(wallet::Worker::default())
         .invoke_handler(tauri::generate_handler![
             commands::safe_create,
+            commands::safe_create_controlled,
+            commands::safe_manage_controlled,
             commands::safe_open,
             commands::safe_unlock,
             commands::safe_list,
@@ -36,7 +50,9 @@ fn main() {
             commands::safe_create_directory,
             commands::safe_lock,
             owner::owner_prepare,
+            owner::owner_identifier,
             releaser::releaser_status,
+            releaser::releaser_authorize,
             releaser::releaser_set_running,
             releaser::releaser_verify,
             wallet::wallet_status,

@@ -78,7 +78,7 @@ impl SafeAdapter {
     }
 
     pub fn open(&mut self, path: &Path, password: &str, read_only: bool) -> Result<SafeInfo> {
-        let safe = Safe::open(path, password, read_only).map_err(BridgeError::core)?;
+        let safe = Self::open_payload(path, password, read_only)?;
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -93,11 +93,19 @@ impl SafeAdapter {
             .ok_or_else(|| BridgeError::new("SAFE_NOT_FOUND", "Choose the safe file again."))?;
         let path = record.path.clone();
         let name = record.name.clone();
-        let safe = Safe::open(&path, password, read_only).map_err(BridgeError::core)?;
+        let safe = Self::open_payload(&path, password, read_only)?;
         Ok(self.activate(&path, &name, safe, read_only))
     }
 
-    fn activate(&mut self, path: &Path, name: &str, safe: Safe, read_only: bool) -> SafeInfo {
+    fn open_payload(path: &Path, password: &str, read_only: bool) -> Result<Safe> {
+        if Safe::has_controlled_registration(path).map_err(BridgeError::core)? {
+            crate::controlled::open(path, password, read_only)
+        } else {
+            Safe::open(path, password, read_only).map_err(BridgeError::core)
+        }
+    }
+
+    pub(crate) fn activate(&mut self, path: &Path, name: &str, safe: Safe, read_only: bool) -> SafeInfo {
         let id = self
             .records
             .iter()

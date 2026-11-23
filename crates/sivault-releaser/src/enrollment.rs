@@ -1,10 +1,13 @@
 //! Signed enrollment record carried inside the authenticated releaser channel.
 //! Decoding authenticates the record, but never approves or provisions a slot.
 
+use std::io::{Read, Write};
+
 use libcrux_ml_dsa::ml_dsa_65::{MLDSA65Signature, MLDSA65VerificationKey};
 use sha2::{Digest, Sha256};
 use sivault_core::{
     Error, Result,
+    controlled_channel::{ReleaserIdentity, ReleaserPins, stream::Session, verify_receipt},
     controlled_credential::{ChannelBinding, ReleaserVerifier},
     crypto::Secret,
     owner::{self, OwnerIdentity},
@@ -13,7 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     ledger::{Record, SlotIdentity},
-    message::{Body, Domain, Id, Message, Operation},
+    message::{Body, Domain, Id, Kind, Message, Operation, Status},
     opening::{OpeningRecord, ReleaseMaterial, folder_key_id},
 };
 
@@ -37,6 +40,82 @@ pub struct Offer<'a> {
     pub allowance: u64,
     pub expiry: u64,
     pub wrap_context_digest: Id,
+}
+
+/// Submit one enrollment and require a signed durable receipt from the pinned key.
+pub fn submit<R: Read, W: Write>(
+    mut session: Session<R, W>,
+    identity: &OwnerIdentity,
+    offer: Offer<'_>,
+    pins: &ReleaserPins,
+) -> Result<Id> {
+    let request = offer.request;
+    let scope = offer.release.scope.clone();
+    if offer.releaser.0 != pins.identifier() {
+        return Err(Error::Authentication);
+    }
+    let payload = sign(identity, offer, &session.binding()?)?;
+    let digest = hash(b"enrollment", &payload[..payload.len() - SIGNATURE_LEN]);
+    session.send(Kind::Enroll as u8, &payload)?;
+    drop(payload);
+    let ack = session.receive(Kind::EnrollAck as u8)?;
+    let end = ack
+        .len()
+        .checked_sub(SIGNATURE_LEN)
+        .ok_or(Error::InvalidFormat)?;
+    let (body, signature) = ack.split_at(end);
+    verify_receipt(
+        &pins.verification,
+        &receipt_transcript(&session.binding()?, body),
+        &MLDSA65Signature::new(signature.try_into().map_err(|_| Error::InvalidFormat)?),
+    )?;
+    let message = Message::decode(body).map_err(|_| Error::InvalidFormat)?;
+    match message.body {
+        Body::EnrollAck {
+            enroll,
+            releaser_key,
+            ledger,
+            durable_record,
+            status: Status::Accepted,
+        } if message.domain == domain(&scope, request)
+            && enroll == digest
+            && releaser_key.0 == pins.identifier()
+            && ledger == scope.slot.ledger
+            && durable_record != Id::default() =>
+        {
+            Ok(hash(b"enrollment-ack", &ack))
+        }
+        _ => Err(Error::Authentication),
+    }
+}
+
+/// Send an acknowledgement only with the independently checkpointed journal
+/// head obtained after provisioning the locally accepted offer.
+pub fn acknowledge<R: Read, W: Write>(
+    session: &mut Session<R, W>,
+    identity: &ReleaserIdentity,
+    enrollment: &VerifiedEnrollment,
+    journal_head: Id,
+) -> Result<()> {
+    if journal_head == Id::default() {
+        return Err(Error::Authentication);
+    }
+    let scope = &enrollment.release.scope;
+    let mut ack = Message {
+        domain: domain(scope, enrollment.request),
+        body: Body::EnrollAck {
+            enroll: enrollment.digest,
+            releaser_key: Id(identity.pins().identifier()),
+            ledger: scope.slot.ledger,
+            durable_record: journal_head,
+            status: Status::Accepted,
+        },
+    }
+    .encode()
+    .map_err(|_| Error::InvalidFormat)?;
+    let signature = identity.sign_receipt(&receipt_transcript(&session.binding()?, &ack))?;
+    ack.extend_from_slice(signature.as_slice());
+    session.send(Kind::EnrollAck as u8, &ack)
 }
 
 pub fn sign(
@@ -68,16 +147,7 @@ pub fn sign(
     material.extend_from_slice(release.verifier.server_key.as_ref());
     material.extend_from_slice(release.share.as_ref());
     let message = Message {
-        domain: Domain {
-            suite: scope.slot.suite,
-            network: scope.slot.network,
-            safe: scope.slot.safe,
-            generation: scope.record.generation,
-            slot: scope.slot.slot,
-            incarnation: scope.record.incarnation,
-            request,
-            operation: Operation::Owner,
-        },
+        domain: domain(scope, request),
         body: Body::Enroll {
             owner_key: Id(identity.identifier()),
             manifest: scope.record.manifest,
@@ -94,6 +164,19 @@ pub fn sign(
     let signature = identity.sign_command(&transcript(binding, &bytes))?;
     bytes.extend_from_slice(signature.as_slice());
     Ok(bytes)
+}
+
+pub(crate) fn domain(scope: &OpeningRecord, request: Id) -> Domain {
+    Domain {
+        suite: scope.slot.suite,
+        network: scope.slot.network,
+        safe: scope.slot.safe,
+        generation: scope.record.generation,
+        slot: scope.slot.slot,
+        incarnation: scope.record.incarnation,
+        request,
+        operation: Operation::Owner,
+    }
 }
 
 /// Check the signed record and channel scope. The included owner key is
@@ -216,6 +299,13 @@ fn hash(label: &[u8], bytes: &[u8]) -> Id {
 fn transcript(binding: &ChannelBinding, body: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(48 + body.len()));
     bytes.extend_from_slice(b"SV-ENROLL-SIGNED");
+    bytes.extend_from_slice(binding.as_bytes());
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn receipt_transcript(binding: &ChannelBinding, body: &[u8]) -> Vec<u8> {
+    let mut bytes = b"SV-ENROLL-RECEIPT".to_vec();
     bytes.extend_from_slice(binding.as_bytes());
     bytes.extend_from_slice(body);
     bytes

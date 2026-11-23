@@ -11,6 +11,7 @@ publish = false
 custom-protocol = ["tauri/custom-protocol"]
 dev-windows-write = ["sivault-core/dev-windows-write"]
 dev-wallet-chain = ["dep:siworld-native-wallet-engine", "reqwest/blocking"]
+desktop-e2e = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

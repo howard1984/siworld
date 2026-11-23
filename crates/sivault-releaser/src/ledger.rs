@@ -443,6 +443,29 @@ impl Ledger {
             return Err(PolicyError::InvalidPhase);
         }
         let phase = match action {
+            Action::Revoke { ledger, record } => {
+                if *ledger != self.identity.ledger || *record != self.active.manifest {
+                    return Err(PolicyError::DomainMismatch);
+                }
+                if self.prepared.is_some() {
+                    return Err(PolicyError::InvalidPhase);
+                }
+                self.retired.insert(
+                    (self.active.generation, self.active.incarnation),
+                    Retirement {
+                        record: self.active,
+                        rotation: meta.command,
+                        next_root: Id::default(),
+                        certificate: Id::default(),
+                        fence: Some(digest),
+                        tombstone: Some(digest),
+                        deletion_confirmed: false,
+                    },
+                );
+                self.serving = false;
+                self.pending.clear();
+                AckPhase::DeletionPending
+            }
             Action::Refill {
                 ledger,
                 delta,
@@ -732,6 +755,9 @@ impl<A: DurableAuthority> Releaser<A> {
     }
     pub fn snapshot(&self) -> Option<&Ledger> {
         self.ledger.as_ref()
+    }
+    pub(crate) fn authority(&self) -> &A {
+        &self.authority
     }
     pub fn quarantine(&mut self) {
         self.ledger = None;

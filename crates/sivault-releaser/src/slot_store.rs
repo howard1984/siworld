@@ -55,6 +55,16 @@ pub fn provision<M: MarkerStore>(
     allowance: u64,
     password: &str,
 ) -> Result<Releaser<Journal<M>>> {
+    provision_with_head(path, marker, material, allowance, password).map(|(releaser, _)| releaser)
+}
+
+pub fn provision_with_head<M: MarkerStore>(
+    path: &Path,
+    marker: M,
+    material: &SlotMaterial,
+    allowance: u64,
+    password: &str,
+) -> Result<(Releaser<Journal<M>>, Id)> {
     if allowance == 0 || material.port == 0 {
         return Err(AuthorityError::InvalidEvidence);
     }
@@ -106,7 +116,8 @@ pub fn provision<M: MarkerStore>(
             .and_then(|file| file.sync_all())
             .map_err(|_| AuthorityError::Unavailable)?;
     }
-    recover(journal, scope.slot)
+    let head = journal.protected_head();
+    Ok((recover(journal, scope.slot)?, head))
 }
 
 pub fn open<M: MarkerStore>(
@@ -124,6 +135,19 @@ pub fn open<M: MarkerStore>(
     journal.require_material(digest(&bytes))?;
     let releaser = recover(journal, slot)?;
     Ok((material, releaser))
+}
+
+pub(crate) fn remove_revoked_material(path: &Path) -> Result<()> {
+    match fs::remove_file(path.join(FILE)) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return Err(AuthorityError::Unavailable),
+    }
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| AuthorityError::Unavailable)?;
+    Ok(())
 }
 
 fn recover<M: MarkerStore>(

@@ -15,6 +15,41 @@ use zeroize::{Zeroize, Zeroizing};
 
 type Word = [u8; 32];
 
+/// Portable folder possession key, separate from the verifier's folder input.
+pub struct FolderIdentity {
+    signing: MLDSA65SigningKey,
+    public: MLDSA65VerificationKey,
+}
+
+impl FolderIdentity {
+    pub fn derive(folder_secret: &Secret, safe_id: &[u8; 16]) -> Self {
+        let seed = crypto::derive(
+            folder_secret,
+            safe_id,
+            b"sivault/folder-possession/ML-DSA-65/v1",
+        );
+        let keys = ml_dsa_65::generate_key_pair(*seed);
+        Self {
+            signing: keys.signing_key,
+            public: keys.verification_key,
+        }
+    }
+
+    pub fn signing_key(&self) -> &MLDSA65SigningKey {
+        &self.signing
+    }
+
+    pub fn verification_key(&self) -> &MLDSA65VerificationKey {
+        &self.public
+    }
+}
+
+impl Drop for FolderIdentity {
+    fn drop(&mut self) {
+        self.signing.as_mut_slice().zeroize();
+    }
+}
+
 /// An authenticated channel transcript digest.
 ///
 /// ```compile_fail,E0423

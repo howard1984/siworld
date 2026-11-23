@@ -283,6 +283,14 @@ impl Safe {
         Ok(bytes)
     }
 
+    pub fn has_controlled_registration(path: impl AsRef<Path>) -> Result<bool> {
+        match Directory::open(path.as_ref())?.file(CONTROLLED_REGISTRATION, false) {
+            Ok(_) => Ok(true),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn create_payload(
         path: &Path,
         safe_id: [u8; 16],

@@ -24,6 +24,12 @@ impl OwnerState {
         state.epoch = state.epoch.wrapping_add(1);
         state.exiting |= exiting;
     }
+
+    pub(crate) fn with_identity<T>(&self, action: impl FnOnce(&OwnerIdentity) -> Result<T>) -> Result<T> {
+        let state = self.lifecycle.lock().map_err(|_| unavailable())?;
+        let identity = state.identity.as_ref().filter(|_| !state.exiting).ok_or_else(unavailable)?;
+        action(identity)
+    }
 }
 
 fn unavailable() -> BridgeError {
@@ -37,14 +43,26 @@ pub async fn owner_prepare(app: AppHandle) -> Result<bool> {
         .map_err(|_| unavailable())?
 }
 
+#[tauri::command]
+pub fn owner_identifier(state: tauri::State<'_, OwnerState>) -> Result<String> {
+    state.with_identity(|identity| {
+        use std::fmt::Write;
+        let mut value = String::with_capacity(64);
+        for byte in identity.identifier() {
+            write!(&mut value, "{byte:02x}").expect("string write");
+        }
+        Ok(value)
+    })
+}
+
 impl OwnerState {
     #[cfg(not(any(target_os = "macos", windows)))]
-    fn prepare(&self, _: &AppHandle) -> Result<bool> {
+    pub(crate) fn prepare(&self, _: &AppHandle) -> Result<bool> {
         Err(unavailable())
     }
 
     #[cfg(any(target_os = "macos", windows))]
-    fn prepare(&self, app: &AppHandle) -> Result<bool> {
+    pub(crate) fn prepare(&self, app: &AppHandle) -> Result<bool> {
         use crate::locale as l;
         use std::io::{Read, Write};
 

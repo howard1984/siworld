@@ -160,6 +160,10 @@ pub struct Journal<M> {
 }
 
 impl<M: MarkerStore> Journal<M> {
+    pub(crate) fn protected_head(&self) -> Id {
+        self.checkpoint.head
+    }
+
     /// Provision only after authenticated enrollment and local acceptance.
     /// The caller supplies a freshly generated random instance identifier.
     pub fn provision(

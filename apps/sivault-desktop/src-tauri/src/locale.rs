@@ -1,9 +1,27 @@
 pub const SAFE_CREATE_LOCATION: &str = "Choose location for new safe";
-pub const SAFE_OPEN_LOCATION: &str = "Open standard safe folder";
+pub const SAFE_OPEN_LOCATION: &str = "Open safe folder";
+pub const CONTROLLED_SELECT: &str = "Select an enrolled controlled safe";
+pub const CONTROLLED_MANAGE: &str = "Confirm controlled safe command";
+pub const CONTROLLED_COMMAND_FAILED: &str = "The releaser did not confirm this command.";
+pub const REVOKE_LABEL_MISMATCH: &str = "The entered label does not match the selected safe.";
+pub fn revoke_confirmation(label: &str) -> String {
+    format!("Permanently revoke {label}? This cannot be undone. After the releaser deletes its live share, the safe cannot be recovered through that releaser. This does not recall plaintext or keys already received.")
+}
+pub fn refill_confirmation(current: u64, total: u64) -> String {
+    format!("Increase the total attempt allowance from {current} to {total}? Attempts already used still count.")
+}
 pub const SAFE_IMPORT_LOCATION: &str = "Import files into safe";
 pub const SAFE_EXPORT_LOCATION: &str = "Export unencrypted file";
 #[cfg(any(target_os = "macos", windows))]
 pub const RELEASER_PASSWORD: &str = "Unlock releaser storage";
+#[cfg(any(target_os = "macos", windows))]
+pub const RELEASER_SET_PASSWORD: &str = "Set a separate releaser storage password";
+#[cfg(any(target_os = "macos", windows))]
+pub const APPROVE_ENROLLMENT: &str = "Allow one controlled safe enrollment";
+#[cfg(any(target_os = "macos", windows))]
+pub fn enrollment_approval(owner: &str, allowance: u64) -> String {
+    format!("Owner identifier: {owner}\nAttempt allowance: {allowance}\nVerify the owner identifier independently before allowing one enrollment.")
+}
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const SAFE_SET_PASSWORD: &str = "Set safe password";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -14,7 +32,7 @@ pub const PASSWORD: &str = "Password";
 pub const PASSWORD_CONFIRM: &str = "Confirm password";
 #[cfg(target_os = "macos")]
 pub const CONTINUE: &str = "Continue";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub const CANCEL: &str = "Cancel";
 #[cfg(any(target_os = "macos", windows))]
 pub const WALLET_UNLOCK: &str = "Unlock wallet";

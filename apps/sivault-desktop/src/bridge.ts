@@ -25,6 +25,14 @@ export const setReleaserRunning = (enabled: boolean) =>
   invoke<ReleaserStatus>('releaser_set_running', { enabled });
 export const verifyReleaser = (address: string, identifier: string) =>
   invoke<void>('releaser_verify', { address, identifier });
+export const prepareOwner = async () => await invoke<boolean>('owner_prepare')
+  ? invoke<string>('owner_identifier') : null;
+export const authorizeReleaser = (owner: string, allowance: number) =>
+  invoke<boolean>('releaser_authorize', { owner, allowance });
+export const createControlled = (name: string, address: string, identifier: string, allowance: number) =>
+  invoke<SafeInfo | null>('safe_create_controlled', { name, address, identifier, allowance });
+export const manageControlled = (current: number, additional: number, revokeLabel: string | null) =>
+  invoke<boolean>('safe_manage_controlled', { current, additional, revokeLabel });
 
 export interface SafeBridge {
   create(name: string): Promise<SafeInfo | null>;

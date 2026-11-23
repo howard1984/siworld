@@ -2,7 +2,7 @@ import { en } from './locale/en';
 import { WalletNodeStatus, WalletView } from './WalletView';
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, Check, ChevronRight, Download, FileText, Folder, FolderOpen, FolderPlus, HardDrive, Info, KeyRound, LockKeyhole, Plus, Search, ShieldCheck, Upload, Wallet, X } from 'lucide-react';
-import { demoAvailable, message, native, nativeBridge, releaserStatus, setReleaserRunning, verifyReleaser, type Entry, type ReleaserStatus, type SafeBridge, type SafeInfo } from './bridge';
+import { authorizeReleaser, createControlled, demoAvailable, manageControlled, message, native, nativeBridge, prepareOwner, releaserStatus, setReleaserRunning, verifyReleaser, type Entry, type ReleaserStatus, type SafeBridge, type SafeInfo } from './bridge';
 
 const brandMark = Object.values(import.meta.glob<string>('./branding.local/siworld-icon.svg', {
   eager: true,
@@ -29,6 +29,8 @@ export default function App() {
   const [bridge, setBridge] = useState<SafeBridge | null>(native ? nativeBridge : null);
   const [section, setSection] = useState<'vault' | 'wallet' | 'releaser'>('vault');
   const [localReleaser, setLocalReleaser] = useState<ReleaserStatus | null>(null);
+  const [ownerId, setOwnerId] = useState<string | null>(null);
+  const [controlled, setControlled] = useState(false);
   const [demo, setDemo] = useState(false);
   const [recent, setRecent] = useState<Recent[]>([]);
   const [safe, setSafe] = useState<SafeInfo | null>(null);
@@ -109,7 +111,7 @@ export default function App() {
     });
   }
 
-  function showModal(next: Modal) { setError(''); setNotice(''); setModal(next); }
+  function showModal(next: Modal) { setError(''); setNotice(''); setControlled(false); setModal(next); }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -126,7 +128,9 @@ export default function App() {
         if (exported) setNotice(demo ? en.sampleExported : en.exported);
       } else {
         if (safe) await lock();
-        const info = modal === 'create' ? await bridge.create(name)
+        const info = modal === 'create' ? controlled && native
+          ? await createControlled(name, String(form.get('address') ?? ''), String(form.get('identifier') ?? ''), Number(form.get('allowance')))
+          : await bridge.create(name)
           : modal === 'unlock' && chosenId ? await bridge.unlock(chosenId, readOnly)
           : await bridge.open(readOnly);
         if (info) await accept(info);
@@ -173,6 +177,40 @@ export default function App() {
       {localReleaser?.address && <p>{en.releaserAddress}: <code>{localReleaser.address}</code></p>}
       {localReleaser?.identifier && <p>{en.releaserIdentifier}: <code className="releaser-identifier">{localReleaser.identifier}</code></p>}
       {localReleaser?.address && <p>{localReleaser.enrolled ? en.releaserServing : en.noReleaserEnrollment}</p>}
+      {localReleaser?.address && !localReleaser.enrolled && <form className="releaser-form" onSubmit={(event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        void run(async () => {
+          if (await authorizeReleaser(String(form.get('owner') ?? ''), Number(form.get('allowance')))) setNotice(en.enrollmentAuthorized);
+        });
+      }}>
+        <label className="field">{en.ownerIdentifier}<input name="owner" required minLength={64} maxLength={64} autoComplete="off" spellCheck={false} /></label>
+        <label className="field">{en.attemptAllowance}<input name="allowance" type="number" required min={1} max={1000} defaultValue={2} /></label>
+        <button type="submit" className="button" disabled={busy}>{en.allowEnrollment}</button>
+      </form>}
+      <button type="button" className="button" disabled={busy} onClick={() => run(async () => setOwnerId(await prepareOwner()))}>{en.showOwnerIdentifier}</button>
+      {ownerId && <p>{en.ownerIdentifier}: <code className="releaser-identifier">{ownerId}</code></p>}
+      <form className="releaser-form" onSubmit={(event) => {
+        event.preventDefault();
+        const values = new FormData(event.currentTarget);
+        void run(async () => {
+          if (await manageControlled(Number(values.get('current')), Number(values.get('additional')), null)) setNotice(en.refillConfirmed);
+        });
+      }}>
+        <label className="field">{en.currentAllowance}<input name="current" type="number" required min={1} defaultValue={2} /></label>
+        <label className="field">{en.additionalAllowance}<input name="additional" type="number" required min={1} defaultValue={2} /></label>
+        <button type="submit" className="button" disabled={busy}>{en.refillAllowance}</button>
+      </form>
+      <form className="releaser-form" onSubmit={(event) => {
+        event.preventDefault();
+        const values = new FormData(event.currentTarget);
+        void run(async () => {
+          if (await manageControlled(0, 0, String(values.get('label') ?? ''))) setNotice(en.revocationConfirmed);
+        });
+      }}>
+        <label className="field">{en.safeName}<input name="label" required maxLength={120} autoComplete="off" /></label>
+        <button type="submit" className="button" disabled={busy}>{en.revokeSafe}</button>
+      </form>
       <form className="releaser-form" onSubmit={(event) => {
         event.preventDefault();
         const form = new FormData(event.currentTarget);
@@ -225,7 +263,15 @@ export default function App() {
       </main>
     </div>}
     <dialog ref={dialogRef} className="modal" onCancel={(event) => { if (busy) event.preventDefault(); else setModal(null); }} onClose={() => { if (!busy) setModal(null); }} aria-labelledby="modal-title"><form onSubmit={submit} key={modal}>
-      <div className="modal-heading"><h2 id="modal-title">{modal === 'create' ? en.createStandard : modal === 'folder' ? en.newFolder : modal === 'export' ? en.exportFile : en.openStandard}</h2><IconButton label={en.closeDialog} disabled={busy} onClick={() => setModal(null)}><X size={18} /></IconButton></div>
+      <div className="modal-heading"><h2 id="modal-title">{modal === 'create' ? (native ? en.createSafe : en.createStandard) : modal === 'folder' ? en.newFolder : modal === 'export' ? en.exportFile : (native ? en.openSafe : en.openStandard)}</h2><IconButton label={en.closeDialog} disabled={busy} onClick={() => setModal(null)}><X size={18} /></IconButton></div>
+      {modal === 'create' && native && <label className="field">{en.safeType}<select value={controlled ? 'controlled' : 'offline'} onChange={(event) => setControlled(event.target.value === 'controlled')}>
+        <option value="offline">{en.offlineSafe}</option><option value="controlled">{en.controlledSafe}</option>
+      </select></label>}
+      {modal === 'create' && controlled && <div className="controlled-fields">
+        <label className="field">{en.releaserAddress}<input name="address" required maxLength={21} autoComplete="off" /></label>
+        <label className="field">{en.releaserIdentifier}<input name="identifier" required minLength={64} maxLength={64} autoComplete="off" spellCheck={false} /></label>
+        <label className="field">{en.attemptAllowance}<input name="allowance" type="number" required min={1} max={1000} defaultValue={2} /></label>
+      </div>}
       {demo && <p className="demo-note">{en.demoNote}</p>}
       {(modal === 'create' || modal === 'folder') && <label className="field">{modal === 'folder' ? en.folderName : en.safeName}<input name="name" required autoFocus maxLength={120} pattern={'[^/\\\\]+'} autoComplete="off" placeholder={modal === 'folder' ? en.untitledFolder : en.personalArchive} /></label>}
       {modal === 'unlock' && <p className="unlock-name"><HardDrive size={17} />{chosen?.name}</p>}

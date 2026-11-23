@@ -65,6 +65,7 @@ pub enum Kind {
     Delete = 12,
     RestoreService = 13,
     CommandAck = 14,
+    Revoke = 15,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +138,10 @@ pub struct OwnerMeta {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
+    Revoke {
+        ledger: Id,
+        record: Id,
+    },
     Refill {
         ledger: Id,
         delta: u64,
@@ -238,6 +243,7 @@ impl Body {
 impl Action {
     pub fn kind(&self) -> Kind {
         match self {
+            Self::Revoke { .. } => Kind::Revoke,
             Self::Refill { .. } => Kind::Refill,
             Self::Prepare { .. } => Kind::Prepare,
             Self::Commit { .. } => Kind::Commit,
@@ -395,6 +401,7 @@ impl Body {
                 w.ids(&[meta.command, meta.predecessor, meta.manifest]);
                 w.u64(meta.expiry);
                 match action {
+                    Action::Revoke { ledger, record } => w.ids(&[*ledger, *record]),
                     Action::Refill {
                         ledger,
                         delta,
@@ -550,6 +557,7 @@ impl Body {
             | Kind::Commit
             | Kind::Retire
             | Kind::Delete
+            | Kind::Revoke
             | Kind::RestoreService => {
                 let meta = OwnerMeta {
                     owner_key: r.id()?,
@@ -560,6 +568,10 @@ impl Body {
                     expiry: r.u64()?,
                 };
                 let action = match kind {
+                    Kind::Revoke => Action::Revoke {
+                        ledger: r.id()?,
+                        record: r.id()?,
+                    },
                     Kind::Refill => Action::Refill {
                         ledger: r.id()?,
                         delta: r.u64()?,
@@ -718,6 +730,7 @@ impl<'a> Reader<'a> {
             12 => Ok(Kind::Delete),
             13 => Ok(Kind::RestoreService),
             14 => Ok(Kind::CommandAck),
+            15 => Ok(Kind::Revoke),
             _ => Err(CodecError::UnknownTag),
         }
     }

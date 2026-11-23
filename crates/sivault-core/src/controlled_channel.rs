@@ -25,6 +25,7 @@ const RECORD_OVERHEAD: usize = 26;
 const LIFETIME: Duration = Duration::from_secs(120);
 const PIN_MAGIC: &[u8; 8] = b"SVPIN001";
 const KEM_KEY_LEN: usize = 1184;
+const RECEIPT_CONTEXT: &[u8] = b"sivault/releaser-receipt/v1";
 
 struct KemPrivate(MlKem768PrivateKey);
 impl Drop for KemPrivate {
@@ -115,6 +116,16 @@ impl ReleaserIdentity {
         self.pins.clone()
     }
 
+    pub fn sign_receipt(&self, transcript: &[u8]) -> Result<MLDSA65Signature> {
+        ml_dsa_65::sign(
+            &self.signing,
+            transcript,
+            RECEIPT_CONTEXT,
+            crypto::random()?,
+        )
+        .map_err(|_| Error::Authentication)
+    }
+
     pub fn accept(&self, deployment: &Word, client: &[u8]) -> Result<(Vec<u8>, Channel)> {
         if client.len() != CLIENT_LEN {
             return Err(Error::InvalidFormat);
@@ -172,6 +183,15 @@ impl ReleaserIdentity {
             ),
         ))
     }
+}
+
+pub fn verify_receipt(
+    key: &MLDSA65VerificationKey,
+    transcript: &[u8],
+    signature: &MLDSA65Signature,
+) -> Result<()> {
+    ml_dsa_65::verify(key, transcript, RECEIPT_CONTEXT, signature)
+        .map_err(|_| Error::Authentication)
 }
 
 impl Drop for ReleaserIdentity {

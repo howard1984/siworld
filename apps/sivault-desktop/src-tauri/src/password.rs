@@ -13,6 +13,18 @@ pub fn prompt_releaser(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
     })
 }
 
+#[cfg(target_os = "macos")]
+pub fn set_releaser_storage_password(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
+    on_main(app, || {
+        native_secret(crate::locale::RELEASER_SET_PASSWORD, crate::locale::PASSWORD, true)
+    })
+}
+
+#[cfg(windows)]
+pub fn set_releaser_storage_password(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
+    windows_prompt(app, Zeroizing::new(crate::locale::RELEASER_SET_PASSWORD.into()), true)
+}
+
 #[cfg(windows)]
 pub fn prompt_releaser(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
     windows_prompt(
