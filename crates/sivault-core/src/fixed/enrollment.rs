@@ -14,7 +14,7 @@ use std::{
     io::{Read, Write},
     path::Path,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 pub struct RootChain {
     pub active: Root,
@@ -128,7 +128,10 @@ pub struct ReadOnlySafe {
 
 impl ReadOnlySafe {
     pub fn open(path: &Path, password: &str) -> Result<Self> {
-        let mut media = Segments::open(path)?;
+        Self::authenticate(Segments::open(path)?, password).map(|(view, _)| view)
+    }
+
+    fn authenticate(mut media: Segments, password: &str) -> Result<(Self, Wrap)> {
         let mut selected = None;
         for number in 0..2 {
             match read_wrap(&mut media, number, password) {
@@ -144,13 +147,14 @@ impl ReadOnlySafe {
         }
         let (slot, wrap, chain) = selected.ok_or(Error::Authentication)?;
         let entries = index::decode(media.geometry(), &chain.index)?;
-        Ok(Self {
+        let view = Self {
             media,
             entries,
-            seed: wrap.local_seed,
+            seed: wrap.local_seed.clone(),
             safe_id: wrap.safe_id,
             slot,
-        })
+        };
+        Ok((view, wrap))
     }
 
     pub fn entries(&self) -> impl Iterator<Item = ([u8; 16], [u8; 16], &str, bool, u64)> {
@@ -166,26 +170,192 @@ impl ReadOnlySafe {
     }
 
     pub fn read_file(&mut self, id: [u8; 16], mut out: impl Write) -> Result<()> {
-        let entry = self
-            .entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .ok_or(Error::InvalidName)?;
-        let file = entry.file.as_ref().ok_or(Error::InvalidName)?;
-        let revision = FileRevision::new(
-            self.media.geometry(),
+        read_file(
+            &mut self.media,
             self.safe_id,
             self.slot,
-            entry.id,
-            file.revision,
-            entry.size,
-        )?;
-        let mut record = vec![0; super::UNIT_BYTES as usize];
-        for (ordinal, &unit) in file.units.iter().enumerate() {
-            self.media.read(unit, 0, &mut record)?;
-            let bytes = revision.open(&self.seed, unit, ordinal as u32, &record)?;
-            out.write_all(&bytes)?;
+            &self.seed,
+            &self.entries,
+            id,
+            &mut out,
+        )
+    }
+}
+
+fn read_file(
+    media: &mut Segments,
+    safe_id: [u8; 16],
+    slot: u8,
+    seed: &[u8; 32],
+    entries: &[IndexEntry],
+    id: [u8; 16],
+    mut out: impl Write,
+) -> Result<()> {
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .ok_or(Error::InvalidName)?;
+    let file = entry.file.as_ref().ok_or(Error::InvalidName)?;
+    let revision = FileRevision::new(
+        media.geometry(),
+        safe_id,
+        slot,
+        entry.id,
+        file.revision,
+        entry.size,
+    )?;
+    let mut record = vec![0; super::UNIT_BYTES as usize];
+    for (ordinal, &unit) in file.units.iter().enumerate() {
+        media.read(unit, 0, &mut record)?;
+        let bytes = revision.open(seed, unit, ordinal as u32, &record)?;
+        out.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+pub enum FixedSafe {
+    ReadOnly(ReadOnlySafe),
+    Owner(OwnerSafe),
+}
+
+pub struct OwnerSafe {
+    media: SegmentWriter,
+    primary: u8,
+    wrap: Wrap,
+}
+
+pub struct FixedEntry {
+    pub id: [u8; 16],
+    pub parent: [u8; 16],
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+impl FixedSafe {
+    pub fn open(path: &Path, password: &str, read_only: bool) -> Result<Self> {
+        let (view, wrap) = ReadOnlySafe::authenticate(Segments::open(path)?, password)?;
+        if read_only || wrap.write_slot.is_none() {
+            return Ok(Self::ReadOnly(view));
         }
+        let primary = view.slot;
+        drop(view);
+        let mut media = SegmentWriter::open(path)?;
+        let (_, wrap, _, _) = read_wrap(media.segments(), primary, password)?;
+        if wrap.write_slot != Some(primary) {
+            return Err(Error::Authentication);
+        }
+        Ok(Self::Owner(OwnerSafe {
+            media,
+            primary,
+            wrap,
+        }))
+    }
+
+    pub fn create(
+        path: &Path,
+        primary_password: &str,
+        decoy_password: Option<&str>,
+    ) -> Result<Self> {
+        let primary = crypto::random::<1>()?[0] & 1;
+        let geometry = super::Geometry::new(1)?;
+        let wrap = Wrap {
+            safe_id: crypto::random()?,
+            epoch: 1,
+            local_seed: Zeroizing::new(crypto::random()?),
+            write_slot: Some(primary),
+            management: None,
+        };
+        let slot = Slot::new(geometry, wrap.safe_id, primary)?;
+        let seed = slot.metadata_seed(&wrap.local_seed);
+        let page = slot.metadata_range().start;
+        let (root, records) = slot.seal_index(&seed, 1, 1, &[page], &[0; 8])?;
+        let sealed_wrap = wrap.seal(geometry, primary, 0, primary_password)?;
+        if let Some(password) = decoy_password
+            && same_password(primary_password, password)?
+        {
+            return Err(Error::InvalidPassword);
+        }
+        let sealed_root = slot.seal_root(&seed, 0, &root)?;
+        let mut media = SegmentWriter::create(path)?;
+        media.write(page, 0, &records[0])?;
+        media.write(u32::from(primary), wrap_offset(0), &sealed_wrap)?;
+        media.write(u32::from(primary), root_offset(0), &sealed_root)?;
+        media.barrier()?;
+        let wrap = if let Some(password) = decoy_password {
+            enroll_empty(&mut media, primary, primary_password, password)?;
+            read_wrap(media.segments(), primary, primary_password)?.1
+        } else {
+            wrap
+        };
+        Ok(Self::Owner(OwnerSafe {
+            media,
+            primary,
+            wrap,
+        }))
+    }
+
+    pub fn read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly(_))
+    }
+
+    pub fn can_manage_decoy(&self) -> bool {
+        matches!(self, Self::Owner(owner) if owner.wrap.management.is_some())
+    }
+
+    pub fn entries(&mut self) -> Result<Vec<FixedEntry>> {
+        let entries;
+        let source = match self {
+            Self::ReadOnly(view) => &view.entries,
+            Self::Owner(owner) => {
+                entries = owner.entries()?;
+                &entries
+            }
+        };
+        Ok(source
+            .iter()
+            .map(|entry| FixedEntry {
+                id: entry.id,
+                parent: entry.parent,
+                name: entry.name.clone(),
+                is_dir: entry.file.is_none(),
+                size: entry.size,
+            })
+            .collect())
+    }
+
+    pub fn read_file(&mut self, id: [u8; 16], out: impl Write) -> Result<()> {
+        match self {
+            Self::ReadOnly(view) => view.read_file(id, out),
+            Self::Owner(owner) => {
+                let entries = owner.entries()?;
+                read_file(
+                    owner.media.segments(),
+                    owner.wrap.safe_id,
+                    owner.primary,
+                    &owner.wrap.local_seed,
+                    &entries,
+                    id,
+                    out,
+                )
+            }
+        }
+    }
+
+    pub fn export_file(
+        &mut self,
+        id: [u8; 16],
+        safe_path: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        self.read_file(id, std::io::sink())?;
+        let media = match self {
+            Self::ReadOnly(view) => &view.media,
+            Self::Owner(owner) => owner.media.segments(),
+        };
+        let mut output = media.export(safe_path, destination)?;
+        self.read_file(id, &mut output.file)?;
+        output.file.sync_all()?;
         Ok(())
     }
 }
@@ -198,19 +368,86 @@ pub fn put_decoy_file(
     password: &str,
     name: &str,
     size: u64,
+    input: impl Read,
+) -> Result<()> {
+    let (_, wrap, _, real) = read_wrap(media.segments(), primary, password)?;
+    put_file(media, primary, &wrap, real, true, name, size, input)
+}
+
+impl OwnerSafe {
+    fn entries(&mut self) -> Result<Vec<IndexEntry>> {
+        let geometry = self.media.segments().geometry();
+        let slot = Slot::new(geometry, self.wrap.safe_id, self.primary)?;
+        let key = slot.metadata_seed(&self.wrap.local_seed);
+        let chain = read_chain(self.media.segments(), self.primary, slot, &key)?;
+        index::decode(geometry, &chain.index)
+    }
+
+    pub fn put_file(&mut self, decoy: bool, name: &str, size: u64, input: impl Read) -> Result<()> {
+        let slot = Slot::new(
+            self.media.segments().geometry(),
+            self.wrap.safe_id,
+            self.primary,
+        )?;
+        let key = slot.metadata_seed(&self.wrap.local_seed);
+        let chain = read_chain(self.media.segments(), self.primary, slot, &key)?;
+        put_file(
+            &mut self.media,
+            self.primary,
+            &self.wrap,
+            chain,
+            decoy,
+            name,
+            size,
+            input,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_file(
+    media: &mut SegmentWriter,
+    primary: u8,
+    wrap: &Wrap,
+    real: RootChain,
+    decoy: bool,
+    name: &str,
+    size: u64,
     mut input: impl Read,
 ) -> Result<()> {
     crate::standard::validate_name(name)?;
-    if primary != 0 {
-        return Err(Error::ReadOnly);
-    }
     let geometry = media.segments().geometry();
-    let (_, wrap, _, real) = read_wrap(media.segments(), primary, password)?;
-    let grant = wrap.management.ok_or(Error::ReadOnly)?;
-    let secondary = 1 - primary;
-    let slot = Slot::new(geometry, wrap.safe_id, secondary)?;
-    let peer = read_chain(media.segments(), secondary, slot, &grant.peer_metadata_seed)?;
-    let mut entries = index::decode(geometry, &peer.index)?;
+    let number = if decoy { 1 - primary } else { primary };
+    let slot = Slot::new(geometry, wrap.safe_id, number)?;
+    let grant = wrap.management.as_ref();
+    let other = if let Some(grant) = grant {
+        let other_slot = Slot::new(geometry, wrap.safe_id, 1 - primary)?;
+        Some(read_chain(
+            media.segments(),
+            1 - primary,
+            other_slot,
+            &grant.peer_metadata_seed,
+        )?)
+    } else {
+        None
+    };
+    let (chain, peer, metadata_seed, payload_seed) = if decoy {
+        let grant = grant.ok_or(Error::ReadOnly)?;
+        (
+            other.as_ref().ok_or(Error::ReadOnly)?,
+            Some(&real),
+            grant.peer_metadata_seed.clone(),
+            &grant.peer_local_seed,
+        )
+    } else {
+        (
+            &real,
+            other.as_ref(),
+            slot.metadata_seed(&wrap.local_seed),
+            &wrap.local_seed,
+        )
+    };
+    let mut entries = index::decode(geometry, &chain.index)?;
     let existing = entries
         .iter()
         .position(|e| e.parent == [0; 16] && e.name == name);
@@ -220,19 +457,14 @@ pub fn put_decoy_file(
         None => crypto::random()?,
     };
     let revision_id = crypto::random()?;
-    let revision = FileRevision::new(
-        geometry,
-        wrap.safe_id,
-        secondary,
-        entry_id,
-        revision_id,
-        size,
-    )?;
+    let revision = FileRevision::new(geometry, wrap.safe_id, number, entry_id, revision_id, size)?;
     let count = usize::try_from(size.div_ceil(PAYLOAD_BYTES as u64)).map_err(|_| Error::Limit)?;
     let allocated = Access::OwnerWrite.plan(
         geometry,
-        peer.references(),
-        PeerReferences::Authenticated(real.references()),
+        chain.references(),
+        peer.map_or(PeerReferences::NotEnrolled, |peer| {
+            PeerReferences::Authenticated(peer.references())
+        }),
         count,
     )?;
     let entry = IndexEntry {
@@ -255,20 +487,20 @@ pub fn put_decoy_file(
     let page_count = stream.len().div_ceil(PAYLOAD_BYTES - 12);
     let pages: Vec<_> = slot
         .metadata_range()
-        .filter(|unit| !peer.protected_pages.contains(unit))
+        .filter(|unit| !chain.protected_pages.contains(unit))
         .take(page_count)
         .collect();
     if pages.len() != page_count {
         return Err(Error::Limit);
     }
     let (root, metadata) = slot.seal_index(
-        &grant.peer_metadata_seed,
-        peer.active.sequence + 1,
-        peer.active.epoch,
+        &metadata_seed,
+        chain.active.sequence.checked_add(1).ok_or(Error::Limit)?,
+        chain.active.epoch,
         &pages,
         &stream,
     )?;
-    let next_root = slot.seal_root(&grant.peer_metadata_seed, 1 - peer.active_lane, &root)?;
+    let next_root = slot.seal_root(&metadata_seed, 1 - chain.active_lane, &root)?;
     let metadata: Vec<_> = pages
         .into_iter()
         .zip(&metadata)
@@ -283,12 +515,7 @@ pub fn put_decoy_file(
     for (ordinal, unit) in allocated.into_iter().enumerate() {
         let used = remaining.min(PAYLOAD_BYTES as u64) as usize;
         input.read_exact(&mut buffer[..used])?;
-        let record = revision.seal(
-            &grant.peer_local_seed,
-            unit,
-            ordinal as u32,
-            &buffer[..used],
-        )?;
+        let record = revision.seal(payload_seed, unit, ordinal as u32, &buffer[..used])?;
         media.write(unit, 0, &record)?;
         remaining -= used as u64;
     }
@@ -297,8 +524,8 @@ pub fn put_decoy_file(
     }
     DecoyUpdate {
         geometry,
-        decoy_slot: secondary,
-        live_root_lane: peer.active_lane,
+        decoy_slot: number,
+        live_root_lane: chain.active_lane,
         data: &[],
         metadata: &metadata,
         next_root: &next_root,
@@ -308,30 +535,29 @@ pub fn put_decoy_file(
 
 /// The caller must authenticate primary management authority before calling.
 /// An uncommitted secondary slot can be replaced on retry; a committed grant cannot.
+fn same_password(primary: &str, secondary: &str) -> Result<bool> {
+    use subtle::ConstantTimeEq;
+    let a = crypto::password_bytes(primary)?;
+    let b = crypto::password_bytes(secondary)?;
+    Ok(bool::from(a.as_bytes().ct_eq(b.as_bytes())))
+}
+
 pub fn enroll_empty(
     media: &mut SegmentWriter,
     primary: u8,
     primary_password: &str,
     secondary_password: &str,
 ) -> Result<()> {
-    use subtle::ConstantTimeEq;
-    if primary != 0 {
-        return Err(Error::ReadOnly);
-    }
-    let mut normalized_primary = crypto::password_bytes(primary_password)?;
-    let mut normalized_secondary = crypto::password_bytes(secondary_password)?;
-    let same = normalized_primary
-        .as_bytes()
-        .ct_eq(normalized_secondary.as_bytes());
-    normalized_primary.zeroize();
-    normalized_secondary.zeroize();
-    if bool::from(same) {
+    if same_password(primary_password, secondary_password)? {
         return Err(Error::InvalidPassword);
     }
 
     let geometry = media.segments().geometry();
     let (wrap_lane, mut wrap, slot, chain) =
         read_wrap(media.segments(), primary, primary_password)?;
+    if wrap.write_slot != Some(primary) {
+        return Err(Error::ReadOnly);
+    }
     if wrap.management.is_some() {
         return Err(Error::InvalidFormat);
     }
@@ -341,6 +567,7 @@ pub fn enroll_empty(
         safe_id: wrap.safe_id,
         epoch: 1,
         local_seed: Zeroizing::new(crypto::random()?),
+        write_slot: None,
         management: None,
     };
     let peer_key = peer.metadata_seed(&secondary_wrap.local_seed);
@@ -413,6 +640,7 @@ mod tests {
             safe_id: [1; 16],
             epoch: 1,
             local_seed: Zeroizing::new([2; 32]),
+            write_slot: Some(0),
             management: None,
         };
         let slot = Slot::new(geometry, wrap.safe_id, 0).unwrap();

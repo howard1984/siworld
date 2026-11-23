@@ -47,7 +47,19 @@ pub(crate) struct Directory {
 }
 
 impl Directory {
+    pub(crate) fn identity(&self) -> Result<same_file::Handle> {
+        Ok(same_file::Handle::from_file(self.handle.try_clone()?)?)
+    }
+
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        Self::open_access(path, false)
+    }
+
+    pub(crate) fn open_export_parent(path: &Path) -> Result<Self> {
+        Self::open_access(path, true)
+    }
+
+    fn open_access(path: &Path, _pin: bool) -> Result<Self> {
         if !fs::symlink_metadata(path)?.is_dir() {
             return Err(Error::InvalidName);
         }
@@ -66,10 +78,13 @@ impl Directory {
         #[cfg(windows)]
         let handle = {
             use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-            let f = OpenOptions::new()
-                .read(true)
-                .custom_flags(0x02200000)
-                .open(path)?;
+            let mut options = OpenOptions::new();
+            options.read(true).custom_flags(0x02200000);
+            if _pin {
+                // Keep the checked path from being redirected by a directory rename.
+                options.share_mode(0x00000003);
+            }
+            let f = options.open(path)?;
             if f.metadata()?.file_attributes() & 0x400 != 0 {
                 return Err(Error::InvalidName);
             }
@@ -199,7 +214,7 @@ impl Directory {
         self.sync()
     }
 
-    fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         #[cfg(unix)]
         self.handle.sync_all()?;
         #[cfg(windows)]

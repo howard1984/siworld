@@ -22,7 +22,12 @@ async fn blocking<T: Send + 'static>(
 }
 
 #[tauri::command]
-pub async fn safe_create(app: AppHandle, name: String) -> Result<Option<SafeInfo>> {
+pub async fn safe_create(
+    app: AppHandle,
+    name: String,
+    fixed: Option<bool>,
+    decoy: Option<bool>,
+) -> Result<Option<SafeInfo>> {
     blocking(app, move |app, state| {
         if name.trim().is_empty()
             || name == "."
@@ -46,9 +51,48 @@ pub async fn safe_create(app: AppHandle, name: String) -> Result<Option<SafeInfo
         let Some(password) = crate::password::prompt(app, true)? else {
             return Ok(None);
         };
-        state
-            .create(&path.join(format!("{name}.sivault")), &name, &password)
-            .map(Some)
+        let path = path.join(format!("{name}.sivault"));
+        if fixed == Some(true) {
+            let secondary = if decoy == Some(true) {
+                let Some(secondary) = crate::password::prompt_secondary(app)? else {
+                    return Ok(None);
+                };
+                Some(secondary)
+            } else {
+                None
+            };
+            state
+                .create_fixed(
+                    &path,
+                    &name,
+                    &password,
+                    secondary.as_ref().map(|password| password.as_str()),
+                )
+                .map(Some)
+        } else {
+            state.create(&path, &name, &password).map(Some)
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn safe_update_decoy(app: AppHandle, session_id: String) -> Result<bool> {
+    blocking(app, move |app, state| {
+        state.check_decoy_management(&session_id)?;
+        let Some(file) = app
+            .dialog()
+            .file()
+            .set_title(crate::locale::SAFE_DECOY_IMPORT)
+            .blocking_pick_file()
+        else {
+            return Ok(false);
+        };
+        let path = file
+            .into_path()
+            .map_err(|_| BridgeError::new("INVALID_PATH", "Choose a local file."))?;
+        state.update_decoy(&session_id, &path)?;
+        Ok(true)
     })
     .await
 }
@@ -62,8 +106,12 @@ pub async fn safe_create_controlled(
     allowance: u64,
 ) -> Result<Option<SafeInfo>> {
     blocking(app, move |app, state| {
-        if name.trim().is_empty() || name == "." || name == ".."
-            || name.contains(['/', '\\']) || name.len() > 120 {
+        if name.trim().is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\\'])
+            || name.len() > 120
+        {
             return Err(BridgeError::new("INVALID_NAME", "Enter a valid safe name."));
         }
         let peer = crate::releaser::LocalPeer::parse(&address, &identifier)?;
@@ -71,17 +119,27 @@ pub async fn safe_create_controlled(
         if !owner.prepare(app)? {
             return Ok(None);
         }
-        let Some(directory) = app.dialog().file().set_title(crate::locale::SAFE_CREATE_LOCATION)
-            .blocking_pick_folder() else { return Ok(None) };
-        let directory = directory.into_path()
+        let Some(directory) = app
+            .dialog()
+            .file()
+            .set_title(crate::locale::SAFE_CREATE_LOCATION)
+            .blocking_pick_folder()
+        else {
+            return Ok(None);
+        };
+        let directory = directory
+            .into_path()
             .map_err(|_| BridgeError::new("INVALID_PATH", "Choose a local file."))?;
-        let Some(password) = crate::password::prompt(app, true)? else { return Ok(None) };
+        let Some(password) = crate::password::prompt(app, true)? else {
+            return Ok(None);
+        };
         let path = directory.join(format!("{name}.sivault"));
         let safe = owner.with_identity(|identity| {
             crate::controlled::create(&path, &password, &peer, allowance, identity)
         })?;
         Ok(Some(state.activate(&path, &name, safe, false)))
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -96,29 +154,58 @@ pub async fn safe_manage_controlled(
 
     blocking(app, move |app, _| {
         let owner = app.state::<crate::owner::OwnerState>();
-        let Some(folder) = app.dialog().file().set_title(crate::locale::CONTROLLED_SELECT)
-            .blocking_pick_folder() else { return Ok(false) };
-        let path = folder.into_path().map_err(|_| {
-            BridgeError::new("INVALID_PATH", "Choose a local safe file.")
-        })?;
+        let Some(folder) = app
+            .dialog()
+            .file()
+            .set_title(crate::locale::CONTROLLED_SELECT)
+            .blocking_pick_folder()
+        else {
+            return Ok(false);
+        };
+        let path = folder
+            .into_path()
+            .map_err(|_| BridgeError::new("INVALID_PATH", "Choose a local safe file."))?;
         let (change, confirm) = if let Some(label) = revoke_label {
-            if label.is_empty() || path.file_stem().and_then(|s| s.to_str()) != Some(label.as_str()) {
-                return Err(BridgeError::new("REVOKE_LABEL_MISMATCH", crate::locale::REVOKE_LABEL_MISMATCH));
+            if label.is_empty() || path.file_stem().and_then(|s| s.to_str()) != Some(label.as_str())
+            {
+                return Err(BridgeError::new(
+                    "REVOKE_LABEL_MISMATCH",
+                    crate::locale::REVOKE_LABEL_MISMATCH,
+                ));
             }
             (Change::Revoke, crate::locale::revoke_confirmation(&label))
         } else {
-            let total = current.checked_add(additional).filter(|_| additional > 0).ok_or_else(|| {
-                BridgeError::new("CONTROLLED_COMMAND_FAILED", crate::locale::CONTROLLED_COMMAND_FAILED)
-            })?;
-            (Change::Refill { current, additional }, crate::locale::refill_confirmation(current, total))
+            let total = current
+                .checked_add(additional)
+                .filter(|_| additional > 0)
+                .ok_or_else(|| {
+                    BridgeError::new(
+                        "CONTROLLED_COMMAND_FAILED",
+                        crate::locale::CONTROLLED_COMMAND_FAILED,
+                    )
+                })?;
+            (
+                Change::Refill {
+                    current,
+                    additional,
+                },
+                crate::locale::refill_confirmation(current, total),
+            )
         };
-        if !app.dialog().message(confirm).title(crate::locale::CONTROLLED_MANAGE)
-            .buttons(MessageDialogButtons::OkCancel).blocking_show() || !owner.prepare(app)? {
+        if !app
+            .dialog()
+            .message(confirm)
+            .title(crate::locale::CONTROLLED_MANAGE)
+            .buttons(MessageDialogButtons::OkCancel)
+            .blocking_show()
+            || !owner.prepare(app)?
+        {
             return Ok(false);
         }
         owner.with_identity(|owner| crate::controlled::manage(&path, owner, change))?;
         Ok(true)
-    }).await
+    })
+    .await
 }
 
 #[tauri::command]

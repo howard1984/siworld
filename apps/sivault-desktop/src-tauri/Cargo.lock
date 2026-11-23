@@ -4638,6 +4638,7 @@ dependencies = [
  "libcrux-ml-kem",
  "precis-profiles",
  "rustix",
+ "same-file",
  "serde",
  "sha2 0.10.9",
  "subtle",

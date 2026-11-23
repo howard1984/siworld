@@ -14,6 +14,8 @@ export type SafeInfo = {
   name: string;
   sessionId: string;
   readOnly: boolean;
+  fixed?: boolean;
+  canManageDecoy?: boolean;
 };
 
 export const native = isTauri();
@@ -37,6 +39,8 @@ export const authorizeReleaser = (owner: string, allowance: number) =>
   invoke<boolean>('releaser_authorize', { owner, allowance });
 export const createControlled = (name: string, address: string, identifier: string, allowance: number) =>
   invoke<SafeInfo | null>('safe_create_controlled', { name, address, identifier, allowance });
+export const createFixed = (name: string, decoy: boolean) => invoke<SafeInfo | null>('safe_create', { name, fixed: true, decoy });
+export const updateDecoy = (sessionId: string) => invoke<boolean>('safe_update_decoy', { sessionId });
 export const manageControlled = (current: number, additional: number, revokeLabel: string | null) =>
   invoke<boolean>('safe_manage_controlled', { current, additional, revokeLabel });
 

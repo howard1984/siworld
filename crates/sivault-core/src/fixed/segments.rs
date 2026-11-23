@@ -13,6 +13,12 @@ const SEGMENT_BYTES: u64 = UNIT_BYTES as u64 * UNITS_PER_SEGMENT as u64;
 pub struct Segments {
     geometry: Geometry,
     files: Vec<File>,
+    directory: Directory,
+}
+
+pub(super) struct ExportFile {
+    pub file: File,
+    _parents: Vec<Directory>,
 }
 
 impl Segments {
@@ -62,7 +68,54 @@ impl Segments {
             }
             files.push(file);
         }
-        Ok(Self { geometry, files })
+        Ok(Self {
+            geometry,
+            files,
+            directory,
+        })
+    }
+
+    pub(super) fn export(&self, safe_path: &Path, destination: &Path) -> Result<ExportFile> {
+        let parent = destination
+            .parent()
+            .ok_or(Error::InvalidName)?
+            .canonicalize()?;
+        let name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::InvalidName)?;
+        let safe = self.directory.identity()?;
+        if Directory::open(&safe_path.canonicalize()?)?.identity()? != safe {
+            return Err(Error::InvalidName);
+        }
+        let directory = Directory::open(&parent)?;
+        let directory_id = directory.identity()?;
+        let mut parents = Vec::new();
+        for ancestor in parent.ancestors() {
+            let handle = Directory::open_export_parent(ancestor)?;
+            if handle.identity()? == safe {
+                return Err(Error::InvalidName);
+            }
+            parents.push(handle);
+        }
+        // Exclusive creation rejects both existing outputs and aliases.
+        let output = directory.file(name, true)?;
+        let output_id = same_file::Handle::from_file(output.try_clone()?)?;
+        if parents[0].identity()? != directory_id
+            || Directory::open(&parent)?.identity()? != directory_id
+            || same_file::Handle::from_file(directory.file(name, false)?)? != output_id
+        {
+            return Err(Error::InvalidName);
+        }
+        for file in &self.files {
+            if same_file::Handle::from_file(file.try_clone()?)? == output_id {
+                return Err(Error::InvalidName);
+            }
+        }
+        Ok(ExportFile {
+            file: output,
+            _parents: parents,
+        })
     }
 
     pub fn geometry(&self) -> Geometry {
@@ -94,7 +147,7 @@ pub struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    pub fn open(path: &Path) -> Result<Self> {
+    fn check_supported() -> Result<()> {
         if !cfg!(unix)
             && !cfg!(all(
                 windows,
@@ -104,10 +157,37 @@ impl SegmentWriter {
         {
             return Err(Error::Unsupported);
         }
+        Ok(())
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::check_supported()?;
         Ok(Self {
             segments: Segments::open_access(path, true)?,
             dirty: Default::default(),
         })
+    }
+
+    pub(super) fn create(path: &Path) -> Result<Self> {
+        Self::check_supported()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir(path)?;
+        let directory = Directory::open(path)?;
+        let mut file = directory.file("s-00000000", true)?;
+        let mut bytes = vec![0; 1 << 20];
+        for _ in 0..SEGMENT_BYTES / bytes.len() as u64 {
+            getrandom::getrandom(&mut bytes).map_err(|_| Error::Random)?;
+            file.write_all(&bytes)?;
+        }
+        file.sync_all()?;
+        directory.sync()?;
+        drop(file);
+        Self::open(path)
     }
 
     pub fn segments(&mut self) -> &mut Segments {

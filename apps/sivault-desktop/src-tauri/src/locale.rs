@@ -5,10 +5,14 @@ pub const CONTROLLED_MANAGE: &str = "Confirm controlled safe command";
 pub const CONTROLLED_COMMAND_FAILED: &str = "The releaser did not confirm this command.";
 pub const REVOKE_LABEL_MISMATCH: &str = "The entered label does not match the selected safe.";
 pub fn revoke_confirmation(label: &str) -> String {
-    format!("Permanently revoke {label}? This cannot be undone. After the releaser deletes its live share, the safe cannot be recovered through that releaser. This does not recall plaintext or keys already received.")
+    format!(
+        "Permanently revoke {label}? This cannot be undone. After the releaser deletes its live share, the safe cannot be recovered through that releaser. This does not recall plaintext or keys already received."
+    )
 }
 pub fn refill_confirmation(current: u64, total: u64) -> String {
-    format!("Increase the total attempt allowance from {current} to {total}? Attempts already used still count.")
+    format!(
+        "Increase the total attempt allowance from {current} to {total}? Attempts already used still count."
+    )
 }
 pub const SAFE_IMPORT_LOCATION: &str = "Import files into safe";
 pub const SAFE_EXPORT_LOCATION: &str = "Export unencrypted file";
@@ -20,7 +24,9 @@ pub const RELEASER_SET_PASSWORD: &str = "Set a separate releaser storage passwor
 pub const APPROVE_ENROLLMENT: &str = "Allow one controlled safe enrollment";
 #[cfg(any(target_os = "macos", windows))]
 pub fn enrollment_approval(owner: &str, allowance: u64) -> String {
-    format!("Owner identifier: {owner}\nAttempt allowance: {allowance}\nVerify the owner identifier independently before allowing one enrollment.")
+    format!(
+        "Owner identifier: {owner}\nAttempt allowance: {allowance}\nVerify the owner identifier independently before allowing one enrollment."
+    )
 }
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const SAFE_SET_PASSWORD: &str = "Set safe password";
@@ -88,3 +94,6 @@ pub const OWNER_RECOVERY_LIMITS: &str = concat!(
     "These words are not a strong standalone secret. Compromise can also expose these ",
     "three words of your owner phrase."
 );
+pub const SAFE_DECOY_IMPORT: &str = "Choose a file for the decoy view";
+#[cfg(any(target_os = "macos", windows))]
+pub const SAFE_SECONDARY_PASSWORD: &str = "Set the decoy password";

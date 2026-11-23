@@ -6,6 +6,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "safe_create",
+            "safe_update_decoy",
             "safe_create_controlled",
             "safe_manage_controlled",
             "safe_open",
@@ -17,6 +18,7 @@ fn main() {
             "safe_lock",
             "owner_prepare",
             "owner_identifier",
+            "owner_show_recovery",
             "releaser_status",
             "releaser_authorize",
             "releaser_set_running",

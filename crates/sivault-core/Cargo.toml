@@ -22,6 +22,7 @@ libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["m
 libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
 precis-profiles = "=0.2.0"
 serde = { version = "=1.0.228", features = ["derive"] }
+same-file = "=1.0.6"
 sha2 = "=0.10.9"
 subtle = "=2.6.1"
 zeroize = { version = "=1.9.1", features = ["derive"] }

@@ -40,6 +40,7 @@ pub struct Wrap {
     pub safe_id: [u8; 16],
     pub epoch: u64,
     pub local_seed: crypto::Secret,
+    pub(crate) write_slot: Option<u8>,
     pub management: Option<ManagementGrant>,
 }
 
@@ -51,7 +52,11 @@ pub struct ManagementGrant {
 impl Wrap {
     fn check(&self, geometry: Geometry, slot: u8) -> Result<()> {
         let local = Slot::new(geometry, self.safe_id, slot)?;
-        if !(1..=MAX_COUNTER).contains(&self.epoch) || *self.local_seed == [0; 32] {
+        if !(1..=MAX_COUNTER).contains(&self.epoch)
+            || *self.local_seed == [0; 32]
+            || self.write_slot.is_some_and(|number| number != slot)
+            || (self.management.is_some() && self.write_slot.is_none())
+        {
             return Err(Error::InvalidFormat);
         }
         if let Some(grant) = &self.management {
@@ -98,6 +103,9 @@ impl Wrap {
             plain[72..104].copy_from_slice(grant.peer_metadata_seed.as_ref());
             plain[104..136].copy_from_slice(grant.peer_local_seed.as_ref());
         }
+        if let Some(number) = self.write_slot {
+            plain[136] = number + 1;
+        }
         let mut out = salt.to_vec();
         out.extend(seal(&key, &ad, plain.as_ref())?);
         Ok(out)
@@ -123,7 +131,8 @@ impl Wrap {
             || plain[10] != slot
             || plain[11] > 1
             || plain[12..16] != geometry.binding()[8..]
-            || !zeros(&plain[136..])
+            || plain[136] > 2
+            || !zeros(&plain[137..])
             || (plain[11] == 0 && !zeros(&plain[72..136]))
         {
             return Err(Error::InvalidFormat);
@@ -132,6 +141,7 @@ impl Wrap {
             safe_id: array(&plain[16..32]),
             epoch: u64::from_le_bytes(array(&plain[32..40])),
             local_seed: Zeroizing::new(array(&plain[40..72])),
+            write_slot: plain[136].checked_sub(1),
             management: (plain[11] == 1).then(|| ManagementGrant {
                 peer_metadata_seed: Zeroizing::new(array(&plain[72..104])),
                 peer_local_seed: Zeroizing::new(array(&plain[104..136])),

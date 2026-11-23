@@ -41,3 +41,17 @@ Known limitations and filesystem acceptance gaps are documented in the
 [security model](../../docs/sivault-security-model.md). Existing source files
 must remain stable during import. Cooperating clients use OS file locks;
 this is not a boundary against a malicious local process with write access.
+
+## Fixed-size development format
+
+The desktop development build can create a fixed-size safe with one 1 GiB
+random-filled segment and an optional decoy password. The primary slot is
+chosen at random. Only its encrypted wrap carries write authority. Explicit
+read-only opening and decoy opening both use a read-only segment handle and
+do not publish metadata or create sidecars. Only the writable primary view
+can add or replace decoy files. The development UI supports root files only.
+
+Any claim about indistinguishability is limited to a single captured image
+without additional secrets or external traces. This format does not hide
+timing, OS logs, memory, or changes across multiple images. Physical
+power-loss and removable-media validation remain distribution requirements.
