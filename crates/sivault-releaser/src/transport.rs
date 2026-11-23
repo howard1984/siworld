@@ -125,7 +125,15 @@ impl Worker {
     pub fn loopback(
         exchange: impl FnMut(TcpStream) + Send + 'static,
     ) -> io::Result<(SocketAddr, Self)> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        Self::loopback_on(0, exchange)
+    }
+
+    /// Bind the previously enrolled local port, or allocate a port if zero.
+    pub fn loopback_on(
+        port: u16,
+        exchange: impl FnMut(TcpStream) + Send + 'static,
+    ) -> io::Result<(SocketAddr, Self)> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let worker = Self::spawn(

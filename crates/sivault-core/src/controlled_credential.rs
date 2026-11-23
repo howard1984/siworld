@@ -11,7 +11,7 @@ use libcrux_ml_dsa::ml_dsa_65::{
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type Word = [u8; 32];
 
@@ -124,6 +124,12 @@ pub struct ClientCredential {
 pub struct ReleaserVerifier {
     pub stored_key: Word,
     pub server_key: Secret,
+}
+
+impl Drop for ReleaserVerifier {
+    fn drop(&mut self) {
+        self.stored_key.zeroize();
+    }
 }
 
 fn derive(salt: &[u8; 32], input: &[u8; 32], label: &[u8], record: &RecordContext) -> Secret {

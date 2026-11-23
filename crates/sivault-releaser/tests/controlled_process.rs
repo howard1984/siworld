@@ -9,7 +9,8 @@ mod support;
 #[cfg(not(target_arch = "wasm32"))]
 mod fixture {
     use std::{
-        env, io,
+        env, fs, io,
+        io::Read,
         path::Path,
         process::{Command, Stdio},
         sync::mpsc,
@@ -27,10 +28,11 @@ mod fixture {
         crypto::{Secret, random},
     };
     use sivault_releaser::{
-        journal::{Checkpoint, Journal, MarkerStore},
-        ledger::{AuthorityError, Event, Releaser, SlotIdentity},
+        journal::{Checkpoint, MarkerStore},
+        ledger::{AuthorityError, Event, SlotIdentity},
         message::{Id, Message},
         opening::{self, OpeningRecord, ReleaseMaterial},
+        slot_store::{self, SlotMaterial},
     };
     use zeroize::Zeroizing;
 
@@ -40,6 +42,7 @@ mod fixture {
     use super::support::*;
 
     const CHILD: &str = "--synthetic-releaser";
+    const RESTARTED: &str = "--synthetic-releaser-restarted";
     const ENROLL: u8 = 1;
     const INIT: u8 = 3;
     const OWNER: u8 = 8;
@@ -49,26 +52,40 @@ mod fixture {
     const EXHAUSTED: u8 = 3;
     const RETIRED: u8 = 4;
     const PASSWORD: &str = "synthetic integration test password";
+    const STORAGE_PASSWORD: &str = "synthetic releaser storage password";
 
-    #[derive(Default)]
-    struct Marker(Option<Checkpoint>);
+    // Test-only checkpoint storage, independent of the slot directory.
+    struct Marker<'a>(&'a Path);
 
-    impl MarkerStore for &mut Marker {
-        fn load(&mut self, _: SlotIdentity) -> Result<Option<Checkpoint>, AuthorityError> {
-            Ok(self.0)
+    impl MarkerStore for Marker<'_> {
+        fn load(&mut self, slot: SlotIdentity) -> Result<Option<Checkpoint>, AuthorityError> {
+            assert_eq!(slot, super::support::slot());
+            let bytes = match fs::read(self.0) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => return Err(AuthorityError::Unavailable),
+            };
+            let bytes: [u8; 64] = bytes
+                .try_into()
+                .map_err(|_| AuthorityError::InvalidEvidence)?;
+            Ok(Some(Checkpoint {
+                instance: Id(bytes[..32].try_into().unwrap()),
+                head: Id(bytes[32..].try_into().unwrap()),
+            }))
         }
 
         fn compare_and_store(
             &mut self,
-            _: SlotIdentity,
+            slot: SlotIdentity,
             expected: Option<Checkpoint>,
             next: Checkpoint,
         ) -> Result<(), AuthorityError> {
-            if self.0 != expected {
+            if self.load(slot)? != expected {
                 return Err(AuthorityError::Stale);
             }
-            self.0 = Some(next);
-            Ok(())
+            let mut bytes = next.instance.0.to_vec();
+            bytes.extend_from_slice(&next.head.0);
+            fs::write(self.0, bytes).map_err(|_| AuthorityError::Unavailable)
         }
     }
 
@@ -117,13 +134,12 @@ mod fixture {
         body
     }
 
-    fn releaser(path: &Path) {
+    fn enroll(path: &Path) {
         let identity = identity();
         let owner = ml_dsa_65::generate_key_pair([75; 32]).verification_key;
         let folder = ml_dsa_65::generate_key_pair([76; 32]).verification_key;
         let mut input = io::stdin().lock();
         let mut output = io::stdout().lock();
-        let mut marker = Marker::default();
         let mut session =
             Session::accept(&mut input, &mut output, &slot().network.0, &identity).unwrap();
         let signed = session.receive(ENROLL).unwrap();
@@ -143,20 +159,42 @@ mod fixture {
             verifier,
             share,
         };
-        let journal = Journal::provision(
-            path,
-            &mut marker,
-            slot(),
-            Id(random().unwrap()),
-            2,
-            record(),
-        )
-        .unwrap();
+        let material = SlotMaterial {
+            port: 31337,
+            release: material,
+            owner_key: owner,
+            identity_kem_seed: Zeroizing::new([72; 64]),
+            identity_signing_seed: Secret::new([73; 32]),
+        };
+        drop(
+            slot_store::provision(
+                &path.join("slot"),
+                Marker(&path.join("checkpoint")),
+                &material,
+                2,
+                STORAGE_PASSWORD,
+            )
+            .unwrap(),
+        );
         session.send(RESULT, &[OK]).unwrap();
-        drop(journal);
-        drop(session);
+    }
 
-        // Reopen and replay the journal for each new authenticated exchange.
+    fn resume(path: &Path) {
+        let mut input = io::stdin().lock();
+        let mut output = io::stdout().lock();
+        let mut start = [0; 1];
+        input.read_exact(&mut start).unwrap();
+        assert_eq!(start, [OK]);
+        let checkpoint = path.join("checkpoint");
+        let slot_path = path.join("slot");
+        assert!(
+            slot_store::open(&slot_path, Marker(&checkpoint), "wrong storage password").is_err()
+        );
+
+        let (material, mut service) =
+            slot_store::open(&slot_path, Marker(&checkpoint), STORAGE_PASSWORD).unwrap();
+        assert_eq!(material.port, 31337);
+        let identity = material.identity();
         for (kind, spent) in [
             (INIT, 1),
             (INIT, 2),
@@ -166,14 +204,11 @@ mod fixture {
             (OWNER, 3),
             (INIT, 3),
         ] {
-            let journal = Journal::open(path, &mut marker, slot()).unwrap();
-            let mut service = Releaser::new(journal);
-            service.recover(slot()).unwrap();
             let mut session =
                 Session::accept(&mut input, &mut output, &slot().network.0, &identity).unwrap();
             if kind == OWNER {
                 let payload = session.receive(kind).unwrap();
-                let bytes = signed_body(&session, kind, &payload, &owner);
+                let bytes = signed_body(&session, kind, &payload, &material.owner_key);
                 service
                     .apply(Event::Owner {
                         message: Box::new(Message::decode(bytes).unwrap()),
@@ -184,12 +219,36 @@ mod fixture {
                 session.send(RESULT, &[OK]).unwrap();
                 continue;
             }
-            opening::serve(session, &mut service, &material).unwrap();
+            opening::serve(session, &mut service, &material.release).unwrap();
             assert_eq!(service.snapshot().unwrap().spent(), spent);
         }
+        drop(service);
+        let file = slot_path.join("material-v1");
+        let original = fs::read(&file).unwrap();
+        let replacement_path = path.join("replacement");
+        drop(
+            slot_store::provision(
+                &replacement_path,
+                Marker(&path.join("replacement-checkpoint")),
+                &material,
+                2,
+                STORAGE_PASSWORD,
+            )
+            .unwrap(),
+        );
+        fs::copy(replacement_path.join("material-v1"), &file).unwrap();
+        assert!(slot_store::open(&slot_path, Marker(&checkpoint), STORAGE_PASSWORD).is_err());
+        fs::write(file, original).unwrap();
+        let (_, service) =
+            slot_store::open(&slot_path, Marker(&checkpoint), STORAGE_PASSWORD).unwrap();
+        assert!(!service.snapshot().unwrap().is_serving());
     }
 
-    fn owner<R: io::Read, W: io::Write>(mut input: R, mut output: W) {
+    fn owner<R: io::Read, W: io::Write>(
+        mut input: R,
+        mut output: W,
+        restarted: impl FnOnce() -> (R, W),
+    ) {
         let owner = ml_dsa_65::generate_key_pair([75; 32]);
         let folder = ml_dsa_65::generate_key_pair([76; 32]);
         let folder_id = opening::folder_key_id(&folder.verification_key).0;
@@ -229,6 +288,11 @@ mod fixture {
         session.send(ENROLL, &body).unwrap();
         assert_eq!(&**session.receive(RESULT).unwrap(), &[OK]);
         drop(session);
+        assert_eq!(
+            input.read(&mut [0]).unwrap(),
+            0,
+            "enrollment process must exit"
+        );
         #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         {
             Registration {
@@ -245,6 +309,9 @@ mod fixture {
             drop(payload);
         }
 
+        let (mut input, mut output) = restarted();
+        output.write_all(&[OK]).unwrap();
+        output.flush().unwrap();
         let cases = [
             (OK, None),
             (WRONG, None),
@@ -312,35 +379,43 @@ mod fixture {
 
     pub fn run() {
         let mut args = env::args_os().skip(1);
-        if args.next().as_deref() == Some(CHILD.as_ref()) {
-            releaser(Path::new(&args.next().unwrap()));
-            return;
+        match args.next() {
+            Some(mode) if mode == CHILD => return enroll(Path::new(&args.next().unwrap())),
+            Some(mode) if mode == RESTARTED => return resume(Path::new(&args.next().unwrap())),
+            _ => {}
         }
         let directory = tempfile::tempdir().unwrap();
-        let mut child = Command::new(env::current_exe().unwrap())
-            .arg(CHILD)
-            .arg(directory.path().join("journal"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let input = child.stdout.take().unwrap();
-        let output = child.stdin.take().unwrap();
+        let spawn = |mode| {
+            let mut child = Command::new(env::current_exe().unwrap())
+                .arg(mode)
+                .arg(directory.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let input = child.stdout.take().unwrap();
+            let output = child.stdin.take().unwrap();
+            (child, input, output)
+        };
+        let (mut child, input, output) = spawn(CHILD);
+        let (mut restarted, second_input, second_output) = spawn(RESTARTED);
         let (done, outcome) = mpsc::sync_channel(1);
         let worker = thread::spawn(move || {
-            owner(input, output);
+            owner(input, output, || (second_input, second_output));
             done.send(()).unwrap();
         });
         let outcome = outcome.recv_timeout(Duration::from_secs(15));
         if outcome.is_err() {
             let _ = child.kill();
+            let _ = restarted.kill();
         }
         let status = child.wait().unwrap();
+        let restart_status = restarted.wait().unwrap();
         worker.join().unwrap();
         outcome.unwrap();
-        assert!(status.success());
+        assert!(status.success() && restart_status.success());
         println!(
-            "Controlled credential lifecycle passed between independent processes with a file-backed journal"
+            "Controlled credential lifecycle passed after releaser process restart with an encrypted slot and file-backed journal"
         );
     }
 }

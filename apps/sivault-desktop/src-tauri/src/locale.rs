@@ -2,6 +2,8 @@ pub const SAFE_CREATE_LOCATION: &str = "Choose location for new safe";
 pub const SAFE_OPEN_LOCATION: &str = "Open standard safe folder";
 pub const SAFE_IMPORT_LOCATION: &str = "Import files into safe";
 pub const SAFE_EXPORT_LOCATION: &str = "Export unencrypted file";
+#[cfg(any(target_os = "macos", windows))]
+pub const RELEASER_PASSWORD: &str = "Unlock releaser storage";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub const SAFE_SET_PASSWORD: &str = "Set safe password";
 #[cfg(any(target_os = "macos", target_os = "windows"))]

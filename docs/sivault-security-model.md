@@ -28,23 +28,27 @@ The controlled channel derives traffic keys from two ML-KEM shared secrets.
 It does not promise forward secrecy against later releaser key compromise for
 captures that also expose the other KEM secret or endpoint state.
 The desktop loopback identity check compares an identifier obtained separately
-from the address, then verifies the channel handshake. The current listener
-generates a new identity on each start and does not accept enrollment or
-release shares.
+from the address, then verifies the channel handshake. An unprovisioned
+listener uses a temporary identity and does not accept enrollment or release
+shares. When a provisioned slot is resumed, the identity and port are recovered
+from the encrypted local record. The credential verifier and share are
+encrypted under a separate releaser-storage password; the journal commits a
+digest of that ciphertext and refuses a substituted record.
 The provisional controlled payload has no offline password slot. Its
 single-slot registration record stores the pinned releaser identifier,
 assigned allowance, record scope, and encrypted key envelope. Opening code
 must authenticate the saved record with the freshly recovered key before
 exposing files. The persistence test uses synthetic enrollment messages;
-desktop enrollment and restart recovery are not implemented.
+desktop enrollment and two-application acceptance are not implemented.
 
 The releaser journal commits a charge before allowing credential evaluation.
 The slot is unavailable when its attempt history cannot be verified against
 the checkpoint in the operating system credential store. Restoring a wallet
 backup does not restore approval authority or spent attempts. Restoring both
 stores to a matching older state may evade detection. The attempt limit is
-not a defense against someone who controls the releaser's device. The native
-credential-store adapters are not yet wired into a desktop opening flow.
+not a defense against someone who controls the releaser's device. Desktop
+releaser startup uses the native checkpoint adapter for a provisioned slot;
+the desktop owner enrollment flow is not yet connected.
 On macOS the checkpoint is a local login Keychain item accessible to the
 logged-in user. Releaser protection does not exceed the device's login protection.
 

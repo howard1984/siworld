@@ -3,6 +3,26 @@ use tauri::AppHandle;
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
+pub fn prompt_releaser(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
+    on_main(app, || {
+        native_secret(
+            crate::locale::RELEASER_PASSWORD,
+            crate::locale::PASSWORD,
+            false,
+        )
+    })
+}
+
+#[cfg(windows)]
+pub fn prompt_releaser(app: &AppHandle) -> Result<Option<Zeroizing<String>>> {
+    windows_prompt(
+        app,
+        Zeroizing::new(crate::locale::RELEASER_PASSWORD.into()),
+        false,
+    )
+}
+
+#[cfg(target_os = "macos")]
 pub fn prompt(app: &AppHandle, create: bool) -> Result<Option<Zeroizing<String>>> {
     let title = if create {
         crate::locale::SAFE_SET_PASSWORD

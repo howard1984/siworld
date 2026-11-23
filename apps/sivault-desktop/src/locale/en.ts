@@ -48,6 +48,7 @@ export const en = {
   verifyReleaser: "Verify releaser",
   releaserVerified: "Releaser identity verified. No safe has been enrolled.",
   noReleaserEnrollment: "No enrolled safes",
+  releaserServing: "Serving one enrolled safe",
   demoActive: "Synthetic demo · memory only · no encryption",
   browserPreview: "Browser preview · native safe operations require the desktop app",
   openDemo: "Open synthetic demo",

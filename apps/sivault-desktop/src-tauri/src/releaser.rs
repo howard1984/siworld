@@ -11,6 +11,8 @@ use sivault_core::controlled_channel::{
 };
 use sivault_releaser::transport::Worker;
 use tauri::State;
+#[cfg(any(target_os = "macos", windows))]
+use tauri::{AppHandle, Manager};
 
 use crate::adapter::{BridgeError, Result};
 
@@ -21,12 +23,14 @@ struct Listening {
     address: SocketAddr,
     identifier: [u8; 32],
     worker: Worker,
+    enrolled: bool,
 }
 
 #[derive(Default)]
 struct Lifecycle {
     listener: Option<Listening>,
     exiting: bool,
+    epoch: u64,
 }
 
 #[derive(Default)]
@@ -37,17 +41,23 @@ pub struct ReleaserState(Mutex<Lifecycle>);
 pub struct ReleaserStatus {
     address: Option<String>,
     identifier: Option<String>,
+    enrolled: bool,
 }
 
 impl ReleaserState {
     fn set_running(&self, enabled: bool) -> Result<ReleaserStatus> {
+        self.set_running_at(enabled, None)
+    }
+
+    fn set_running_at(&self, enabled: bool, epoch: Option<u64>) -> Result<ReleaserStatus> {
         let mut state = self.0.lock().map_err(|_| unavailable())?;
-        if enabled && state.exiting {
+        if enabled && (state.exiting || epoch.is_some_and(|epoch| epoch != state.epoch)) {
             return Err(unavailable());
         }
         if !enabled || address(&state).is_none() {
             // Keep the state lock until the old worker and socket are gone.
             drop(state.listener.take());
+            state.epoch = state.epoch.wrapping_add(1);
         }
         if enabled && state.listener.is_none() {
             let identity = ReleaserIdentity::generate().map_err(|_| unavailable())?;
@@ -68,6 +78,7 @@ impl ReleaserState {
                 address,
                 identifier,
                 worker,
+                enrolled: false,
             });
         }
         Ok(status(&state))
@@ -76,7 +87,51 @@ impl ReleaserState {
     pub fn stop(&self, exiting: bool) {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         state.exiting |= exiting;
+        state.epoch = state.epoch.wrapping_add(1);
         drop(state.listener.take());
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    fn resume(&self, data: &std::path::Path, password: &str, epoch: u64) -> Result<ReleaserStatus> {
+        use sivault_releaser::{journal::platform::PlatformMarker, opening, slot_store};
+        let marker_dir = data.join("releaser-marker-locks");
+        std::fs::create_dir_all(&marker_dir).map_err(|_| unavailable())?;
+        let marker = PlatformMarker::new(&marker_dir).map_err(|_| unavailable())?;
+        let (material, mut service) =
+            slot_store::open(&data.join("releaser-slot"), marker, password)
+                .map_err(|_| unavailable())?;
+        let network = material.release.scope.slot.network.0;
+        if network != LOOPBACK_DEPLOYMENT
+            || !service.snapshot().is_some_and(|view| {
+                view.is_serving() && view.active() == material.release.scope.record
+            })
+        {
+            return Err(unavailable());
+        }
+        let identity = material.identity();
+        let pins = identity.pins();
+        let identifier = pins.identifier();
+        let advertised = pins.encode();
+        let mut state = self.0.lock().map_err(|_| unavailable())?;
+        if state.exiting || state.epoch != epoch || state.listener.is_some() {
+            return Err(unavailable());
+        }
+        let (address, worker) = Worker::loopback_on(material.port, move |mut stream| {
+            if stream.write_all(&advertised).is_ok()
+                && let Ok(reader) = stream.try_clone()
+                && let Ok(session) = Session::accept(reader, &mut stream, &network, &identity)
+            {
+                let _ = opening::serve(session, &mut service, &material.release);
+            }
+        })
+        .map_err(|_| unavailable())?;
+        state.listener = Some(Listening {
+            address,
+            identifier,
+            worker,
+            enrolled: true,
+        });
+        Ok(status(&state))
     }
 }
 
@@ -102,6 +157,7 @@ fn status(state: &Lifecycle) -> ReleaserStatus {
             }
             value
         }),
+        enrolled: listening(state).is_some_and(|listener| listener.enrolled),
     }
 }
 
@@ -188,12 +244,51 @@ pub async fn releaser_verify(address: String, identifier: String) -> Result<()> 
         .map_err(|_| unavailable())?
 }
 
+#[cfg(not(any(target_os = "macos", windows)))]
 #[tauri::command]
 pub fn releaser_set_running(
     state: State<'_, ReleaserState>,
     enabled: bool,
 ) -> Result<ReleaserStatus> {
     state.set_running(enabled)
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[tauri::command]
+pub async fn releaser_set_running(app: AppHandle, enabled: bool) -> Result<ReleaserStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<ReleaserState>();
+        if !enabled {
+            return state.set_running(false);
+        }
+        let data = app.path().app_local_data_dir().map_err(|_| unavailable())?;
+        let epoch = {
+            let mut lifecycle = state.0.lock().map_err(|_| unavailable())?;
+            if lifecycle.exiting {
+                return Err(unavailable());
+            }
+            if address(&lifecycle).is_some() {
+                return Ok(status(&lifecycle));
+            }
+            drop(lifecycle.listener.take());
+            lifecycle.epoch = lifecycle.epoch.wrapping_add(1);
+            lifecycle.epoch
+        };
+        match std::fs::symlink_metadata(data.join("releaser-slot")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                state.set_running_at(true, Some(epoch))
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                let Some(password) = crate::password::prompt_releaser(&app)? else {
+                    return releaser_status(state);
+                };
+                state.resume(&data, &password, epoch)
+            }
+            _ => Err(unavailable()),
+        }
+    })
+    .await
+    .map_err(|_| unavailable())?
 }
 
 #[cfg(test)]

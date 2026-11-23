@@ -172,7 +172,7 @@ export default function App() {
       }} />{en.runReleaser}</label>
       {localReleaser?.address && <p>{en.releaserAddress}: <code>{localReleaser.address}</code></p>}
       {localReleaser?.identifier && <p>{en.releaserIdentifier}: <code className="releaser-identifier">{localReleaser.identifier}</code></p>}
-      <p>{en.noReleaserEnrollment}</p>
+      {localReleaser?.address && <p>{localReleaser.enrolled ? en.releaserServing : en.noReleaserEnrollment}</p>}
       <form className="releaser-form" onSubmit={(event) => {
         event.preventDefault();
         const form = new FormData(event.currentTarget);

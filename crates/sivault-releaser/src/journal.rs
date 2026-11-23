@@ -52,6 +52,8 @@ struct Header {
     instance: Id,
     allowance: u64,
     record: Record,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    material: Option<Id>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -154,6 +156,7 @@ pub struct Journal<M> {
     checkpoint: Checkpoint,
     len: u64,
     poisoned: bool,
+    material: Option<Id>,
 }
 
 impl<M: MarkerStore> Journal<M> {
@@ -161,11 +164,43 @@ impl<M: MarkerStore> Journal<M> {
     /// The caller supplies a freshly generated random instance identifier.
     pub fn provision(
         path: &Path,
+        marker: M,
+        slot: SlotIdentity,
+        instance: Id,
+        allowance: u64,
+        record: Record,
+    ) -> Result<Self> {
+        Self::provision_inner(path, marker, slot, instance, allowance, record, None)
+    }
+
+    pub(crate) fn provision_material(
+        path: &Path,
+        marker: M,
+        slot: SlotIdentity,
+        instance: Id,
+        allowance: u64,
+        record: Record,
+        material: Id,
+    ) -> Result<Self> {
+        Self::provision_inner(
+            path,
+            marker,
+            slot,
+            instance,
+            allowance,
+            record,
+            Some(material),
+        )
+    }
+
+    fn provision_inner(
+        path: &Path,
         mut marker: M,
         slot: SlotIdentity,
         instance: Id,
         allowance: u64,
         record: Record,
+        material: Option<Id>,
     ) -> Result<Self> {
         if instance == Id::default() || marker.load(slot)?.is_some() {
             return Err(AuthorityError::InvalidEvidence);
@@ -176,6 +211,7 @@ impl<M: MarkerStore> Journal<M> {
             instance,
             allowance,
             record,
+            material,
         })?;
         let checkpoint = Checkpoint {
             instance,
@@ -193,6 +229,7 @@ impl<M: MarkerStore> Journal<M> {
             checkpoint,
             len: (MAGIC.len() + header.len()) as u64,
             poisoned: false,
+            material,
         })
     }
 
@@ -241,7 +278,16 @@ impl<M: MarkerStore> Journal<M> {
             checkpoint,
             len,
             poisoned: false,
+            material: header.material,
         })
+    }
+
+    pub(crate) fn require_material(&self, digest: Id) -> Result<()> {
+        if self.material == Some(digest) {
+            Ok(())
+        } else {
+            Err(AuthorityError::InvalidEvidence)
+        }
     }
 
     fn check_current(&mut self, slot: SlotIdentity) -> Result<()> {

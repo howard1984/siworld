@@ -15,4 +15,6 @@ pub mod opening;
 pub mod registration;
 pub mod scheduler;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod slot_store;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
