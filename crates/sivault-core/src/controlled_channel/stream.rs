@@ -62,6 +62,14 @@ impl<R: Read, W: Write> Session<R, W> {
             .claimed_folder_key())
     }
 
+    pub fn reply_key_digest(&self) -> Result<&Word> {
+        Ok(self
+            .channel
+            .as_ref()
+            .ok_or(Error::Authentication)?
+            .reply_key_digest())
+    }
+
     pub fn send(&mut self, kind: u8, payload: &[u8]) -> Result<()> {
         let mut channel = self.channel.take().ok_or(Error::Authentication)?;
         write_frame(&mut self.writer, &channel.seal(kind, payload)?)?;
@@ -70,15 +78,26 @@ impl<R: Read, W: Write> Session<R, W> {
     }
 
     pub fn receive(&mut self, kind: u8) -> Result<Zeroizing<Vec<u8>>> {
+        let (received, payload) = self.receive_message()?;
+        if received != kind {
+            self.channel = None;
+            return Err(Error::Authentication);
+        }
+        Ok(payload)
+    }
+
+    /// Return the message type only after authenticating it with the payload.
+    pub fn receive_message(&mut self) -> Result<(u8, Zeroizing<Vec<u8>>)> {
         let mut channel = self.channel.take().ok_or(Error::Authentication)?;
         let bytes = read_frame(
             &mut self.reader,
             RECORD_OVERHEAD,
             MAX_PAYLOAD + RECORD_OVERHEAD,
         )?;
+        let kind = bytes[0];
         let payload = channel.open(kind, &bytes)?;
         self.channel = Some(channel);
-        Ok(payload)
+        Ok((kind, payload))
     }
 }
 

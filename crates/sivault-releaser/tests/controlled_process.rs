@@ -22,17 +22,15 @@ mod fixture {
     use sivault_core::{
         controlled_channel::{PendingClient, ReleaserIdentity, stream::Session},
         controlled_credential::{
-            AttemptContext, ClientCredential, RecordContext, ReleaserVerifier, sign_possession,
-            verify_possession,
+            ClientCredential, ReleaserVerifier, sign_possession, verify_possession,
         },
         crypto::{Secret, random},
     };
     use sivault_releaser::{
         journal::{Checkpoint, Journal, MarkerStore},
-        ledger::{
-            Attempt, AuthorityError, Error, Event, Outcome, PolicyError, Releaser, SlotIdentity,
-        },
+        ledger::{AuthorityError, Event, Releaser, SlotIdentity},
         message::{Id, Message},
+        opening::{self, OpeningRecord, ReleaseMaterial},
     };
     use zeroize::Zeroizing;
 
@@ -41,8 +39,6 @@ mod fixture {
     const CHILD: &str = "--synthetic-releaser";
     const ENROLL: u8 = 1;
     const INIT: u8 = 3;
-    const CHALLENGE: u8 = 4;
-    const PROOF: u8 = 5;
     const OWNER: u8 = 8;
     const RESULT: u8 = 64;
     const OK: u8 = 1;
@@ -81,38 +77,13 @@ mod fixture {
         Id(Sha256::digest(bytes).into())
     }
 
-    fn scope() -> RecordContext {
-        RecordContext {
-            suite: slot().suite,
-            version: 1,
-            deployment: slot().network.0,
-            safe: slot().safe.0,
-            generation: record().generation,
-            slot: slot().slot.0,
-            ledger: slot().ledger.0,
-            operation: 1,
-            record: attempt(0).selected_record.0,
-            argon_salt: [74; 32],
+    fn scope() -> OpeningRecord {
+        OpeningRecord {
+            slot: slot(),
+            record: record(),
+            record_id: attempt(0).selected_record,
+            salt: id(74),
         }
-    }
-
-    fn transcript<R: io::Read, W: io::Write>(
-        session: &Session<R, W>,
-        attempt: &Attempt,
-    ) -> Vec<u8> {
-        AttemptContext {
-            request: attempt.domain.request.0,
-            client_nonce: attempt.client_nonce.0,
-            server_nonce: attempt.server_nonce.0,
-            challenge: attempt.challenge.0,
-            reply_key_digest: attempt.reply_key_digest.0,
-            init_digest: attempt.init_digest.0,
-            challenge_digest: attempt.challenge_digest.0,
-            incarnation: attempt.domain.incarnation.0,
-            deadline: attempt.deadline,
-            channel_binding: session.binding().unwrap(),
-        }
-        .encode(&scope())
     }
 
     fn signed_bytes<R: io::Read, W: io::Write>(
@@ -154,12 +125,21 @@ mod fixture {
             Session::accept(&mut input, &mut output, &slot().network.0, &identity).unwrap();
         let signed = session.receive(ENROLL).unwrap();
         let body = signed_body(&session, ENROLL, &signed, &owner);
-        assert_eq!(&body[..32], digest(&scope().encode()).0.as_slice());
+        assert_eq!(
+            &body[..32],
+            digest(&scope().context().encode()).0.as_slice()
+        );
         let verifier = ReleaserVerifier {
             stored_key: body[32..64].try_into().unwrap(),
             server_key: Secret::new(body[64..96].try_into().unwrap()),
         };
         let share = Secret::new(body[96..].try_into().unwrap());
+        let material = ReleaseMaterial {
+            scope: scope(),
+            folder_key: folder,
+            verifier,
+            share,
+        };
         let journal = Journal::provision(
             path,
             &mut marker,
@@ -174,18 +154,22 @@ mod fixture {
         drop(session);
 
         // Reopen and replay the journal for each new authenticated exchange.
-        for kind in [INIT, INIT, INIT, OWNER, INIT, OWNER, INIT] {
+        for (kind, spent) in [
+            (INIT, 1),
+            (INIT, 2),
+            (INIT, 2),
+            (OWNER, 2),
+            (INIT, 3),
+            (OWNER, 3),
+            (INIT, 3),
+        ] {
             let journal = Journal::open(path, &mut marker, slot()).unwrap();
             let mut service = Releaser::new(journal);
             service.recover(slot()).unwrap();
             let mut session =
                 Session::accept(&mut input, &mut output, &slot().network.0, &identity).unwrap();
-            assert_eq!(
-                session.claimed_folder_key().unwrap(),
-                &digest(folder.as_slice()).0
-            );
-            let payload = session.receive(kind).unwrap();
             if kind == OWNER {
+                let payload = session.receive(kind).unwrap();
                 let bytes = signed_body(&session, kind, &payload, &owner);
                 service
                     .apply(Event::Owner {
@@ -197,64 +181,26 @@ mod fixture {
                 session.send(RESULT, &[OK]).unwrap();
                 continue;
             }
-            let mut attempt = attempt(0);
-            attempt.domain.request = Id(payload[..32].try_into().unwrap());
-            attempt.client_nonce = Id(payload[32..].try_into().unwrap());
-            attempt.server_nonce = Id(random().unwrap());
-            attempt.challenge = Id(random().unwrap());
-            attempt.init_digest = digest(&payload);
-            attempt.reply_key_digest = digest(session.binding().unwrap().as_bytes());
-            attempt.challenge_digest = Id::default();
-            let bytes = serde_json::to_vec(&attempt).unwrap();
-            attempt.challenge_digest = digest(&bytes);
-            let denial = match service.apply(register(&attempt)) {
-                Ok(Outcome::ChallengeRecorded) => 0,
-                Err(Error::Policy(PolicyError::Exhausted)) => EXHAUSTED,
-                Err(Error::Policy(PolicyError::InvalidPhase)) => RETIRED,
-                other => panic!("unexpected registration outcome: {other:?}"),
-            };
-            let mut challenge = vec![denial];
-            if denial == 0 {
-                challenge.extend_from_slice(&bytes);
-            }
-            session.send(CHALLENGE, &challenge).unwrap();
-            if denial != 0 {
-                continue;
-            }
-            let proof = session.receive(PROOF).unwrap();
-            let auth = transcript(&session, &attempt);
-            let signature = MLDSA65Signature::new(proof[32..].try_into().unwrap());
-            verify_possession(&folder, &auth, &signature).unwrap();
-            let Outcome::CredentialReady(token) = service.apply(charge(&attempt)).unwrap() else {
-                panic!("credential evaluation requires a committed charge");
-            };
-            assert_eq!(token.attempt(), &attempt);
-            match verifier.evaluate_charged_proof(&auth, proof[..32].try_into().unwrap()) {
-                Ok(mac) => {
-                    let mut reply = Zeroizing::new(vec![OK]);
-                    reply.extend_from_slice(&mac);
-                    reply.extend_from_slice(share.as_ref());
-                    session.send(RESULT, &reply).unwrap();
-                }
-                Err(_) => session.send(RESULT, &[WRONG]).unwrap(),
-            }
+            opening::serve(session, &mut service, &material).unwrap();
+            assert_eq!(service.snapshot().unwrap().spent(), spent);
         }
     }
 
     fn owner<R: io::Read, W: io::Write>(mut input: R, mut output: W) {
         let owner = ml_dsa_65::generate_key_pair([75; 32]);
         let folder = ml_dsa_65::generate_key_pair([76; 32]);
-        let folder_id = digest(folder.verification_key.as_slice()).0;
+        let folder_id = opening::folder_key_id(&folder.verification_key).0;
         let pins = identity().pins();
         let pending = || PendingClient::start(pins.clone(), &slot().network.0, folder_id).unwrap();
         let folder_secret = Secret::new(random().unwrap());
         let share = Secret::new(random().unwrap());
         let generation_key = Secret::new(random().unwrap());
         let scope = scope();
-        let correct = ClientCredential::new(PASSWORD, &folder_secret, &scope).unwrap();
-        let envelope = correct.wrap(&scope, &share, &generation_key).unwrap();
+        let context = scope.context();
+        let correct = ClientCredential::new(PASSWORD, &folder_secret, &context).unwrap();
+        let envelope = correct.wrap(&context, &share, &generation_key).unwrap();
         let verifier = correct.enrollment_verifier();
-        let mut body = Zeroizing::new(digest(&scope.encode()).0.to_vec());
+        let mut body = Zeroizing::new(digest(&context.encode()).0.to_vec());
         body.extend_from_slice(&verifier.stored_key);
         body.extend_from_slice(verifier.server_key.as_ref());
         body.extend_from_slice(share.as_ref());
@@ -287,49 +233,17 @@ mod fixture {
                 assert_eq!(&**session.receive(RESULT).unwrap(), &[OK]);
                 continue;
             }
-            let init = random::<64>().unwrap();
-            session.send(INIT, &init).unwrap();
-            let challenge = session.receive(CHALLENGE).unwrap();
-            if matches!(expected, EXHAUSTED | RETIRED) {
-                assert_eq!(&**challenge, &[expected]);
-                continue;
-            }
-            assert_eq!(challenge[0], 0);
-            let mut attempt: Attempt = serde_json::from_slice(&challenge[1..]).unwrap();
-            assert_eq!(attempt.init_digest, digest(&init));
-            assert_eq!(attempt.domain.request.0.as_slice(), &init[..32]);
-            assert_eq!(attempt.client_nonce.0.as_slice(), &init[32..]);
-            attempt.challenge_digest = digest(&challenge[1..]);
-            let auth = transcript(&session, &attempt);
             let password = if expected == WRONG {
                 "synthetic wrong password"
             } else {
                 PASSWORD
             };
-            let credential = ClientCredential::new(password, &folder_secret, &scope).unwrap();
-            let mut proof = Zeroizing::new(credential.proof(&auth).to_vec());
-            proof.extend_from_slice(
-                sign_possession(&folder.signing_key, &auth)
-                    .unwrap()
-                    .as_slice(),
-            );
-            session.send(PROOF, &proof).unwrap();
-            let reply = session.receive(RESULT).unwrap();
-            if expected == WRONG {
-                assert_eq!(&**reply, &[WRONG]);
+            let credential = ClientCredential::new(password, &folder_secret, &context).unwrap();
+            let result = opening::open(session, &scope, credential, &folder.signing_key, &envelope);
+            if expected == OK {
+                assert_eq!(*result.unwrap(), *generation_key);
             } else {
-                assert_eq!(reply[0], OK);
-                let received_share = Secret::new(reply[33..].try_into().unwrap());
-                let key = credential
-                    .verify_and_unwrap(
-                        &scope,
-                        &auth,
-                        reply[1..33].try_into().unwrap(),
-                        &received_share,
-                        &envelope,
-                    )
-                    .unwrap();
-                assert_eq!(*key, *generation_key);
+                assert!(matches!(result, Err(opening::Error::Denied)));
             }
         }
     }

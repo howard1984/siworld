@@ -123,7 +123,14 @@ impl ReleaserIdentity {
         let binding = hash(b"binding", &[client, &server]);
         Ok((
             server,
-            Channel::derive(binding, folder_key, &first, &second, 2),
+            Channel::derive(
+                binding,
+                folder_key,
+                reply_key.as_slice(),
+                &first,
+                &second,
+                2,
+            ),
         ))
     }
 }
@@ -139,6 +146,7 @@ pub struct PendingClient {
     hello: Vec<u8>,
     folder_key: Word,
     first: crypto::Secret,
+    reply_key_digest: Word,
     reply: KemPrivate,
     started: Instant,
 }
@@ -169,6 +177,7 @@ impl PendingClient {
             hello,
             folder_key,
             first: Zeroizing::new(first),
+            reply_key_digest: hash(b"reply-key", &[key.as_slice()]),
             reply: KemPrivate(reply),
             started: Instant::now(),
         })
@@ -210,9 +219,10 @@ impl PendingClient {
             &MlKem768Ciphertext::from(take::<1088>(&mut input)),
         ));
         let binding = hash(b"binding", &[&self.hello, server]);
-        Ok(Channel::derive(
+        Ok(Channel::with_reply_digest(
             binding,
             self.folder_key,
+            self.reply_key_digest,
             &self.first,
             &second,
             1,
@@ -228,11 +238,12 @@ impl PendingClient {
 ///
 /// ```compile_fail,E0624
 /// use sivault_core::controlled_channel::Channel;
-/// let _ = Channel::derive([0; 32], [0; 32], &[0; 32], &[0; 32], 1);
+/// let _ = Channel::with_reply_digest([0; 32], [0; 32], [0; 32], &[0; 32], &[0; 32], 1);
 /// ```
 pub struct Channel {
     binding: ChannelBinding,
     folder_key: Word,
+    reply_key_digest: Word,
     traffic: Option<[crypto::Secret; 2]>,
     counters: [u64; 2],
     outgoing: u8,
@@ -240,7 +251,32 @@ pub struct Channel {
 }
 
 impl Channel {
-    fn derive(binding: Word, folder_key: Word, first: &Word, second: &Word, outgoing: u8) -> Self {
+    fn derive(
+        binding: Word,
+        folder_key: Word,
+        reply_key: &[u8],
+        first: &Word,
+        second: &Word,
+        outgoing: u8,
+    ) -> Self {
+        Self::with_reply_digest(
+            binding,
+            folder_key,
+            hash(b"reply-key", &[reply_key]),
+            first,
+            second,
+            outgoing,
+        )
+    }
+
+    fn with_reply_digest(
+        binding: Word,
+        folder_key: Word,
+        reply_key_digest: Word,
+        first: &Word,
+        second: &Word,
+        outgoing: u8,
+    ) -> Self {
         let mut secrets = Zeroizing::new([0; 64]);
         secrets[..32].copy_from_slice(first);
         secrets[32..].copy_from_slice(second);
@@ -254,6 +290,7 @@ impl Channel {
         Self {
             binding: ChannelBinding::authenticated(binding),
             folder_key,
+            reply_key_digest,
             traffic: Some(traffic),
             counters: [0; 2],
             outgoing,
@@ -267,6 +304,10 @@ impl Channel {
 
     pub fn claimed_folder_key(&self) -> &Word {
         &self.folder_key
+    }
+
+    pub fn reply_key_digest(&self) -> &Word {
+        &self.reply_key_digest
     }
 
     pub fn seal(&mut self, kind: u8, plaintext: &[u8]) -> Result<Vec<u8>> {

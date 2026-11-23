@@ -9,4 +9,8 @@ pub mod ipc;
 pub mod journal;
 pub mod ledger;
 pub mod message;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod opening;
 pub mod scheduler;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod transport;

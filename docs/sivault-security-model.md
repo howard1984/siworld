@@ -35,6 +35,8 @@ backup does not restore approval authority or spent attempts. Restoring both
 stores to a matching older state may evade detection. The attempt limit is
 not a defense against someone who controls the releaser's device. The native
 credential-store adapters are not yet wired into a desktop opening flow.
+On macOS the checkpoint is a local login Keychain item accessible to the
+logged-in user. Releaser protection does not exceed the device's login protection.
 
 The desktop and web shells have different trust boundaries. A web opener
 depends on the origin delivering its code. The desktop renderer handles typed

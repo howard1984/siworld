@@ -102,24 +102,24 @@ fn decode(bytes: [u8; MARKER_LEN]) -> Checkpoint {
 
 #[cfg(target_os = "macos")]
 mod native {
-    use security_framework::{
-        access_control::{ProtectionMode, SecAccessControl},
-        passwords::{PasswordOptions, generic_password, set_generic_password_options},
-    };
+    use security_framework::os::macos::keychain::SecKeychain;
     use security_framework_sys::base::errSecItemNotFound;
 
     use super::{AuthorityError, MARKER_LEN, Result, SERVICE};
 
-    fn options(account: &str) -> PasswordOptions {
-        let mut options = PasswordOptions::new_generic_password(SERVICE, account);
-        options.use_protected_keychain();
-        options.set_access_synchronized(Some(false));
-        options
+    pub(super) fn login_keychain() -> Result<SecKeychain> {
+        let home = std::env::var_os("HOME").ok_or(AuthorityError::Unavailable)?;
+        let path = std::path::PathBuf::from(home).join("Library/Keychains/login.keychain-db");
+        if !path.is_absolute() || !path.is_file() {
+            return Err(AuthorityError::Unavailable);
+        }
+        SecKeychain::open(path).map_err(|_| AuthorityError::Unavailable)
     }
 
     pub(super) fn read(account: &str) -> Result<Option<[u8; MARKER_LEN]>> {
-        match generic_password(options(account)) {
-            Ok(bytes) => bytes
+        match login_keychain()?.find_generic_password(SERVICE, account) {
+            Ok((bytes, _)) => bytes
+                .as_ref()
                 .try_into()
                 .map(Some)
                 .map_err(|_| AuthorityError::InvalidEvidence),
@@ -129,16 +129,67 @@ mod native {
     }
 
     pub(super) fn write(account: &str, bytes: [u8; MARKER_LEN], create: bool) -> Result<()> {
-        let mut options = options(account);
+        // File-based login keychain items are local, not iCloud Keychain items.
+        let keychain = login_keychain()?;
         if create {
-            let control = SecAccessControl::create_with_protection(
-                Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-                0,
-            )
-            .map_err(|_| AuthorityError::Unavailable)?;
-            options.set_access_control(control);
+            return keychain
+                .add_generic_password(SERVICE, account, &bytes)
+                .map_err(|_| AuthorityError::Unavailable);
         }
-        set_generic_password_options(&bytes, options).map_err(|_| AuthorityError::Unavailable)
+        let (_, mut item) = keychain
+            .find_generic_password(SERVICE, account)
+            .map_err(|_| AuthorityError::Unavailable)?;
+        item.set_password(&bytes)
+            .map_err(|_| AuthorityError::Unavailable)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use sivault_core::crypto::random;
+
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an unlocked macOS login keychain"]
+    fn macos_keychain_checkpoint_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut marker = PlatformMarker::new(directory.path()).unwrap();
+        let slot = SlotIdentity {
+            suite: 1,
+            network: Id(random().unwrap()),
+            safe: Id(random().unwrap()),
+            slot: Id(random().unwrap()),
+            ledger: Id(random().unwrap()),
+        };
+        let initial = Checkpoint {
+            instance: Id(random().unwrap()),
+            head: Id(random().unwrap()),
+        };
+        let advanced = Checkpoint {
+            head: Id(random().unwrap()),
+            ..initial
+        };
+        assert_eq!(marker.load(slot), Ok(None));
+        let result: Result<()> = (|| {
+            marker.compare_and_store(slot, None, initial)?;
+            assert_eq!(marker.load(slot)?, Some(initial));
+            marker.compare_and_store(slot, Some(initial), advanced)?;
+            assert_eq!(marker.load(slot)?, Some(advanced));
+            assert_eq!(
+                marker.compare_and_store(slot, Some(initial), initial),
+                Err(AuthorityError::Stale)
+            );
+            Ok(())
+        })();
+        if let Ok((_, item)) = native::login_keychain()
+            .unwrap()
+            .find_generic_password(SERVICE, &account(slot))
+        {
+            item.delete();
+        }
+        result.unwrap();
+        assert_eq!(marker.load(slot), Ok(None));
     }
 }
 
