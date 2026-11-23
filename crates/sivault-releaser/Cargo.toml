@@ -30,5 +30,11 @@ tempfile = "=3.27.0"
 name = "controlled_process"
 harness = false
 
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [lints.rust]
 unsafe_code = "deny"

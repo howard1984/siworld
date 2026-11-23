@@ -69,12 +69,14 @@ pub fn provision_with_head<M: MarkerStore>(
         return Err(AuthorityError::InvalidEvidence);
     }
     let bytes = seal(material, password)?;
-    let mut directory = fs::DirBuilder::new();
+    let directory = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let directory = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut directory = directory;
         directory.mode(0o700);
-    }
+        directory
+    };
     directory
         .create(path)
         .map_err(|_| AuthorityError::Unavailable)?;

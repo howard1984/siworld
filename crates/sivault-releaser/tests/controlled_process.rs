@@ -377,7 +377,11 @@ mod fixture {
                     assert_eq!(safe.entries()[0].name, "Synthetic files");
                 }
             } else {
-                assert!(matches!(result, Err(opening::Error::Denied)));
+                assert!(
+                    matches!(&result, Err(opening::Error::Denied)),
+                    "unexpected refusal result for fixture case {expected}: {:?}",
+                    result.err(),
+                );
             }
         }
     }
@@ -416,7 +420,11 @@ mod fixture {
         }
         let status = child.wait().unwrap();
         let restart_status = restarted.wait().unwrap();
-        worker.join().unwrap();
+        let joined = worker.join();
+        if outcome == Err(mpsc::RecvTimeoutError::Timeout) {
+            panic!("controlled lifecycle exceeded its 15-second deadline");
+        }
+        joined.unwrap();
         outcome.unwrap();
         assert!(status.success() && restart_status.success());
         println!(
