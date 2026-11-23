@@ -1,5 +1,6 @@
 mod support;
 
+use sivault_releaser::ipc;
 use sivault_releaser::message::*;
 use support::*;
 
@@ -21,6 +22,31 @@ fn init() -> Message {
             record: id(0x88),
             commit_certificate: None,
         },
+    }
+}
+
+#[test]
+fn ipc_frames_preserve_boundaries_and_reject_partial_or_oversize_input() {
+    let first = init();
+    let second = refill(1, 6, 2);
+    let mut bytes = Vec::new();
+    ipc::write(&mut bytes, &first).unwrap();
+    ipc::write(&mut bytes, &second).unwrap();
+    let mut reader = bytes.as_slice();
+    assert_eq!(ipc::read(&mut reader).unwrap(), Some(first));
+    assert_eq!(ipc::read(&mut reader).unwrap(), Some(second));
+    assert_eq!(ipc::read(&mut reader).unwrap(), None);
+    for index in [1, 3, 4, 5] {
+        assert!(matches!(
+            ipc::read(&mut &bytes[..index]),
+            Err(ipc::Error::Io(_))
+        ));
+    }
+    for length in [0, MAX_MESSAGE_BYTES as u32 + 1, u32::MAX] {
+        assert!(matches!(
+            ipc::read(&mut length.to_be_bytes().as_slice()),
+            Err(ipc::Error::InvalidLength)
+        ));
     }
 }
 

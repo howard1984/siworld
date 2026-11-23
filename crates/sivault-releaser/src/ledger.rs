@@ -16,6 +16,10 @@ pub const MAX_ISSUED_HISTORY: usize = 1024;
 pub const MAX_COMMAND_HISTORY: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct SlotIdentity {
     pub suite: u16,
     pub network: Id,
@@ -25,6 +29,10 @@ pub struct SlotIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct Record {
     pub generation: u64,
     pub incarnation: Id,
@@ -36,6 +44,10 @@ pub struct Record {
 /// the authenticated protocol integration. `record_manifest` identifies the
 /// active provisioned record set; the adapter validates `selected_record` in it.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct Attempt {
     pub domain: Domain,
     pub record_manifest: Id,
@@ -628,18 +640,17 @@ pub enum AuthorityError {
 
 /// Trusted deployment adapter; no implementation is provided by this crate.
 ///
-/// Recovery must return the EXACT current slot ledger and establish exclusive,
-/// rollback-resistant authority across backups, workers, generations and
-/// incarnations. If it cannot establish either property it MUST fail closed.
-/// File contents, timestamps, locks or an owner signature alone are insufficient.
+/// Recovery requires exclusive access and checking the journal against state
+/// outside the normal backup domain. Unknown or mismatched state fails closed.
+/// A simultaneous restore of both stores can evade best-effort detection.
 /// Initial enrollment must be installed once, never overwrite an existing slot.
 ///
 /// Commit must compare the entire expected ledger with protected current state,
 /// serialize writers and durably commit ALL of `transition.next()` atomically.
 /// No successful return before persistence. An uncertain commit is an error;
 /// recovery must retain any charge that did reach storage. Even no-op retries
-/// require the exclusive current-state check. It must authenticate all event
-/// inputs, independently check trusted time/deadlines and possession verdicts,
+/// require the exclusive current-state check. The calling protocol must
+/// authenticate event inputs, check time/deadlines and possession verdicts,
 /// compute/check transcript and command digests, and validate selected records.
 /// Owner commands additionally require authenticated owner/manifest/predecessor,
 /// expected ledger-head and tombstone digests, commit/readiness certificates,

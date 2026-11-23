@@ -1,10 +1,9 @@
 # SIVault Releaser Policy
 
-This dependency-free library contains noncredential message metadata, permanent
-slot ledger transitions, and sequential client scheduling. It has no credential
-evaluation, proof, wrapping, authentication, network, or storage implementation.
-Its tests establish policy behavior under explicitly modeled adapter assumptions;
-they do not establish cryptographic security or platform rollback resistance.
+This library contains noncredential message metadata, permanent slot ledger
+transitions, sequential client scheduling, and a native admission journal.
+The calling protocol authenticates messages and evaluates credentials; this
+library does not expose a releaser service.
 
 ## Metadata encoding
 
@@ -60,14 +59,19 @@ freshness. `Releaser::new` and `Releaser::default` start quarantined. Only
 exclusive authority. Owner restore commands alone cannot clear quarantine.
 
 `DurableAuthority::commit` must check exclusive current-state ownership, compare
-the complete expected ledger, and atomically persist the full next ledger before
-returning success. It must also validate authenticated event inputs, trusted time,
+the complete expected ledger, and durably commit the full transition before
+returning success. The calling protocol validates event authentication, time,
 possession verdicts, selected record membership, command/predecessor and manifest
 bindings, expected ledger-head and tombstone digests, certificates/readiness,
 replacement fencing, and physical deletion evidence. Payload rotation and its
 fresh-key/re-encryption requirements remain an external integration obligation.
-The trait contract in `ledger.rs` defines these requirements; the crate provides
-no production adapter. The only supplied default adapter always fails closed.
+The default adapter always fails closed. The native journal appends and
+synchronizes each transition before advancing its credential-store checkpoint.
+An absent checkpoint, divergent head or torn tail denies service. The journal
+does not resolve an interrupted checkpoint update by truncating records.
+Its marker is best-effort restore detection, not protection against a
+simultaneous rollback of both stores. The macOS and Windows checkpoint adapters
+are not yet integrated into the desktop application.
 
 After that commit, `Releaser::apply` may return a non-cloneable `CredentialReady`
 token containing the exact admitted attempt metadata and committed revision.

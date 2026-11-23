@@ -13,9 +13,17 @@ const MAGIC: &[u8; 4] = b"SVMN";
 
 /// A fixed-width, opaque identifier or externally computed digest.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct Id(pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 #[repr(u8)]
 pub enum Operation {
     Normal = 1,
@@ -25,6 +33,10 @@ pub enum Operation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
 pub struct Domain {
     pub suite: u16,
     pub network: Id,

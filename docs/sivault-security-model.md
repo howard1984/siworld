@@ -1,8 +1,8 @@
 # SIVault Security Model
 
 SIVault includes a provisional offline standard-folder implementation and a
-non-credential releaser state model. Controlled credential handling requires
-separate construction review. The standard format uses Argon2id, RFC 8265
+releaser state model. Controlled credential and channel primitives are
+separate from the desktop opening flow. The standard format uses Argon2id, RFC 8265
 OpaqueString password preparation, independently derived keys, and the
 published STREAM construction with 64 KiB authentication units.
 
@@ -23,6 +23,18 @@ copied folder.
 | Multiple observations of a fixed-size safe | Constant file sizes do not hide which bytes change or imply plausible deniability. |
 | Relay or traffic observer | A relay can observe routing and timing and delay or drop messages. Release decisions must not depend on relay state. |
 | Releaser unavailable or restored from stale state | An unavailable or unverified releaser must not grant a fresh opening. Availability depends on the remaining eligible releasers and their attempt budgets. |
+
+The controlled channel derives traffic keys from two ML-KEM shared secrets.
+It does not promise forward secrecy against later releaser key compromise for
+captures that also expose the other KEM secret or endpoint state.
+
+The releaser journal commits a charge before allowing credential evaluation.
+The slot is unavailable when its attempt history cannot be verified against
+the checkpoint in the operating system credential store. Restoring a wallet
+backup does not restore approval authority or spent attempts. Restoring both
+stores to a matching older state may evade detection. The attempt limit is
+not a defense against someone who controls the releaser's device. The native
+credential-store adapters are not yet wired into a desktop opening flow.
 
 The desktop and web shells have different trust boundaries. A web opener
 depends on the origin delivering its code. The desktop renderer handles typed

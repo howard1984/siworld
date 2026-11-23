@@ -1,4 +1,7 @@
 //! Portable library boundary for SIVault formats.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod controlled_channel;
+pub mod controlled_credential;
 pub mod crypto;
 pub mod standard;
 

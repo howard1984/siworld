@@ -35,6 +35,10 @@ pub fn password_bytes(password: &str) -> Result<Zeroizing<String>> {
 }
 
 pub fn stretch(password: &str, salt: &[u8; 16]) -> Result<Secret> {
+    stretch_with_salt(password, salt)
+}
+
+pub(crate) fn stretch_with_salt(password: &str, salt: &[u8]) -> Result<Secret> {
     let password = password_bytes(password)?;
     let parameters = Params::new(65_536, 3, 1, Some(32)).map_err(|_| Error::InvalidFormat)?;
     let mut key = Zeroizing::new([0; 32]);

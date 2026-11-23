@@ -2,6 +2,12 @@ mod support;
 
 use std::sync::{Arc, Barrier, Mutex};
 
+#[cfg(not(target_arch = "wasm32"))]
+use sivault_core::{
+    controlled_channel::{PendingClient, ReleaserIdentity},
+    controlled_credential::{AttemptContext, ClientCredential, RecordContext},
+    crypto::Secret,
+};
 use sivault_releaser::ledger::*;
 use sivault_releaser::message::{AckPhase, Action, Body, Domain, Operation};
 use support::*;
@@ -95,6 +101,80 @@ fn step(ledger: &Ledger, event: Event) -> Ledger {
 }
 fn policy_error(ledger: &Ledger, event: Event, expected: PolicyError) {
     assert_eq!(ledger.transition(event).unwrap_err(), expected);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn synthetic_credentials_are_evaluated_only_after_charge_and_owner_refill() {
+    let authority = ModelAuthority::new(ledger(2));
+    let mut service = authority.service();
+    let initial = attempt(1);
+    let record = RecordContext {
+        suite: initial.domain.suite,
+        version: 1,
+        deployment: initial.domain.network.0,
+        safe: initial.domain.safe.0,
+        generation: initial.domain.generation,
+        slot: initial.domain.slot.0,
+        ledger: slot().ledger.0,
+        operation: initial.domain.operation as u8,
+        record: initial.selected_record.0,
+        argon_salt: [42; 32],
+    };
+    let folder_secret = Secret::new([43; 32]);
+    let generation_key = Secret::new([44; 32]);
+    let share = Secret::new([45; 32]);
+    let client = || ClientCredential::new("synthetic password", &folder_secret, &record).unwrap();
+    let enrollment = client();
+    let verifier = enrollment.enrollment_verifier();
+    let envelope = enrollment.wrap(&record, &share, &generation_key).unwrap();
+    let releaser = ReleaserIdentity::generate().unwrap();
+    let open = |service: &mut Releaser<ModelAuthority>,
+                request: u8,
+                credential: ClientCredential| {
+        let candidate = attempt(request);
+        let pending = PendingClient::start(releaser.pins(), &record.deployment, [46; 32]).unwrap();
+        let (hello, session) = releaser
+            .accept(&record.deployment, pending.hello())
+            .unwrap();
+        let channel = pending.finish(&hello).unwrap();
+        assert_eq!(channel.binding(), session.binding());
+        service.apply(register(&candidate)).unwrap();
+        let Outcome::CredentialReady(admitted) = service.apply(charge(&candidate)).unwrap() else {
+            panic!("expected committed attempt");
+        };
+        let admitted = admitted.into_attempt();
+        assert_eq!(admitted, candidate);
+        let transcript = AttemptContext {
+            request: admitted.domain.request.0,
+            client_nonce: admitted.client_nonce.0,
+            server_nonce: admitted.server_nonce.0,
+            challenge: admitted.challenge.0,
+            reply_key_digest: admitted.reply_key_digest.0,
+            init_digest: admitted.init_digest.0,
+            challenge_digest: admitted.challenge_digest.0,
+            incarnation: admitted.domain.incarnation.0,
+            deadline: admitted.deadline,
+            channel_binding: channel.binding(),
+        }
+        .encode(&record);
+        let response =
+            verifier.evaluate_charged_proof(&transcript, &credential.proof(&transcript))?;
+        credential.verify_and_unwrap(&record, &transcript, &response, &share, &envelope)
+    };
+    assert_eq!(*open(&mut service, 1, client()).unwrap(), *generation_key);
+    assert_eq!(authority.ledger().remaining(), 1);
+    let wrong = ClientCredential::new("synthetic wrong password", &folder_secret, &record).unwrap();
+    assert!(open(&mut service, 2, wrong).is_err());
+    assert_eq!(authority.ledger().remaining(), 0);
+    assert_eq!(
+        service.apply(register(&attempt(3))).unwrap_err(),
+        Error::Policy(PolicyError::Exhausted),
+    );
+    service.apply(command(refill(1, 2, 1))).unwrap();
+    assert_eq!(authority.ledger().remaining(), 1);
+    assert_eq!(*open(&mut service, 4, client()).unwrap(), *generation_key);
+    assert_eq!(authority.ledger().remaining(), 0);
 }
 
 #[test]
