@@ -114,7 +114,10 @@ impl Directory {
         #[cfg(not(unix))]
         let f = {
             let mut options = OpenOptions::new();
-            options.read(!create).write(create || update).create_new(create);
+            options
+                .read(!create)
+                .write(create || update)
+                .create_new(create);
             #[cfg(windows)]
             {
                 use std::os::windows::fs::OpenOptionsExt;
