@@ -106,6 +106,7 @@ pub(crate) fn create(
     Registration {
         peer: Id(peer.identifier),
         port: peer.address.port(),
+        endpoint: (!peer.address.ip().is_loopback()).then_some(*peer.address.ip()),
         scope,
         allowance,
         enrollment_ack: ack,

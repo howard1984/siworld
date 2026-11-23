@@ -216,7 +216,7 @@ impl Drop for Worker {
     }
 }
 
-fn in_tailnet(addr: Ipv4Addr) -> bool {
+pub fn in_tailnet(addr: Ipv4Addr) -> bool {
     let [a, b, _, _] = addr.octets();
     a == 100 && (64..128).contains(&b)
 }

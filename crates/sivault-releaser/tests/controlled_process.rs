@@ -302,6 +302,7 @@ mod fixture {
             Registration {
                 peer: Id(identity().pins().identifier()),
                 port: 31337,
+                endpoint: None,
                 scope,
                 allowance: 2,
                 enrollment_ack: enroll_digest,

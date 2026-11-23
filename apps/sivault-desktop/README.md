@@ -1,6 +1,6 @@
 # SIVault Desktop
 
-Tauri 2 shell for offline standard safes. The React frontend displays metadata;
+Tauri 2 shell for offline and controlled safes. The React frontend displays metadata;
 the Rust adapter owns `sivault_core::standard::Safe` and its key material.
 The initial format stores each safe in a directory. Creation selects a parent
 directory and creates a new named `.sivault` directory; opening selects that directory.
@@ -27,6 +27,34 @@ The browser preview has an explicit synthetic fixture mode in development builds
 It never reads user files, handles real passwords, or encrypts data. Synthetic
 exports contain only fixed fixture text. Production builds exclude this mode;
 browser use of a production build cannot operate on safes.
+
+## Controlled Safe Development
+
+Controlled safes require an enrolled, reachable releaser for each opening.
+The desktop prototype supports one releaser slot, with a fixed initial
+allowance, explicit refills and terminal revocation. The releaser must
+authorize the owner's identifier and initial allowance before enrollment.
+The releaser storage password, safe password and owner recovery phrase are
+entered in native dialogs. A revoke receipt confirms removal of live share
+material on that releaser; it does not recall data already disclosed or prove
+erasure of backups. An unconfirmed command does not establish that an
+unreachable releaser enforced it.
+
+The releaser binds IPv4 loopback by default. A non-distributable debug
+build with `desktop-e2e` can instead bind one Tailscale IPv4 address and
+port named by `SIVAULT_TEST_RELEASER_BIND` and accept only the single Tailscale
+IPv4 address named by `SIVAULT_TEST_RELEASER_PEER`. Both settings are required
+together. The pinned authenticated channel is still required. An enrolled
+releaser resumes on its stored port; do not change the pairing between runs.
+Build and run the synthetic loopback lifecycle test on a development machine:
+
+```sh
+cargo test --locked --manifest-path src-tauri/Cargo.toml --features desktop-e2e --test controlled_desktop
+```
+
+On Windows, also enable `dev-windows-write` for synthetic tests of safe creation.
+The test starts two native processes without opening their windows and uses
+separate temporary data directories.
 
 ## Engineering Wallet
 
@@ -107,6 +135,14 @@ accepted from the renderer, and selected safe paths remain in Rust memory.
 | Command | Input | Result |
 | --- | --- | --- |
 | `safe_create` | `name` | safe descriptor, or `null` if cancelled |
+| `safe_create_controlled` | `name`, releaser `address`, `identifier`, `allowance` | safe descriptor after durable enrollment, or `null` if cancelled |
+| `safe_manage_controlled` | `current`, `additional`, nullable `revokeLabel` | whether the selected command was confirmed |
+| `owner_prepare` | none | whether native owner setup or restore completed |
+| `owner_identifier` | none | public identifier of the prepared owner |
+| `releaser_status` | none | current listener address, public identifier and enrollment state |
+| `releaser_authorize` | `owner`, `allowance` | whether one enrollment was locally authorized |
+| `releaser_set_running` | `enabled` | current listener status |
+| `releaser_verify` | `address`, `identifier` | no value after authenticating the peer |
 | `safe_open` | `readOnly` | safe descriptor, or `null` if cancelled |
 | `safe_unlock` | `id`, `readOnly` | safe descriptor, or `null` if cancelled |
 | `safe_list` | `sessionId`, nullable `parent` | direct child entry metadata |

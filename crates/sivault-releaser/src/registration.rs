@@ -28,6 +28,8 @@ const SIGNATURE_LEN: usize = libcrux_ml_dsa::ml_dsa_65::MLDSA65Signature::len();
 pub struct Registration {
     pub peer: Id,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<Ipv4Addr>,
     pub scope: OpeningRecord,
     pub allowance: u64,
     pub enrollment_ack: Id,
@@ -39,6 +41,9 @@ impl Registration {
     fn validate(&self) -> Result<()> {
         if self.peer == Id::default()
             || self.port == 0
+            || self
+                .endpoint
+                .is_some_and(|address| !crate::transport::in_tailnet(address))
             || self.scope.record.generation == 0
             || self.allowance == 0
             || self.enrollment_ack == Id::default()
@@ -50,7 +55,7 @@ impl Registration {
     }
 
     pub fn address(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port)
+        SocketAddrV4::new(self.endpoint.unwrap_or(Ipv4Addr::LOCALHOST), self.port)
     }
 
     pub fn envelope(&self) -> Result<Envelope> {

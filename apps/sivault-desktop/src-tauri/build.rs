@@ -6,6 +6,8 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "safe_create",
+            "safe_create_controlled",
+            "safe_manage_controlled",
             "safe_open",
             "safe_unlock",
             "safe_list",
@@ -13,6 +15,12 @@ fn main() {
             "safe_export",
             "safe_create_directory",
             "safe_lock",
+            "owner_prepare",
+            "owner_identifier",
+            "releaser_status",
+            "releaser_authorize",
+            "releaser_set_running",
+            "releaser_verify",
             "wallet_status",
             "wallet_access",
             "wallet_endpoint",

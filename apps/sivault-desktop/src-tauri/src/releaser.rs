@@ -22,6 +22,47 @@ use crate::adapter::{BridgeError, Result};
 pub(crate) const LOOPBACK_DEPLOYMENT: [u8; 32] = *b"sivault/local-controlled-safe/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(any(target_os = "macos", windows))]
+fn listen(
+    saved_port: Option<u16>,
+    exchange: impl FnMut(TcpStream) + Send + 'static,
+) -> Result<(SocketAddr, Worker)> {
+    #[cfg(all(feature = "desktop-e2e", debug_assertions))]
+    {
+        let local = std::env::var_os("SIVAULT_TEST_RELEASER_BIND");
+        let peer = std::env::var_os("SIVAULT_TEST_RELEASER_PEER");
+        match (local, peer) {
+            (Some(local), Some(peer)) => {
+                let local: SocketAddrV4 = local
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(unavailable)?;
+                let peer: Ipv4Addr = peer
+                    .to_str()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(unavailable)?;
+                if saved_port.is_some_and(|port| port != local.port()) {
+                    return Err(unavailable());
+                }
+                let listener = sivault_releaser::transport::TailnetListener::bind(local, peer)
+                    .map_err(|_| unavailable())?;
+                let worker = listener.run(exchange).map_err(|_| unavailable())?;
+                return Ok((local.into(), worker));
+            }
+            (None, None) => (),
+            _ => return Err(unavailable()),
+        }
+    }
+    Worker::loopback_on(saved_port.unwrap_or(0), exchange).map_err(|_| unavailable())
+}
+
+fn safe_endpoint(address: SocketAddrV4) -> bool {
+    address.port() != 0
+        && (*address.ip() == Ipv4Addr::LOCALHOST
+            || (cfg!(all(feature = "desktop-e2e", debug_assertions))
+                && sivault_releaser::transport::in_tailnet(*address.ip())))
+}
+
 struct Listening {
     address: SocketAddr,
     identifier: [u8; 32],
@@ -163,7 +204,7 @@ impl ReleaserState {
         let authorization = Arc::new(Mutex::new(None::<Authorization>));
         let permitted = Arc::clone(&authorization);
         let mut active = None::<Service<PlatformMarker>>;
-        let (address, worker) = Worker::loopback(move |mut stream| {
+        let (address, worker) = listen(None, move |mut stream| {
             let Ok(local) = stream.local_addr() else {
                 return;
             };
@@ -251,8 +292,7 @@ impl ReleaserState {
             let _ = enrollment::acknowledge(&mut session, &identity, &accepted, head);
             active = Some(Service::new(service, accepted.release, accepted.owner_key));
             serving.store(true, Ordering::Release);
-        })
-        .map_err(|_| unavailable())?;
+        })?;
         lifecycle.listener = Some(Listening {
             address,
             identifier,
@@ -298,7 +338,7 @@ impl ReleaserState {
         if state.exiting || state.epoch != epoch || state.listener.is_some() {
             return Err(unavailable());
         }
-        let (address, worker) = Worker::loopback_on(material.port, move |mut stream| {
+        let (address, worker) = listen(Some(material.port), move |mut stream| {
             if stream.write_all(&advertised).is_ok()
                 && let Ok(reader) = stream.try_clone()
                 && let Ok(mut session) = Session::accept(reader, &mut stream, &network, &identity)
@@ -307,8 +347,7 @@ impl ReleaserState {
             {
                 let _ = service.serve(session, kind, &payload, &identity, &slot_path, now);
             }
-        })
-        .map_err(|_| unavailable())?;
+        })?;
         state.listener = Some(Listening {
             address,
             identifier,
@@ -350,7 +389,7 @@ fn status(state: &Lifecycle) -> ReleaserStatus {
 fn invalid_peer() -> BridgeError {
     BridgeError::new(
         "RELEASER_INVALID_PEER",
-        "Enter a releaser identifier and a local address.",
+        "Enter a releaser identifier and a supported IPv4 address.",
     )
 }
 
@@ -363,7 +402,7 @@ impl LocalPeer {
     pub(crate) fn parse(address: &str, identifier: &str) -> Result<Self> {
         let address: SocketAddrV4 = address.trim().parse().map_err(|_| invalid_peer())?;
         let identifier = parse_identifier(identifier)?;
-        if *address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 {
+        if !safe_endpoint(address) {
             return Err(invalid_peer());
         }
         Ok(Self {
@@ -376,6 +415,9 @@ impl LocalPeer {
         &self,
         folder: [u8; 32],
     ) -> Result<(Session<TcpStream, TcpStream>, ReleaserPins)> {
+        if !safe_endpoint(self.address) {
+            return Err(invalid_peer());
+        }
         let mut stream = TcpStream::connect_timeout(&self.address.into(), CONNECT_TIMEOUT)
             .map_err(|_| unavailable())?;
         stream
@@ -612,6 +654,11 @@ mod tests {
         assert!(LocalPeer::parse("localhost:31337", &identifier).is_err());
         assert!(LocalPeer::parse("127.0.0.1:31337", "10").is_err());
         assert!(LocalPeer::parse("127.0.0.1:31337", &"GG".repeat(32)).is_err());
+        assert!(LocalPeer::parse("192.0.2.3:31337", &identifier).is_err());
+        assert_eq!(
+            LocalPeer::parse("100.127.255.254:31337", &identifier).is_ok(),
+            cfg!(all(feature = "desktop-e2e", debug_assertions))
+        );
     }
 
     #[test]
