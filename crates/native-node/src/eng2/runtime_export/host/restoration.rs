@@ -144,17 +144,15 @@ impl Host {
             preparation.retained_request = false;
             match result {
                 Ok(Some(result)) => {
-                    // Authentication errors remain errors. Only a successful
-                    // result captured before a canonical advance is discarded
-                    // as pending; it cannot restore signing or wallet readiness.
+                    // A strictly longer canonical chain can retain the verified
+                    // artifacts. The install step rechecks the current signer
+                    // context, publication generation, and retirement state.
                     *stage = Stage::Revision;
-                    if !result.revision.is_current_revision(store)? {
+                    if !result.revision.is_current_revision(store)?
+                        && !result.revision.is_canonical_extension(store)?
+                    {
                         *stage = Stage::StaleWithdrawal;
-                        if result.revision.is_canonical_extension(store)? {
-                            self.pause_current_exports()?;
-                        } else {
-                            self.pause_reorganization_exports()?;
-                        }
+                        self.pause_reorganization_exports()?;
                         return Ok(false);
                     }
                     *stage = Stage::Install;
@@ -269,7 +267,11 @@ impl Host {
         Ok(())
     }
     fn install_retained(&mut self, store: &Store, result: ValidatedRetained) -> Result<(), String> {
-        result.revision.check(store)?;
+        if !result.revision.is_current_revision(store)?
+            && !result.revision.is_canonical_extension(store)?
+        {
+            return Err("checkpoint retained restoration canonical prefix changed".into());
+        }
         let preparation = self
             .preparation
             .as_ref()

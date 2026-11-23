@@ -242,6 +242,7 @@ impl PeerReadiness {
 pub(crate) struct NetworkStatus {
     inner: Mutex<StatusInner>,
     lane_identities: BTreeSet<Hash>,
+    #[cfg(test)]
     checkpoint_references: BTreeSet<Hash>,
 }
 pub(super) struct Snapshot {
@@ -269,6 +270,7 @@ impl Drop for Connected {
         }
     }
 }
+#[cfg(test)]
 pub(crate) struct CheckpointReady<'a> {
     _guard: std::sync::MutexGuard<'a, StatusInner>,
 }
@@ -304,16 +306,19 @@ impl NetworkStatus {
     /// Lane identity pins do not themselves confer checkpoint reference status.
     pub(crate) fn with_pinned_peers(peers: impl IntoIterator<Item = (Hash, bool)>) -> Self {
         let mut lane_identities = BTreeSet::new();
+        #[cfg(test)]
         let mut checkpoint_references = BTreeSet::new();
-        for (peer, checkpoint_reference) in peers {
+        for (peer, _checkpoint_reference) in peers {
             lane_identities.insert(peer);
-            if checkpoint_reference {
+            #[cfg(test)]
+            if _checkpoint_reference {
                 checkpoint_references.insert(peer);
             }
         }
         Self {
             inner: Mutex::default(),
             lane_identities,
+            #[cfg(test)]
             checkpoint_references,
         }
     }
@@ -476,6 +481,7 @@ impl NetworkStatus {
     /// This guard cannot be created from a caller's asserted readiness boolean.
     /// Hold it through proposal creation or signing; disconnect and round-start
     /// updates cannot race between this check and the protected operation.
+    #[cfg(test)]
     pub(crate) fn checkpoint_ready(
         &self,
         head: (u64, Hash),

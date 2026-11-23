@@ -155,7 +155,7 @@ fn resident_ticks_progress_during_delayed_full_component_validation_and_reject_u
 
 #[test]
 #[ignore = "requires disposable minimum-difficulty native blocks 1..37 and existing synthetic checkpoint signer records"]
-fn delayed_native_preparation_allows_append_but_requires_a_new_fresh_round_before_journaling_and_signing()
+fn delayed_native_preparation_signs_after_append_with_an_old_peer_head()
  {
     let fixture = fixture_root();
     let accepted = source(&fixture);
@@ -259,66 +259,13 @@ fn delayed_native_preparation_allows_append_but_requires_a_new_fresh_round_befor
     network
         .round([1; 32], 0, Some((37, header.id().unwrap())))
         .unwrap();
-    network.expire_checkpoint_round_for_test([1; 32]);
+    network
+        .round([1; 32], 0, Some((36, [9; 32])))
+        .unwrap();
     release_tx.send(()).unwrap();
     wait_prepared(&mut host, &owner, &network, &mut now);
-    assert!(host.pending.is_none());
-    assert!(host.preparation.as_ref().unwrap().completed.is_some());
-    assert!(journals(&root, "candidate-").is_empty());
-    assert!(journals(&root, "vote-").is_empty());
-    network
-        .round([1; 32], 0, Some((36, statement.authorization_block)))
-        .unwrap();
-    now += 1;
-    {
-        let store = owner.lock().unwrap();
-        assert!(
-            host.tick_resident(
-                &store,
-                now,
-                &[],
-                &network,
-                &crate::eng2::checkpoint_observer::Observer::default()
-            )
-            .unwrap()
-            .vote
-            .is_none()
-        );
-    }
-    assert!(journals(&root, "candidate-").is_empty());
-    network.begin_round([1; 32]).unwrap();
-    now += 1;
-    {
-        let store = owner.lock().unwrap();
-        assert!(
-            host.tick_resident(
-                &store,
-                now,
-                &[],
-                &network,
-                &crate::eng2::checkpoint_observer::Observer::default()
-            )
-            .unwrap()
-            .vote
-            .is_none()
-        );
-    }
-    assert!(journals(&root, "vote-").is_empty());
-    network
-        .round([1; 32], 0, Some((37, header.id().unwrap())))
-        .unwrap();
-    now += 1;
     let store = owner.lock().unwrap();
-    let tick = host
-        .tick_resident(
-            &store,
-            now,
-            &[],
-            &network,
-            &crate::eng2::checkpoint_observer::Observer::default(),
-        )
-        .unwrap();
-    assert!(tick.vote.is_some());
+    assert!(host.journaled_vote.is_some());
     let pending = host.pending.as_ref().unwrap();
     assert_eq!(pending.statement(), &statement);
     assert_eq!(pending.witness(), &witness);
@@ -328,7 +275,7 @@ fn delayed_native_preparation_allows_append_but_requires_a_new_fresh_round_befor
     assert_eq!(journals(&root, "candidate-").len(), 1);
     let first_vote = journals(&root, "vote-");
     assert_eq!(first_vote.len(), 1);
-    let vote = tick.vote.unwrap();
+    let vote = host.journaled_vote.as_ref().unwrap().1.clone();
     let duplicate = Incoming::Certified {
         certificate: Box::new(Certificate {
             statement: statement.clone(),

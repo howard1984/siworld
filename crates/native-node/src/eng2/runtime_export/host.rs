@@ -143,7 +143,6 @@ pub enum Alarm {
     Unavailable,
     Stale,
     SignerNotCurrent,
-    WaitingForPeerHead,
     CurrentQuorumConflict,
 }
 impl Alarm {
@@ -152,7 +151,6 @@ impl Alarm {
             Self::Unavailable => "checkpoint_unavailable",
             Self::Stale => "checkpoint_stale",
             Self::SignerNotCurrent => "checkpoint_signer_not_current",
-            Self::WaitingForPeerHead => "checkpoint_signing_waiting_for_current_peer_tip",
             Self::CurrentQuorumConflict => "checkpoint_current_quorum_conflict",
         }
     }
@@ -195,14 +193,8 @@ impl TickFailureReason {
 }
 // Only the resident entry point can construct the production readiness gate.
 // Public observation never accepts an asserted boolean or a caller-made permit.
-struct SigningGuard<'a> {
-    #[cfg(feature = "eng2-runtime")]
-    _network: crate::eng2::resident::peers::CheckpointReady<'a>,
-    #[cfg(not(feature = "eng2-runtime"))]
-    _marker: std::marker::PhantomData<&'a ()>,
-}
 trait SigningReadiness {
-    fn guard(&self, store: &Store) -> Result<SigningGuard<'_>, Alarm>;
+    fn guard(&self, store: &Store) -> Result<(), Alarm>;
     fn alarm(&self, store: &Store) -> Option<Alarm> {
         self.guard(store).err()
     }
@@ -215,7 +207,7 @@ fn with_signing_readiness<T>(
     let Some(gate) = readiness else {
         return Ok(None);
     };
-    let Ok(_guard) = gate.guard(store) else {
+    let Ok(()) = gate.guard(store) else {
         return Ok(None);
     };
     action().map(Some)
@@ -223,7 +215,6 @@ fn with_signing_readiness<T>(
 #[cfg(feature = "eng2-runtime")]
 struct ResidentSigningReadiness<'a> {
     head: (Hash, Hash, Hash, u64, Hash, Hash),
-    network: &'a crate::eng2::resident::peers::NetworkStatus,
     observer: &'a crate::eng2::checkpoint_observer::Observer,
 }
 #[cfg(feature = "eng2-runtime")]
@@ -244,18 +235,14 @@ impl ResidentSigningReadiness<'_> {
 }
 #[cfg(feature = "eng2-runtime")]
 impl SigningReadiness for ResidentSigningReadiness<'_> {
-    fn guard(&self, store: &Store) -> Result<SigningGuard<'_>, Alarm> {
+    fn guard(&self, store: &Store) -> Result<(), Alarm> {
         if Self::head(store).ok().as_ref() != Some(&self.head) {
             return Err(Alarm::Unavailable);
         }
         if self.observer.conflicted() {
             return Err(Alarm::CurrentQuorumConflict);
         }
-        let guard = self
-            .network
-            .checkpoint_ready((self.head.3, self.head.4))
-            .map_err(|_| Alarm::WaitingForPeerHead)?;
-        Ok(SigningGuard { _network: guard })
+        Ok(())
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -946,13 +933,12 @@ impl Host {
         store: &Store,
         now: u64,
         incoming: &[Incoming],
-        network: &crate::eng2::resident::peers::NetworkStatus,
+        _network: &crate::eng2::resident::peers::NetworkStatus,
         observer: &crate::eng2::checkpoint_observer::Observer,
     ) -> Result<Tick, String> {
         self.tick_failure = Some(TickFailureReason::Context);
         let readiness = ResidentSigningReadiness {
             head: ResidentSigningReadiness::head(store)?,
-            network,
             observer,
         };
         self.tick_inner(store, now, incoming, Some(&readiness))
@@ -1296,7 +1282,7 @@ impl Host {
         self.tick_failure = Some(TickFailureReason::StatusPublication);
         let paused = self.export.pruning_paused(now)?;
         let signing_alarm = self.signer.as_ref().and_then(|_| {
-            readiness.map_or(Some(Alarm::WaitingForPeerHead), |gate| gate.alarm(store))
+            readiness.map_or(Some(Alarm::Unavailable), |gate| gate.alarm(store))
         });
         let alarm = if self.signer.is_some() && !current_signer {
             Some(Alarm::SignerNotCurrent)

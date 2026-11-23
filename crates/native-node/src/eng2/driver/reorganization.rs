@@ -36,6 +36,8 @@ pub(super) struct Reorganization {
     memory_admission: MemoryAdmission,
     active: Option<Active>,
     pending_restart: bool,
+    #[cfg(feature = "eng2-runtime")]
+    depth_warning: Option<ForkDepthWarning>,
     cached_candidate: Option<Hash>,
     cached_revision: u64,
     pub(super) stopped: Option<&'static str>,
@@ -50,6 +52,76 @@ pub struct SwitchEvent {
     pub old_tip: Hash,
     pub new_tip: Hash,
     pub frequent: bool,
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Copy)]
+struct ForkDepthWarning {
+    depth: usize,
+    observed: Instant,
+    ancestor_height: u64,
+    fork: [Hash; 2],
+}
+
+#[cfg(feature = "eng2-runtime")]
+impl ForkDepthWarning {
+    fn from_path(path: &crate::eng2::branches::CandidatePath, observed: Instant) -> Option<Self> {
+        let depth = path.removed.len();
+        if depth < 12 {
+            return None;
+        }
+        let mut fork = [*path.removed.last()?, *path.replacement.first()?];
+        fork.sort_unstable();
+        Some(Self {
+            depth,
+            observed,
+            ancestor_height: path.ancestor_height,
+            fork,
+        })
+    }
+
+    fn status_at(self, now: Instant) -> Option<serde_json::Value> {
+        // Read-only polling must see a short-lived warning even if the switch
+        // completes between two samples. Expiry never affects the owner gate.
+        (now.saturating_duration_since(self.observed).as_secs() < 120).then(|| {
+            serde_json::json!({
+                "depth": self.depth,
+                "ancestor_height": self.ancestor_height,
+                "fork": self.fork.map(|id| crate::local::hex(&id)),
+            })
+        })
+    }
+}
+
+#[cfg(all(test, feature = "eng2-runtime"))]
+#[test]
+fn short_lived_depth_warning_survives_poll_and_is_scoped_to_the_fork() {
+    let mut path = crate::eng2::branches::CandidatePath {
+        ancestor_height: 20,
+        ancestor_id: [7; 32],
+        ancestor_execution_commitment: None,
+        removed: vec![[3; 32]; 11],
+        replacement: vec![[4; 32]],
+        cumulative_work: 1.into(),
+        first_seen: 0,
+    };
+    let now = Instant::now();
+    assert!(ForkDepthWarning::from_path(&path, now).is_none());
+    path.removed.push([5; 32]);
+    let warning = ForkDepthWarning::from_path(&path, now).unwrap();
+    let status = warning
+        .status_at(now + std::time::Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(status["depth"], 12);
+    assert_eq!(
+        status["fork"],
+        serde_json::json!(["04".repeat(32), "05".repeat(32)])
+    );
+    assert!(
+        warning
+            .status_at(now + std::time::Duration::from_secs(120))
+            .is_none()
+    );
 }
 
 fn current_alarm_at(
@@ -177,6 +249,8 @@ impl Driver {
             memory_admission: MemoryAdmission::default(),
             active: None,
             pending_restart,
+            #[cfg(feature = "eng2-runtime")]
+            depth_warning: None,
             cached_candidate,
             cached_revision,
             stopped: refused.then_some(DEEP_REFUSAL),
@@ -219,6 +293,15 @@ impl Driver {
                 Instant::now(),
             )
         })
+    }
+
+    /// Recent independently verified competing path; advisory only.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn reorganization_depth_warning(&self) -> Option<serde_json::Value> {
+        self.reorganization
+            .as_ref()?
+            .depth_warning?
+            .status_at(Instant::now())
     }
 
     /// One bounded numeric admission observation, independent of completed switches.
@@ -371,6 +454,10 @@ impl Driver {
             }
         }
         let path = state.branches.candidate_path(current, candidate)?;
+        #[cfg(feature = "eng2-runtime")]
+        if let Some(warning) = ForkDepthWarning::from_path(&path, Instant::now()) {
+            state.depth_warning = Some(warning);
+        }
         if path.removed.len() > 24 {
             state.invalidate_progress();
             return refuse_depth(&mut state.stopped, || {
@@ -750,6 +837,8 @@ mod memory_gate_tests {
             memory_admission: MemoryAdmission::default(),
             active: None,
             pending_restart: false,
+            #[cfg(feature = "eng2-runtime")]
+            depth_warning: None,
             cached_candidate: None,
             cached_revision: 0,
             stopped: None,

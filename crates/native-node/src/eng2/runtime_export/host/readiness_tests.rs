@@ -10,12 +10,10 @@ use std::sync::Arc;
 
 fn readiness<'a>(
     store: &Store,
-    network: &'a NetworkStatus,
     observer: &'a Observer,
 ) -> ResidentSigningReadiness<'a> {
     ResidentSigningReadiness {
         head: ResidentSigningReadiness::head(store).unwrap(),
-        network,
         observer,
     }
 }
@@ -52,20 +50,20 @@ fn guarded_actions(store: &Store, gate: &dyn SigningReadiness, expected: bool) {
     assert_eq!(voted.is_some(), expected);
 }
 #[test]
-fn checkpoint_signing_requires_completed_current_round_and_revokes_stale_head_evidence() {
+fn checkpoint_signing_uses_local_context_with_divergent_or_missing_peer_heads() {
     let dir = Directory::new();
     let store = dir.store();
     let head = (0, store.engine().state().tip());
     let network = Arc::new(NetworkStatus::new([[1; 32], [2; 32]]));
     let observer = Observer::default();
-    let gate = readiness(&store, &network, &observer);
-    guarded_actions(&store, &gate, false);
+    let gate = readiness(&store, &observer);
+    guarded_actions(&store, &gate, true);
     let connection = network.connected([1; 32]).unwrap();
-    guarded_actions(&store, &gate, false);
+    guarded_actions(&store, &gate, true);
     network.round([1; 32], 8, None).unwrap();
-    guarded_actions(&store, &gate, false);
+    guarded_actions(&store, &gate, true);
     network.round([1; 32], 0, Some((head.0, [9; 32]))).unwrap();
-    guarded_actions(&store, &gate, false);
+    guarded_actions(&store, &gate, true);
     network.round([1; 32], 0, Some(head)).unwrap();
     guarded_actions(&store, &gate, true);
     // Public miner sessions cannot establish or block a signing reference.
@@ -75,19 +73,19 @@ fn checkpoint_signing_requires_completed_current_round_and_revokes_stale_head_ev
     drop(unpinned);
     let behind = network.connected([2; 32]).unwrap();
     network.round([2; 32], 8, None).unwrap();
-    guarded_actions(&store, &gate, false);
+    guarded_actions(&store, &gate, true);
     network.round([2; 32], 0, Some(head)).unwrap();
     guarded_actions(&store, &gate, true);
     network.begin_round([1; 32]).unwrap();
-    guarded_actions(&store, &gate, false);
+    guarded_actions(&store, &gate, true);
     network.round([1; 32], 0, Some(head)).unwrap();
-    let mut changed = readiness(&store, &network, &observer);
+    let mut changed = readiness(&store, &observer);
     changed.head.4[0] ^= 1;
     assert_eq!(changed.alarm(&store), Some(Alarm::Unavailable));
     guarded_actions(&store, &changed, false);
     drop(behind);
     drop(connection);
-    guarded_actions(&store, &gate, false);
+    guarded_actions(&store, &gate, true);
 }
 #[test]
 fn checkpoint_quorum_conflict_blocks_new_signing_but_keeps_public_exports() {
@@ -100,7 +98,7 @@ fn checkpoint_quorum_conflict_blocks_new_signing_but_keeps_public_exports() {
         .round([1; 32], 0, Some((0, store.engine().state().tip())))
         .unwrap();
     let observer = crate::eng2::checkpoint_observer::tests::synthetic_current_conflict();
-    let gate = readiness(&store, &network, &observer);
+    let gate = readiness(&store, &observer);
     assert_eq!(gate.alarm(&store), Some(Alarm::CurrentQuorumConflict));
     guarded_actions(&store, &gate, false);
     let key = dir.0.join("synthetic-signer.bin");
@@ -211,7 +209,7 @@ fn pending_authorization_blocks_proposal_and_vote_even_with_current_peer_round()
         .round([1; 32], 0, Some((0, store.engine().state().tip())))
         .unwrap();
     let observer = crate::eng2::checkpoint_observer::tests::synthetic_pending_authorization();
-    let gate = readiness(&store, &network, &observer);
+    let gate = readiness(&store, &observer);
     assert_eq!(gate.alarm(&store), Some(Alarm::CurrentQuorumConflict));
     guarded_actions(&store, &gate, false);
 }

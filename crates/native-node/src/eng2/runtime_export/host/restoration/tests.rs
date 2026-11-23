@@ -561,3 +561,71 @@ fn retained_budget_diagnostic_distinguishes_artifact_pressure_on_worker() {
         "budget_unavailable",
     );
 }
+
+#[test]
+#[ignore = "requires a disposable locally verified native history"]
+fn retained_authentication_survives_a_verified_canonical_append() {
+    use crate::eng2::genesis::Genesis;
+    use crate::proofs::NativeVerifier;
+    let fixture = std::path::PathBuf::from(
+        std::env::var_os("SIWORLD_CHECKPOINT_APPEND_FIXTURE").expect("native fixture required"),
+    );
+    assert!(fixture.is_absolute());
+    let genesis_bytes = std::fs::read(fixture.join("genesis.bin")).unwrap();
+    let genesis = Genesis::decode(&genesis_bytes).unwrap();
+    let verifier = NativeVerifier::for_genesis(&genesis).unwrap();
+    let network = genesis.config().network;
+    let directory = Directory::new();
+    let mut store =
+        Store::create(&directory.0.join("chain.redb"), genesis, limits().chain).unwrap();
+    let frame_path = fixture.join("block-0001.frame");
+    let header_size = crate::eng2::header::HEADER_BYTES;
+    let policy = store.engine().body_policy();
+    assert!(
+        std::fs::metadata(&frame_path).unwrap().len()
+            <= (header_size + policy.max_body_bytes) as u64
+    );
+    let frame = std::fs::read(frame_path).unwrap();
+    let (header_bytes, body_bytes) = frame.split_at(header_size);
+    let header = crate::eng2::header::Header::decode(header_bytes, &network).unwrap();
+    let body = crate::eng2::body::Body::decode(body_bytes, network, 1, policy).unwrap();
+    let root = directory.private("append-during-restoration");
+    let budget = crate::p2p::Budget::new(64 * 1024 * 1024);
+    let mut host = Host::open_resident(&root, &store, limits(), None, &budget).unwrap();
+    let work = RetainedWork::capture(
+        &store,
+        None,
+        &host.export,
+        limits(),
+        &budget,
+        host.preparation.as_ref().unwrap().generation,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let preparation = host.preparation.as_mut().unwrap();
+    preparation
+        .worker
+        .start_retained_with_test_hook(work, move |_| {
+            start_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        })
+        .unwrap();
+    preparation.retained_request = true;
+    start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    store.append(&header, &body, &verifier).unwrap();
+    release_tx.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !host.reconcile_retained_async(&store, || Ok(None)).unwrap() {
+        assert!(host.preparation.as_ref().unwrap().retained_request);
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(host.retained_ready);
+    assert_eq!(host.retained_head, Some((1, header.id().unwrap())));
+    assert!(host.latest_checkpoint().is_none());
+    host.stop_preparation().unwrap();
+}
