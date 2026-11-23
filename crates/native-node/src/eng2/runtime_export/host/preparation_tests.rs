@@ -155,8 +155,7 @@ fn resident_ticks_progress_during_delayed_full_component_validation_and_reject_u
 
 #[test]
 #[ignore = "requires disposable minimum-difficulty native blocks 1..37 and existing synthetic checkpoint signer records"]
-fn delayed_native_preparation_signs_after_append_with_an_old_peer_head()
- {
+fn delayed_native_preparation_signs_after_append_with_an_old_peer_head() {
     let fixture = fixture_root();
     let accepted = source(&fixture);
     let dir = super::super::tests::Directory::new();
@@ -259,9 +258,7 @@ fn delayed_native_preparation_signs_after_append_with_an_old_peer_head()
     network
         .round([1; 32], 0, Some((37, header.id().unwrap())))
         .unwrap();
-    network
-        .round([1; 32], 0, Some((36, [9; 32])))
-        .unwrap();
+    network.round([1; 32], 0, Some((36, [9; 32]))).unwrap();
     release_tx.send(()).unwrap();
     wait_prepared(&mut host, &owner, &network, &mut now);
     let store = owner.lock().unwrap();

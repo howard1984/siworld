@@ -8,10 +8,7 @@ use crate::eng2_governance::{
 };
 use std::sync::Arc;
 
-fn readiness<'a>(
-    store: &Store,
-    observer: &'a Observer,
-) -> ResidentSigningReadiness<'a> {
+fn readiness<'a>(store: &Store, observer: &'a Observer) -> ResidentSigningReadiness<'a> {
     ResidentSigningReadiness {
         head: ResidentSigningReadiness::head(store).unwrap(),
         observer,

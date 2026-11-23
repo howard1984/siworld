@@ -1281,9 +1281,10 @@ impl Host {
         }
         self.tick_failure = Some(TickFailureReason::StatusPublication);
         let paused = self.export.pruning_paused(now)?;
-        let signing_alarm = self.signer.as_ref().and_then(|_| {
-            readiness.map_or(Some(Alarm::Unavailable), |gate| gate.alarm(store))
-        });
+        let signing_alarm = self
+            .signer
+            .as_ref()
+            .and_then(|_| readiness.map_or(Some(Alarm::Unavailable), |gate| gate.alarm(store)));
         let alarm = if self.signer.is_some() && !current_signer {
             Some(Alarm::SignerNotCurrent)
         } else if signing_alarm == Some(Alarm::CurrentQuorumConflict) {
