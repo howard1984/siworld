@@ -9,3 +9,10 @@ condition = "AND"
 paths = ['''(^|/)Cargo\.lock$''']
 regexTarget = "match"
 regexes = ['''^libcrux-secrets",(?:\s|\\n)*"libcrux-sha3"$''']
+
+[[allowlists]]
+description = "Exact published Argon2 and HKDF known-answer fixture"
+condition = "AND"
+paths = ['''^crates/sivault-core/vectors/independent\.json$''']
+regexTarget = "line"
+regexes = ['''^\s*"wrap_key": "c6dac31c331cff4a4271b25e3be35707be35db3233ec9f26b11c0612edd00b72",\s*$''']
