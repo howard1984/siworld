@@ -1,5 +1,14 @@
 # Engineering network 2 protocol requirements
 
+The [candidate mining and checkpoint requirements](protocol.md#candidate-mining-and-checkpoint-finality)
+replace the future block-work and finality targets with RandomX v1.2.1,
+SIWORLD-specific parameters and an independent salt, a one-hour ASERT half-life,
+measured effective work rate times 300 seconds for initial difficulty, and
+checkpoint coverage under the authorized 2-of-3 roster. Candidate miner threads
+default to available cores minus two and are configurable. Existing engineering
+profiles and deferred synchronization designs below remain distinct from that
+candidate; they do not establish its implementation or activation.
+
 Status: requirements for a separately versioned engineering network. Component
 implementations and tests do not activate these rules on an existing network.
 A selected genesis must identify the exact implemented transition, fee mode and
@@ -55,7 +64,8 @@ and execute the ordered body; derive every component; then commit atomically.
 A newly included proposal cannot change its own block's policy. Failed proofs,
 governance actions or accounting checks leave the parent state unchanged.
 Parallel proof verification cannot change execution order or bypass context
-binding. The existing 300-second target and four-hour ASERT half-life remain.
+binding. The retained engineering implementation uses a 300-second target and
+four-hour ASERT half-life; these are not the candidate one-hour requirements.
 
 ## Confidential transaction fees
 

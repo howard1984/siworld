@@ -12,6 +12,64 @@ block runtime and network are not activated. Existing source constants and
 commands belong to the [legacy protocol](legacy/protocol.md) unless an
 integration milestone explicitly adopts and tests a native rule.
 
+## Candidate mining and checkpoint finality
+
+Status: candidate requirements, distinct from the implementations retained in
+this source revision. This specification does not activate a network or attest
+to the software or parameters deployed on any node. Existing engineering and
+legacy formats remain unchanged. Activation requires a source-bound release,
+compatible genesis/rules, qualified clients and separate deployment acceptance.
+
+| Parameter | Candidate requirement |
+| --- | --- |
+| Block work | RandomX v1.2.1 with SIWORLD-specific parameters and an independent SIWORLD salt |
+| Work profile | CPU-friendly and memory-intensive; intended to reduce GPU/ASIC advantages |
+| Block interval | 300 seconds as a stochastic target, not a deadline |
+| ASERT half-life | 3,600 seconds (one hour) |
+| Initial difficulty | Measured effective work rate in valid attempts per second multiplied by 300 seconds, with the consensus difficulty representation and rounding fixed before activation |
+| Miner work threads | Available CPU cores minus two by default; explicitly configurable |
+| Finality | Coverage by a valid checkpoint certificate signed by two of the three authorized checkpoint signers (2-of-3) |
+| Fork choice | No reorganization at or below the accepted checkpoint; greatest cumulative valid work among compatible branches above it |
+
+The exact RandomX parameter set, independent salt bytes, canonical input and
+output encodings, test vectors and network binding must be pinned in the
+activation specification. The version name alone is insufficient. CPU
+friendliness does not imply equal performance, eliminate specialized hardware
+or guarantee that ASIC mining will remain impossible. Initial difficulty must
+use measurements of effective work under the selected profile; internal hash
+rounds, proof-generation throughput and a different network's calibration are
+not substitutes. Recalibration must not silently change an existing network.
+The default thread rule concerns mining work, not proof-generation workers or
+hardware admission floors. The minimum valid thread count on machines with two
+or fewer available cores remains an implementation detail to define explicitly;
+this specification does not add a command-line option to existing binaries.
+
+A checkpoint certificate must authenticate the pinned network, covered block
+and authorized signer roster. A block is final when its canonical ancestry is
+covered by that accepted certificate. A fixed confirmation count or elapsed
+time does not establish finality. Conflicting valid certificates require
+fail-closed handling and explicit recovery; more work cannot override an
+accepted final checkpoint. This model limits deep reorganizations and
+associated double-spend risk under its checkpoint trust assumptions. It does
+not make a 51% attack impossible or guarantee signer honesty or availability.
+The existing 24-block reward maturity and longer unlock schedules are separate
+spendability rules and are not changed by this candidate finality requirement.
+
+Wallets must distinguish inclusion in an accepted block from checkpoint
+finality. The candidate browser wallet verifies pinned checkpoint certificates
+and the applicable authenticated proofs; it does not verify RandomX in the
+browser. It must disclose its full-node validity and checkpoint trust boundary
+and must not label an unsigned service response or an inclusion receipt as
+finality. Missing or invalid checkpoint evidence leaves inclusion unfinalized.
+This client model does not describe the existing engineering light client,
+which checks its older work profile in WASM.
+
+BLAKE3 remains in use for non-mining purposes, including addresses, short-address
+derivation, commitments, identifiers and checksums wherever those formats
+already specify it. Those uses are not replaced by RandomX. Transaction
+anti-spam work, historical proof-system grinding and historical measurements
+are separate from the candidate block-work algorithm.
+
 ## Transaction and proof format
 
 All payment/padding transactions use two inputs and three outputs. Notes bind
@@ -62,7 +120,7 @@ terms ≥80 bits after halving; and selected BHT commitment collision resistance
 | Reward locks | Initial note matures after 24 blocks; Holder adds four height-locked notes; input unlocks use the trusted selected snapshot height |
 | Economic state | Pool deposits/draws, cumulative burn and independent fund vesting/spending roll back atomically |
 | State application | One deterministic integer-only atomic transition for production, validation and replay |
-| Reorganization | Local `MAX_REORG_DEPTH=24`; deeper recovery requires an explicit procedure |
+| Reorganization | Candidate: checkpoint-covered history is final; greatest cumulative valid work above it. Retained implementation: local `MAX_REORG_DEPTH=24` |
 | Network capacity | Conditional minimum 43-Mbps uplink; 100 Mbps recommended |
 
 The isolated native block codec and shared transition enforce strict BLAKE3

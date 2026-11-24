@@ -1,5 +1,17 @@
 # Windows native miner
 
+The [candidate mining profile](protocol.md#candidate-mining-and-checkpoint-finality)
+selects CPU-friendly, memory-intensive RandomX v1.2.1 with SIWORLD-specific
+parameters and an independent salt. It aims to reduce GPU/ASIC advantages.
+Candidate ASERT has a one-hour half-life and a 300-second target; initial
+difficulty is measured effective work rate times 300 seconds. Candidate mining
+threads default to available cores minus two and are configurable. The
+configuration interface and small-core handling must be defined by a qualified
+package; the steps below describe the existing engineering package and do not
+implement those settings. A valid 2-of-3 checkpoint establishes finality,
+separately from block inclusion and 24-block reward maturity. No candidate
+package availability or deployment is established here.
+
 Status: implementation for engineering-network qualification. A public-testnet package has not yet been qualified or published. Local build artifacts are test packages, not public releases. A build is not evidence of Windows 10/11 hardware acceptance or successful mining. The first package is unsigned and installs no service or GUI.
 
 ## Requirements

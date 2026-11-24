@@ -1,5 +1,12 @@
 # Native Transaction Proof Design
 
+The [candidate mining/checkpoint requirements](protocol.md#candidate-mining-and-checkpoint-finality)
+supersede this route's future work/finality targets. Retained depth-24 tests,
+proof-retention sizing and implementation observations below keep their original
+scope. Candidate finality requires a valid 2-of-3 checkpoint; no fixed count of
+blocks supplies that evidence. Delayed checkpoints require a separately sized
+unfinalized tail before retention can be qualified.
+
 The [monetary revision](v1-economics.md) is included in the engineering-frozen
 transaction, fixed-576 settlement and three-note issuance profiles. Notes bind
 unlock heights; each nonzero input must be unlocked at its trusted referenced
@@ -442,13 +449,15 @@ The following changes are proposed and are not implemented by this document:
 - Relay compact block inventories with collision-safe transaction identifiers
   and bounded missing-transaction/proof retrieval. Reconstruct and authenticate
   the complete block before applying it. Missing data is not proof validity.
-- Set the new route's local `MAX_REORG_DEPTH` to 24. Test depth 23/24/25,
-  root-window boundaries and conflict re-admission. A deeper fork requires
+- The retained route uses local `MAX_REORG_DEPTH=24`. Its tests cover depth
+  23/24/25, root-window boundaries and conflict re-admission. In that
+  implementation a deeper fork requires
   explicit checkpoint recovery rather than silent partial rollback.
 - Bootstrap and validator nodes retain transaction, settlement and native
   issuance proofs for at least 24 elapsed hours after observed finality;
   the nominal 300-second-target window is 312 blocks, including the existing
-  24-block finality tail. Miner and ordinary nodes retain the latest 96 blocks
+  24-block tail assumed by the retained sizing model. Miner and ordinary nodes
+  retain the latest 96 blocks
   without historical proof service. Private sidecars use bounded admission
   expiry. Persist finality/retention metadata and extend the window after
   uncertain clocks or recovery. Checkpoint publication is required every six

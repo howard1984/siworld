@@ -1,5 +1,13 @@
 # Native Proof Storage
 
+The [candidate checkpoint profile](protocol.md#candidate-mining-and-checkpoint-finality)
+is separate from this retained storage implementation and its depth-24
+observations. It finalizes history through valid 2-of-3 checkpoint coverage;
+fixed block counts do not establish that coverage. The nominal 312-block
+example below cannot bound a candidate tail during checkpoint delay. This
+documentation does not change a store, authorize proof deletion or establish
+candidate deployment.
+
 Status: engineering implementation with deployment and operating-system acceptance
 gates. This policy does not change transaction
 validity, proof profiles, rewards, difficulty or the 24-block reorganization rule.
