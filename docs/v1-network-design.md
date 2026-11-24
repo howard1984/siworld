@@ -1,5 +1,11 @@
 # Native V1 Transport and Checkpoint Design
 
+For the [candidate mining/checkpoint profile](protocol.md#candidate-mining-and-checkpoint-finality),
+valid 2-of-3 checkpoint coverage defines finality, and compatible branches above
+the accepted checkpoint use greatest cumulative valid work. A fixed local
+reorganization depth does not replace that boundary. The retained bootstrap
+and transport designs below are not acceptance evidence for the candidate.
+
 Status: selected engineering design for the independent, resettable V1 network.
 These mechanisms require implementation, adversarial testing and independent
 review. They are not cryptographic approval or authorization to start a network.

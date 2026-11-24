@@ -1,5 +1,16 @@
 # Current Protocol Decisions
 
+The [candidate mining and checkpoint requirements](protocol.md#candidate-mining-and-checkpoint-finality)
+select RandomX v1.2.1 with SIWORLD-specific parameters and an independent salt,
+ASERT half-life 3,600 seconds, a 300-second target and initial difficulty from
+measured effective work rate times 300 seconds. Mining threads default to
+available cores minus two and are configurable. A valid 2-of-3 checkpoint
+finalizes covered history; compatible branches above it use greatest cumulative
+valid work. These requirements supersede older design targets for a future
+activation, not the behavior or evidence of retained implementations. They do
+not attest to deployment. Reward maturity and non-mining BLAKE3 formats remain
+separate and unchanged.
+
 Status: native V1 transaction, fixed-capacity settlement and three-note
 issuance proof parameters have source-bound engineering profiles for the
 `native-v1-economics-1` relation. Revised actual-AIR reports and 39 isolated
@@ -234,7 +245,8 @@ Transaction, settlement and native issuance proof bodies follow local role
 storage policy: bootstrap and validator nodes retain at least 24 elapsed
 hours after observed finality and provide synchronization within that window;
 miner and ordinary nodes retain the latest 96 blocks and disable historical
-proof service. The 24-block consensus reorganization limit is unchanged.
+proof service. The retained implementation has a 24-block local reorganization
+limit; candidate finality instead requires authenticated checkpoint coverage.
 Private sidecars follow bounded admission expiry. Public data remains permanent
 on every node; no V1 archive-node role is selected. Openings use eight independent canonical KoalaBear elements,
 approximately 247.91 bits of entropy. The corrected settlement AIR keeps the
@@ -284,7 +296,8 @@ invalid padding or exceeding caps.
 The [integration plan](v1-node-network-plan.md) covers the shared atomic block
 transition, bounded admission, compact relay, role-based proof retention,
 permanent public-data storage, checkpoint-plus-PoW synchronization, authenticated X25519 + ML-KEM transport and
-Dandelion++. Use groups of 16, 64–576 positions and `MAX_REORG_DEPTH=24`.
+Dandelion++. Use groups of 16 and 64–576 positions. The retained integration
+uses `MAX_REORG_DEPTH=24`; this is not the candidate checkpoint boundary.
 The fixed settlement AIR has 576 openings; smaller blocks derive canonical
 zero-fee internal tails without additional chain transactions. Checkpoint
 bootstrap has an explicit trust assumption after historical proof deletion.
@@ -335,8 +348,9 @@ boundary, zero swap and failure on resource-limit events. This qualification
 does not change runtime proof decoders or consensus limits, replace maximal
 fee/full-block acceptance, or establish sustained node resource acceptance.
 
-At the target block rate, proofs and sidecars including the nominal depth-24
-finality tail require 118,158,124,032 rolling bytes at the separate caps.
+The earlier storage model, including a nominal depth-24 tail, estimates
+118,158,124,032 rolling bytes at the separate caps. This is not a candidate
+checkpoint-finality bound: delayed checkpoints extend the unfinalized tail.
 The 2,115-byte position codec adds 128,061,388,800 permanent bytes/year at
 full load. The [finite storage model](v1-storage-and-sync.md) also reserves
 64 KiB/block for economic permanent block records, 16 KiB/block for issuance records,

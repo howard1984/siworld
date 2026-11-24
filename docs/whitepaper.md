@@ -1,6 +1,11 @@
 # SIWORLD: Post-Quantum Shielded Payments with Native STARK Transaction Proofs
 
-31 October 2026 · SIWORLD contributors
+Status: protocol design with candidate mining and checkpoint-finality
+requirements. The consensus section specifies a candidate profile; this paper
+does not confirm its implementation or deployment. Retained engineering
+software and historical measurements require separate source-bound acceptance.
+
+24 November 2026 · SIWORLD contributors
 
 ## Abstract
 
@@ -131,17 +136,52 @@ The settlement proof sums fee commitments only. A miner can start without holdin
 
 ## 5. Consensus
 
-SIWORLD uses Nakamoto consensus: the valid chain with the most accumulated work wins, and a block is final after 24 confirmations, about two hours.
+The candidate model combines valid proof of work with checkpoint finality.
+A block is final when covered by a valid certificate signed by two of the three
+authorized checkpoint signers. Nodes do not reorganize at or below an accepted
+checkpoint. Above it, they select the compatible chain with greatest cumulative
+valid work. A fixed confirmation count does not establish finality.
 
-**Proof of work.** The work function is a chain of sequential BLAKE3 hashes over a fixed header seed and nonce. It has no elliptic-curve component; a quantum computer gains at most Grover's quadratic search speedup, which shifts difficulty but does not break the rule.
+**Proof of work.** The candidate uses RandomX v1.2.1 with SIWORLD-specific
+parameters and an independent salt. It is CPU-friendly and memory-intensive,
+with the aim of reducing GPU/ASIC advantages. This does not guarantee equal
+hardware performance or make specialized mining permanently impossible.
+Exact parameters, salt, encodings and vectors require activation specification.
+BLAKE3 remains in non-mining addresses, short-address derivation, commitments,
+identifiers and checksums where specified.
 
-**Difficulty.** An ASERT controller retargets every block toward a 300-second interval with a 4-hour half-life, so hash-rate swings correct within hours rather than weeks. Timestamps must exceed the median of the previous 11 blocks and may run at most 15 minutes ahead of local time.
+**Difficulty.** Candidate ASERT retargets toward a stochastic 300-second interval
+with a one-hour half-life. Initial difficulty is measured effective work rate
+in valid attempts per second multiplied by 300 seconds, encoded under pinned
+consensus rounding rules. This is a calibration requirement, not a promise of
+five-minute blocks or evidence that a network has adopted these parameters.
 
-**Validity before work.** A node accepts a block only after it has verified every transaction proof and the settlement proof, checked every nullifier against the spent set, and applied one deterministic, integer-only state transition. The same transition is used for building, validating and replaying blocks.
+**Mining threads.** The candidate default is available CPU cores minus two;
+the operator can specify the count. Mining threads are distinct from the
+workers that generate transaction and settlement proofs. Small-core boundary
+handling and the exact configuration interface require implementation review.
 
-**Reorganization bound.** Nodes reorganize at most 24 blocks automatically. A deeper fork stops the node and requires an explicit recovery procedure, rather than silently rewriting settled history.
+**Validity before work.** Nodes must verify transaction and settlement proofs,
+reject spent or repeated nullifiers, and apply the same deterministic,
+integer-only transition for production, validation and replay. Work does not
+substitute for transaction validity.
 
-**Checkpoints.** Because proofs are pruned after three days (Section 7), a new node cannot re-verify every historical proof from genesis. Checkpoints are signed under a 2-of-3 authority fixed in the genesis block. Proof of work alone does not prove the validity of deleted history; the checkpoint is an explicit, disclosed trust assumption for bootstrapping.
+**Checkpoint trust and risk.** Certificates must bind the pinned network,
+covered block and authorized signer roster. Conflicting valid certificates
+require fail-closed recovery. This limits deep reorganizations and associated
+double-spend risk under the checkpoint trust assumptions; it does not make a
+51% attack impossible. Signer compromise, withholding and availability remain
+risks. Checkpoints also expose an explicit historical-state trust assumption
+after proof pruning; work alone cannot prove deleted historical validity.
+
+**Wallet verification.** Wallets distinguish block inclusion from finality.
+The candidate browser wallet verifies pinned checkpoint certificates and
+applicable authenticated proofs, without verifying RandomX in the browser.
+It must disclose reliance on full-node validity checks. Neither a service
+acknowledgment nor a fixed number of confirmations proves checkpoint coverage.
+The 24-block reward-maturity rule and longer locks are separate spendability
+conditions. See the [candidate requirements](protocol.md#candidate-mining-and-checkpoint-finality)
+for implementation and activation boundaries.
 
 ## 6. Monetary policy
 
@@ -216,7 +256,7 @@ SIWORLD keeps the public ledger forever and the proofs for three days. A proof's
 | Settlement declarations (without proofs), reward notes, fund records, issuance records, recent-root snapshots | Permanently |
 | Transaction, settlement and issuance proofs; fee sidecars | Until three days after finality |
 
-At full load, every slot adds 2,115 permanent bytes, about 128 GB a year. The rolling proof window covers 888 blocks (24 unfinalized plus three days) and is capped at about 336 GB. A validating node therefore needs roughly 680 GB in its first year at sustained maximum load; a 1 TB SSD is recommended, and actual use grows with real traffic rather than with the cap.
+At full load, every slot adds 2,115 permanent bytes, about 128 GB a year. A fixed 24-block unfinalized tail cannot size the candidate proof window: checkpoint delay can extend it. Earlier 888-block and 336-GB rolling-window estimates, and the derived first-year storage estimate, do not qualify this candidate. Storage must include the measured checkpoint lag, retained proof policy and recovery pins; capacity pressure must not authorize deleting unfinalized proofs.
 
 A new node starts from a checkpoint signed by the genesis-fixed 2-of-3 authority, downloads the permanent public data, verifies that it matches the checkpoint, and then verifies every proof from that point on. Ciphertexts are kept forever, so a wallet restored from its seed can always scan the chain and recover its notes, including locked ones.
 

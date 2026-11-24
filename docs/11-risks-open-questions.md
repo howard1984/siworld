@@ -1,5 +1,14 @@
 # Risks and Open Protocol Questions
 
+The [candidate mining/checkpoint profile](protocol.md#candidate-mining-and-checkpoint-finality)
+requires pinned RandomX v1.2.1 parameters, independent salt, work encodings and
+vectors; effective-work calibration and integer difficulty rounding; configurable
+mining threads and explicit small-core handling; certificate conflict recovery;
+and a browser verification path without local RandomX. Checkpoint delay and
+compromise, majority-work attacks, specialized hardware advantages and the
+unbounded-by-confirmation-count unfinalized tail remain review concerns.
+Older engineering measurements do not resolve these candidate requirements.
+
 Status: unresolved V1 multi-asset protocol and qualification questions. This
 register records open work under [the decisions](00-decisions.md) and
 [multi-asset design](v1-multi-asset.md). Experimental behavior, caller-supplied

@@ -50,8 +50,15 @@ The selected design requires the following integrated behavior:
    Missing data requires authenticated bounded recovery. Production,
    validation and replay must share one atomic state transition.
 
-The target block interval is 300 seconds; PoW timing is stochastic. Native V1
-requires a 24-block local reorganization bound. It accepts the newest 4,096
+The [candidate mining profile](protocol.md#candidate-mining-and-checkpoint-finality)
+uses RandomX v1.2.1, SIWORLD-specific parameters and an independent salt,
+a one-hour ASERT half-life and a stochastic 300-second target. Initial
+difficulty uses measured effective work rate times 300 seconds. Mining
+threads default to available cores minus two and are configurable. Candidate
+finality requires valid 2-of-3 checkpoint coverage; greatest cumulative valid
+work selects compatible branches above the checkpoint. The retained runtime
+still has its separate 24-block local bound; this document does not activate
+the candidate. The snapshot window remains the newest 4,096
 canonical recent-root-tree snapshots. Expired or orphaned selectors require
 transaction eviction and wallet reproof.
 

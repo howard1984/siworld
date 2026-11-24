@@ -1,5 +1,18 @@
 # Native V1 browser wallet
 
+## Candidate checkpoint verification boundary
+
+The [candidate RandomX profile](protocol.md#candidate-mining-and-checkpoint-finality)
+requires a different wallet trust model from the engineering implementation
+below. Its browser client verifies pinned 2-of-3 checkpoint certificates and
+applicable authenticated proofs; it does not verify RandomX in the browser.
+A payment included in an accepted block is distinct from one covered by an
+accepted checkpoint. No fixed confirmation count or 24-block reward maturity
+establishes checkpoint finality. The client must disclose its full-node
+validity assumptions and preserve unfinalized or unknown status when evidence
+is missing. This section is a candidate requirement, not an activated website
+or a claim that the older WASM work verifier implements RandomX.
+
 Status: local engineering light-sync, browser-proving and independent encrypted
 Vault implementation. Public deployment, independent review and phone send
 measurements are incomplete. Existing native CLI interfaces are preserved.

@@ -1,5 +1,12 @@
 # Native V1 Engineering Runtime
 
+The [candidate mining/checkpoint requirements](protocol.md#candidate-mining-and-checkpoint-finality)
+are separate from this retained runtime's sequential BLAKE3 work, calibrated
+configuration, proof-worker settings and 24-block reorganization implementation.
+Changing documentation does not alter those rules, activate RandomX or qualify
+a running node. Its source-bound observations remain evidence for their original
+profile only.
+
 Status: the continuous single-node service and native node-integration library
 are implemented engineering components. The library adds bounded admission,
 authenticated-stream protocol interfaces, full-proof synchronization,

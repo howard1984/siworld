@@ -1,5 +1,14 @@
 # V1 Storage, Retention and Bootstrap
 
+The [candidate checkpoint profile](protocol.md#candidate-mining-and-checkpoint-finality)
+finalizes only history covered by a valid 2-of-3 certificate. Retained depth-24
+implementation rules and storage examples below do not qualify that profile.
+A delayed checkpoint extends the unfinalized tail; 312 or 888 blocks cannot be
+claimed as a candidate bound. Retention must use authenticated finality for the
+exact block, preserve recovery pins and fail closed when required evidence is
+unavailable. This documentation does not change a running store or authorize
+proof deletion.
+
 Status: selected retention policy and conditional component model for the
 [V1 economic revision](v1-economics.md). The tables use the explicit
 `--economic-rewards` planning mode: five reward notes and eight native signed
@@ -36,15 +45,15 @@ storage roles select retention without changing block validity or fork choice:
 | Miner | Latest 96 canonical blocks | Disabled |
 | Ordinary | Latest 96 canonical blocks | Disabled |
 
-The consensus reorganization bound remains 24 blocks. The 96-block local
-window does not increase that bound. Private fee-opening sidecars retain their
+The retained implementation has a 24-block local reorganization bound. The
+96-block local window does not increase that bound. Private fee-opening sidecars retain their
 existing bounded admission lifecycle and are not added to permanent storage.
 
 Persist finality and deletion metadata. Extend retention on clock or recovery
 uncertainty; age alone cannot remove an unfinalized block's proof. Service
 expiry uses the first local observation of finality for the exact block ID,
 never the producer's timestamp. Restart downtime does not advance the certain
-retention clock. At a five-minute target and depth-24 finality, 312 blocks is a
+retention clock. Under the earlier five-minute/depth-24 model, 312 blocks is a
 nominal service-store sizing example, not permission to expire by height.
 
 The native store can atomically replace expired canonical and detached proof

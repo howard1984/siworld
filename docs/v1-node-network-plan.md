@@ -1,5 +1,14 @@
 # Native V1 Node and Network Integration
 
+The [candidate mining/checkpoint profile](protocol.md#candidate-mining-and-checkpoint-finality)
+supersedes this plan's future block-work and finality targets. The 24-block
+fork tests and sizing examples below describe the retained integration baseline,
+not checkpoint-finality acceptance. A fixed 312-block estimate cannot bound
+an unfinalized tail when checkpoints are delayed. Candidate release acceptance
+must bind the RandomX parameters, independent salt, one-hour ASERT, measured
+initial difficulty, configurable mining threads and 2-of-3 checkpoint boundary
+without reinterpreting older measurements as evidence of activation.
+
 Integrate [the monetary rules](v1-economics.md) through the same block
 transition for production, validation, replay, forks and audit. Bind the
 explicit reward mode at template creation; reconstruct every reward note,
@@ -223,8 +232,9 @@ current snapshot and nullifier checks pass. A shortage of usable padding
 delays production or triggers bounded regeneration; it does not permit an
 undersized block or invalid placeholder.
 
-At the 300-second target, finality is depth 24 and `MAX_REORG_DEPTH=24` for the
-new route. The chain library reconstructs the local ancestor, replays every
+The retained integration baseline uses `MAX_REORG_DEPTH=24`; that local
+bound does not establish finality for the candidate checkpoint profile. The
+chain library reconstructs the local ancestor, replays every
 candidate block, then selects strictly greater verified cumulative work. Equal
 work retains the current chain. A shorter branch can win by doing more verified
 work; a taller advertised chain cannot bypass validation. Adoption updates
@@ -301,8 +311,9 @@ replay base. Remote checkpoint trust and delivery remain incomplete; non-fixture
 service expiry is gated until those paths are qualified.
 
 Bootstrap and validator nodes retain transaction, settlement and native issuance
-proof bodies until at least 24 elapsed hours after observed finality. At the
-300-second target, 24 unresolved blocks plus 288 finalized blocks give a nominal
+proof bodies until at least 24 elapsed hours after observed finality. Under the
+earlier 300-second/depth-24 model, 24 unresolved blocks plus 288 older blocks
+give a nominal
 312-block service window. Miner and ordinary nodes retain the latest 96 blocks
 without historical proof service. Private sidecars follow bounded admission
 expiry. Persist finality metadata and extend retention on clock or recovery

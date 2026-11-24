@@ -11,6 +11,7 @@ outstanding.
 ## Native V1
 
 - [SIWORLD whitepaper](whitepaper.md): protocol design and economic model.
+- [Candidate mining and checkpoint finality](protocol.md#candidate-mining-and-checkpoint-finality): RandomX profile, difficulty, miner threads, wallet trust and activation boundary.
 
 1. [System overview](v1-overview.md): selected design, implementation status and trust boundaries.
 2. [Current decisions](00-decisions.md): authoritative requirements and freeze scope.

@@ -1,5 +1,13 @@
 # SIWORLD — post-quantum private payments (in development)
 
+The [candidate mining and checkpoint requirements](docs/protocol.md#candidate-mining-and-checkpoint-finality)
+select RandomX v1.2.1 with SIWORLD-specific parameters and an independent salt,
+a one-hour ASERT half-life and a 300-second target. They specify configurable
+mining threads (available cores minus two by default) and finality on coverage
+by a valid 2-of-3 checkpoint. These are candidate requirements; the retained
+BLAKE3 engineering implementation and any deployed node are not changed or
+qualified by this documentation.
+
 [![CI](https://github.com/howard1984/siworld/actions/workflows/ci.yml/badge.svg)](https://github.com/howard1984/siworld/actions/workflows/ci.yml)
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 

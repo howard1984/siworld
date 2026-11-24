@@ -74,8 +74,16 @@ Encrypted transport protects contents against recording attacks; endpoints
 remain visible to peers. The existing legacy node uses Noise and direct flood
 relay. Worker-handshake tests do not qualify native hybrid peer transport.
 
-Native V1 requires a local 24-block reorganization bound, the newest 4,096
-canonical snapshots and fail-closed recovery beyond the supported boundary.
+The retained implementation uses a local 24-block reorganization bound and the
+newest 4,096 canonical snapshots. The [candidate model](protocol.md#candidate-mining-and-checkpoint-finality)
+uses RandomX v1.2.1 with SIWORLD-specific parameters and an independent salt,
+and finalizes history covered by a valid 2-of-3 checkpoint. Compatible branches
+above it use greatest cumulative valid work. The CPU-friendly, memory-intensive
+work profile aims to reduce GPU/ASIC advantages; it does not eliminate them.
+Checkpoint trust limits deep reorganizations and double-spend risk without
+making a 51% attack impossible. Conflicting valid certificates require
+fail-closed recovery. This requirement does not attest to implementation or
+deployment; fixed confirmations and reward maturity do not prove finality.
 Three-day-after-finality proof deletion makes full proof replay from genesis
 unavailable by default. Release checkpoint bootstrap explicitly trusts a
 genesis-pinned two-of-three authority; PoW does not prove deleted historical

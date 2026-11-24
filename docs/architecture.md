@@ -54,8 +54,11 @@ payment and update the registry.
 Native V1 permanently retains public ledger data and deletes transaction,
 settlement and native issuance proofs plus fee sidecars three days after final
 confirmation. Finality/deletion metadata must survive restarts and recovery.
-The native local reorganization bound is 24 blocks; the accepted snapshot
-window is the newest 4,096 canonical identities.
+The retained native implementation has a 24-block local reorganization bound.
+The [candidate profile](protocol.md#candidate-mining-and-checkpoint-finality)
+instead finalizes history covered by a valid 2-of-3 checkpoint and selects
+greatest cumulative valid work above it. It is not activated by this document.
+The accepted snapshot window is the newest 4,096 canonical identities.
 
 Default bootstrap uses a release checkpoint under explicit genesis-pinned
 quorum trust, followed by PoW and normal block verification. PoW cannot replace

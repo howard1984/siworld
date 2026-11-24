@@ -1,5 +1,16 @@
 # Native V1 Node Operations Boundary
 
+For the [candidate mining profile](protocol.md#candidate-mining-and-checkpoint-finality),
+require RandomX v1.2.1 with pinned SIWORLD parameters and an independent salt,
+a 3,600-second ASERT half-life, a 300-second target and initial difficulty
+calibrated from measured effective work rate times 300 seconds. Candidate
+mining threads default to available cores minus two and permit an explicit
+count. Do not reinterpret proof-worker settings or hardware admission floors
+as that mining default. Verify a valid 2-of-3 checkpoint before reporting
+covered blocks as final; compatible work above it remains unfinalized.
+These are candidate operating requirements, not commands for existing packages
+or authorization to restart or migrate a network.
+
 Status: native V1 node and network integration is incomplete. The isolated
 proof executable is not a node runtime, and no native V1 deployment command is
 available. The existing node executable runs the
