@@ -491,6 +491,30 @@ impl PublicExport {
         )?;
         Ok(vote)
     }
+    /// Record the exact public vote returned by independent custody so the
+    /// keyless restore worker can check provenance without reading custody.
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn record_custody_vote(
+        &mut self,
+        store: &Store,
+        prepared: &PreparedCheckpoint,
+        vote: &Vote,
+        limits: ImportLimits,
+    ) -> Result<(), String> {
+        self.check_store(store)?;
+        prepared.check_current(store)?;
+        prepared.verify_vote(vote)?;
+        let epoch = prepared.statement.roster_sequence;
+        let height = prepared.statement.checkpoint_height;
+        let slot = vote.slot;
+        self.write_candidate(&candidate_name(epoch, height), prepared, limits)?;
+        let statement = prepared
+            .statement
+            .encode()
+            .map_err(|_| "checkpoint statement malformed")?;
+        let name = format!("vote-{epoch:020}-{height:020}-{slot}.eng2.bin");
+        self.write_once_parts(&name, &[&statement, &[slot], &vote.signature])
+    }
     /// Restore public artifacts only after checking exact cursor fields, content
     /// digests, local historical state, executed authorization and both signatures.
     pub fn restore_latest(

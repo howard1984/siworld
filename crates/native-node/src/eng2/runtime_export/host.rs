@@ -1306,12 +1306,17 @@ impl Host {
                         .map_err(|_| "checkpoint signing entropy unavailable")?;
                     #[cfg(feature = "eng2-runtime")]
                     if store.engine().genesis().checkpoint_fork_choice() {
-                        return signer
+                        let vote = signer
                             .history
                             .borrow_mut()
                             .as_mut()
                             .ok_or("checkpoint signer custody unavailable")?
-                            .sign(signer, store, pending, *random);
+                            .sign(signer, store, pending, *random)?;
+                        if let Some(vote) = &vote {
+                            self.export
+                                .record_custody_vote(store, pending, vote, self.limits)?;
+                        }
+                        return Ok(vote);
                     }
                     self.export
                         .sign_vote(
