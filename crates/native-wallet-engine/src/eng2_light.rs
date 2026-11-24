@@ -1,9 +1,11 @@
 //! Engineering-v2 header/receipt wallet state under explicit full-node trust.
 //!
-//! This client verifies complete header work and receipt inclusion. It does not
-//! execute governance, verify transaction proofs, or authenticate a checkpoint
-//! state. Every receipt from genesis must be scanned before a balance is usable.
+//! The native default verifies complete header work. The browser relies on
+//! checkpoint signatures for RandomX finality and treats the service's suffix
+//! as provisional. Both modes verify receipt inclusion. Neither verifies
+//! transaction proofs or imports checkpoint state.
 use crate::{
+    eng2_governance::GovernanceState,
     eng2_history::{Context, HEADER_BYTES, Header, ReceiptBlock},
     paths::OwnedPaths,
     state::{CanonicalSnapshot, SNAPSHOT_WINDOW, State, base_fee},
@@ -21,6 +23,9 @@ use zeroize::Zeroizing;
 
 #[path = "eng2_light_cache.rs"]
 mod cache;
+#[path = "eng2_light_checkpoint.rs"]
+mod checkpoint;
+pub use checkpoint::VerifiedCheckpoint;
 #[path = "eng2_payments.rs"]
 mod payments;
 pub use payments::PaymentAnchor;
@@ -31,12 +36,34 @@ pub fn native_profile() -> Hash {
 pub const MAX_HEADERS: usize = 100_000;
 pub const TRUST: &str = "eng2-header-work-and-body-receipt-authenticated-full-node-consensus";
 
+pub const CHECKPOINT_TRUST: &str =
+    "eng2-genesis-checkpoint-and-body-receipt-authenticated-service-suffix";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderValidation {
+    FullWork,
+    CheckpointAuthenticated,
+}
+
+impl HeaderValidation {
+    fn for_browser(context: &Context) -> Self {
+        match context.config().pow_algorithm() {
+            pow::Algorithm::SequentialBlake3 => Self::FullWork,
+            pow::Algorithm::SiworldRandomX => Self::CheckpointAuthenticated,
+        }
+    }
+}
+
 pub struct Eng2LightState {
+    header_validation: HeaderValidation,
     context: Context,
     state: State,
     wallet: Wallet,
     paths: OwnedPaths,
     headers: Vec<Header>,
+    genesis_governance: Option<GovernanceState>,
+    checkpoint_governance: Option<GovernanceState>,
+    checkpoint_replay_required: bool,
     prover: Option<native::multi_asset_transaction::TransactionProver>,
     prepared: Option<crate::wallet::PreparedTransfer>,
 }
@@ -47,12 +74,45 @@ impl Eng2LightState {
         seed: Zeroizing<[u8; 32]>,
         account: u32,
     ) -> Result<Self, String> {
-        Self::from_context(Context::from_genesis(genesis, expected)?, seed, account)
+        let (context, genesis_governance) = Self::wallet_genesis(genesis, expected)?;
+        Self::from_context(
+            context,
+            genesis_governance,
+            seed,
+            account,
+            HeaderValidation::FullWork,
+        )
+    }
+    /// Explicit browser entry point. A RandomX view is provisional outside its
+    /// independently verified checkpoint; no RandomX VM is constructed.
+    pub fn new_for_browser(
+        genesis: &[u8],
+        expected: Hash,
+        seed: Zeroizing<[u8; 32]>,
+        account: u32,
+    ) -> Result<Self, String> {
+        let (context, genesis_governance) = Self::wallet_genesis(genesis, expected)?;
+        let validation = HeaderValidation::for_browser(&context);
+        Self::from_context(context, genesis_governance, seed, account, validation)
+    }
+    fn wallet_genesis(
+        genesis: &[u8],
+        expected: Hash,
+    ) -> Result<(Context, Option<GovernanceState>), String> {
+        let (context, governance_bytes) =
+            Context::from_genesis_with_governance_bytes(genesis, expected)?;
+        let governance =
+            GovernanceState::decode_component(governance_bytes, context.config().network)
+                .ok()
+                .filter(|state| state.height() == 0);
+        Ok((context, governance))
     }
     fn from_context(
         context: Context,
+        genesis_governance: Option<GovernanceState>,
         seed: Zeroizing<[u8; 32]>,
         account: u32,
+        header_validation: HeaderValidation,
     ) -> Result<Self, String> {
         // State is only a private note/tree carrier. Its V1 genesis, execution
         // function and economic ledger are never used to validate eng2 blocks.
@@ -65,7 +125,13 @@ impl Eng2LightState {
             .selector
             .block_id = context.genesis();
         let wallet = Wallet::from_seed(context.config().network, seed, account)?;
-        Self::from_wallet_context(context, state, wallet)
+        Self::from_wallet_context(
+            context,
+            genesis_governance,
+            state,
+            wallet,
+            header_validation,
+        )
     }
     /// Fresh scan from an authenticated existing custody wallet; no seed export.
     pub fn from_existing_wallet(
@@ -73,7 +139,7 @@ impl Eng2LightState {
         expected: Hash,
         wallet: Wallet,
     ) -> Result<Self, String> {
-        let context = Context::from_genesis(genesis, expected)?;
+        let (context, genesis_governance) = Self::wallet_genesis(genesis, expected)?;
         let mut state = State::new(context.config().clone())?;
         state.tip = context.genesis();
         state
@@ -82,29 +148,48 @@ impl Eng2LightState {
             .ok_or("missing initial wallet root")?
             .selector
             .block_id = context.genesis();
-        Self::from_wallet_context(context, state, wallet)
+        Self::from_wallet_context(
+            context,
+            genesis_governance,
+            state,
+            wallet,
+            HeaderValidation::FullWork,
+        )
     }
     fn from_wallet_context(
         context: Context,
+        genesis_governance: Option<GovernanceState>,
         state: State,
         mut wallet: Wallet,
+        header_validation: HeaderValidation,
     ) -> Result<Self, String> {
         if wallet.head().is_some() || !wallet.receipts().is_empty() {
             return Err("eng2 wallet requires a fresh existing custody view".into());
         }
         wallet.scan_light_data(&state, &[], &[], false)?;
+        let checkpoint_governance = genesis_governance.clone();
         Ok(Self {
+            header_validation,
             context,
             state,
             wallet,
             paths: OwnedPaths::new(),
             headers: Vec::new(),
+            genesis_governance,
+            checkpoint_governance,
+            checkpoint_replay_required: false,
             prover: None,
             prepared: None,
         })
     }
     pub fn fresh(&self, seed: Zeroizing<[u8; 32]>, account: u32) -> Result<Self, String> {
-        Self::from_context(self.context.clone(), seed, account)
+        Self::from_context(
+            self.context.clone(),
+            self.genesis_governance.clone(),
+            seed,
+            account,
+            self.header_validation,
+        )
     }
     pub fn context(&self) -> &Context {
         &self.context
@@ -115,8 +200,12 @@ impl Eng2LightState {
     pub fn tip(&self) -> Hash {
         self.state.tip
     }
+    /// Returns zero in the browser RandomX view, which never credits declared work.
     pub fn cumulative_work(&self) -> pow::Work {
         self.state.cumulative_work
+    }
+    pub fn header_pow_verified(&self) -> bool {
+        self.header_validation == HeaderValidation::FullWork
     }
     pub fn wallet(&self) -> &Wallet {
         &self.wallet
@@ -146,11 +235,19 @@ impl Eng2LightState {
             .and_then(|index| self.headers.get(index))
     }
     pub fn fork(&self, seed: Zeroizing<[u8; 32]>, account: u32) -> Result<Self, String> {
-        let mut result = Self::from_context(self.context.clone(), seed, account)?;
+        let mut result = Self::from_context(
+            self.context.clone(),
+            self.genesis_governance.clone(),
+            seed,
+            account,
+            self.header_validation,
+        )?;
         result.wallet.copy_light_receipts(&self.wallet)?;
         result.state = self.state.clone();
         result.paths = self.paths.clone();
         result.headers = self.headers.clone();
+        result.checkpoint_governance = self.checkpoint_governance.clone();
+        result.checkpoint_replay_required = self.checkpoint_replay_required;
         Ok(result)
     }
     /// Only complete candidate scans may replace an accepted local wallet.
@@ -166,7 +263,9 @@ impl Eng2LightState {
         if previous.is_some_and(|previous| {
             binding(&self.context) != binding(&previous.context)
                 || self.wallet.address() != previous.wallet.address()
-                || self.tip() != previous.tip()
+                || self.header_validation != previous.header_validation
+                || self.header_pow_verified()
+                    && self.tip() != previous.tip()
                     && self.cumulative_work() <= previous.cumulative_work()
         }) {
             return Err("eng2 wallet candidate context or greater-work requirement failed".into());
@@ -182,11 +281,18 @@ impl Eng2LightState {
         let header = Header::decode(raw_header, &self.context.config().network)
             .map_err(|_| "eng2 wallet header encoding rejected")?;
         let mut trial = self.state.clone();
-        verify_header(&trial, &header)?;
+        verify_header(
+            &self.context,
+            &trial,
+            &self.headers,
+            &header,
+            self.header_validation,
+        )?;
         let encoded: [u8; HEADER_BYTES] = raw_header
             .try_into()
             .map_err(|_| "eng2 wallet header width rejected")?;
         let receipt = ReceiptBlock::decode(&self.context, &encoded, bytes)?;
+        let governance = self.checkpoint_after_receipt(&receipt);
         let staged = receipt.scan_receipts(&self.wallet)?;
         let owned_nullifiers = self
             .wallet
@@ -274,7 +380,7 @@ impl Eng2LightState {
         while trial.snapshots.len() > SNAPSHOT_WINDOW {
             trial.snapshots.pop_front();
         }
-        advance_header(&mut trial, &header)?;
+        advance_header(&mut trial, &header, self.header_validation)?;
         // This carrier supplies only a canonical receipt timestamp to the
         // private wallet. It is never encoded, executed or passed to V1 sync.
         let timestamp = Block {
@@ -296,6 +402,7 @@ impl Eng2LightState {
         self.state = trial;
         self.paths = paths;
         self.headers.push(header);
+        self.checkpoint_governance = governance;
         Ok(())
     }
     pub fn balance_json(&self) -> Result<String, String> {
@@ -307,10 +414,15 @@ impl Eng2LightState {
             .collect::<BTreeSet<_>>();
         let rows = assets.into_iter().map(|asset| json!({"asset": crate::local::hex(&asset.0), "available_atoms":balances.available.get(asset).copied().unwrap_or(0).to_string(),"locked_atoms":balances.locked.get(asset).copied().unwrap_or(0).to_string()})).collect::<Vec<_>>();
         let tranches = balances.tranches.iter().map(|row| json!({"asset":crate::local::hex(&row.asset.0),"amount_atoms":row.amount.to_string(),"unlock_height":row.unlock_height,"estimated_timestamp":row.estimated_timestamp})).collect::<Vec<_>>();
-        Ok(json!({"version":2,"network":crate::local::hex(&self.context.config().network),"genesis":crate::local::hex(&self.context.genesis()),"rules":crate::local::hex(&self.context.rules()),"profile":crate::local::hex(&self.context.profile()),"fee_mode":self.context.fee_mode(),"height":self.height(),"tip":crate::local::hex(&self.tip()),"trust":TRUST,"full_node_consensus_verified":false,"send_supported":false,"rows":rows,"locked_tranches":tranches}).to_string())
+        Ok(json!({"version":2,"network":crate::local::hex(&self.context.config().network),"genesis":crate::local::hex(&self.context.genesis()),"rules":crate::local::hex(&self.context.rules()),"profile":crate::local::hex(&self.context.profile()),"fee_mode":self.context.fee_mode(),"height":self.height(),"tip":crate::local::hex(&self.tip()),"trust":if self.header_pow_verified() { TRUST } else { CHECKPOINT_TRUST },"header_pow_verified":self.header_pow_verified(),"full_node_consensus_verified":false,"send_supported":false,"rows":rows,"locked_tranches":tranches}).to_string())
     }
     pub fn history_json(&self) -> String {
-        serde_json::Value::Array(self.wallet.receipts().iter().filter(|row| row.note().value > 0 && row.output_index != 1 && row.output_index != 2).map(|row| json!({"id":crate::local::hex(&row.commitment),"block_id":crate::local::hex(&row.block_id),"height":row.height,"asset":crate::local::hex(&row.note().asset_id.0),"amount_atoms":row.note().value.to_string(),"unlock_height":row.note().unlock_height,"spent":row.spent,"kind":if row.output_index == 0 { "received" } else if row.output_index < 8 { "mining" } else { "allocation" }})).collect()).to_string()
+        self.checkpoint_history_json(None)
+    }
+    /// Each incoming row comes from the exact locally authenticated wallet
+    /// receipt, including after reopening its encrypted persisted history.
+    pub fn checkpoint_history_json(&self, floor: Option<VerifiedCheckpoint>) -> String {
+        serde_json::Value::Array(self.wallet.receipts().iter().filter(|row| row.note().value > 0 && row.output_index != 1 && row.output_index != 2).map(|row| json!({"id":crate::local::hex(&row.commitment),"block_id":crate::local::hex(&row.block_id),"height":row.height,"checkpoint_covered":floor.is_some_and(|floor| self.checkpoint_covers_inclusion(floor, Snapshot { height: row.height, block_id: row.block_id })),"asset":crate::local::hex(&row.note().asset_id.0),"amount_atoms":row.note().value.to_string(),"unlock_height":row.note().unlock_height,"spent":row.spent,"kind":if row.output_index == 0 { "received" } else if row.output_index < 8 { "mining" } else { "allocation" }})).collect()).to_string()
     }
 }
 fn binding(context: &Context) -> Vec<u8> {
@@ -326,7 +438,13 @@ fn binding(context: &Context) -> Vec<u8> {
     result.push(context.fee_mode());
     result
 }
-fn verify_header(state: &State, header: &Header) -> Result<(), String> {
+fn verify_header(
+    context: &Context,
+    state: &State,
+    verified_prefix: &[Header],
+    header: &Header,
+    validation: HeaderValidation,
+) -> Result<(), String> {
     if header.network != state.config.network
         || header.height
             != state
@@ -338,37 +456,92 @@ fn verify_header(state: &State, header: &Header) -> Result<(), String> {
     {
         return Err("eng2 wallet header continuity or time rejected".into());
     }
-    if header.target != state.next_target()
-        || !pow::meets_target(
-            &pow::pow_hash(
-                &header
-                    .pow_seed()
-                    .map_err(|_| "eng2 wallet header work seed rejected")?,
-                header.nonce,
-                state.config.pow_iterations,
-            ),
-            &header.target,
-        )
-    {
-        return Err("eng2 wallet header difficulty or work rejected".into());
+    if header.target != state.next_target() {
+        return Err("eng2 wallet header difficulty rejected".into());
     }
-    state
-        .cumulative_work
-        .checked_add(pow::block_work(&header.target))
-        .ok_or("eng2 wallet cumulative work overflow")?;
+    if validation == HeaderValidation::CheckpointAuthenticated {
+        return Ok(());
+    }
+    let input = header
+        .pow_seed()
+        .map_err(|_| "eng2 wallet header work seed rejected")?;
+    let work = match state.config.pow_algorithm() {
+        pow::Algorithm::SequentialBlake3 => {
+            pow::pow_hash(&input, header.nonce, state.config.pow_iterations)
+        }
+        pow::Algorithm::SiworldRandomX => {
+            let epoch = pow::randomx_epoch_key(context.genesis(), header.height, |height| {
+                let index = usize::try_from(height.checked_sub(1)?).ok()?;
+                let ancestor = verified_prefix.get(index)?;
+                if ancestor.height != height {
+                    return None;
+                }
+                ancestor.id().ok()
+            })
+            .ok_or("eng2 wallet RandomX key ancestor unavailable")?;
+            randomx_hash(epoch, input, header.nonce)?
+        }
+    };
+    if !pow::meets_target(&work, &header.target) {
+        return Err("eng2 wallet header work rejected".into());
+    }
     Ok(())
 }
-fn advance_header(state: &mut State, header: &Header) -> Result<(), String> {
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        all(target_os = "windows", target_env = "msvc")
+    )
+))]
+fn randomx_hash(epoch: Hash, input: Hash, nonce: u64) -> Result<Hash, &'static str> {
+    use siworld_randomx_pow::{Cache, Implementation};
+    use std::sync::Mutex;
+    static LIGHT: Mutex<Option<(Hash, Cache)>> = Mutex::new(None);
+    let mut slot = LIGHT
+        .lock()
+        .map_err(|_| "eng2 wallet RandomX cache poisoned")?;
+    if slot.as_ref().is_none_or(|(key, _)| *key != epoch) {
+        *slot = None;
+        *slot = Some((epoch, Cache::new(&epoch, Implementation::Hardware)?));
+    }
+    let mut vm = slot
+        .as_ref()
+        .ok_or("eng2 wallet RandomX cache unavailable")?
+        .1
+        .vm()?;
+    Ok(vm.hash_header(input, nonce))
+}
+
+#[cfg(not(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        all(target_os = "windows", target_env = "msvc")
+    )
+)))]
+fn randomx_hash(_: Hash, _: Hash, _: u64) -> Result<Hash, &'static str> {
+    Err("eng2 wallet RandomX verification unavailable on this target")
+}
+
+fn advance_header(
+    state: &mut State,
+    header: &Header,
+    validation: HeaderValidation,
+) -> Result<(), String> {
     let id = header
         .id()
         .map_err(|_| "eng2 wallet header identity rejected")?;
-    let work = state
-        .cumulative_work
-        .checked_add(pow::block_work(&header.target))
-        .ok_or("eng2 wallet cumulative work overflow")?;
+    if validation == HeaderValidation::FullWork {
+        state.cumulative_work = state
+            .cumulative_work
+            .checked_add(pow::block_work(&header.target))
+            .ok_or("eng2 wallet cumulative work overflow")?;
+    }
     state.height = header.height;
     state.tip = id;
-    state.cumulative_work = work;
     state.timestamps.push_back(header.timestamp);
     while state.timestamps.len() > siworld_core::params::MEDIAN_TIME_PAST_WINDOW {
         state.timestamps.pop_front();

@@ -169,6 +169,171 @@ fn existing_native_fixture_signer_compatibility() {
     );
 }
 
+/// Reuse a closed, minimum-work RandomX source without running a node or
+/// generating proofs. The short miner threshold exercises physical body
+/// deletion and the same permanent wallet reader used by service nodes.
+#[cfg(all(unix, feature = "eng2-runtime"))]
+#[test]
+#[ignore = "owner-local only: requires a closed native RandomX H36 corpus"]
+fn randomx_signed_floor_and_wallet_receipt_survive_proof_body_expiry() {
+    use crate::eng2::{
+        runtime_export::{
+            PreparedCheckpoint, WalletPolicy,
+            host::{Host, initialize_fixture_custody, vote_with_fixture_custody},
+        },
+        snapshot::ImportLimits,
+        wallet_history::{self, Head, codec},
+    };
+    use libcrux_ml_dsa::ml_dsa_65;
+    use std::time::Instant;
+
+    assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+    let source = PathBuf::from(
+        std::env::var_os("SIWORLD_PROOF_RETENTION_SOURCE").expect("closed fixture required"),
+    );
+    assert!(source.is_absolute() && source.join("disposable-fixture").is_file());
+    let raw = std::fs::read(source.join("genesis.bin")).unwrap();
+    assert_eq!(&raw[..8], b"SWE2POW5");
+    let genesis = || Genesis::decode(&raw).unwrap();
+    assert!(genesis().checkpoint_fork_choice());
+    assert_eq!(genesis().config().genesis_target, [255; 32]);
+    let keys = [3, 4, 5].map(|seed| {
+        *ml_dsa_65::generate_key_pair([seed; 32])
+            .verification_key
+            .as_ref()
+    });
+    assert_eq!(
+        genesis().initial_governance().active_roster().keys(),
+        &keys,
+        "known fixture signers required"
+    );
+    let limits = Limits {
+        max_leaves: 1_000_000,
+        max_nullifiers: 1_000_000,
+        max_component_bytes: 64 * 1024 * 1024,
+    };
+    let imports = ImportLimits {
+        chain: limits,
+        max_snapshot_bytes: 64 * 1024 * 1024,
+    };
+    let directory = Directory::new();
+    let identity =
+        crate::identity::NativeIdentity::initialize(&directory.0, genesis().peer_binding())
+            .unwrap();
+    let mut store = Store::initialize_selected(&directory.0, genesis(), limits, identity).unwrap();
+    let custody = Directory::new();
+    let export = directory.0.join("public");
+    let signers = [0, 1].map(|slot| {
+        let key = custody.0.join(format!("fixture-signer-{slot}.bin"));
+        initialize_fixture_custody(&key, &export, &store, slot);
+        key
+    });
+    let verifier = NativeVerifier::for_genesis(&genesis()).unwrap();
+    let original = redb::Database::builder()
+        .set_cache_size(16 * 1024 * 1024)
+        .open_read_only(source.join("chain.redb"))
+        .unwrap();
+    let read = original.begin_read().unwrap();
+    let blocks = read.open_table(BLOCKS).unwrap();
+    assert!(blocks.len().unwrap() >= 36);
+    for height in 1..=36 {
+        let row = blocks.get(height).unwrap().unwrap();
+        let (header, body) = decode(store.engine(), row.value()).unwrap();
+        store.append(&header, &body, &verifier).unwrap();
+        if height % 12 == 0 {
+            store.archive_checkpoint_anchor(imports).unwrap();
+        }
+    }
+    let prepared = PreparedCheckpoint::prepare_from_archive(&store, imports)
+        .unwrap()
+        .unwrap();
+    let statement = prepared.statement();
+    assert_eq!(statement.checkpoint_height, 12);
+    let votes = [
+        vote_with_fixture_custody(&signers[0], &export, &store, &prepared, true),
+        vote_with_fixture_custody(&signers[1], &export, &store, &prepared, false),
+    ];
+    let now = store.header(36).unwrap().timestamp;
+    let certified = prepared.certify(&store, votes, now).unwrap();
+    store.admit_finalized_checkpoint(&certified).unwrap();
+    assert!(store.check_finalized_ancestor(11).is_err());
+    assert!(store.check_finalized_ancestor(12).is_ok());
+
+    let budget = crate::p2p::Budget::new(1024 * 1024 * 1024);
+    let pins = crate::eng2::bootstrap::leases::Registry::default().body_pins(Instant::now());
+    let head = Head::capture(&store).unwrap();
+    let before = wallet_history::receipts(&store, &head, 1, &budget).unwrap();
+    let digest = blake3::hash(before.bytes());
+    let mut maintenance = Maintenance::new(Policy::miner(Some(24)).unwrap()).unwrap();
+    let warmup = maintenance
+        .tick(&mut store, Some(&certified), now, 0, &budget, &pins)
+        .unwrap();
+    assert_eq!(warmup.removed_blocks, 0);
+    let report = maintenance
+        .tick(&mut store, Some(&certified), now + 1, 1, &budget, &pins)
+        .unwrap();
+    assert!(report.removed_blocks > 0 && report.removed_encoded_bytes > 0);
+    assert!(store.block(1).is_err());
+    drop(store);
+
+    let reopened = Store::resume_selected(&directory.0, genesis(), limits).unwrap();
+    assert_eq!(
+        reopened.finalized_checkpoint().unwrap().as_ref(),
+        Some(certified.certificate())
+    );
+    assert!(reopened.block(1).is_err());
+    assert_eq!(head, Head::capture(&reopened).unwrap());
+    let after = wallet_history::receipts(&reopened, &head, 1, &budget).unwrap();
+    assert_eq!(blake3::hash(after.bytes()), digest);
+    let context = codec::Context::from_genesis(&raw, genesis().id()).unwrap();
+    let header = reopened.header(1).unwrap().encode().unwrap();
+    let decoded = codec::ReceiptBlock::decode(&context, &header, after.bytes()).unwrap();
+    assert_eq!(decoded.transactions().len(), 16);
+    let mut tampered = after.bytes().to_vec();
+    let last = tampered.last_mut().expect("nonempty receipt");
+    *last ^= 1;
+    assert!(codec::ReceiptBlock::decode(&context, &header, &tampered).is_err());
+
+    // Run the real publisher after deletion, starting with no cached wallet
+    // receipts. An optional private output lets the HTTP and WASM adapters
+    // consume the exact same generation in owner-local acceptance.
+    use std::os::unix::fs::DirBuilderExt;
+    let wallet_export = std::env::var_os("SIWORLD_FIXTURE_WALLET_EXPORT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| directory.0.join("wallet"));
+    assert!(wallet_export.is_absolute());
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&wallet_export)
+        .unwrap();
+    let mut host = Host::open(&wallet_export, &reopened, imports, None).unwrap();
+    host.enable_wallet_export(&reopened, WalletPolicy::default(), &budget)
+        .unwrap();
+    let progress = (0..=head.height())
+        .map(|_| {
+            host.tick_wallet_export(&reopened, now, &budget)
+                .unwrap()
+                .unwrap()
+        })
+        .find(|progress| progress.current)
+        .expect("complete wallet export after body deletion");
+    assert_eq!(progress.published_height, Some(head.height()));
+    assert_eq!(host.wallet_export_diagnostic(), ("current", None));
+    assert_eq!(
+        std::fs::read(wallet_export.join("wallet-checkpoint-eng2.bin")).unwrap(),
+        certified.certificate().encode().unwrap()
+    );
+    let filename = format!("wallet-1-{}.bin", crate::local::hex(&after.id()));
+    assert_eq!(
+        std::fs::read(wallet_export.join(filename)).unwrap(),
+        after.bytes()
+    );
+    println!(
+        "native_floor=12 native_head=36 signer_restore_abstained=true removed_body_bytes={} receipt_digest={digest}",
+        report.removed_encoded_bytes
+    );
+}
+
 /// Full native acceptance using existing public proofs; no miner, proof generation,
 /// production key, live network or modification of the supplied source is used.
 #[test]
@@ -246,7 +411,9 @@ fn real_store_prune_reopen_replay_and_signed_checkpoint_sync() {
         genesis_timestamp: config.genesis_timestamp,
         genesis_target: config.genesis_target,
         target_interval: config.target_interval,
+        asert_half_life: config.asert_half_life(),
         pow_iterations: config.pow_iterations,
+        pow_algorithm: config.pow_algorithm(),
         max_headers: 1000,
     };
     let mut branches = crate::eng2::branches::BranchStore::create(
@@ -539,7 +706,9 @@ fn real_store_prune_reopen_replay_and_signed_checkpoint_sync() {
             genesis_timestamp: config.genesis_timestamp,
             genesis_target: config.genesis_target,
             target_interval: config.target_interval,
+            asert_half_life: config.asert_half_life(),
             pow_iterations: config.pow_iterations,
+            pow_algorithm: config.pow_algorithm(),
             max_headers: 1000,
         },
         headers,

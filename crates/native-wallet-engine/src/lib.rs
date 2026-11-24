@@ -50,3 +50,8 @@ pub mod paths;
 
 /// Complete immutable engineering receipt scans with explicit trust boundaries.
 pub mod receipt_scan;
+
+#[path = "../../native-node/src/eng2/certificate_wire.rs"]
+pub mod eng2_certificate;
+#[path = "../../native-node/src/eng2_governance.rs"]
+pub mod eng2_governance;

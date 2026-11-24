@@ -15,7 +15,9 @@ pub struct HeaderRules {
     pub genesis_timestamp: u64,
     pub genesis_target: Hash,
     pub target_interval: u64,
+    pub asert_half_life: pow::AsertHalfLife,
     pub pow_iterations: u64,
+    pub pow_algorithm: pow::Algorithm,
     pub max_headers: usize,
 }
 
@@ -28,6 +30,7 @@ pub enum SelectionError {
     Time,
     Difficulty,
     Work,
+    WorkUnavailable,
     WorkOverflow,
     Sources,
     Equivocation,
@@ -43,12 +46,31 @@ pub struct VerifiedHeaders {
     work: Vec<Work>,
 }
 
+/// Result of comparing independently qualified headers with a local fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointAncestry {
+    Matches,
+    Conflicts,
+    Incomplete,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SourceObservation<'a> {
     /// Supplied by the authenticated transport, never by peer metadata.
     pub authenticated_identity: Hash,
     pub transport_address: IpAddr,
     pub chain: &'a VerifiedHeaders,
+}
+
+fn branch_epoch(genesis: Hash, candidate_height: u64, verified_prefix: &[Header]) -> Option<Hash> {
+    pow::randomx_epoch_key(genesis, candidate_height, |height| {
+        let index = usize::try_from(height.checked_sub(1)?).ok()?;
+        let header = verified_prefix.get(index)?;
+        if header.height != height {
+            return None;
+        }
+        header.id().ok()
+    })
 }
 
 impl VerifiedHeaders {
@@ -101,6 +123,9 @@ impl VerifiedHeaders {
             || rules.genesis_target == [0; 32]
             || rules.target_interval != 300
             || rules.pow_iterations > crate::state::MAX_POW_ITERATIONS
+            || (rules.pow_algorithm == pow::Algorithm::SiworldRandomX
+                && (rules.pow_iterations != 0
+                    || rules.asert_half_life != pow::AsertHalfLife::OneHour))
             || rules.max_headers == 0
         {
             return Err(SelectionError::Rules);
@@ -128,21 +153,25 @@ impl VerifiedHeaders {
             if header.timestamp <= pow::median_time_past(&times).ok_or(SelectionError::Time)? {
                 return Err(SelectionError::Time);
             }
-            let target = pow::asert_target(
+            let target = pow::asert_target_with_half_life(
                 &rules.genesis_target,
                 rules.genesis_timestamp,
                 rules.target_interval,
                 index as u64,
                 *timestamps.back().ok_or(SelectionError::Time)?,
+                rules.asert_half_life,
             );
             if header.target != target {
                 return Err(SelectionError::Difficulty);
             }
-            let seed = header.pow_seed().map_err(SelectionError::Header)?;
-            if !pow::meets_target(
-                &pow::pow_hash(&seed, header.nonce, rules.pow_iterations),
-                &header.target,
-            ) {
+            if !super::proof_of_work::verify(
+                rules.pow_algorithm,
+                rules.pow_iterations,
+                header,
+                || branch_epoch(rules.genesis, header.height, &headers[..index]),
+            )
+            .map_err(|_| SelectionError::WorkUnavailable)?
+            {
                 return Err(SelectionError::Work);
             }
             if !available() {
@@ -210,21 +239,25 @@ impl VerifiedHeaders {
             if header.timestamp <= pow::median_time_past(&times).ok_or(SelectionError::Time)? {
                 return Err(SelectionError::Time);
             }
-            let target = pow::asert_target(
+            let target = pow::asert_target_with_half_life(
                 &self.rules.genesis_target,
                 self.rules.genesis_timestamp,
                 self.rules.target_interval,
                 index as u64,
                 *timestamps.back().ok_or(SelectionError::Time)?,
+                self.rules.asert_half_life,
             );
             if header.target != target {
                 return Err(SelectionError::Difficulty);
             }
-            let seed = header.pow_seed().map_err(SelectionError::Header)?;
-            if !pow::meets_target(
-                &pow::pow_hash(&seed, header.nonce, self.rules.pow_iterations),
-                &header.target,
-            ) {
+            if !super::proof_of_work::verify(
+                self.rules.pow_algorithm,
+                self.rules.pow_iterations,
+                header,
+                || branch_epoch(self.rules.genesis, header.height, &result.headers),
+            )
+            .map_err(|_| SelectionError::WorkUnavailable)?
+            {
                 return Err(SelectionError::Work);
             }
             cumulative = cumulative
@@ -255,6 +288,29 @@ impl VerifiedHeaders {
             .id()
             .map_err(SelectionError::Header)
     }
+    /// Compare exact ancestry against a caller-authenticated checkpoint.
+    /// This checks neither the certificate nor any candidate body or state.
+    /// A prefix ending below the fence cannot qualify for a switch.
+    pub fn checkpoint_ancestry(
+        &self,
+        local_network: Hash,
+        local_genesis: Hash,
+        height: u64,
+        block: Hash,
+    ) -> Result<CheckpointAncestry, SelectionError> {
+        if self.rules.network != local_network || self.rules.genesis != local_genesis {
+            return Err(SelectionError::Rules);
+        }
+        if self.height() < height {
+            return Ok(CheckpointAncestry::Incomplete);
+        }
+        Ok(if self.id(height)? == block {
+            CheckpointAncestry::Matches
+        } else {
+            CheckpointAncestry::Conflicts
+        })
+    }
+
     pub fn header(&self, height: u64) -> Option<&Header> {
         usize::try_from(height.checked_sub(1)?)
             .ok()
@@ -352,7 +408,9 @@ mod tests {
             genesis_timestamp: 1,
             genesis_target: [0xff; 32],
             target_interval: 300,
+            asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
             pow_iterations: 0,
+            pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
             max_headers: 1000,
         }
     }
@@ -394,6 +452,59 @@ mod tests {
     }
 
     #[test]
+    fn randomx_epoch_uses_the_verified_branch_only_at_activation() {
+        let activation = pow::RANDOMX_KEY_INTERVAL + pow::RANDOMX_KEY_DELAY;
+        let path = headers(pow::RANDOMX_KEY_INTERVAL, 3);
+        let mut competing = path.clone();
+        competing.last_mut().unwrap().body_commitment[0] ^= 1;
+        let genesis = rules().genesis;
+
+        let prior = branch_epoch(genesis, activation - 1, &[]).unwrap();
+        assert_eq!(branch_epoch(genesis, activation - 1, &path), Some(prior));
+        assert_eq!(
+            branch_epoch(genesis, activation - 1, &competing),
+            Some(prior)
+        );
+        assert!(branch_epoch(genesis, activation, &path[..path.len() - 1]).is_none());
+        let current = branch_epoch(genesis, activation, &path).unwrap();
+        assert_ne!(current, prior);
+        assert_ne!(
+            current,
+            branch_epoch(genesis, activation, &competing).unwrap()
+        );
+        competing.last_mut().unwrap().height -= 1;
+        assert!(branch_epoch(genesis, activation, &competing).is_none());
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            all(target_os = "windows", target_env = "msvc")
+        )
+    ))]
+    #[test]
+    fn randomx_header_admission_qualifies_both_full_path_and_extension() {
+        let mut candidate = rules();
+        candidate.asert_half_life = pow::AsertHalfLife::OneHour;
+        candidate.pow_algorithm = pow::Algorithm::SiworldRandomX;
+        let path = headers(2, 3);
+        let full = VerifiedHeaders::verify(candidate.clone(), path.clone()).unwrap();
+        let first = VerifiedHeaders::verify(candidate, path[..1].to_vec()).unwrap();
+        let extended = first.verify_extension(&path[1..]).unwrap();
+        assert_eq!(extended.id(2), full.id(2));
+        assert_eq!(extended.cumulative_work(), full.cumulative_work());
+        assert_eq!(first.height(), 1);
+        let mut different_target = path[1].clone();
+        different_target.target[31] = 254;
+        assert_eq!(
+            first.verify_extension(&[different_target]).unwrap_err(),
+            SelectionError::Difficulty
+        );
+    }
+
+    #[test]
     fn incremental_qualification_matches_full_path_without_mutating_the_prefix() {
         let all = headers(24, 3);
         for split in [0, 1, 10, 11, 12, 23, 24] {
@@ -422,6 +533,73 @@ mod tests {
             );
             assert_eq!(prefix.height(), 12);
         }
+    }
+
+    #[test]
+    fn qualified_header_drift_uses_genesis_half_life() {
+        let mut legacy = rules();
+        legacy.genesis_target[0] = 0x7f;
+        let mut current = legacy.clone();
+        current.asert_half_life = pow::AsertHalfLife::OneHour;
+        let mut first = headers(1, 3).remove(0);
+        first.timestamp = current.genesis_timestamp + current.target_interval + 3600;
+        first.target = current.genesis_target;
+        let seal = |header: &mut Header| {
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let seed = header.pow_seed().unwrap();
+            header.nonce = (0..32)
+                .take_while(|_| std::time::Instant::now() < limit)
+                .find(|nonce| pow::meets_target(&pow::pow_hash(&seed, *nonce, 0), &header.target))
+                .expect("bounded fixture nonce");
+        };
+        seal(&mut first);
+        let mut second = first.clone();
+        second.height = 2;
+        second.timestamp += 300;
+        second.parent = first.id().unwrap();
+        second.target = pow::asert_target_with_half_life(
+            &current.genesis_target,
+            current.genesis_timestamp,
+            300,
+            1,
+            first.timestamp,
+            current.asert_half_life,
+        );
+        seal(&mut second);
+        assert!(
+            VerifiedHeaders::verify(current.clone(), vec![first.clone(), second.clone()]).is_ok()
+        );
+        assert_eq!(
+            VerifiedHeaders::verify(legacy, vec![first.clone(), second.clone()]).unwrap_err(),
+            SelectionError::Difficulty,
+        );
+        let prefix = VerifiedHeaders::verify(current, vec![first]).unwrap();
+        assert_eq!(prefix.verify_extension(&[second]).unwrap().height(), 2);
+    }
+
+    #[test]
+    fn checkpoint_ancestry_requires_exact_block_and_local_context() {
+        let rules = rules();
+        let current = chain(3, 1);
+        let checkpoint = current.id(2).unwrap();
+        let compare = |candidate: &VerifiedHeaders| {
+            candidate.checkpoint_ancestry(rules.network, rules.genesis, 2, checkpoint)
+        };
+        assert_eq!(compare(&chain(8, 1)), Ok(CheckpointAncestry::Matches));
+        for additional in [30, 60, 100] {
+            let incompatible = chain(current.height() + additional, 2);
+            assert!(incompatible.cumulative_work() > current.cumulative_work());
+            assert_eq!(compare(&incompatible), Ok(CheckpointAncestry::Conflicts));
+        }
+        assert_eq!(compare(&chain(1, 1)), Ok(CheckpointAncestry::Incomplete));
+        assert_eq!(
+            current.checkpoint_ancestry(rules.network, [9; 32], 2, checkpoint),
+            Err(SelectionError::Rules)
+        );
+        assert_eq!(
+            current.checkpoint_ancestry(rules.network, rules.genesis, 0, rules.genesis),
+            Ok(CheckpointAncestry::Matches)
+        );
     }
 
     #[test]

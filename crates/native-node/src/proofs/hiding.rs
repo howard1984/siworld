@@ -32,7 +32,7 @@ fn air_identity() -> [u8; 32] {
         let mut hash = blake3::Hasher::new_derive_key(
             "siworld retained native V2 AIR and preprocessing closure",
         );
-        for source in [
+        for source in &include!("profile_v2_inputs.rs")([
             include_bytes!("../../../bench-d8/src/lib.rs").as_slice(),
             include_bytes!("../../../bench-d8/src/air.rs").as_slice(),
             include_bytes!("../../../bench-d8/src/common.rs").as_slice(),
@@ -64,7 +64,7 @@ fn air_identity() -> [u8; 32] {
             include_bytes!("../proof_codec/v2/backend/relations.rs").as_slice(),
             include_bytes!("../proof_codec/v2/backend/issuance_trace.rs").as_slice(),
             include_bytes!("../proof_codec/v2/backend/settlement_trace.rs").as_slice(),
-        ] {
+        ]) {
             hash.update(&(source.len() as u64).to_le_bytes());
             hash.update(source);
         }

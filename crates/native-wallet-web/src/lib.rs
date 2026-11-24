@@ -185,6 +185,8 @@ pub struct BrowserWallet {
     candidate: Option<engine::light::LightWallet>,
     eng2: Option<engine::eng2_light::Eng2LightState>,
     eng2_candidate: Option<engine::eng2_light::Eng2LightState>,
+    eng2_checkpoint: Option<engine::eng2_light::VerifiedCheckpoint>,
+    eng2_checkpoint_suspended: bool,
 }
 #[wasm_bindgen]
 impl BrowserWallet {
@@ -196,6 +198,8 @@ impl BrowserWallet {
             candidate: None,
             eng2: None,
             eng2_candidate: None,
+            eng2_checkpoint: None,
+            eng2_checkpoint_suspended: false,
         })
     }
     pub fn restore(
@@ -215,6 +219,8 @@ impl BrowserWallet {
             candidate: None,
             eng2: None,
             eng2_candidate: None,
+            eng2_checkpoint: None,
+            eng2_checkpoint_suspended: false,
         })
     }
     pub fn unlock(
@@ -231,6 +237,8 @@ impl BrowserWallet {
             candidate: None,
             eng2: None,
             eng2_candidate: None,
+            eng2_checkpoint: None,
+            eng2_checkpoint_suspended: false,
         })
     }
     pub fn recovery_words(&self) -> Result<String, JsValue> {
@@ -307,6 +315,8 @@ impl BrowserWallet {
             candidate: None,
             eng2: None,
             eng2_candidate: None,
+            eng2_checkpoint: None,
+            eng2_checkpoint_suspended: false,
         })
     }
 
@@ -646,7 +656,7 @@ impl BrowserWallet {
                 "A fresh confirmed wallet session is required for eng2 sync.".into(),
             ));
         }
-        let state = engine::eng2_light::Eng2LightState::new(
+        let state = engine::eng2_light::Eng2LightState::new_for_browser(
             genesis,
             wallet_core::hex_array::<32>(expected).map_err(js)?,
             Zeroizing::new(*self.material.entropy),
@@ -662,6 +672,8 @@ impl BrowserWallet {
         }
         self.eng2 = Some(state);
         self.eng2_candidate = None;
+        self.eng2_checkpoint = None;
+        self.eng2_checkpoint_suspended = false;
         self.eng2_balance()
     }
     pub fn begin_eng2_candidate(&mut self, extension: bool) -> Result<(), JsValue> {
@@ -755,8 +767,8 @@ impl BrowserWallet {
         }
         Ok(serde_json::Value::Array(rows).to_string())
     }
-    /// Decode bounded public header pages. Each header still requires complete
-    /// work verification when its body-authenticated receipt is applied.
+    /// Decode bounded public header pages. Applying a receipt checks the
+    /// linked header and body commitment under the browser validation policy.
     pub fn eng2_header_page(
         &self,
         bytes: &[u8],
@@ -799,6 +811,14 @@ impl BrowserWallet {
             .eng2_candidate
             .as_ref()
             .ok_or_else(|| js("No eng2 synchronization candidate.".into()))?;
+        if self
+            .eng2_checkpoint
+            .is_some_and(|floor| !state.preserves_checkpoint(floor))
+        {
+            return Err(js(
+                "Engineering-v2 candidate conflicts with the verified checkpoint.".into(),
+            ));
+        }
         state
             .check_head(
                 height
@@ -832,7 +852,7 @@ impl BrowserWallet {
             .eng2
             .as_ref()
             .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
-            .history_json())
+            .checkpoint_history_json(self.eng2_checkpoint))
     }
     pub fn eng2_cache(&self, candidate: bool) -> Result<Vec<u8>, JsValue> {
         let state = if candidate {
@@ -877,7 +897,7 @@ impl BrowserWallet {
             "siworld eng2 browser local scan cache key v1",
             64 * 1024 * 1024,
         )?;
-        let restored = engine::eng2_light::Eng2LightState::open_local(
+        let restored = engine::eng2_light::Eng2LightState::open_local_for_browser(
             genesis,
             wallet_core::hex_array::<32>(expected).map_err(js)?,
             Zeroizing::new(*self.material.entropy),
@@ -982,17 +1002,60 @@ impl BrowserWallet {
         receipt: &[u8],
         statement: &str,
     ) -> Result<String, JsValue> {
-        self.eng2
+        let state = self
+            .eng2
             .as_ref()
-            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?
-            .payment_receipt(
-                height
-                    .parse()
-                    .map_err(|_| js("Invalid eng2 receipt height.".into()))?,
-                receipt,
-                wallet_core::hex_array::<32>(statement).map_err(js)?,
-            )
-            .map_err(js)
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        let height: u64 = height
+            .parse()
+            .map_err(|_| js("Invalid eng2 receipt height.".into()))?;
+        let statement = wallet_core::hex_array::<32>(statement).map_err(js)?;
+        let inclusion = state
+            .authenticated_payment_receipt(height, receipt, statement)
+            .map_err(js)?;
+        let record = eng2_receipt_record(state.context().genesis(), inclusion, statement);
+        let token = self.seal_private(
+            &record,
+            b"SWE2PR01",
+            "siworld eng2 browser private payment receipt v1",
+            104,
+        )?;
+        Ok(json!({"statement_id":hex(&statement),"height":height,
+            "block_id":hex(&inclusion.block_id),"receipt_authenticated":true,
+            "full_node_consensus_verified":false,"receipt_token":hex(&token)})
+        .to_string())
+    }
+    pub fn eng2_checkpoint_payment_covered(
+        &self,
+        height: &str,
+        block: &str,
+        statement: &str,
+        token: &str,
+    ) -> Result<bool, JsValue> {
+        let (Some(state), Some(floor)) = (&self.eng2, self.eng2_checkpoint) else {
+            return Ok(false);
+        };
+        let inclusion = engine::wire::Snapshot {
+            height: height
+                .parse()
+                .map_err(|_| js("Invalid eng2 receipt height.".into()))?,
+            block_id: wallet_core::hex_array::<32>(block).map_err(js)?,
+        };
+        let statement = wallet_core::hex_array::<32>(statement).map_err(js)?;
+        let Ok(token) = wallet_core::hex_array::<152>(token) else {
+            return Ok(false);
+        };
+        let Ok(record) = self.open_private(
+            &token,
+            b"SWE2PR01",
+            "siworld eng2 browser private payment receipt v1",
+            104,
+        ) else {
+            return Ok(false);
+        };
+        Ok(record.as_slice()
+            == eng2_receipt_record(state.context().genesis(), inclusion, statement)
+            && state.checkpoint_covers_inclusion(floor, inclusion))
     }
     pub fn eng2_payment_inclusion_valid(&self, height: &str, block: &str) -> Result<bool, JsValue> {
         Ok(self
@@ -1005,6 +1068,82 @@ impl BrowserWallet {
                     .map_err(|_| js("Invalid eng2 inclusion height.".into()))?,
                 wallet_core::hex_array::<32>(block).map_err(js)?,
             ))
+    }
+    pub fn eng2_checkpoint_replay_required(&self) -> bool {
+        self.eng2
+            .as_ref()
+            .is_some_and(|state| state.checkpoint_replay_required())
+    }
+    /// A verified record is staged but not displayed until storage succeeds.
+    pub fn stage_eng2_checkpoint(&self, certificate: &[u8]) -> Result<Vec<u8>, JsValue> {
+        if self.eng2_checkpoint_suspended {
+            return Ok(Vec::new());
+        }
+        let state = self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        let floor = state.verify_checkpoint(certificate).map_err(js)?;
+        if self
+            .eng2_checkpoint
+            .is_some_and(|prior| prior.anchor().height >= floor.anchor().height)
+        {
+            return Ok(Vec::new());
+        }
+        self.seal_eng2_checkpoint(floor, false)
+    }
+    pub fn eng2_checkpoint_suspended(&self) -> bool {
+        self.eng2_checkpoint_suspended
+    }
+    pub fn eng2_candidate_conflicts_with_checkpoint(&self) -> bool {
+        match (&self.eng2_candidate, self.eng2_checkpoint) {
+            (Some(candidate), Some(floor)) => !candidate.preserves_checkpoint(floor),
+            _ => false,
+        }
+    }
+    pub fn stage_eng2_checkpoint_conflict(&self, certificate: &[u8]) -> Result<Vec<u8>, JsValue> {
+        let (Some(state), Some(candidate), Some(floor)) =
+            (&self.eng2, &self.eng2_candidate, self.eng2_checkpoint)
+        else {
+            return Ok(Vec::new());
+        };
+        if self.eng2_checkpoint_suspended
+            || !state
+                .checkpoint_conflicts(floor, candidate, certificate)
+                .map_err(js)?
+        {
+            return Ok(Vec::new());
+        }
+        self.seal_eng2_checkpoint(floor, true)
+    }
+    pub fn restore_eng2_checkpoint(&mut self, sealed: &[u8]) -> Result<(), JsValue> {
+        let state = self
+            .eng2
+            .as_ref()
+            .ok_or_else(|| js("Engineering-v2 sync is not initialized.".into()))?;
+        let bytes = self.open_private(
+            sealed,
+            b"SWE2CP02",
+            "siworld eng2 browser local checkpoint key v2",
+            73,
+        )?;
+        let bytes: &[u8; 73] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| js("Invalid local checkpoint record.".into()))?;
+        if bytes[72] > 1 {
+            return Err(js("Invalid local checkpoint suspension state.".into()));
+        }
+        let floor = state.restore_local_checkpoint(&bytes[..72]).map_err(js)?;
+        if !self.eng2_checkpoint_suspended
+            && self
+                .eng2_checkpoint
+                .is_none_or(|prior| prior.anchor().height <= floor.anchor().height)
+        {
+            self.eng2_checkpoint = Some(floor);
+            self.eng2_checkpoint_suspended = bytes[72] == 1;
+        }
+        Ok(())
     }
     pub fn protect_eng2_local(&self, bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
         if self.eng2.is_none() {
@@ -1032,7 +1171,35 @@ impl BrowserWallet {
     }
 }
 
+fn eng2_receipt_record(
+    genesis: [u8; 32],
+    inclusion: engine::wire::Snapshot,
+    statement: [u8; 32],
+) -> [u8; 104] {
+    let mut record = [0; 104];
+    record[..32].copy_from_slice(&genesis);
+    record[32..40].copy_from_slice(&inclusion.height.to_le_bytes());
+    record[40..72].copy_from_slice(&inclusion.block_id);
+    record[72..].copy_from_slice(&statement);
+    record
+}
+
 impl BrowserWallet {
+    fn seal_eng2_checkpoint(
+        &self,
+        floor: engine::eng2_light::VerifiedCheckpoint,
+        suspended: bool,
+    ) -> Result<Vec<u8>, JsValue> {
+        let mut record = [0; 73];
+        record[..72].copy_from_slice(&floor.local_record());
+        record[72] = u8::from(suspended);
+        self.seal_private(
+            &record,
+            b"SWE2CP02",
+            "siworld eng2 browser local checkpoint key v2",
+            73,
+        )
+    }
     fn private_key(&self, domain: &'static str) -> Zeroizing<[u8; 32]> {
         let mut h = blake3::Hasher::new_derive_key(domain);
         h.update(self.material.entropy.as_ref());

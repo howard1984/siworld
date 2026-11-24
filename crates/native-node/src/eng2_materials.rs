@@ -208,7 +208,9 @@ pub fn bind_checkpoint(
     // Config::decode_rules can invoke development fixture constructors.
     if bytes.len() < 41 + crate::state::CONFIG_RULE_BYTES
         || (&bytes[..8] != crate::wire::LEGACY_GENESIS_MAGIC
-            && &bytes[..8] != crate::wire::PUBLIC_GENESIS_MAGIC)
+            && &bytes[..8] != crate::wire::PUBLIC_GENESIS_MAGIC
+            && &bytes[..8] != crate::wire::CHECKPOINT_FORK_GENESIS_MAGIC
+            && &bytes[..8] != crate::wire::RANDOMX_GENESIS_MAGIC)
         || bytes[8] != crate::eng2::genesis::FeeMode::LegacyMiner as u8
         || bytes[41 + 33] != 0
     {
@@ -216,7 +218,8 @@ pub fn bind_checkpoint(
     }
     let genesis = Genesis::decode(&bytes)?;
     if genesis.config().fixture
-        || genesis.config().pow_iterations == 0
+        || (genesis.config().pow_algorithm() == siworld_core::pow::Algorithm::SequentialBlake3
+            && genesis.config().pow_iterations == 0)
         || genesis.config().economics != siworld_core::v1_economics::EconomicsParams::production()
     {
         return Err("production economic and work parameters are required".into());

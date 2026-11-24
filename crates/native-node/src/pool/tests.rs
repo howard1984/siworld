@@ -287,3 +287,65 @@ fn failed_fill_counts_leave_originals_bytes_and_reservations_unchanged() {
     assert_eq!(pool.take_for_fill(&state, 1).unwrap().len(), 1);
     assert_eq!(pool.bytes(), 0);
 }
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn abandoned_private_templates_do_not_fill_publication_reservations() {
+    let state = state();
+    let verify = verifier();
+    let mut pool = Pool::new(state.config.network);
+
+    for round in 0..(MAX_CONSUMED / 16 + 2) {
+        for position in 0..16 {
+            let seed = 1 + (round * 16 + position) as u32 * 1000;
+            pool.insert(&state, entry(&state, seed), &verify).unwrap();
+        }
+        let selected = pool
+            .take_for_fill_with_visibility(&state, 16, true)
+            .unwrap();
+        assert_eq!(pool.consumed.len(), 16);
+        assert_eq!(
+            pool.take_for_fill_with_visibility(&state, 0, true).err(),
+            Some(FillError::PrivateTemplateActive)
+        );
+        drop(selected);
+        pool.discard_unpublished_template();
+        assert!(pool.is_empty());
+        assert!(pool.consumed.is_empty());
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn attempted_publication_is_never_released_by_private_cancellation() {
+    let state = state();
+    let verify = verifier();
+    let mut pool = Pool::new(state.config.network);
+    pool.insert(&state, entry(&state, 1), &verify).unwrap();
+    drop(pool.take_for_fill_with_visibility(&state, 1, true).unwrap());
+    pool.mark_template_published();
+    pool.discard_unpublished_template();
+    assert_eq!(pool.consumed.len(), 1);
+    assert!(pool.insert(&state, entry(&state, 1), &verify).is_err());
+
+    assert_eq!(
+        pool.take_for_fill_with_visibility(&state, 1, true).err(),
+        Some(FillError::Insufficient { required: 1 })
+    );
+    for id in 1..MAX_CONSUMED {
+        pool.consumed.insert(
+            blake3::hash(&id.to_le_bytes()).into(),
+            Consumed {
+                inputs: [[0; 48]; 2],
+                outputs: [[0; 48]; 3],
+            },
+        );
+    }
+    pool.insert(&state, entry(&state, 1000), &verify).unwrap();
+    assert_eq!(
+        pool.take_for_fill_with_visibility(&state, 1, true).err(),
+        Some(FillError::ReservationsExhausted)
+    );
+    assert_eq!(pool.len(), 1);
+    assert_eq!(pool.consumed.len(), MAX_CONSUMED);
+}

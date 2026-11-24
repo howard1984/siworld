@@ -9,6 +9,8 @@ const metadataKeys = 'fee_mode,genesis,height,network,profile,rules,tip,type,ver
 const headQuery = head => new URLSearchParams({height:String(head.height),tip:head.tip});
 const exactHeight = value => Number.isSafeInteger(value) && value >= 0 && value <= 100000;
 const PREFIX_BLOCKS = 8;
+const CERTIFICATE_BYTES = 6778;
+const CHECKPOINT_BUDGET_MS = 5000;
 
 // A display status never changes native reward maturity or proves finality.
 export function eng2Confirmations(height,head) {
@@ -40,6 +42,7 @@ export class Eng2Session {
   }
   checkBalance(value) {
     if (!sameEng2Context(value,this.config) || !exactHeight(value.height) || typeof value.tip !== 'string' || !/^[0-9a-f]{64}$/.test(value.tip) || value.send_supported !== false || value.full_node_consensus_verified !== false) throw new Error('Engineering-v2 native wallet capability or context differs.');
+    if (value.header_pow_verified === false && !this.config.checkpoint_finality) throw new Error('This wallet profile requires checkpoint settlement.');
     return value;
   }
   checkMetadata(value) {
@@ -68,7 +71,7 @@ export class Eng2Session {
       if (info.network !== this.config.network) throw new Error('Wallet belongs to another network. No conversion was performed.');
       this.key = 'scan:' + await this.hash(new TextEncoder().encode(info.full_address));
       controller.signal.throwIfAborted();
-      this.cacheKey = 'cache:' + this.key; this.lockKey = this.namespace + ':' + this.key;
+      this.cacheKey = 'cache:' + this.key; this.checkpointKey = 'checkpoint:' + this.key; this.lockKey = this.namespace + ':' + this.key;
       stage='genesis-fetch';
       const {bytes} = await this.get(this.base+'/genesis',{limit:262144,signal:controller.signal});
       controller.signal.throwIfAborted();
@@ -100,6 +103,7 @@ export class Eng2Session {
           const window = advanceEng2Rollback(emptyEng2Rollback(this.config),[],this.wallet.eng2_cache(false));
           await this.persist(metadata,false,window); this.metadata = metadata; this.rollback = window;
         }
+        await this.restoreCheckpoint();
         stage='summary';return this.summary();
       });
     } catch(error) {throw failureContext(error,stage);}
@@ -107,7 +111,37 @@ export class Eng2Session {
   }
   summary() {
     const value = this.checkBalance(JSON.parse(this.wallet.eng2_balance()));
-    return {...value,ready:this.ready,stale:!this.ready,committed:true,send_supported:false,received_records:JSON.parse(this.wallet.eng2_history()).map(row=>({...row,...eng2Confirmations(row.height,value.height)})),payments:[],reserved_count:0};
+    const settlement=this.config.checkpoint_finality;
+    return {...value,ready:this.ready,stale:!this.ready,committed:true,send_supported:false,
+      checkpoint_finality:settlement,finality_suspended:settlement && this.wallet.eng2_checkpoint_suspended(),
+      received_records:JSON.parse(this.wallet.eng2_history()).map(row=>({...row,...eng2Confirmations(row.height,value.height),checkpoint_covered:settlement && row.checkpoint_covered===true})),payments:[],reserved_count:0};
+  }
+  async restoreCheckpoint() {
+    if(!this.config.checkpoint_finality)return;
+    const saved=await this.storage.read(this.checkpointKey);
+    if(saved)this.wallet.restore_eng2_checkpoint(saved);
+  }
+  async refreshCheckpoint(head,signal,conflict=false) {
+    if(!this.config.checkpoint_finality || head.height===0 || this.wallet.eng2_checkpoint_suspended())return false;
+    let staged;
+    try {
+      const optional=AbortSignal.any([signal,AbortSignal.timeout(CHECKPOINT_BUDGET_MS)]);
+      const {bytes}=await this.get(this.base+'/checkpoint?'+headQuery(head),{limit:CERTIFICATE_BYTES,signal:optional});
+      try {
+        optional.throwIfAborted();
+        if(bytes.length===CERTIFICATE_BYTES)staged=conflict
+          ? this.wallet.stage_eng2_checkpoint_conflict(bytes)
+          : this.wallet.stage_eng2_checkpoint(bytes);
+      } finally {bytes.fill(0);}
+    } catch(error) {
+      signal.throwIfAborted();
+      // A missing, stale or invalid certificate cannot revoke an accepted floor.
+      return false;
+    }
+    if(!staged?.length)return false;
+    await this.storage.atomic([[this.checkpointKey,staged]]);
+    this.wallet.restore_eng2_checkpoint(staged);
+    return true;
   }
   async fresh() {
     const bytes = await this.storage.read(this.key);
@@ -120,7 +154,8 @@ export class Eng2Session {
     const controller = new AbortController(); this.controller = controller;
     let persisted = false,stage='sync-lock';
     try { return await this.locks.request(this.lockKey,{signal:controller.signal},async () => {
-      stage='cache-fresh';await this.fresh();
+      stage='cache-fresh';await this.fresh();await this.restoreCheckpoint();
+      const fullReplay=this.config.checkpoint_finality && this.wallet.eng2_checkpoint_replay_required();
       stage='head-fetch';const reply=await this.json(this.base+'/head',{limit:20000,signal:controller.signal});
       stage='head-validate';const head = eng2Head(reply,this.config,this.now());
       controller.signal.throwIfAborted();
@@ -146,13 +181,15 @@ export class Eng2Session {
         if (head.height === this.metadata.height && head.tip === this.metadata.tip && !savedHeadMatches) throw new Error('Engineering-v2 saved header hash differs from the advertised tip. Previous balance was preserved.');
       }
       controller.signal.throwIfAborted();
-      if (head.height === this.metadata.height && head.tip === this.metadata.tip && savedHeadMatches) { this.ready = true; return this.summary(); }
-      if (head.height > this.metadata.height) {
+      if (!fullReplay && head.height === this.metadata.height && head.tip === this.metadata.tip && savedHeadMatches) {
+        await this.refreshCheckpoint(head,controller.signal);this.ready = true; return this.summary();
+      }
+      if (!fullReplay && head.height > this.metadata.height) {
         firstPage = await page(this.metadata.height+1);
         extension = savedHeadMatches && firstPage.headers[0].parent === this.metadata.tip;
       }
       let window=this.rollback,scanStartHeight=extension?this.metadata.height:0,cached=false;
-      if(!extension && window){
+      if(!extension && window && !fullReplay){
         const from=Math.max(1,this.metadata.height-24),to=Math.min(this.metadata.height,head.height);
         const remote=to>=from?(await page(from,head,to-from+1)).headers:[];
         const plan=selectEng2Rollback(window,{height:head.height,tip:head.tip,headers:remote});
@@ -220,7 +257,17 @@ export class Eng2Session {
           }
         }
       }
+      // A rival head or service flag alone cannot suspend finality. Only
+      // a quorum verified against the independently scanned rival history can.
+      if (this.config.checkpoint_finality && this.wallet.eng2_candidate_conflicts_with_checkpoint()) {
+        stage='candidate-checkpoint-conflict';
+        await this.refreshCheckpoint(head,controller.signal,true);
+        this.wallet.abort_eng2_candidate();
+        return {...this.summary(),downloaded_bytes:downloaded,catchup_pending:true,
+          candidate_conflicts_with_checkpoint:true,target_height:head.height,target_tip:head.tip};
+      }
       const current = await adopt(head.height,head.tip);
+      await this.refreshCheckpoint(head,controller.signal);
       const advanced = current.height !== head.height || current.tip !== head.tip;
       // Preserve completed native verification across a moving head. The next
       // owner refresh extends this durable prefix; the new head is still stale.

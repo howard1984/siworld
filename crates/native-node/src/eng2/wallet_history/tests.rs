@@ -289,6 +289,11 @@ fn only_actual_accepted_store_head_can_authorize_export() {
     assert!(receipts(&store, &head, 1, &budget).is_err());
     assert!(receipts(&store, &head, 0, &budget).is_err());
     assert!(header_page(&store, &head, 1, 1, &budget).is_err());
+    assert_eq!(
+        payment_inclusion(&store, &head, 1, [1; 32], [2; 32], &budget),
+        Ok(PaymentInclusion::BlockNotCanonical)
+    );
+    assert!(payment_inclusion(&store, &head, 0, head.tip(), [2; 32], &budget).is_err());
     let mut forged = head.clone();
     forged.height = 1;
     assert!(receipts(&store, &forged, 1, &budget).is_err());

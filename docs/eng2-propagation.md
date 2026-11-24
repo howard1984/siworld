@@ -108,10 +108,28 @@ descriptor, piece zero and the ordered remaining pieces. Metadata declares only
 piece zero. The receiver authenticates its length and descriptor against the
 header commitment, installs the candidate in the shared registry, then checks
 each remaining piece before installation. The entire credited stream consumes
-one application query, retains the original deadline and ends within the same
-socket turn. A live stream prevents duplicate pull assignments for that job.
-Disconnects and malformed or duplicate pieces retain partial byte charges and
-only the previously authenticated pieces; they grant no complete decode.
+one application query and retains the original deadline. After two seconds without
+an authenticated piece, or eight seconds of streaming, the receiver can pull
+missing tail pieces in parallel from configured peers with live, session-bound
+evidence of the exact branch. These pulls use the same transfer and query budget;
+the push counts toward the three-lane limit. Parallel pulls receive mutually
+disjoint assignments. The ordered push can overlap a pull: every response is
+independently charged and authenticated, and only the first copy contributes
+unique authenticated body bytes. Completion interrupts redundant reads without
+cancelling the body owner or downstream forwarding. Malformed responses retain
+partial byte charges and cannot install unauthenticated bytes.
+
+Version-2 miners can require exactly three dialable, independently pinned
+services with `require_three_direct_push_targets: true` and three peers tagged
+`fixed_relay_role: "service"`. Each service selects the reciprocal pinned
+miner. A miner prioritizes these connections within its worker limit and tries
+its local direct push before issuing body pulls on each selected lane. Per-destination `native-miner-direct-push` observations show
+declared body size, sent application bytes and the outcome. `body_sent` means
+the local send finished; the receiver's native acceptance is recorded separately.
+No send is guaranteed for a disconnected peer or an exhausted relay quota.
+Configuration validation counts selected peers and requires all dialable routes
+to fit within the connection limit. Deployment must verify that the three peers
+are the intended service roster.
 
 A version-2 service may explicitly configure another independently pinned
 service with `fixed_relay_role: "service"`. Miner and service selections remain

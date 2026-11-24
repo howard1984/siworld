@@ -135,6 +135,17 @@ impl Observer {
             return Err("checkpoint observation evidence already active".into());
         }
         let evidence = super::runtime_export::PublicExport::open_observation_evidence(root, store)?;
+        #[cfg(feature = "eng2-runtime")]
+        if store.engine().genesis().checkpoint_fork_choice() {
+            self.hard = match evidence.accepted_conflict(store) {
+                Ok(true) => Some(Error::Conflict),
+                Ok(false) => None,
+                Err(_) => Some(Error::EvidenceUnavailable),
+            };
+            self.error = self.hard;
+            self.evidence = Some(evidence);
+            return Ok(());
+        }
         if let Some(certificate) = evidence.observed_retirement()? {
             let roster = store.engine().state().governance().active_roster();
             if certificate.statement.roster_sequence == roster.epoch_sequence {
@@ -219,9 +230,124 @@ impl Observer {
             return Err(Error::Unavailable);
         }
         let view = Accepted { store, retained };
+        #[cfg(feature = "eng2-runtime")]
+        if store.engine().genesis().checkpoint_fork_choice() {
+            return self.check_bounded_fork_choice(store, &view, now, incoming);
+        }
         self.reconcile_view(&view);
         self.check(&view, now, incoming)
     }
+    #[cfg(feature = "eng2-runtime")]
+    fn check_bounded_fork_choice(
+        &mut self,
+        store: &Store,
+        view: &impl View,
+        now: u64,
+        incoming: &Incoming,
+    ) -> Result<Outcome, Error> {
+        self.check_bounded_view(
+            view,
+            store.finality_fence(),
+            now,
+            incoming,
+            |_this, _certificate| {
+                #[cfg(unix)]
+                {
+                    let accepted = store
+                        .finalized_checkpoint()
+                        .map_err(|_| Error::EvidenceUnavailable)?
+                        .ok_or(Error::EvidenceUnavailable)?;
+                    _this
+                        .evidence
+                        .as_ref()
+                        .ok_or(Error::EvidenceUnavailable)?
+                        .write_accepted_conflict(store, &accepted, _certificate)
+                        .map_err(|_| Error::EvidenceUnavailable)?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    fn check_bounded_view(
+        &mut self,
+        view: &impl View,
+        floor: Option<(u64, Hash)>,
+        now: u64,
+        incoming: &Incoming,
+        persist_conflict: impl FnOnce(&Self, &Certificate) -> Result<(), Error>,
+    ) -> Result<Outcome, Error> {
+        if let Some(error) = self.hard {
+            return Err(error);
+        }
+        let result = (|| {
+            if now >= 1u64 << 53
+                || self.last_now.is_some_and(|last| now < last)
+                || incoming.encode(MAX_GOVERNANCE_BYTES).is_err()
+            {
+                return Err(Error::Rejected);
+            }
+            self.last_now = Some(now);
+            let Incoming::Certified {
+                certificate,
+                witness,
+            } = incoming
+            else {
+                return evaluate(view, incoming, false);
+            };
+            let current = current_quorum(view, certificate)?;
+            let statement = &certificate.statement;
+            let canonical = headers(view, statement);
+            if canonical.as_ref().is_ok_and(|(header, selected)| {
+                *selected == statement.checkpoint_block
+                    && header.id().ok() == Some(statement.authorization_block)
+            }) {
+                return evaluate(view, incoming, current);
+            }
+            // A quorum on another provisional chain alone is not proof of
+            // finality conflict. Establish the exact signed ancestry first.
+            if !current {
+                return Err(Error::Unavailable);
+            }
+            let Some((floor_height, floor_id)) = floor else {
+                return Err(Error::Unavailable);
+            };
+            let authorization = exact_header(
+                view,
+                statement.authorization_height,
+                statement.authorization_block,
+            )?;
+            authority(view, statement, &authorization, witness)?;
+            let comparison_height = floor_height.min(statement.checkpoint_height);
+            let compared = certified_ancestor(view, statement, authorization, comparison_height)?;
+            let expected = if comparison_height == floor_height {
+                floor_id
+            } else {
+                view.header(comparison_height)?
+                    .id()
+                    .map_err(|_| Error::Unavailable)?
+            };
+            if compared == expected {
+                return Err(Error::Unavailable);
+            }
+            persist_conflict(self, certificate)?;
+            Err(Error::Conflict)
+        })();
+        match result {
+            Ok(Outcome::CurrentCertificate(height)) => {
+                self.observed_height = Some(self.observed_height.unwrap_or(0).max(height));
+                self.error = None;
+            }
+            Err(error @ (Error::Conflict | Error::EvidenceUnavailable)) => {
+                self.hard = Some(error);
+                self.error = Some(error);
+            }
+            _ => (),
+        }
+        result
+    }
+
     /// Called only under the canonical owner lock after an allowed transition.
     /// Matching identities alone never clear pending evidence or grant readiness.
     pub fn reconcile(
@@ -508,6 +634,55 @@ impl Observer {
         result
     }
 }
+// Bound the synchronous checkpoint phase. An unavailable witness or longer
+// ancestry needs the candidate recovery worker; it does not imply invalidity.
+#[cfg(feature = "eng2-runtime")]
+const MAX_CONFLICT_ANCESTRY_HEADERS: u64 = 256;
+
+#[cfg(feature = "eng2-runtime")]
+fn exact_header(view: &impl View, height: u64, id: Hash) -> Result<Header, Error> {
+    let matches = |header: &Header| header.height == height && header.id().ok() == Some(id);
+    if let Ok(header) = view.header(height)
+        && matches(&header)
+    {
+        return Ok(header);
+    }
+    view.retained_header(height, id)?
+        .filter(matches)
+        .ok_or(Error::Unavailable)
+}
+
+#[cfg(feature = "eng2-runtime")]
+fn certified_ancestor(
+    view: &impl View,
+    statement: &Statement,
+    authorization: Header,
+    comparison_height: u64,
+) -> Result<Hash, Error> {
+    if !super::runtime_export::confirmed_checkpoint(
+        statement.checkpoint_height,
+        statement.authorization_height,
+    ) || authorization.height != statement.authorization_height
+        || comparison_height > statement.checkpoint_height
+    {
+        return Err(Error::Rejected);
+    }
+    if authorization.height - comparison_height > MAX_CONFLICT_ANCESTRY_HEADERS {
+        return Err(Error::Unavailable);
+    }
+    let mut header = authorization;
+    loop {
+        let id = header.id().map_err(|_| Error::Rejected)?;
+        if header.height == statement.checkpoint_height && id != statement.checkpoint_block {
+            return Err(Error::Rejected);
+        }
+        if header.height == comparison_height {
+            return Ok(id);
+        }
+        header = exact_header(view, header.height - 1, header.parent)?;
+    }
+}
+
 fn current_quorum(view: &impl View, certificate: &Certificate) -> Result<bool, Error> {
     let statement = &certificate.statement;
     let current = view.governance().active_roster();

@@ -49,7 +49,7 @@ test('eng2 registry and selection only open the exact custody database',async()=
 });
 test('eng2 worker dispatch cannot select V1 endpoints or enable mutation through flags',()=>{
  assert.equal(sessionConfiguration(pin,pin).read_only,true);
- for(const changes of [{name:'siworld-eng-1'},{genesis:'9'.repeat(64)},{api:'http://127.0.0.1:8891'},{apis:[pin.api,'https://foreign.example.test']},{submission_apis:['https://foreign.example.test']},{read_only:false},{desktop_send_measured:true}])assert.throws(()=>sessionConfiguration({...pin,...changes},pin));
+ for(const changes of [{name:'siworld-eng-1'},{genesis:'9'.repeat(64)},{api:'http://127.0.0.1:8891'},{apis:[pin.api,'https://foreign.example.test']},{submission_apis:['https://foreign.example.test']},{checkpoint_finality:true},{read_only:false},{desktop_send_measured:true}])assert.throws(()=>sessionConfiguration({...pin,...changes},pin));
  for(const action of ['prepare','submit','cancel-payment','register-address'])assert.throws(()=>assertWalletOperation(action,pin),/unavailable/);
  for(const action of ['sync','online-init','inspect','accounts-add'])assert.doesNotThrow(()=>assertWalletOperation(action,pin));
  assert.throws(()=>eng2ReadOnlyProfile({...pin,fee_mode:1}));

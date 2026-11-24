@@ -113,6 +113,61 @@ impl PublicExport {
         Self::open_unrestored(root, store)
     }
 
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn write_accepted_conflict(
+        &self,
+        store: &Store,
+        accepted: &Certificate,
+        competing: &Certificate,
+    ) -> Result<(), String> {
+        self.check_store(store)?;
+        if store.finalized_checkpoint()?.as_ref() != Some(accepted) {
+            return Err("checkpoint conflict does not bind the accepted floor".into());
+        }
+        let mut bytes = accepted
+            .encode()
+            .map_err(|_| "accepted conflict certificate malformed")?
+            .to_vec();
+        bytes.extend_from_slice(
+            &competing
+                .encode()
+                .map_err(|_| "competing conflict certificate malformed")?,
+        );
+        let seal = store.bind_conflict_evidence(&bytes)?;
+        self.write_once(
+            "checkpoint-accepted-conflict-eng2.bin",
+            &[bytes.as_slice(), &seal].concat(),
+        )
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn accepted_conflict(&self, store: &Store) -> Result<bool, String> {
+        use crate::{
+            eng2::certificate::CERTIFICATE_BYTES, identity::storage_checkpoint::SEAL_BYTES,
+        };
+        self.check_store(store)?;
+        let payload = 2 * CERTIFICATE_BYTES;
+        let Some(bytes) = self.read_optional(
+            "checkpoint-accepted-conflict-eng2.bin",
+            payload + SEAL_BYTES,
+        )?
+        else {
+            return Ok(false);
+        };
+        if bytes.len() != payload + SEAL_BYTES {
+            return Err("checkpoint conflict record length invalid".into());
+        }
+        store.verify_conflict_evidence(&bytes[..payload], &bytes[payload..])?;
+        let accepted = Certificate::decode(&bytes[..CERTIFICATE_BYTES], self.network)
+            .map_err(|_| "accepted conflict certificate malformed")?;
+        Certificate::decode(&bytes[CERTIFICATE_BYTES..payload], self.network)
+            .map_err(|_| "competing conflict certificate malformed")?;
+        if store.finalized_checkpoint()?.as_ref() != Some(&accepted) {
+            return Err("retained checkpoint conflict floor differs".into());
+        }
+        Ok(true)
+    }
+
     /// Preserve the first independently verified quorum for an epoch and anchor.
     /// The caller has already checked the incoming current-roster signatures.
     /// A different statement is retained separately before reporting conflict.
@@ -398,6 +453,9 @@ impl PublicExport {
         randomness: [u8; 32],
         limits: ImportLimits,
     ) -> Result<Vote, String> {
+        if store.engine().genesis().checkpoint_fork_choice() {
+            return Err("bounded fork choice requires independent signer custody".into());
+        }
         self.check_store(store)?;
         prepared.check_current(store)?;
         self.write_candidate(
@@ -432,6 +490,30 @@ impl PublicExport {
             &[statement.as_slice(), &[slot], vote.signature.as_slice()].concat(),
         )?;
         Ok(vote)
+    }
+    /// Record the exact public vote returned by independent custody so the
+    /// keyless restore worker can check provenance without reading custody.
+    #[cfg(feature = "eng2-runtime")]
+    pub(super) fn record_custody_vote(
+        &mut self,
+        store: &Store,
+        prepared: &PreparedCheckpoint,
+        vote: &Vote,
+        limits: ImportLimits,
+    ) -> Result<(), String> {
+        self.check_store(store)?;
+        prepared.check_current(store)?;
+        prepared.verify_vote(vote)?;
+        let epoch = prepared.statement.roster_sequence;
+        let height = prepared.statement.checkpoint_height;
+        let slot = vote.slot;
+        self.write_candidate(&candidate_name(epoch, height), prepared, limits)?;
+        let statement = prepared
+            .statement
+            .encode()
+            .map_err(|_| "checkpoint statement malformed")?;
+        let name = format!("vote-{epoch:020}-{height:020}-{slot}.eng2.bin");
+        self.write_once_parts(&name, &[&statement, &[slot], &vote.signature])
     }
     /// Restore public artifacts only after checking exact cursor fields, content
     /// digests, local historical state, executed authorization and both signatures.

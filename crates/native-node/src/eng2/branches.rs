@@ -188,7 +188,9 @@ impl CheckpointHeaders {
         {
             return Err("captured retained header height differs".into());
         }
-        Ok(entry.map(|entry| entry.header))
+        Ok(entry
+            .filter(|entry| entry.status != Status::Invalid)
+            .map(|entry| entry.header))
     }
 }
 impl BranchStore {
@@ -460,23 +462,60 @@ impl BranchStore {
         {
             return Err("incremental archive median time rejected".into());
         }
-        let target = pow::asert_target(
+        let target = pow::asert_target_with_half_life(
             &self.rules.genesis_target,
             self.rules.genesis_timestamp,
             self.rules.target_interval,
             header.height - 1,
             parent_time,
+            self.rules.asert_half_life,
         );
         if header.target != target {
             return Err("incremental archive difficulty rejected".into());
         }
-        let seed = header
-            .pow_seed()
-            .map_err(|_| "incremental archive seed rejected")?;
-        if !pow::meets_target(
-            &pow::pow_hash(&seed, header.nonce, self.rules.pow_iterations),
-            &target,
-        ) {
+        let epoch = if self.rules.pow_algorithm == pow::Algorithm::SiworldRandomX {
+            let key_height = pow::randomx_key_height(header.height);
+            let key_block = if key_height == 0 {
+                None
+            } else {
+                let transaction = self
+                    .database
+                    .begin_read()
+                    .map_err(|_| "incremental key ancestry unavailable")?;
+                let table = transaction
+                    .open_table(HEADERS)
+                    .map_err(|_| "incremental key ancestry unavailable")?;
+                let mut ancestor = header.parent;
+                for height in (key_height..header.height).rev() {
+                    let Some(row) = table
+                        .get(ancestor.as_slice())
+                        .map_err(|_| "incremental key ancestor unreadable")?
+                    else {
+                        return Ok(false);
+                    };
+                    let entry = Entry::decode(row.value(), &self.rules.network)?;
+                    if entry.status == Status::Invalid
+                        || entry.header.height != height
+                        || entry.header.id().ok() != Some(ancestor)
+                    {
+                        return Err("incremental RandomX key ancestry rejected".into());
+                    }
+                    if height != key_height {
+                        ancestor = entry.header.parent;
+                    }
+                }
+                Some(ancestor)
+            };
+            pow::randomx_epoch_key(self.rules.genesis, header.height, |_| key_block)
+        } else {
+            None
+        };
+        if !super::proof_of_work::verify(
+            self.rules.pow_algorithm,
+            self.rules.pow_iterations,
+            header,
+            || epoch,
+        )? {
             return Err("incremental archive proof of work rejected".into());
         }
         let work = parent_work
@@ -607,7 +646,9 @@ impl BranchStore {
         }
         transaction
             .commit()
-            .map_err(|_| "branch body commit failed".to_string())
+            .map_err(|_| "branch body commit failed".to_string())?;
+        self.selection_changed();
+        Ok(())
     }
 
     /// Read persisted length without allocating or decoding raw proof data.
@@ -1041,6 +1082,15 @@ impl BranchStore {
     /// tie breaking. Neither this choice nor possession of its body authorizes
     /// adoption; the owner must fully execute the replacement first.
     pub fn best_candidate(&self) -> Result<Option<Hash>, String> {
+        self.select_candidate(None).map(|(best, _)| best)
+    }
+
+    /// Partition eligible and conflicting paths before work comparison.
+    /// Descendants of invalid headers cannot win either comparison.
+    pub(super) fn select_candidate(
+        &self,
+        fence: Option<(u64, Hash)>,
+    ) -> Result<(Option<Hash>, Option<Hash>), String> {
         let transaction = self
             .database
             .begin_read()
@@ -1075,22 +1125,141 @@ impl BranchStore {
             entries.push((id, entry));
         }
         entries.sort_unstable_by_key(|(_, entry)| entry.header.height);
-        let mut eligible = BTreeSet::from([self.rules.genesis]);
-        let mut best: Option<(Hash, Entry)> = None;
+        let mut ancestry = std::collections::BTreeMap::from([(self.rules.genesis, true)]);
+        let mut best = None::<(Hash, Work, u64)>;
+        let mut conflict = None::<(Hash, Work, u64)>;
         for (id, entry) in entries {
-            if entry.status == Status::Invalid || !eligible.contains(&entry.header.parent) {
+            if entry.status == Status::Invalid {
                 continue;
             }
-            eligible.insert(id);
-            if best.as_ref().is_none_or(|(_, old)| {
-                entry.cumulative_work > old.cumulative_work
-                    || (entry.cumulative_work == old.cumulative_work
-                        && entry.first_seen < old.first_seen)
+            let Some(mut preserves) = ancestry.get(&entry.header.parent).copied() else {
+                continue;
+            };
+            if let Some((height, expected)) = fence {
+                if entry.header.height < height {
+                    ancestry.insert(id, preserves);
+                    continue;
+                }
+                if entry.header.height == height {
+                    preserves = id == expected;
+                }
+            }
+            ancestry.insert(id, preserves);
+            let winner = if preserves { &mut best } else { &mut conflict };
+            if winner.as_ref().is_none_or(|(_, old, first_seen)| {
+                entry.cumulative_work > *old
+                    || (entry.cumulative_work == *old && entry.first_seen < *first_seen)
             }) {
-                best = Some((id, entry));
+                *winner = Some((id, entry.cumulative_work, entry.first_seen));
             }
         }
-        Ok(best.map(|(id, _)| id))
+        // Report only a conflict that would otherwise outrank the best
+        // compatible branch. The caller exposes this as advisory state.
+        let conflict = conflict.filter(|(_, work, _)| {
+            best.as_ref()
+                .is_none_or(|(_, best_work, _)| work > best_work)
+        });
+        Ok((best.map(|(id, _, _)| id), conflict.map(|(id, _, _)| id)))
+    }
+
+    /// Rank only branches whose suffix bodies are present. Missing material
+    /// on a stronger header path never makes that path a scheduling barrier.
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(super) fn select_shadow_candidate(
+        &self,
+        canonical: &Store,
+        fence: Option<(u64, Hash)>,
+        budget: &crate::p2p::Budget,
+        mut deferred: impl FnMut(Hash) -> bool,
+    ) -> Result<Option<Hash>, String> {
+        let txn = self
+            .database
+            .begin_read()
+            .map_err(|_| "shadow branch read unavailable")?;
+        let headers = txn
+            .open_table(HEADERS)
+            .map_err(|_| "shadow branch headers unavailable")?;
+        let bodies = txn
+            .open_table(BODIES)
+            .map_err(|_| "shadow branch bodies unavailable")?;
+        use redb::ReadableTableMetadata;
+        let count = headers
+            .len()
+            .map_err(|_| "shadow branch count unavailable")?;
+        if count > self.limits.maximum_headers as u64 {
+            return Err("shadow branch capacity differs".into());
+        }
+        let count = usize::try_from(count).map_err(|_| "shadow branch count overflow")?;
+        let charge = count
+            .checked_mul(std::mem::size_of::<(Hash, Entry)>() + 128)
+            .ok_or("shadow scan memory accounting overflow")?;
+        let _scan = budget
+            .reserve(charge)
+            .map_err(|_| "shadow branch scan memory deferred")?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(count)
+            .map_err(|_| "shadow branch scan allocation failed")?;
+        for row in headers
+            .iter()
+            .map_err(|_| "shadow branch iteration failed")?
+        {
+            let (key, row) = row.map_err(|_| "shadow branch record unavailable")?;
+            let id: Hash = key
+                .value()
+                .try_into()
+                .map_err(|_| "shadow branch key rejected")?;
+            let entry = Entry::decode(row.value(), &self.rules.network)?;
+            if entry.header.id().ok() != Some(id) {
+                return Err("shadow branch header key differs".into());
+            }
+            entries.push((id, entry));
+        }
+        entries.sort_unstable_by_key(|(_, entry)| entry.header.height);
+        let state = canonical.engine().state();
+        let mut ready = BTreeSet::from([fence.map_or(self.rules.genesis, |(_, id)| id)]);
+        let mut best = None::<(Hash, Work, u64)>;
+        for (id, entry) in entries {
+            if fence.is_some_and(|(height, _)| entry.header.height <= height)
+                || entry.status == Status::Invalid
+                || !ready.contains(&entry.header.parent)
+            {
+                continue;
+            }
+            let on_current = entry.header.height <= state.height()
+                && canonical.header(entry.header.height)?.id().ok() == Some(id);
+            if !on_current
+                && bodies
+                    .get(id.as_slice())
+                    .map_err(|_| "shadow branch body lookup failed")?
+                    .is_none()
+            {
+                continue;
+            }
+            ready.insert(id);
+            if !on_current
+                && entry.cumulative_work > state.chain().cumulative_work
+                && !deferred(id)
+                && best.as_ref().is_none_or(|(_, work, first)| {
+                    entry.cumulative_work > *work
+                        || (entry.cumulative_work == *work && entry.first_seen < *first)
+                })
+            {
+                best = Some((id, entry.cumulative_work, entry.first_seen));
+            }
+        }
+        Ok(best.map(|(id, _, _)| id))
+    }
+
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(super) fn capture_shadow_branch(&self) -> Result<ShadowBranch, String> {
+        Ok(ShadowBranch {
+            txn: self
+                .database
+                .begin_read()
+                .map_err(|_| "shadow branch capture failed")?,
+            network: self.rules.network,
+        })
     }
 
     fn valid_ancestry(&self, mut id: Hash) -> Result<bool, String> {
@@ -1164,6 +1333,53 @@ impl BranchStore {
     }
 }
 
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(super) struct ShadowBranch {
+    txn: redb::ReadTransaction,
+    network: Hash,
+}
+
+#[cfg(all(unix, feature = "eng2-runtime"))]
+impl ShadowBranch {
+    pub(super) fn size(&self, id: Hash) -> Result<usize, String> {
+        let table = self
+            .txn
+            .open_table(BODIES)
+            .map_err(|_| "shadow branch body table unavailable")?;
+        Ok(table
+            .get(id.as_slice())
+            .map_err(|_| "shadow branch body unavailable")?
+            .ok_or("shadow branch body missing")?
+            .value()
+            .len())
+    }
+
+    pub(super) fn block(&self, id: Hash, policy: Policy) -> Result<(Header, Body), String> {
+        let headers = self
+            .txn
+            .open_table(HEADERS)
+            .map_err(|_| "shadow branch header table unavailable")?;
+        let row = headers
+            .get(id.as_slice())
+            .map_err(|_| "shadow branch header unavailable")?
+            .ok_or("shadow branch header missing")?;
+        let entry = Entry::decode(row.value(), &self.network)?;
+        if entry.status == Status::Invalid || entry.header.id().ok() != Some(id) {
+            return Err("shadow branch header changed".into());
+        }
+        let bodies = self
+            .txn
+            .open_table(BODIES)
+            .map_err(|_| "shadow branch body table unavailable")?;
+        let bytes = bodies
+            .get(id.as_slice())
+            .map_err(|_| "shadow branch body unavailable")?
+            .ok_or("shadow branch body missing")?;
+        let body = Body::decode(bytes.value(), self.network, entry.header.height, policy)?;
+        Ok((entry.header, body))
+    }
+}
+
 fn meta_number(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
     key: &str,
@@ -1187,6 +1403,12 @@ fn rules_bytes(rules: &HeaderRules) -> Vec<u8> {
     bytes.extend_from_slice(&rules.genesis_target);
     bytes.extend_from_slice(&rules.target_interval.to_le_bytes());
     bytes.extend_from_slice(&rules.pow_iterations.to_le_bytes());
+    if rules.asert_half_life != siworld_core::pow::AsertHalfLife::FourHours {
+        bytes.extend_from_slice(&rules.asert_half_life.seconds().to_le_bytes());
+    }
+    if rules.pow_algorithm == siworld_core::pow::Algorithm::SiworldRandomX {
+        bytes.extend_from_slice(siworld_core::pow::RANDOMX_ALGORITHM.as_bytes());
+    }
     bytes
 }
 

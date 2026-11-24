@@ -234,7 +234,9 @@ fn run(root: &Path, source_root: &Path, page_path: &Path) -> Result<Value, Strin
             genesis_timestamp: config.genesis_timestamp,
             genesis_target: config.genesis_target,
             target_interval: config.target_interval,
+            asert_half_life: config.asert_half_life(),
             pow_iterations: config.pow_iterations,
+            pow_algorithm: config.pow_algorithm(),
             max_headers: 96,
         },
         headers.clone(),
@@ -530,7 +532,7 @@ fn run(root: &Path, source_root: &Path, page_path: &Path) -> Result<Value, Strin
     )?;
     // Projection must use authenticated permanent receipts where imported
     // historical proof bodies are intentionally unavailable.
-    let tick = retained.tick(&store, published + 1, &[])?;
+    let tick = retained.tick(&mut store, published + 1, &[])?;
     require(
         tick.proposal.is_none() && tick.vote.is_none() && tick.certificate.is_none(),
         "retired authorization returned coordination capabilities",

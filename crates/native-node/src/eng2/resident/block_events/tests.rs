@@ -361,6 +361,43 @@ fn optional_body_attempts_retain_actual_edges_and_failure_without_claiming_accep
 }
 
 #[test]
+fn direct_push_keeps_independent_destination_receipts_without_claiming_acceptance() {
+    let directory = Directory::new();
+    let recorder = directory.recorder();
+    for (peer, outcome, sent) in [
+        ([7; 32], "body_sent", 10_000_100),
+        ([8; 32], "credit_declined", 128),
+        ([9; 32], "interrupted", 65_536),
+    ] {
+        recorder.record(
+            Kind::DirectPush {
+                peer,
+                outcome,
+                body_bytes: 10_000_000,
+                sent_application_bytes: sent,
+            },
+            42,
+            Some([6; 32]),
+            Some(123),
+            "10".into(),
+        );
+    }
+    let records = directory.records();
+    let receipt_keys: std::collections::BTreeSet<_> = records[1..]
+        .iter()
+        .map(|event| {
+            assert_eq!(event["native_acceptance_implied"], false);
+            assert_eq!(event["declared_body_bytes"], 10_000_000);
+            event["deduplication_key"].to_string()
+        })
+        .collect();
+    assert_eq!(receipt_keys.len(), 3);
+    assert_eq!(records[1]["outcome"], "body_sent");
+    assert_eq!(records[2]["sent_application_bytes"], 128);
+    assert_eq!(records[3]["outcome"], "interrupted");
+}
+
+#[test]
 fn piece_source_failure_and_completion_preserve_counters_under_the_original_record_cap() {
     use crate::eng2::propagation::pipeline::SourceBytes;
     let directory = Directory::new();
@@ -382,6 +419,7 @@ fn piece_source_failure_and_completion_preserve_counters_under_the_original_reco
         requested: u64::MAX,
         queries: u64::MAX,
         received: u64::MAX,
+        authenticated_body_bytes: u64::MAX,
         sent: u64::MAX,
         reserved_wire: u64::MAX,
         bad_pieces: u64::MAX,
@@ -413,6 +451,7 @@ fn piece_source_failure_and_completion_preserve_counters_under_the_original_reco
             u64::MAX
         );
         assert_eq!(record["source_counters"]["queries"], u64::MAX);
+        assert_eq!(record["source_counters"]["unique_body_bytes"], u64::MAX);
         assert_eq!(record["native_acceptance_implied"], false);
         assert_eq!(record["transfer_times_ns"]["body"], "3600000000000");
         assert!(

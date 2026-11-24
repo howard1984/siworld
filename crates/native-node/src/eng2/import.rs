@@ -159,7 +159,9 @@ fn preflight(
         || rules.genesis_timestamp != config.genesis_timestamp
         || rules.genesis_target != config.genesis_target
         || rules.target_interval != config.target_interval
+        || rules.asert_half_life != config.asert_half_life()
         || rules.pow_iterations != config.pow_iterations
+        || config.pow_algorithm() != rules.pow_algorithm
         || pin.tip_height > policy.max_headers as u64
         || pin.anchor_height == 0
         || !(CHECKPOINT_CONFIRMATIONS..=super::selection::TAIL_BLOCKS).contains(&tail)

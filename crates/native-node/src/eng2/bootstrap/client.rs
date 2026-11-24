@@ -113,7 +113,9 @@ impl Candidate {
                 genesis_timestamp: config.genesis_timestamp,
                 genesis_target: config.genesis_target,
                 target_interval: config.target_interval,
+                asert_half_life: config.asert_half_life(),
                 pow_iterations: config.pow_iterations,
+                pow_algorithm: config.pow_algorithm(),
                 max_headers: self.import_policy.max_headers,
             },
             history.headers.clone(),
@@ -402,9 +404,17 @@ impl Client {
             Installation::Durable(store) => {
                 drop(store);
                 let reopened = (|| {
+                    let genesis = Genesis::decode(&genesis_bytes)?;
+                    #[cfg(all(unix, feature = "eng2-runtime"))]
+                    let store = Store::resume_selected(
+                        directory,
+                        genesis,
+                        self.candidate.import_policy.state.chain,
+                    )?;
+                    #[cfg(not(all(unix, feature = "eng2-runtime")))]
                     let store = Store::resume_existing(
                         &directory.join("chain.redb"),
-                        Genesis::decode(&genesis_bytes)?,
+                        genesis,
                         self.candidate.import_policy.state.chain,
                     )?;
                     let pin = self.plan.pin();
@@ -421,6 +431,13 @@ impl Client {
                         || store.imported_checkpoint_height() != Some(pin.anchor_height)
                     {
                         return Err("bootstrap authenticated reopened state differs".to_owned());
+                    }
+                    #[cfg(all(unix, feature = "eng2-runtime"))]
+                    if store.engine().genesis().checkpoint_fork_choice()
+                        && store.finalized_checkpoint()?.as_ref()
+                            != Some(&self.manifest().certificate)
+                    {
+                        return Err("bootstrap reopened checkpoint floor differs".into());
                     }
                     Ok(store)
                 })();

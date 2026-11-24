@@ -36,34 +36,42 @@ fn address(value: &Value) -> Result<native::encryption::PaymentAddress> {
         .map_err(|_| "invalid_public_address")
 }
 fn parameters(value: &Value) -> Result<(Config, GovernanceState, Expected)> {
-    fields(
-        value,
-        &[
-            "version",
-            "network",
-            "proof_profile",
-            "fixture",
-            "work_bits",
-            "genesis_timestamp",
-            "genesis_target",
-            "pow_iterations",
-            "target_interval",
-            "economics",
-            "fee_mode",
-            "checkpoint_threshold",
-            "checkpoint_public_keys",
-            "founder_public_key",
-            "revocation_public_key",
-            "fee_destination",
-            "fund",
-            "issuance",
-        ],
-    )?;
-    if value["version"] != 1
+    let mut names = vec![
+        "version",
+        "network",
+        "proof_profile",
+        "fixture",
+        "work_bits",
+        "genesis_timestamp",
+        "genesis_target",
+        "pow_iterations",
+        "target_interval",
+        "economics",
+        "fee_mode",
+        "checkpoint_threshold",
+        "checkpoint_public_keys",
+        "founder_public_key",
+        "revocation_public_key",
+        "fee_destination",
+        "fund",
+        "issuance",
+    ];
+    let one_hour = value.get("asert_half_life_seconds").is_some();
+    if one_hour {
+        names.push("asert_half_life_seconds");
+    }
+    let randomx = value.get("proof_of_work").is_some();
+    if randomx {
+        names.push("proof_of_work");
+    }
+    fields(value, &names)?;
+    if (randomx && (value["proof_of_work"] != randomx_parameters() || !one_hour))
+        || (one_hour && value["asert_half_life_seconds"].as_u64() != Some(3_600))
+        || value["version"] != 1
         || value["fixture"] != false
         || value["work_bits"] != 0
-        || value["genesis_target"] != "ff".repeat(32)
-        || value["pow_iterations"] != 1
+        || (!randomx && value["genesis_target"] != "ff".repeat(32))
+        || value["pow_iterations"].as_u64() != Some(if randomx { 0 } else { 1 })
         || value["target_interval"] != 300
         || value["economics"] != "production"
         || value["fee_mode"] != "legacy-miner"
@@ -114,13 +122,21 @@ fn parameters(value: &Value) -> Result<(Config, GovernanceState, Expected)> {
         destinations.push(address(&member["destination"])?);
     }
     let fee_destination = address(&value["fee_destination"])?;
-    let mut config = Config::asert_development(network, time, [0xff; 32], 1)
+    let target = public_bytes::<32>(&value["genesis_target"])?;
+    let mut config = Config::asert_development(network, time, target, 1)
         .map_err(|_| "invalid_config")?
         .with_fund_wallets(
             FundAllocation::new_bps(shares, team).map_err(|_| "invalid_public_allocation")?,
             authorities,
         )
         .map_err(|_| "invalid_config")?;
+    if randomx {
+        config = config
+            .with_siworld_randomx()
+            .map_err(|_| "invalid_config")?;
+    } else if one_hour {
+        config = config.with_one_hour_asert().map_err(|_| "invalid_config")?;
+    }
     let issuance = &value["issuance"];
     fields(issuance, &["max_metadata_bytes", "max_per_block"])?;
     config.issuance = Some(crate::issuance::IssuanceConfig {
@@ -158,8 +174,7 @@ fn parameters(value: &Value) -> Result<(Config, GovernanceState, Expected)> {
                 .map_err(|_| "invalid_fee_recipient")?,
         ),
     };
-    let genesis = Genesis::seal(config.clone(), governance.clone(), FeeMode::LegacyMiner)
-        .map_err(|_| "invalid_genesis")?;
+    let genesis = seal_parameter_context(config.clone(), governance.clone())?;
     guard(&genesis, expected)?;
     Ok((config, governance, expected))
 }
@@ -167,10 +182,19 @@ fn parameters(value: &Value) -> Result<(Config, GovernanceState, Expected)> {
 #[cfg(all(unix, feature = "eng2-rehearsal", feature = "eng2-runtime"))]
 pub(crate) fn reconstruct(value: &Value) -> Result<Genesis> {
     let (config, governance, expected) = parameters(value)?;
-    let genesis =
-        Genesis::seal(config, governance, FeeMode::LegacyMiner).map_err(|_| "invalid_genesis")?;
+    let genesis = seal_parameter_context(config, governance)?;
     guard(&genesis, expected)?;
     Ok(genesis)
+}
+
+fn seal_parameter_context(config: Config, governance: GovernanceState) -> Result<Genesis> {
+    let rule = if config.pow_algorithm() == siworld_core::pow::Algorithm::SiworldRandomX {
+        SlotRule::PublicGenesis
+    } else {
+        SlotRule::Legacy
+    };
+    Genesis::seal_with_rule(config, governance, FeeMode::LegacyMiner, rule)
+        .map_err(|_| "invalid_genesis")
 }
 
 /// Encode public parameters in an absent directory after all checks complete.
@@ -187,13 +211,11 @@ pub fn encode_public(input: &Path, output: &Path, expected_input: Hash) -> Resul
         .canonical_component_bytes()
         .map_err(|_| "invalid_governance")?;
     // Exercise the same decoders used by seal-public before publishing inputs.
-    let genesis = Genesis::seal(
+    let genesis = seal_parameter_context(
         decode_nonfixture_config(&config_bytes)?,
         GovernanceState::decode_component(&governance_bytes, expected.network)
             .map_err(|_| "invalid_governance")?,
-        FeeMode::LegacyMiner,
-    )
-    .map_err(|_| "invalid_genesis")?;
+    )?;
     let encoded = genesis.encode().map_err(|_| "invalid_genesis")?;
     let decoded = Genesis::decode(&encoded).map_err(|_| "invalid_genesis")?;
     if decoded.encode().map_err(|_| "invalid_genesis")? != encoded {

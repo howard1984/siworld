@@ -3,7 +3,10 @@
 use crate::{
     eng2_governance::GovernanceState,
     state::Config,
-    wire::{Hash, LEGACY_GENESIS_MAGIC, PUBLIC_GENESIS_MAGIC, PUBLIC_GENESIS_RULES, SlotRule},
+    wire::{
+        CHECKPOINT_FORK_GENESIS_MAGIC, CHECKPOINT_FORK_GENESIS_RULES, Hash, LEGACY_GENESIS_MAGIC,
+        PUBLIC_GENESIS_MAGIC, PUBLIC_GENESIS_RULES, RANDOMX_GENESIS_MAGIC, SlotRule,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +50,10 @@ impl Genesis {
         slot_rule: SlotRule,
     ) -> Result<Self, String> {
         config.validate()?;
+        let randomx = config.pow_algorithm() == siworld_core::pow::Algorithm::SiworldRandomX;
+        if randomx && slot_rule != SlotRule::PublicGenesis {
+            return Err("RandomX requires the public slot and checkpoint-fork rules".into());
+        }
         if mode != FeeMode::LegacyMiner {
             return Err(
                 "confidential destination profile is not qualified for internal activation".into(),
@@ -77,6 +84,14 @@ impl Genesis {
         hash.update(crate::state::ORDINARY_FEE_RULES);
         if slot_rule == SlotRule::PublicGenesis {
             hash.update(PUBLIC_GENESIS_RULES);
+        }
+        if slot_rule == SlotRule::PublicGenesis
+            && config.asert_half_life() == siworld_core::pow::AsertHalfLife::OneHour
+        {
+            hash.update(CHECKPOINT_FORK_GENESIS_RULES);
+        }
+        if randomx {
+            siworld_core::pow::bind_randomx(&mut hash);
         }
         let rules = *hash.finalize().as_bytes();
         let id = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
@@ -110,6 +125,10 @@ impl Genesis {
     pub fn slot_rule(&self) -> SlotRule {
         self.slot_rule
     }
+    pub fn checkpoint_fork_choice(&self) -> bool {
+        self.slot_rule == SlotRule::PublicGenesis
+            && self.config.asert_half_life() == siworld_core::pow::AsertHalfLife::OneHour
+    }
     pub fn fee_mode(&self) -> FeeMode {
         self.mode
     }
@@ -131,12 +150,17 @@ impl Genesis {
         let governance = self.governance.canonical_component_bytes()?;
         let length =
             u32::try_from(governance.len()).map_err(|_| "initial governance length overflow")?;
-        let mut bytes = if self.slot_rule == SlotRule::PublicGenesis {
-            PUBLIC_GENESIS_MAGIC
-        } else {
-            LEGACY_GENESIS_MAGIC
-        }
-        .to_vec();
+        let mut bytes =
+            if self.config.pow_algorithm() == siworld_core::pow::Algorithm::SiworldRandomX {
+                RANDOMX_GENESIS_MAGIC
+            } else if self.checkpoint_fork_choice() {
+                CHECKPOINT_FORK_GENESIS_MAGIC
+            } else if self.slot_rule == SlotRule::PublicGenesis {
+                PUBLIC_GENESIS_MAGIC
+            } else {
+                LEGACY_GENESIS_MAGIC
+            }
+            .to_vec();
         bytes.push(self.mode as u8);
         bytes.extend_from_slice(&crate::proofs::protocol_profile_fingerprint());
         bytes.extend_from_slice(&self.config.encode_rules());
@@ -155,7 +179,13 @@ impl Genesis {
         }
         let slot_rule = match &bytes[..8] {
             magic if magic == LEGACY_GENESIS_MAGIC => SlotRule::Legacy,
-            magic if magic == PUBLIC_GENESIS_MAGIC => SlotRule::PublicGenesis,
+            magic
+                if magic == PUBLIC_GENESIS_MAGIC
+                    || magic == CHECKPOINT_FORK_GENESIS_MAGIC
+                    || magic == RANDOMX_GENESIS_MAGIC =>
+            {
+                SlotRule::PublicGenesis
+            }
             _ => return Err("unsupported genesis version".into()),
         };
         let config_end = 41 + crate::state::CONFIG_RULE_BYTES;
@@ -180,6 +210,101 @@ impl Genesis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn genesis_and_wallet_pin_the_selected_asert_schedule() {
+        let parent = crate::eng2::snapshot::tests::bootstrap();
+        let config = parent.chain.config.clone();
+        let before = Genesis::seal_with_rule(
+            config.clone(),
+            parent.governance.clone(),
+            FeeMode::LegacyMiner,
+            SlotRule::PublicGenesis,
+        )
+        .unwrap();
+        let next = Genesis::seal_with_rule(
+            config.with_one_hour_asert().unwrap(),
+            parent.governance.clone(),
+            FeeMode::LegacyMiner,
+            SlotRule::PublicGenesis,
+        )
+        .unwrap();
+        let legacy_bytes = before.encode().unwrap();
+        let candidate_bytes = next.encode().unwrap();
+        assert_eq!(legacy_bytes.len(), candidate_bytes.len());
+        assert_ne!(before.id(), next.id());
+        assert_ne!(before.peer_binding().verifier, next.peer_binding().verifier);
+        assert_eq!(
+            Genesis::decode(&legacy_bytes)
+                .unwrap()
+                .config()
+                .asert_half_life()
+                .seconds(),
+            14_400
+        );
+        assert_eq!(
+            Genesis::decode(&candidate_bytes)
+                .unwrap()
+                .config()
+                .asert_half_life()
+                .seconds(),
+            3600
+        );
+        use crate::eng2::wallet_history::codec::Context;
+        let context = Context::from_genesis(&candidate_bytes, next.id()).unwrap();
+        assert_eq!(context.config().asert_half_life().seconds(), 3600);
+        assert!(Context::from_genesis(&candidate_bytes, before.id()).is_err());
+    }
+
+    #[test]
+    fn randomx_genesis_rejects_profile_downgrades_in_node_and_wallet() {
+        use crate::eng2::wallet_history::codec::Context;
+        use siworld_core::pow::Algorithm;
+        let parent = crate::eng2::snapshot::tests::bootstrap();
+        let prior = &parent.chain.config;
+        let config = Config::asert_development(prior.network, 1, [255; 32], 1)
+            .unwrap()
+            .with_fund_wallets(
+                prior.fund_allocation.clone().unwrap(),
+                prior.fund_verifying_keys.clone(),
+            )
+            .unwrap()
+            .with_siworld_randomx()
+            .unwrap();
+        assert!(
+            Genesis::seal(
+                config.clone(),
+                parent.governance.clone(),
+                FeeMode::LegacyMiner
+            )
+            .is_err()
+        );
+        let genesis = Genesis::seal_with_rule(
+            config,
+            parent.governance.clone(),
+            FeeMode::LegacyMiner,
+            SlotRule::PublicGenesis,
+        )
+        .unwrap();
+        let encoded = genesis.encode().unwrap();
+        assert_eq!(&encoded[..8], RANDOMX_GENESIS_MAGIC);
+        let decoded = Genesis::decode(&encoded).unwrap();
+        let context = Context::from_genesis(&encoded, genesis.id()).unwrap();
+        assert_eq!(decoded.id(), genesis.id());
+        assert_eq!(decoded.config().pow_algorithm(), Algorithm::SiworldRandomX);
+        assert!(decoded.checkpoint_fork_choice());
+        assert_eq!(context.config().pow_algorithm(), Algorithm::SiworldRandomX);
+        for magic in [
+            LEGACY_GENESIS_MAGIC,
+            PUBLIC_GENESIS_MAGIC,
+            CHECKPOINT_FORK_GENESIS_MAGIC,
+        ] {
+            let mut downgraded = encoded.clone();
+            downgraded[..8].copy_from_slice(magic);
+            assert!(Genesis::decode(&downgraded).is_err());
+            assert!(Context::from_genesis(&downgraded, genesis.id()).is_err());
+        }
+    }
 
     #[test]
     fn wallet_context_accepts_native_genesis_and_rejects_the_previous_fee_identity() {

@@ -11,7 +11,6 @@ use crate::eng2::{
     store::Store,
 };
 use crate::wire::Hash;
-use std::collections::BTreeSet;
 
 pub(crate) fn resident_limits() -> Limits {
     Limits {
@@ -28,7 +27,6 @@ pub(crate) fn resident_limits() -> Limits {
 }
 pub struct Discovery {
     ledger: Ledger,
-    qualified: BTreeSet<Hash>,
     body_budget: crate::p2p::Budget,
     body_scope: crate::p2p::BodyScope,
 }
@@ -56,7 +54,6 @@ impl Discovery {
             .map_err(|_| Error::Configuration)?;
         Ok(Self {
             ledger,
-            qualified: BTreeSet::new(),
             body_budget,
             body_scope,
         })
@@ -76,12 +73,28 @@ impl Discovery {
             self.body_budget
                 .advance_body_window(&advance)
                 .map_err(|_| "body accounting window renewal rejected")?;
-            self.qualified.clear();
         }
         Ok(())
     }
     pub fn usage(&self) -> Usage {
         self.ledger.usage()
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn admit_fast_competitor(
+        &mut self,
+        header: &Header,
+        peer: Hash,
+        now_ms: u64,
+    ) -> Result<bool, String> {
+        self.renew_body_window(now_ms)?;
+        let id = header
+            .id()
+            .map_err(|_| "fast competitor identity rejected")?;
+        match self.ledger.begin_for_peer(header.height, id, peer, now_ms) {
+            Ok(_) => Ok(true),
+            Err(error) if deferred(error) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
     }
     pub fn next(
         &mut self,
@@ -124,10 +137,19 @@ impl Discovery {
         if remote.0 == 0 {
             return Ok(DiscoveryAction::Deferred);
         }
-        match self.ledger.begin(remote.0, remote.1, now_ms) {
+        if remote.0 <= canonical.engine().state().height()
+            && canonical.header(remote.0)?.id().ok() == Some(remote.1)
+        {
+            self.ledger.candidates.remove(&remote.1);
+            return Ok(DiscoveryAction::Ready);
+        }
+        match self.ledger.begin_for_peer(remote.0, remote.1, peer, now_ms) {
             Ok(_) => (),
             Err(error) if deferred(error) => return Ok(DiscoveryAction::Deferred),
             Err(error) => return Err(error.to_string()),
+        }
+        if self.ledger.candidates[&remote.1].complete {
+            return Ok(DiscoveryAction::Ready);
         }
         loop {
             let cursor = self
@@ -174,7 +196,7 @@ impl Discovery {
             .ledger
             .path(remote.1, now_ms)
             .map_err(|e| e.to_string())?;
-        if !self.qualified.contains(&remote.1) {
+        if !self.ledger.candidates[&remote.1].qualified {
             let cursor = self
                 .ledger
                 .cursor(remote.1, now_ms)
@@ -197,7 +219,7 @@ impl Discovery {
             let qualified = VerifiedHeaders::verify(branches.rules.clone(), headers)
                 .map_err(|_| "discovered branch complete header qualification rejected")?;
             branches.retain_verified_headers(&qualified)?;
-            self.qualified.insert(remote.1);
+            self.ledger.candidates.get_mut(&remote.1).unwrap().qualified = true;
         }
         if headers_only {
             return Ok(DiscoveryAction::Ready);
@@ -253,6 +275,9 @@ impl Discovery {
                 };
             }
         }
+        // Completed acquisition no longer needs a live candidate slot;
+        // requests, headers and bytes stay charged to the original window.
+        self.ledger.candidates.get_mut(&remote.1).unwrap().complete = true;
         Ok(DiscoveryAction::Ready)
     }
     pub fn received(
@@ -295,16 +320,11 @@ impl Discovery {
             return Err("discovery body request differs".into());
         }
         let length = body.encoded_len(policy)?;
-        if length as u64 > self.ledger.remaining_body_bytes() {
-            self.ledger
-                .defer(request, now_ms)
-                .map_err(|e| e.to_string())?;
-            return Err("discovery body capacity exhausted".into());
-        }
-        branches.retain_body(header, body, policy)?;
         self.ledger
-            .body_retained(request, length, now_ms)
-            .map_err(|e| e.to_string())
+            .retain_body_with(request, length, now_ms, || {
+                branches.retain_body(header, body, policy)
+            })
+            .map_err(|e| e.to_string())?
     }
 }
 fn deferred(error: Error) -> bool {

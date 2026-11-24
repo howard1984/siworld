@@ -2969,8 +2969,8 @@ dependencies = [
  "p3-symmetric",
  "p3-uni-stark",
  "postcard",
- "rayon",
  "rand",
+ "rayon",
  "rcgen",
  "redb",
  "rpassword",
@@ -2982,8 +2982,17 @@ dependencies = [
  "siworld-core",
  "siworld-miner-platform",
  "siworld-multi-asset-experiment",
+ "siworld-randomx-pow",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "siworld-randomx-pow"
+version = "0.1.0"
+dependencies = [
+ "cmake",
+ "siworld-core",
 ]
 
 [[package]]

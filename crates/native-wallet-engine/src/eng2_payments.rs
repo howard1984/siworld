@@ -224,6 +224,23 @@ impl Eng2LightState {
         bytes: &[u8],
         statement: Hash,
     ) -> Result<String, String> {
+        let inclusion = self.authenticated_payment_receipt(height, bytes, statement)?;
+        Ok(
+            json!({"statement_id":crate::local::hex(&statement),"height":height,
+            "block_id":crate::local::hex(&inclusion.block_id),
+            "receipt_authenticated":true,"full_node_consensus_verified":false})
+            .to_string(),
+        )
+    }
+
+    /// Return the block only after the exact statement has been authenticated
+    /// against the complete local receipt commitment.
+    pub fn authenticated_payment_receipt(
+        &self,
+        height: u64,
+        bytes: &[u8],
+        statement: Hash,
+    ) -> Result<Snapshot, String> {
         let header = self
             .header(height)
             .ok_or("eng2 payment receipt header is not committed")?;
@@ -238,8 +255,11 @@ impl Eng2LightState {
         {
             return Err("eng2 payment statement absent from authenticated receipt".into());
         }
-        Ok(json!({"statement_id":crate::local::hex(&statement),"height":height,
-            "block_id":crate::local::hex(&header.id().map_err(|_| "eng2 receipt header identity rejected")?),
-            "receipt_authenticated":true,"full_node_consensus_verified":false}).to_string())
+        Ok(Snapshot {
+            height,
+            block_id: header
+                .id()
+                .map_err(|_| "eng2 receipt header identity rejected")?,
+        })
     }
 }

@@ -12,11 +12,11 @@ from urllib.parse import urlsplit
 
 def engineering_v2_manifest(data):
     required = {'version', 'name', 'network', 'genesis', 'rules', 'profile', 'fee_mode', 'api', 'read_only'}
-    optional = {'apis', 'submission_apis'}
+    optional = {'apis', 'submission_apis', 'checkpoint_finality'}
     identifiers = ('network', 'genesis', 'rules', 'profile')
     if (not isinstance(data, dict) or not required <= set(data) or set(data) - required - optional or type(data['version']) is not int or data['version'] != 2
             or data['name'] != 'siworld-eng-2' or type(data['fee_mode']) is not int or data['fee_mode'] != 0
-            or data['read_only'] is not True or any(not isinstance(data[key], str)
+            or data['read_only'] is not True or type(data.get('checkpoint_finality', False)) is not bool or any(not isinstance(data[key], str)
                 or not re.fullmatch('[0-9a-f]{64}', data[key]) or set(data[key]) == {'0'} for key in identifiers)):
         raise ValueError('Pin the exact read-only engineering-v2 network, genesis, rules, native profile and LegacyMiner mode.')
     def origin(value):

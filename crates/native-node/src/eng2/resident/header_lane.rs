@@ -25,6 +25,8 @@ struct Context {
     id: Hash,
     work: Work,
     times: VecDeque<u64>,
+    // The two latest epoch boundary blocks from this exact parent path.
+    epoch_blocks: [Option<(u64, Hash)>; 2],
 }
 #[derive(Clone)]
 struct Entry {
@@ -89,6 +91,7 @@ pub(crate) struct Hub {
     rules: HeaderRules,
     inner: Mutex<Inner>,
     waiting: AtomicBool,
+    canonical_revision: AtomicU64,
     failed: AtomicBool,
     _charge: p2p::Reservation,
 }
@@ -193,6 +196,10 @@ pub(crate) struct Download {
     hub: Arc<Hub>,
 }
 impl Download {
+    pub(super) fn peer(&self) -> Hash {
+        self.peer
+    }
+
     pub(crate) fn ownership(&self) -> Result<&p2p::BodyClaim, String> {
         self.ownership
             .as_ref()
@@ -255,7 +262,9 @@ impl Hub {
             genesis_timestamp: config.genesis_timestamp,
             genesis_target: config.genesis_target,
             target_interval: config.target_interval,
+            asert_half_life: config.asert_half_life(),
             pow_iterations: config.pow_iterations,
+            pow_algorithm: config.pow_algorithm(),
             max_headers: 1_000_000,
         };
         let genesis = Context {
@@ -263,6 +272,7 @@ impl Hub {
             id: rules.genesis,
             work: Work::zero(),
             times: VecDeque::from([rules.genesis_timestamp]),
+            epoch_blocks: [None; 2],
         };
         let now = Instant::now();
         let hub = Self {
@@ -288,6 +298,7 @@ impl Hub {
                 body_tips: BTreeMap::new(),
             }),
             waiting: AtomicBool::new(false),
+            canonical_revision: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             _charge: budget
                 .reserve(cache_charge())
@@ -327,6 +338,13 @@ impl Hub {
     pub(crate) fn committed(&self, owner: &Driver) -> Result<(), String> {
         self.invalidate_progress_context();
         self.ensure_available()?;
+        // Cancel old-parent work even when body acceptance clears the
+        // higher-work waiting bit before the next nonce batch.
+        self.canonical_revision
+            .try_update(Ordering::Release, Ordering::Relaxed, |revision| {
+                revision.checked_add(1)
+            })
+            .map_err(|_| "canonical header revision exhausted")?;
         let head = owner.head()?;
         let mut contexts = Vec::new();
         let mut work = head.work;
@@ -350,11 +368,28 @@ impl Hub {
                 .transpose()
                 .map_err(|_| "canonical header identity rejected")?
                 .unwrap_or(self.rules.genesis);
+            let mut epoch_blocks = [None; 2];
+            if self.rules.pow_algorithm == pow::Algorithm::SiworldRandomX {
+                let boundary = height / pow::RANDOMX_KEY_INTERVAL * pow::RANDOMX_KEY_INTERVAL;
+                for (index, entry) in epoch_blocks.iter_mut().enumerate() {
+                    let at = boundary.saturating_sub(index as u64 * pow::RANDOMX_KEY_INTERVAL);
+                    if at != 0 {
+                        *entry = Some((
+                            at,
+                            owner
+                                .header(at)?
+                                .id()
+                                .map_err(|_| "canonical RandomX key rejected")?,
+                        ));
+                    }
+                }
+            }
             contexts.push(Context {
                 height,
                 id,
                 work,
                 times,
+                epoch_blocks,
             });
             if let Some(header) = header {
                 work = work
@@ -467,6 +502,9 @@ impl Hub {
             .lock()
             .map_err(|_| "header cache lock poisoned")?;
         Ok((inner.canonical.height, inner.canonical.id))
+    }
+    pub(crate) fn canonical_revision(&self) -> u64 {
+        self.canonical_revision.load(Ordering::Acquire)
     }
     pub(crate) fn waiting(&self) -> bool {
         self.failed.load(Ordering::Acquire) || self.waiting.load(Ordering::Acquire)
@@ -777,7 +815,7 @@ impl Hub {
         {
             return Err("header linkage or timestamp rejected".into());
         }
-        let target = pow::asert_target(
+        let target = pow::asert_target_with_half_life(
             &self.rules.genesis_target,
             self.rules.genesis_timestamp,
             self.rules.target_interval,
@@ -786,15 +824,25 @@ impl Hub {
                 .times
                 .back()
                 .ok_or("header parent time unavailable")?,
+            self.rules.asert_half_life,
         );
         if header.target != target {
             return Err("header target rejected".into());
         }
-        let seed = header.pow_seed().map_err(|_| "header seed rejected")?;
-        if !pow::meets_target(
-            &pow::pow_hash(&seed, header.nonce, self.rules.pow_iterations),
-            &target,
-        ) {
+        if !crate::eng2::proof_of_work::verify(
+            self.rules.pow_algorithm,
+            self.rules.pow_iterations,
+            &header,
+            || {
+                pow::randomx_epoch_key(self.rules.genesis, header.height, |height| {
+                    parent
+                        .epoch_blocks
+                        .iter()
+                        .flatten()
+                        .find_map(|(at, id)| (*at == height).then_some(*id))
+                })
+            },
+        )? {
             return Err("header proof of work rejected".into());
         }
         let work = parent
@@ -811,11 +859,18 @@ impl Hub {
             .checked_add(1)
             .ok_or("header sequence exhausted")?;
         let sequence = inner.sequence;
+        let mut epoch_blocks = parent.epoch_blocks;
+        if self.rules.pow_algorithm == pow::Algorithm::SiworldRandomX
+            && header.height.is_multiple_of(pow::RANDOMX_KEY_INTERVAL)
+        {
+            epoch_blocks = [Some((header.height, id)), epoch_blocks[0]];
+        }
         let context = Context {
             height: header.height,
             id,
             work,
             times,
+            epoch_blocks,
         };
         inner.entries.push_back(Entry {
             header,
@@ -1503,7 +1558,9 @@ mod tests {
             genesis_timestamp: 1,
             genesis_target: [255; 32],
             target_interval: 300,
+            asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
             pow_iterations: 0,
+            pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
             max_headers: 128,
         };
         let context = Context {
@@ -1511,6 +1568,7 @@ mod tests {
             id: rules.genesis,
             work: Work::zero(),
             times: VecDeque::from([1]),
+            epoch_blocks: [None; 2],
         };
         let budget = p2p::Budget::new(32 * 1024 * 1024);
         let body_scope = budget
@@ -1548,6 +1606,7 @@ mod tests {
                 body_tips: BTreeMap::new(),
             }),
             waiting: AtomicBool::new(false),
+            canonical_revision: AtomicU64::new(0),
             failed: AtomicBool::new(false),
             _charge: p2p::Budget::new(1024 * 1024)
                 .reserve(cache_charge())

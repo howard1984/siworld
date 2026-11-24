@@ -96,7 +96,9 @@ pub(super) fn driver_case_inner(
         genesis_timestamp: config.genesis_timestamp,
         genesis_target: config.genesis_target,
         target_interval: config.target_interval,
+        asert_half_life: config.asert_half_life(),
         pow_iterations: config.pow_iterations,
+        pow_algorithm: config.pow_algorithm(),
         max_headers: 96,
     };
     let old_height = depth + 1;

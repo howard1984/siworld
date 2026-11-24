@@ -174,6 +174,108 @@ pub fn receipts(
     })
 }
 
+/// A check of one hinted block under the authenticated canonical head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentInclusion {
+    BlockNotCanonical,
+    StatementNotInBlock,
+    Included { confirmations: u64 },
+}
+
+/// Verify exact membership from a canonical receipt. A negative result covers
+/// only the supplied block; it does not prove global absence or mempool state.
+/// An unavailable receipt remains an error. Checkpoint coverage must be
+/// established separately by proof of a durably accepted checkpoint.
+pub fn payment_inclusion(
+    store: &Store,
+    head: &Head,
+    height: u64,
+    block: Hash,
+    statement: Hash,
+    budget: &p2p::Budget,
+) -> Result<PaymentInclusion, String> {
+    head.check_current(store)?;
+    if height == 0 {
+        return Err("wallet payment inclusion requires a non-genesis height".into());
+    }
+    if height > head.height {
+        return Ok(PaymentInclusion::BlockNotCanonical);
+    }
+    let header = store.header(height)?;
+    if header
+        .id()
+        .map_err(|_| "wallet payment source header identity rejected")?
+        != block
+    {
+        head.check_current(store)?;
+        return Ok(PaymentInclusion::BlockNotCanonical);
+    }
+    let encoded = header
+        .encode()
+        .map_err(|_| "wallet payment source header rejected")?;
+    let export = receipts(store, head, height, budget)?;
+    let receipt = ReceiptBlock::decode(&context(store)?, &encoded, export.bytes())?;
+    head.check_current(store)?;
+    if !receipt.contains_statement(&statement) {
+        return Ok(PaymentInclusion::StatementNotInBlock);
+    }
+    Ok(PaymentInclusion::Included {
+        confirmations: head.height - height + 1,
+    })
+}
+
+/// Signed coverage comes only from the durable canonical finality floor.
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaymentStatus {
+    BlockNotCanonical,
+    StatementNotInBlock,
+    Included {
+        confirmations: u64,
+        checkpoint: CheckpointCoverage,
+    },
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckpointCoverage {
+    Unavailable,
+    NotCovered,
+    Covered(Box<super::certificate::Certificate>),
+}
+
+/// Local node query. The same accepted Store view binds exact receipt
+/// membership, confirmations and the durable checkpoint. A retained proof body
+/// that cannot be authenticated is an error, not a negative membership result.
+#[cfg(feature = "eng2-runtime")]
+pub fn payment_status(
+    store: &Store,
+    head: &Head,
+    height: u64,
+    block: Hash,
+    statement: Hash,
+    budget: &p2p::Budget,
+) -> Result<PaymentStatus, String> {
+    match payment_inclusion(store, head, height, block, statement, budget)? {
+        PaymentInclusion::BlockNotCanonical => Ok(PaymentStatus::BlockNotCanonical),
+        PaymentInclusion::StatementNotInBlock => Ok(PaymentStatus::StatementNotInBlock),
+        PaymentInclusion::Included { confirmations } => {
+            let checkpoint = match store.finalized_checkpoint()? {
+                Some(certificate) if height <= certificate.statement.checkpoint_height => {
+                    CheckpointCoverage::Covered(Box::new(certificate))
+                }
+                Some(_) => CheckpointCoverage::NotCovered,
+                None => CheckpointCoverage::Unavailable,
+            };
+            head.check_current(store)?;
+            Ok(PaymentStatus::Included {
+                confirmations,
+                checkpoint,
+            })
+        }
+    }
+}
+
 /// Raw SWE2 headers, at most 128 per read. Callers still authenticate work,
 /// difficulty and continuity; this page does not manufacture a selected chain.
 pub fn header_page(

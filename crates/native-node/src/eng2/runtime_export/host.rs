@@ -10,6 +10,9 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(feature = "eng2-runtime")]
+mod vote_history;
+
 const KEY_MAGIC: &[u8; 8] = b"SW2KEY01";
 const KEY_BYTES: usize = 8 + 96 + 1 + 32 + 32;
 pub use crate::eng2::checkpoint_wire::{
@@ -25,6 +28,8 @@ pub struct ExistingSigner {
     slot: u8,
     public: [u8; super::super::certificate::VERIFYING_KEY_BYTES],
     key: MLDSA65SigningKey,
+    #[cfg(feature = "eng2-runtime")]
+    history: std::cell::RefCell<Option<vote_history::History>>,
 }
 impl Drop for ExistingSigner {
     fn drop(&mut self) {
@@ -101,9 +106,60 @@ impl ExistingSigner {
             slot,
             public: *pair.verification_key.as_ref(),
             key: pair.signing_key,
+            #[cfg(feature = "eng2-runtime")]
+            history: std::cell::RefCell::new(None),
         };
         value.check_current(store)?;
         Ok(value)
+    }
+    fn load_for_host(path: &Path, root: &Path, store: &Store) -> Result<Self, String> {
+        let signer = Self::load(path, store)?;
+        #[cfg(feature = "eng2-runtime")]
+        if store.engine().genesis().checkpoint_fork_choice() {
+            // A custody failure disables this key without disabling node service.
+            let history = vote_history::History::open(path, root, &signer).ok();
+            signer.history.replace(history);
+        }
+        #[cfg(not(feature = "eng2-runtime"))]
+        let _ = root;
+        Ok(signer)
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn initialize_vote_history(
+        key: &Path,
+        root: &Path,
+        store: &Store,
+    ) -> Result<(), String> {
+        if !store.engine().genesis().checkpoint_fork_choice()
+            || store.engine().state().height() != 0
+        {
+            return Err(
+                "signer custody initialization requires a fresh bounded-fork-choice genesis".into(),
+            );
+        }
+        let signer = Self::load(key, store)?;
+        vote_history::History::initialize(key, root, &signer)
+    }
+    fn can_sign(&self, store: &Store) -> bool {
+        if self.check_current(store).is_err() {
+            return false;
+        }
+        #[cfg(feature = "eng2-runtime")]
+        if store.engine().genesis().checkpoint_fork_choice() {
+            return self.history.borrow().is_some();
+        }
+        !store.engine().genesis().checkpoint_fork_choice()
+    }
+    fn can_propose(&self, store: &Store) -> bool {
+        self.slot == 0
+            && if store.engine().genesis().checkpoint_fork_choice() {
+                // Proposal preparation is keyless. A valid slot-zero identity
+                // may coordinate the other two signers while its custody is
+                // unavailable; the resident readiness gate still applies.
+                self.check_current(store).is_ok()
+            } else {
+                self.can_sign(store)
+            }
     }
     pub fn slot(&self) -> u8 {
         self.slot
@@ -169,6 +225,7 @@ pub enum TickFailureReason {
     CandidatePreparation,
     VoteSigning,
     CertificatePublication,
+    FinalityPersistence,
     StatusPublication,
     CurrentProjection,
 }
@@ -186,6 +243,7 @@ impl TickFailureReason {
             Self::CandidatePreparation => "candidate_preparation",
             Self::VoteSigning => "vote_signing",
             Self::CertificatePublication => "certificate_publication",
+            Self::FinalityPersistence => "finality_persistence",
             Self::StatusPublication => "status_publication",
             Self::CurrentProjection => "current_projection",
         }
@@ -382,7 +440,7 @@ impl Host {
     ) -> Result<Self, String> {
         let export = PublicExport::open(root, store, limits)?;
         let signer = existing_key
-            .map(|path| ExistingSigner::load(path, store))
+            .map(|path| ExistingSigner::load_for_host(path, root, store))
             .transpose()?;
         let latest = export.restore_latest(store, limits)?;
         let pending = export.resume_candidate(store, limits)?.filter(|candidate| {
@@ -438,7 +496,7 @@ impl Host {
     ) -> Result<Self, String> {
         let export = PublicExport::open_unrestored(root, store)?;
         let signer = existing_key
-            .map(|path| ExistingSigner::load(path, store))
+            .map(|path| ExistingSigner::load_for_host(path, root, store))
             .transpose()?;
         let mut value = Self {
             export,
@@ -917,11 +975,24 @@ impl Host {
             .as_ref()
             .err()
             .map(|error| wallet_failure_code(error));
+        #[cfg(feature = "eng2-runtime")]
+        if result.as_ref().is_ok_and(|progress| progress.current)
+            && self.export.publish_wallet_checkpoint(store).is_err()
+        {
+            // Keep the receipt export serving; absent checkpoint evidence
+            // never changes node readiness or previously verified wallet floors.
+            self.wallet_error = Some("checkpoint_finality_unavailable");
+        }
         result.map(Some)
     }
     /// Observe public messages and publish accepted data without creating a new
     /// proposal or signature. An existing key alone grants no network readiness.
-    pub fn tick(&mut self, store: &Store, now: u64, incoming: &[Incoming]) -> Result<Tick, String> {
+    pub fn tick(
+        &mut self,
+        store: &mut Store,
+        now: u64,
+        incoming: &[Incoming],
+    ) -> Result<Tick, String> {
         self.tick_inner(store, now, incoming, None)
     }
     /// Called while the resident owns the canonical Store lock and observer
@@ -930,13 +1001,20 @@ impl Host {
     #[cfg(feature = "eng2-runtime")]
     pub(crate) fn tick_resident(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         now: u64,
         incoming: &[Incoming],
         _network: &crate::eng2::resident::peers::NetworkStatus,
         observer: &crate::eng2::checkpoint_observer::Observer,
     ) -> Result<Tick, String> {
         self.tick_failure = Some(TickFailureReason::Context);
+        if store.engine().genesis().checkpoint_fork_choice()
+            && let Some(reason) = observer.gate_reason()
+        {
+            // The signer gate alone cannot stop a quorum assembled from votes
+            // already held in memory or a certificate queued by the network.
+            return Err(reason.code().into());
+        }
         let readiness = ResidentSigningReadiness {
             head: ResidentSigningReadiness::head(store)?,
             observer,
@@ -949,7 +1027,7 @@ impl Host {
     /// positive 12-block boundary after durable append.
     fn tick_inner(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         now: u64,
         incoming: &[Incoming],
         readiness: Option<&dyn SigningReadiness>,
@@ -969,7 +1047,7 @@ impl Host {
     }
     fn tick_step(
         &mut self,
-        store: &Store,
+        store: &mut Store,
         now: u64,
         incoming: &[Incoming],
         readiness: Option<&dyn SigningReadiness>,
@@ -1021,13 +1099,13 @@ impl Host {
             }
         }
         self.last_now = Some(now);
-        let state = store.engine().state();
+        let head_height = store.engine().state().height();
         if self.pending.as_ref().is_some_and(|p| {
             p.check_current(store).is_err()
                 || super::pending_obsolete(
                     p.statement().checkpoint_height,
                     self.export.latest_height(),
-                    state.height(),
+                    head_height,
                 )
         }) {
             self.pending = None;
@@ -1051,7 +1129,7 @@ impl Host {
                     if super::pending_obsolete(
                         proposal.statement.checkpoint_height,
                         self.export.latest_height(),
-                        state.height(),
+                        head_height,
                     ) {
                         continue;
                     }
@@ -1062,7 +1140,7 @@ impl Host {
                     if super::pending_obsolete(
                         statement.checkpoint_height,
                         self.export.latest_height(),
-                        state.height(),
+                        head_height,
                     ) {
                         continue;
                     }
@@ -1118,7 +1196,7 @@ impl Host {
                         continue;
                     }
                     if self.export.latest_height() != Some(certificate.statement.checkpoint_height)
-                        && eligible_checkpoint(state.height())
+                        && eligible_checkpoint(head_height)
                             != Some(certificate.statement.checkpoint_height)
                     {
                         return Err(
@@ -1171,10 +1249,7 @@ impl Host {
                     }
                     prepared.check_current(store)?;
                     let certified = prepared.certify(store, certificate.votes.clone(), now)?;
-                    if self
-                        .export
-                        .publish_checkpoint(store, &certified, self.limits)?
-                    {
+                    if self.accept_and_publish(store, &certified)? {
                         self.latest = Some(certified);
                         newly_published = true;
                         self.pending = None;
@@ -1187,16 +1262,17 @@ impl Host {
         let current_signer = self
             .signer
             .as_ref()
-            .is_some_and(|signer| signer.check_current(store).is_ok());
-        let due = self.export.publication_due(now, state.height())?;
+            .is_some_and(|signer| signer.can_sign(store));
+        let due = self.export.publication_due(now, head_height)?;
         // Slot zero is the sole local proposer. Other signers wait for its exact
         // independently checked proposal, avoiding competing authorization heads.
         if self.pending.is_none()
             && due
-            && eligible_checkpoint(state.height())
-                .is_some_and(|height| !self.anchor_retired(height))
-            && current_signer
-            && self.signer.as_ref().is_some_and(|s| s.slot == 0)
+            && eligible_checkpoint(head_height).is_some_and(|height| !self.anchor_retired(height))
+            && self
+                .signer
+                .as_ref()
+                .is_some_and(|signer| signer.can_propose(store))
         {
             if self.preparation.is_some() {
                 self.start_local_preparation(store, readiness)?;
@@ -1208,6 +1284,7 @@ impl Host {
             }
         }
         self.tick_failure = Some(TickFailureReason::VoteSigning);
+        let mut signer_abstained = false;
         if let Some(pending) = &self.pending
             && !self.anchor_retired(pending.statement.checkpoint_height)
             && current_signer
@@ -1223,19 +1300,51 @@ impl Host {
                 .ok_or("checkpoint signer disappeared")?;
             let slot = usize::from(signer.slot);
             if self.votes[slot].is_none() {
-                self.votes[slot] = with_signing_readiness(store, readiness, || {
+                let attempt = with_signing_readiness(store, readiness, || {
                     let mut random = Zeroizing::new([0; 32]);
                     getrandom::fill(random.as_mut())
                         .map_err(|_| "checkpoint signing entropy unavailable")?;
-                    self.export.sign_vote(
-                        store,
-                        pending,
-                        signer.slot,
-                        &signer.key,
-                        *random,
-                        self.limits,
-                    )
-                })?;
+                    #[cfg(feature = "eng2-runtime")]
+                    if store.engine().genesis().checkpoint_fork_choice() {
+                        let vote = signer
+                            .history
+                            .borrow_mut()
+                            .as_mut()
+                            .ok_or("checkpoint signer custody unavailable")?
+                            .sign(signer, store, pending, *random)?;
+                        if let Some(vote) = &vote {
+                            self.export
+                                .record_custody_vote(store, pending, vote, self.limits)?;
+                        }
+                        return Ok(vote);
+                    }
+                    self.export
+                        .sign_vote(
+                            store,
+                            pending,
+                            signer.slot,
+                            &signer.key,
+                            *random,
+                            self.limits,
+                        )
+                        .map(Some)
+                });
+                // Distinguish a readiness refusal (no attempt) from custody
+                // abstention. A refusal or failure to sign must not suppress
+                // a quorum formed from independently verified peer votes.
+                self.votes[slot] = match attempt {
+                    Ok(None) => None,
+                    Ok(Some(Some(vote))) => Some(vote),
+                    Ok(Some(None)) => {
+                        signer_abstained = true;
+                        None
+                    }
+                    Err(_) if store.engine().genesis().checkpoint_fork_choice() => {
+                        signer_abstained = true;
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
                 if let Some(vote) = &self.votes[slot] {
                     // Only this successful durable local operation establishes
                     // journal provenance. Incoming peer votes remain in memory.
@@ -1270,10 +1379,7 @@ impl Host {
                     .map_err(|_| "checkpoint quorum cardinality differs")?,
                 now,
             )?;
-            if self
-                .export
-                .publish_checkpoint(store, &certified, self.limits)?
-            {
+            if self.accept_and_publish(store, &certified)? {
                 self.latest = Some(certified);
                 newly_published = true;
             }
@@ -1285,10 +1391,10 @@ impl Host {
             .signer
             .as_ref()
             .and_then(|_| readiness.map_or(Some(Alarm::Unavailable), |gate| gate.alarm(store)));
-        let alarm = if self.signer.is_some() && !current_signer {
-            Some(Alarm::SignerNotCurrent)
-        } else if signing_alarm == Some(Alarm::CurrentQuorumConflict) {
+        let alarm = if signing_alarm == Some(Alarm::CurrentQuorumConflict) {
             signing_alarm
+        } else if self.signer.is_some() && (!current_signer || signer_abstained) {
+            Some(Alarm::SignerNotCurrent)
         } else if self.export.latest_height().is_none() {
             Some(Alarm::Unavailable)
         } else if signing_alarm.is_some() {
@@ -1298,8 +1404,9 @@ impl Host {
         } else {
             None
         };
+        let state = store.engine().state();
         let status = Status {
-            height: state.height(),
+            height: head_height,
             checkpoint_height: self.export.latest_height(),
             published: self.export.last_publication(),
             pending_height: self.pending.as_ref().map(|p| p.statement.checkpoint_height),
@@ -1308,13 +1415,13 @@ impl Host {
             signer_slot: self.signer.as_ref().map(|s| s.slot),
         };
         if self.last_status.as_ref() != Some(&status) {
-            let bytes=serde_json::to_vec(&json!({"version":2,"network":crate::local::hex(&state.network()),"genesis":crate::local::hex(&store.engine().genesis().id()),"height":state.height(),"observed_unix_seconds":now,
+            let bytes=serde_json::to_vec(&json!({"version":2,"network":crate::local::hex(&state.network()),"genesis":crate::local::hex(&store.engine().genesis().id()),"height":head_height,"observed_unix_seconds":now,
                 "checkpoint_height":status.checkpoint_height,"published_unix_seconds":status.published,"pending_height":status.pending_height,"pruning_paused":status.pruning_paused,"alarm":status.alarm.map(Alarm::code),"signer_slot":status.signer_slot})).map_err(|_|"checkpoint status encoding failed")?;
             self.export.write_status(&bytes)?;
             self.last_status = Some(status.clone());
         }
         self.tick_failure = Some(TickFailureReason::CurrentProjection);
-        let export_head = (state.height(), state.tip(), self.export.latest_height());
+        let export_head = (head_height, state.tip(), self.export.latest_height());
         let exported_current = self.last_exported != Some(export_head);
         if exported_current {
             self.export
@@ -1325,10 +1432,25 @@ impl Host {
             statement: p.statement.clone(),
             witness: p.witness.clone(),
         });
-        let vote = self
-            .signer
-            .as_ref()
-            .and_then(|s| self.votes[usize::from(s.slot)].clone());
+        let vote = if store.engine().genesis().checkpoint_fork_choice() {
+            // A peer can supply a valid signature from this slot. It counts
+            // toward a certificate but is not a newly journaled local vote.
+            proposal.as_ref().and_then(|proposal| {
+                self.journaled_vote
+                    .as_ref()
+                    .filter(|(statement, _)| {
+                        current_signer
+                            && !signer_abstained
+                            && signing_alarm.is_none()
+                            && statement == &proposal.statement
+                    })
+                    .map(|(_, vote)| vote.clone())
+            })
+        } else {
+            self.signer
+                .as_ref()
+                .and_then(|s| self.votes[usize::from(s.slot)].clone())
+        };
         Ok(Tick {
             status,
             proposal,
@@ -1340,6 +1462,22 @@ impl Host {
             newly_published,
             exported_current,
         })
+    }
+    fn accept_and_publish(
+        &mut self,
+        store: &mut Store,
+        certified: &CertifiedCheckpoint,
+    ) -> Result<bool, String> {
+        #[cfg(feature = "eng2-runtime")]
+        if store.engine().genesis().checkpoint_fork_choice() {
+            self.tick_failure = Some(TickFailureReason::FinalityPersistence);
+            // Publish no certificate or wallet cursor until its exact canonical
+            // anchor has been made durable under the same owner lock.
+            store.admit_finalized_checkpoint(certified)?;
+        }
+        self.tick_failure = Some(TickFailureReason::CertificatePublication);
+        self.export
+            .publish_checkpoint(store, certified, self.limits)
     }
     fn accept_proposal(&mut self, store: &Store, proposal: &Proposal) -> Result<(), String> {
         if eligible_checkpoint(store.engine().state().height())
@@ -1383,6 +1521,8 @@ mod preparation_tests;
 mod readiness_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "eng2-runtime"))]
+pub(crate) use tests::{initialize_fixture_custody, vote_with_fixture_custody};
 
 mod codec;
 

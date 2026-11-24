@@ -168,7 +168,9 @@ impl AdmissionPlan {
             || state.config.genesis_timestamp != rules.genesis_timestamp
             || state.config.genesis_target != rules.genesis_target
             || state.config.target_interval != rules.target_interval
+            || state.config.asert_half_life() != rules.asert_half_life
             || state.config.pow_iterations != rules.pow_iterations
+            || state.config.pow_algorithm() != rules.pow_algorithm
             || state.height != height
             || state.tip != self.pin.anchor_id
             || state.cumulative_work
@@ -248,7 +250,9 @@ mod tests {
             genesis_timestamp: config.genesis_timestamp,
             genesis_target: config.genesis_target,
             target_interval: config.target_interval,
+            asert_half_life: config.asert_half_life(),
             pow_iterations: config.pow_iterations,
+            pow_algorithm: config.pow_algorithm(),
             max_headers: 1000,
         };
         let mut parent = rules.genesis;

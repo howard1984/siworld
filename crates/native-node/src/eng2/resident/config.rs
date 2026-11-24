@@ -20,6 +20,7 @@ pub(super) struct Configuration {
     pub checkpoint_worker_budget_bytes: Option<usize>,
     pub listen: Option<SocketAddr>,
     pub mining: bool,
+    pub pow_search_threads: Option<usize>,
     pub peers: Vec<Destination>,
     pub fixed_relay_peers: BTreeSet<Hash>,
     pub service_relay_peers: BTreeSet<Hash>,
@@ -51,6 +52,25 @@ fn fixed_relay_role(entry: &Value, local: p2p::Role, streaming: bool) -> Result<
         _ => Err("fixed relay role is not permitted by the local role and genesis profile".into()),
     }
 }
+fn require_three_direct_push_targets(
+    option: Option<&Value>,
+    mining: bool,
+    streaming: bool,
+    selected: usize,
+    dialable: usize,
+    dialable_total: usize,
+) -> Result<(), String> {
+    match option {
+        None | Some(Value::Bool(false)) => Ok(()),
+        Some(Value::Bool(true))
+            if mining && streaming && selected == 3 && dialable == 3
+                && dialable_total <= peers::MAX_WORKERS => Ok(()),
+        Some(Value::Bool(true)) => Err(
+            "three direct push targets require streaming mining, exactly three dialable pinned services and capacity for every configured dial".into(),
+        ),
+        Some(_) => Err("require_three_direct_push_targets requires a boolean".into()),
+    }
+}
 fn checkpoint_reference(entry: &Value) -> Result<bool, String> {
     match entry.get("checkpoint_reference") {
         None => Ok(true),
@@ -76,9 +96,46 @@ fn checkpoint_worker_budget(
         (Some(_), false) => Err("checkpoint worker budget is unavailable on this platform".into()),
     }
 }
+const MAX_POW_SEARCH_THREADS: usize = 256;
+
+fn pow_search_threads(
+    value: Option<&Value>,
+    mining: bool,
+    available: usize,
+) -> Result<Option<usize>, String> {
+    match (value, mining) {
+        (None, false) => Ok(None),
+        (None, true) => Ok(Some(
+            available.saturating_sub(2).clamp(1, MAX_POW_SEARCH_THREADS),
+        )),
+        (Some(value), true) => value
+            .as_u64()
+            .and_then(|threads| usize::try_from(threads).ok())
+            .filter(|threads| (1..=MAX_POW_SEARCH_THREADS).contains(threads))
+            .map(Some)
+            .ok_or_else(|| "PoW search threads must be an integer from 1 through 256".into()),
+        (Some(_), false) => Err("PoW search threads require enabled mining".into()),
+    }
+}
+
 impl Configuration {
     pub(super) fn outbound_peers(&self) -> impl Iterator<Item = &Destination> {
-        self.peers.iter().filter(|peer| peer.dial)
+        // A long general peer list must not occupy all of a miner's bounded
+        // connection workers ahead of its explicit direct-push service routes.
+        let primary = |peer: &Destination| {
+            self.role == p2p::Role::Miner
+                && self
+                    .fixed_relay_peers
+                    .contains(&peer.expected.fingerprint())
+        };
+        self.peers
+            .iter()
+            .filter(move |peer| peer.dial && primary(peer))
+            .chain(
+                self.peers
+                    .iter()
+                    .filter(move |peer| peer.dial && !primary(peer)),
+            )
     }
 
     pub fn load(
@@ -100,6 +157,8 @@ impl Configuration {
             != 7 + usize::from(object.contains_key("legacy_checkpoint_peers"))
                 + usize::from(object.contains_key("proof_retention"))
                 + usize::from(object.contains_key("checkpoint_worker_budget_bytes"))
+                + usize::from(object.contains_key("pow_search_threads"))
+                + usize::from(object.contains_key("require_three_direct_push_targets"))
             || value["version"] != 2
             || value["engineering"] != true
         {
@@ -119,6 +178,11 @@ impl Configuration {
         let mining = value["mining"]
             .as_bool()
             .ok_or("explicit mining selection required")?;
+        let pow_search_threads = pow_search_threads(
+            object.get("pow_search_threads"),
+            mining,
+            std::thread::available_parallelism().map_or(1, usize::from),
+        )?;
         let listen = match value.get("listen") {
             Some(Value::Null) => None,
             Some(Value::String(text)) => {
@@ -235,6 +299,19 @@ impl Configuration {
                 expected,
             });
         }
+        require_three_direct_push_targets(
+            object.get("require_three_direct_push_targets"),
+            mining,
+            crate::eng2::transport::propagation_profile(genesis),
+            fixed_relay_peers.len(),
+            peers
+                .iter()
+                .filter(|peer| {
+                    peer.dial && fixed_relay_peers.contains(&peer.expected.fingerprint())
+                })
+                .count(),
+            peers.iter().filter(|peer| peer.dial).count(),
+        )?;
         let mut legacy_checkpoint_peers = BTreeSet::new();
         if let Some(entries) = object.get("legacy_checkpoint_peers") {
             let entries = entries
@@ -265,6 +342,7 @@ impl Configuration {
             checkpoint_worker_budget_bytes: worker_budget,
             listen,
             mining,
+            pow_search_threads,
             peers,
             checkpoint_key,
             fixed_relay_peers,
@@ -278,6 +356,54 @@ impl Configuration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mining_workers_default_to_effective_parallelism_minus_one_and_validate_overrides() {
+        assert_eq!(pow_search_threads(None, true, 1).unwrap(), Some(1));
+        assert_eq!(pow_search_threads(None, true, 2).unwrap(), Some(1));
+        assert_eq!(pow_search_threads(None, true, 3).unwrap(), Some(1));
+        assert_eq!(pow_search_threads(None, true, 16).unwrap(), Some(14));
+        assert_eq!(pow_search_threads(None, true, 512).unwrap(), Some(256));
+        assert_eq!(pow_search_threads(None, false, 16).unwrap(), None);
+        assert_eq!(
+            pow_search_threads(Some(&json!(2)), true, 16).unwrap(),
+            Some(2)
+        );
+        assert!(pow_search_threads(Some(&json!(1)), false, 16).is_err());
+        for value in [json!(0), json!(257), json!(1.2), json!("4"), Value::Null] {
+            assert!(pow_search_threads(Some(&value), true, 16).is_err());
+        }
+    }
+
+    #[test]
+    fn direct_push_gate_requires_three_dialable_streaming_targets() {
+        let enabled = Value::Bool(true);
+        assert!(require_three_direct_push_targets(Some(&enabled), true, true, 3, 3, 8).is_ok());
+        assert!(require_three_direct_push_targets(None, false, false, 0, 0, 0).is_ok());
+        for (mining, streaming, selected, dialable, dialable_total) in [
+            (true, true, 2, 2, 8),
+            (true, true, 3, 2, 8),
+            (true, true, 4, 4, 8),
+            (true, true, 3, 3, 9),
+            (true, false, 3, 3, 8),
+            (false, true, 3, 3, 8),
+        ] {
+            assert!(
+                require_three_direct_push_targets(
+                    Some(&enabled),
+                    mining,
+                    streaming,
+                    selected,
+                    dialable,
+                    dialable_total,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            require_three_direct_push_targets(Some(&Value::Null), true, true, 3, 3, 8).is_err()
+        );
+    }
 
     #[test]
     fn checkpoint_worker_budget_requires_positive_bytes_and_platform_support() {

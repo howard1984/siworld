@@ -14,18 +14,25 @@ owner. The default unconfigured build remains inactive. Importing this module
 does not activate a website or service.
 
 The client verifies complete native-header continuity, median time past,
-ASERT difficulty, proof of work, cumulative work and receipt authentication
-against each header's body commitment. It scans the complete receipt prefix
+ASERT targets, and receipt membership against each header's body commitment.
+Native consumers verify and count header proof of work. On RandomX networks
+the browser instead verifies checkpoint quorum and ancestry; it does not run
+RandomX or credit work based on declared targets. The service selects the
+provisional suffix, subject to the locally verified checkpoint floor and the
+bounded private rollback cache or a full receipt rescan. It scans the complete receipt prefix
 from the independently pinned engineering-v2 genesis. It verifies local tree
 and owned membership-path consistency. It neither imports a full-node state
 snapshot nor skips an unavailable prefix using a checkpoint.
 
 `full_node_consensus_verified` and `send_supported` are both `false`.
-Transaction proofs, settlement proofs, governance authorization, economics and
-the execution commitment are not independently verified by this light client.
-The API uses the trust label
-`eng2-header-work-and-body-receipt-authenticated-full-node-consensus`.
+Transaction proofs, settlement proofs, economics and the execution commitment
+are not independently verified by this light client. Receipt-bound governance
+replay authenticates signers for the optional checkpoint display only.
+The API exposes `header_pow_verified` and distinguishes native header-work
+trust from the browser's checkpoint-authenticated, provisional suffix.
 A caller must not present it as full-node consensus validation.
+A RandomX browser profile must enable checkpoint settlement. Its private scan
+cache is not interchangeable with a full-work wallet cache.
 
 ## Immutable context
 
@@ -38,6 +45,8 @@ credentials, paths and discovery are rejected. These values are local pins. They
 not learned from the service. The native context authenticates the complete
 genesis bytes against the pinned identifier and compiled native proof profile.
 Other fee modes and legacy genesis or compact encodings are rejected.
+Only a release pinned to a genesis enforcing a durable signed checkpoint floor
+may set `checkpoint_finality: true`. Service responses cannot enable it.
 
 The staged client supports at most 100,000 scanned headers. It requires
 complete permanent receipt history from genesis. A missing record pauses
@@ -54,6 +63,9 @@ The source adapter uses the following routes:
   header page with at most 128 headers.
 - `GET /api/v2/wallet/receipts/N/I?height=H&tip=T` returns the permanent receipt
   at height N and selected header identifier I under the same accepted-head pin.
+- The optional `GET /api/v2/wallet/checkpoint?height=H&tip=T` returns the raw
+  signed certificate for this chain view. It carries no address or statement ID.
+  This optional request has a separate five-second budget.
 
 Head publication must be no more than 300 seconds old or 30 seconds in the
 future. This is a freshness check on a service export, not proof of current
@@ -77,6 +89,24 @@ by either the timer or the explicit synchronization control.
 
 Transport admission or an unsigned head response does not establish native
 proof validity. Redirects, credentials and legacy endpoint fallback are absent.
+
+## Settlement display
+
+Unconfirmed payments lack authenticated block inclusion. Included payments
+show confirmations and remain provisional. Only a payment whose exact
+authenticated block is covered by a verified locally committed checkpoint
+shows **Checkpoint covered (final)**. For large payments, wait for checkpoint
+coverage instead of relying on a fixed confirmation count.
+
+The wallet replays signed governance from the pinned genesis through exact
+receipt frames and verifies both checkpoint signatures against the active
+roster. The signed checkpoint and authorization blocks must match local
+headers, and the authorization depth must satisfy the native rule. A legacy
+scan cache is rescanned before accepting new certificates. The verified
+checkpoint is sealed in a separate wallet-local record outside rollback
+snapshots. A later cache or branch cannot replace it below that block.
+Missing, stale, or invalid evidence leaves an included payment provisional
+and cannot revoke an already verified checkpoint.
 
 ## Candidate adoption and local storage
 
@@ -110,7 +140,10 @@ storage transaction preserves the preceding committed state.
 Every nonzero saved head is looked up under the newly selected service head,
 including a refresh whose advertised head has not changed. A mismatched hash
 cannot mark the accepted balance ready. A complete native candidate must still
-pass receipt and greater-work validation before adoption.
+pass receipt and context validation before adoption. The full-work mode
+also requires greater verified work for a changed tip. The RandomX browser
+mode follows the service's provisional suffix and refuses any view that
+drops its verified checkpoint.
 
 `eng2-rollback.js` supplies worker-private window selection and atomic storage
 contracts. It retains at most 32 linked header identities and four encrypted
@@ -149,8 +182,8 @@ isolated native candidate. The cache must belong to the same wallet and exact
 context, match the requested height/hash, and terminate at an accepted local
 prefix at most 31 blocks back. That bound covers 24 changed blocks plus at most
 seven unchanged replay blocks. The accepted balance and prepared witness remain
-untouched. Receipts are replayed normally and the final complete-candidate and
-greater-work checks still run before durable adoption. A failed or cancelled
+untouched. Receipts are replayed normally and the complete candidate is checked before
+durable adoption under the active header validation policy. A failed or cancelled
 candidate leaves the accepted metadata/cache/archive generation in place; a
 cancellation arriving during persistence finishes matching native adoption and
 keeps readiness false. A native commit failure after durability requires

@@ -42,7 +42,9 @@ fn owner_state_machine_discovers_all_raw_materials_without_canonical_adoption() 
         genesis_timestamp: genesis.config().genesis_timestamp,
         genesis_target: genesis.config().genesis_target,
         target_interval: 300,
+        asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
         pow_iterations: 0,
+        pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
         max_headers: 128,
     };
     let mut branches = BranchStore::create(
@@ -199,7 +201,9 @@ fn body_handoff_waits_for_primary_release_without_consuming_a_source_ticket() {
             genesis_timestamp: genesis.config().genesis_timestamp,
             genesis_target: genesis.config().genesis_target,
             target_interval: 300,
+            asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
             pow_iterations: 0,
+            pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
             max_headers: 128,
         },
         crate::eng2::branches::Limits {

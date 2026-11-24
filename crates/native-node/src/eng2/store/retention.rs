@@ -149,6 +149,36 @@ fn authenticate_prefix(
     Ok(())
 }
 
+/// Carry the authenticated deletion cursor to a replayed copy. Timing and
+/// checkpoint observations above the copied prefix cannot authorize pruning.
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(super) fn copy_prefix_cursor(
+    source: &redb::ReadTransaction,
+    destination: &redb::WriteTransaction,
+    genesis: Hash,
+    identity: &crate::identity::NativeIdentity,
+    through: u64,
+) -> Result<(), String> {
+    let table = match source.open_table(TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(_) => return Err("shadow source retention cursor unavailable".into()),
+    };
+    let mut record = read_record(&table, genesis, identity)?;
+    if record.floor > through {
+        return Err("shadow prefix would omit previously pruned history".into());
+    }
+    record.finality.retain(|&height, _| height <= through);
+    record.observed_through = record.observed_through.min(through);
+    if record
+        .checkpoint
+        .is_some_and(|checkpoint| checkpoint.height > through)
+    {
+        record.checkpoint = None;
+    }
+    write_record(destination, &record, identity)
+}
+
 /// Verify the retention cursor during ordinary accepted-state recovery. A local
 /// seal only authenticates this store's earlier verified history, never a peer.
 pub(super) fn read_floor(

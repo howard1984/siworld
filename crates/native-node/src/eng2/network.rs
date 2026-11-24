@@ -2327,7 +2327,9 @@ mod tests {
                     genesis_timestamp: g.config().genesis_timestamp,
                     genesis_target: g.config().genesis_target,
                     target_interval: 300,
+                    asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
                     pow_iterations: 0,
+                    pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
                     max_headers: 128,
                 },
                 crate::eng2::branches::Limits {
@@ -2376,7 +2378,9 @@ mod tests {
                     genesis_timestamp: g.config().genesis_timestamp,
                     genesis_target: g.config().genesis_target,
                     target_interval: 300,
+                    asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
                     pow_iterations: 0,
+                    pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
                     max_headers: 128,
                 },
                 vec![header],
@@ -2545,7 +2549,9 @@ mod tests {
             genesis_timestamp: genesis.config().genesis_timestamp,
             genesis_target: genesis.config().genesis_target,
             target_interval: 300,
+            asert_half_life: siworld_core::pow::AsertHalfLife::FourHours,
             pow_iterations: 0,
+            pow_algorithm: siworld_core::pow::Algorithm::SequentialBlake3,
             max_headers: 128,
         };
         let mut branches = BranchStore::create(

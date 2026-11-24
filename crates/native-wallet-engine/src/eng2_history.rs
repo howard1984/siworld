@@ -39,6 +39,15 @@ pub struct Context {
 }
 impl Context {
     pub fn from_genesis(bytes: &[u8], expected: Hash) -> Result<Self, String> {
+        Self::from_genesis_with_governance_bytes(bytes, expected).map(|(context, _)| context)
+    }
+
+    /// The governance bytes have been bound to the pin but are not decoded by
+    /// receipt exports, which only need the immutable context.
+    pub(crate) fn from_genesis_with_governance_bytes(
+        bytes: &[u8],
+        expected: Hash,
+    ) -> Result<(Self, &[u8]), String> {
         let end = 41 + crate::state::CONFIG_RULE_BYTES;
         let prefix = end + 4;
         if bytes.len() < prefix + 8
@@ -51,10 +60,24 @@ impl Context {
         }
         let slot_rule = match &bytes[..8] {
             magic if magic == LEGACY_GENESIS_MAGIC => SlotRule::Legacy,
-            magic if magic == PUBLIC_GENESIS_MAGIC => SlotRule::PublicGenesis,
+            magic
+                if magic == PUBLIC_GENESIS_MAGIC
+                    || magic == CHECKPOINT_FORK_GENESIS_MAGIC
+                    || magic == RANDOMX_GENESIS_MAGIC =>
+            {
+                SlotRule::PublicGenesis
+            }
             _ => return Err("wallet genesis version rejected".into()),
         };
         let config = Config::decode_rules(&bytes[41..end])?;
+        let checkpoint_fork_choice = slot_rule == SlotRule::PublicGenesis
+            && config.asert_half_life() == siworld_core::pow::AsertHalfLife::OneHour;
+        let randomx = config.pow_algorithm() == siworld_core::pow::Algorithm::SiworldRandomX;
+        if randomx != (&bytes[..8] == RANDOMX_GENESIS_MAGIC)
+            || checkpoint_fork_choice != (&bytes[..8] == CHECKPOINT_FORK_GENESIS_MAGIC || randomx)
+        {
+            return Err("wallet genesis revision and rule commitment differ".into());
+        }
         if config.encode_rules().as_slice() != &bytes[41..end] {
             return Err("wallet genesis configuration is noncanonical".into());
         }
@@ -75,19 +98,28 @@ impl Context {
         if slot_rule == SlotRule::PublicGenesis {
             hash.update(PUBLIC_GENESIS_RULES);
         }
+        if checkpoint_fork_choice {
+            hash.update(CHECKPOINT_FORK_GENESIS_RULES);
+        }
+        if randomx {
+            siworld_core::pow::bind_randomx(&mut hash);
+        }
         let rules = *hash.finalize().as_bytes();
         let genesis = blake3::derive_key("siworld eng2 internal genesis v1", &rules);
         if genesis != expected {
             return Err("wallet genesis differs from independently pinned identifier".into());
         }
-        Ok(Self {
-            config,
-            genesis,
-            rules,
-            profile,
-            fee_mode: bytes[8],
-            slot_rule,
-        })
+        Ok((
+            Self {
+                config,
+                genesis,
+                rules,
+                profile,
+                fee_mode: bytes[8],
+                slot_rule,
+            },
+            &bytes[prefix..],
+        ))
     }
     pub fn slot_rule(&self) -> SlotRule {
         self.slot_rule

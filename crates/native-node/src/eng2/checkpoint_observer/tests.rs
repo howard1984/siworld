@@ -743,3 +743,210 @@ fn higher_retirement_cannot_hide_missing_or_conflicting_lower_anchor() {
     observer.reconcile_authenticated_view(&fixture);
     assert_eq!(observer.gate_reason(), Some(Error::Conflict));
 }
+
+#[cfg(feature = "eng2-runtime")]
+fn extend_fixture(
+    mut parent: Hash,
+    first: u64,
+    last: u64,
+    tag: u8,
+    network: Hash,
+) -> BTreeMap<u64, Header> {
+    (first..=last)
+        .map(|height| {
+            let mut header = Header {
+                network,
+                height,
+                parent,
+                timestamp: height * 300,
+                target: [255; 32],
+                execution_commitment: [tag; 32],
+                body_commitment: [tag; 32],
+                nonce: 0,
+            };
+            if matches!(height, 36 | 48) {
+                // Authorize certificates with the exact governance height and
+                // execution descriptor root on the corresponding branch.
+                header.execution_commitment = commitment::aggregate_descriptors(
+                    network,
+                    height,
+                    parent,
+                    &fixture_at(height - 24).witness.descriptors,
+                )
+                .unwrap();
+            }
+            parent = header.id().unwrap();
+            (height, header)
+        })
+        .collect()
+}
+
+#[cfg(feature = "eng2-runtime")]
+fn signed_branch(headers: &BTreeMap<u64, Header>, checkpoint: u64, slots: [u8; 2]) -> Incoming {
+    let authorization = checkpoint + 24;
+    let fixture = fixture_at(checkpoint);
+    let statement = Statement {
+        authorization_block: headers[&authorization].id().unwrap(),
+        checkpoint_block: headers[&checkpoint].id().unwrap(),
+        ..fixture.statement
+    };
+    Incoming::Certified {
+        certificate: Box::new(Certificate {
+            votes: slots.map(|slot| vote(&statement, slot, slot + 3)),
+            statement,
+        }),
+        witness: fixture.witness,
+    }
+}
+
+#[cfg(feature = "eng2-runtime")]
+fn bounded_fixture() -> Synthetic {
+    let mut fixture = fixture_at(24);
+    fixture.headers = extend_fixture([1; 32], 1, 48, 2, fixture.governance.network());
+    fixture
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn bounded_profile_accepts_alternate_quorum_for_exact_statement_and_rejects_mixed_signatures() {
+    let fixture = bounded_fixture();
+    let first = signed_branch(&fixture.headers, 12, [0, 1]);
+    let mut observer = Observer::default();
+    let floor = Some((12, fixture.headers[&12].id().unwrap()));
+    let unexpected_write = |_: &Observer, _: &Certificate| panic!("not a checkpoint conflict");
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 1, &first, unexpected_write),
+        Ok(Outcome::CurrentCertificate(12))
+    );
+    let mut alternate = signed_branch(&fixture.headers, 12, [0, 2]);
+    assert_ne!(
+        first.encode(MAX_GOVERNANCE_BYTES).unwrap(),
+        alternate.encode(MAX_GOVERNANCE_BYTES).unwrap()
+    );
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 2, &alternate, unexpected_write),
+        Ok(Outcome::CurrentCertificate(12))
+    );
+    let Incoming::Certified { certificate, .. } = &mut alternate else {
+        unreachable!()
+    };
+    let Incoming::Certified {
+        certificate: newer, ..
+    } = signed_branch(&fixture.headers, 24, [0, 2])
+    else {
+        unreachable!()
+    };
+    certificate.votes[1] = newer.votes[1].clone();
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 3, &alternate, unexpected_write),
+        Err(Error::Rejected)
+    );
+    assert!(!observer.conflicted());
+    assert_eq!(observer.observed_height(), Some(12));
+}
+
+#[cfg(feature = "eng2-runtime")]
+#[test]
+fn bounded_profile_proves_cross_height_conflict_without_latching_a_normal_suffix() {
+    let mut fixture = bounded_fixture();
+    let a = &fixture.headers;
+    let first = signed_branch(a, 12, [0, 1]);
+    let floor_id = a[&12].id().unwrap();
+    let floor = Some((12, floor_id));
+    let network = fixture.governance.network();
+    let branch = |fork: u64, tag: u8| -> BTreeMap<u64, Header> {
+        a.range(..=fork)
+            .map(|(&height, header)| (height, header.clone()))
+            .chain(extend_fixture(
+                a[&fork].id().unwrap(),
+                fork + 1,
+                48,
+                tag,
+                network,
+            ))
+            .collect()
+    };
+    let normal = branch(12, 3);
+    let competing = branch(11, 4);
+    let normal_quorum = signed_branch(&normal, 24, [1, 2]);
+    let same_anchor = signed_branch(&normal, 12, [1, 2]);
+    let conflict = signed_branch(&competing, 24, [1, 2]);
+    let uncertified = Incoming::Vote {
+        statement: match &conflict {
+            Incoming::Certified { certificate, .. } => certificate.statement.clone(),
+            _ => unreachable!(),
+        },
+        vote: Box::new(match &conflict {
+            Incoming::Certified { certificate, .. } => certificate.votes[0].clone(),
+            _ => unreachable!(),
+        }),
+    };
+    let mut observer = Observer::default();
+    let unexpected_write = |_: &Observer, _: &Certificate| panic!("not a checkpoint conflict");
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 1, &first, unexpected_write),
+        Ok(Outcome::CurrentCertificate(12))
+    );
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 2, &conflict, unexpected_write),
+        Err(Error::Unavailable)
+    );
+    fixture.retained = normal
+        .values()
+        .chain(competing.values())
+        .map(|header| (header.id().unwrap(), header.clone()))
+        .collect();
+    assert_eq!(
+        observer.check_bounded_view(&fixture, None, 3, &conflict, unexpected_write),
+        Err(Error::Unavailable)
+    );
+    let mut broken = conflict.clone();
+    if let Incoming::Certified { witness, .. } = &mut broken {
+        witness.governance[0] ^= 1;
+    }
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 4, &broken, unexpected_write),
+        Err(Error::Rejected)
+    );
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 5, &uncertified, unexpected_write),
+        Err(Error::Rejected)
+    );
+    for (now, packet) in [(6, &normal_quorum), (7, &same_anchor)] {
+        assert_eq!(
+            observer.check_bounded_view(&fixture, floor, now, packet, unexpected_write),
+            Err(Error::Unavailable)
+        );
+        assert!(!observer.conflicted());
+    }
+    assert!(observer.pending.is_empty());
+    let mut unavailable = Observer::default();
+    assert_eq!(
+        unavailable.check_bounded_view(&fixture, floor, 8, &conflict, |_, _| {
+            Err(Error::EvidenceUnavailable)
+        }),
+        Err(Error::EvidenceUnavailable)
+    );
+    assert_eq!(unavailable.gate_reason(), Some(Error::EvidenceUnavailable));
+
+    let mut stored = None;
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 8, &conflict, |before, certified| {
+            assert!(!before.conflicted());
+            stored = Some(certified.statement.clone());
+            Ok(())
+        }),
+        Err(Error::Conflict)
+    );
+    assert_eq!(
+        stored.unwrap().checkpoint_block,
+        competing[&24].id().unwrap()
+    );
+    assert_eq!(observer.gate_reason(), Some(Error::Conflict));
+    assert_eq!(observer.observed_height(), Some(12));
+    assert_eq!(fixture.headers[&12].id().unwrap(), floor_id);
+    assert_eq!(
+        observer.check_bounded_view(&fixture, floor, 9, &first, unexpected_write),
+        Err(Error::Conflict)
+    );
+}

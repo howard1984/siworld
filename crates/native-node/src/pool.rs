@@ -27,6 +27,26 @@ struct Reserved {
     outputs: [DigestBytes; 3],
     bytes: usize,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FillError {
+    Limit,
+    Network,
+    Insufficient { required: usize },
+    ReservationsExhausted,
+    PrivateTemplateActive,
+}
+impl FillError {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Limit => "candidate padding shortfall exceeds 576",
+            Self::Network => "private queue network mismatch",
+            Self::Insufficient { .. } => "private queue not ready",
+            Self::ReservationsExhausted => "consumed reservation limit reached",
+            Self::PrivateTemplateActive => "previous private template is still owned",
+        }
+    }
+}
+
 struct Consumed {
     inputs: [DigestBytes; 2],
     outputs: [DigestBytes; 3],
@@ -37,6 +57,9 @@ pub struct Pool {
     inputs: BTreeSet<DigestBytes>,
     outputs: BTreeSet<DigestBytes>,
     consumed: BTreeMap<Hash, Consumed>,
+    // Only one resident producer owns a private candidate at a time. These
+    // identify reservations that have never crossed the publication edge.
+    private_template: Vec<Hash>,
     bytes: usize,
 }
 impl Pool {
@@ -47,6 +70,7 @@ impl Pool {
             inputs: BTreeSet::new(),
             outputs: BTreeSet::new(),
             consumed: BTreeMap::new(),
+            private_template: Vec::new(),
             bytes: 0,
         }
     }
@@ -188,8 +212,8 @@ impl Pool {
             }
             self.bytes -= entry.bytes;
         }
-        // Accepted canonical spends absorb their tombstones. Uncommitted entries
-        // stay reserved even if a candidate failed or a snapshot later expires.
+        // Accepted canonical spends absorb their tombstones. Publication
+        // retains uncommitted entries even if a snapshot later expires.
         self.consumed
             .retain(|_, entry| !entry.inputs.iter().all(|nf| state.spent.contains(nf)));
         Ok(removed.len())
@@ -198,34 +222,73 @@ impl Pool {
         if !(MIN_SLOTS..=MAX_SLOTS).contains(&count) || !count.is_multiple_of(GROUP) {
             return Err("candidate positions must be 64 through 576 in groups of 16".into());
         }
-        self.take_reserved(state, count)
+        self.take_reserved(state, count, false)
+            .map_err(|error| error.message().into())
     }
-    /// Fill a transaction candidate's exact shortfall. The completed candidate
-    /// still needs 64 through 576 positions in groups of 16; a shortfall itself
-    /// may be any count, including zero. Entries remain protected by the same
-    /// consumed reservations as ordinary complete-padding candidates.
+    /// Fill an exact shortfall; a shortfall may be any count, including zero.
+    /// Ordinary callers retain every consumed reservation. Resident private
+    /// templates may release only their unpublished reservations.
     pub(crate) fn take_for_fill(
         &mut self,
         state: &State,
         count: usize,
     ) -> Result<Vec<Padding>, String> {
-        if count > MAX_SLOTS {
-            return Err("candidate padding shortfall exceeds 576".into());
-        }
-        self.take_reserved(state, count)
+        self.take_reserved(state, count, false)
+            .map_err(|error| error.message().into())
     }
-    fn take_reserved(&mut self, state: &State, count: usize) -> Result<Vec<Padding>, String> {
-        self.prune(state)?;
-        if self.entries.len() < count
-            || self
-                .consumed
-                .len()
-                .checked_add(count)
-                .is_none_or(|n| n > MAX_CONSUMED)
+
+    pub(crate) fn take_for_fill_with_visibility(
+        &mut self,
+        state: &State,
+        count: usize,
+        private: bool,
+    ) -> Result<Vec<Padding>, FillError> {
+        self.take_reserved(state, count, private)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn discard_unpublished_template(&mut self) {
+        for id in self.private_template.drain(..) {
+            // Only reservation metadata is released. Proofs and witnesses
+            // left the queue when selected and are never returned to it.
+            self.consumed.remove(&id);
+        }
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn mark_template_published(&mut self) {
+        // An attempted or ambiguous publication is treated as disclosed.
+        self.private_template.clear();
+    }
+
+    fn take_reserved(
+        &mut self,
+        state: &State,
+        count: usize,
+        private: bool,
+    ) -> Result<Vec<Padding>, FillError> {
+        if count > MAX_SLOTS {
+            return Err(FillError::Limit);
+        }
+        if private && !self.private_template.is_empty() {
+            return Err(FillError::PrivateTemplateActive);
+        }
+        self.prune(state).map_err(|_| FillError::Network)?;
+        if self.entries.len() < count {
+            return Err(FillError::Insufficient { required: count });
+        }
+        if self
+            .consumed
+            .len()
+            .checked_add(count)
+            .is_none_or(|n| n > MAX_CONSUMED)
         {
-            return Err("private queue not ready or consumed reservation limit reached".into());
+            return Err(FillError::ReservationsExhausted);
         }
         let ids: Vec<_> = self.entries.keys().take(count).copied().collect();
+        if private {
+            self.private_template.extend(&ids);
+        }
         let mut selected = Vec::with_capacity(count);
         for id in ids {
             let entry = self

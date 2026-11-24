@@ -158,6 +158,9 @@ impl Store {
         mut load: impl FnMut(usize) -> Result<(Header, Body), String>,
     ) -> Result<PrevalidatedReplacement, ReplacementFailure> {
         self.ensure_exportable().map_err(deferred)?;
+        #[cfg(feature = "eng2-runtime")]
+        self.check_finalized_ancestor(ancestor_height)
+            .map_err(deferred)?;
         if expected_ids.is_empty()
             || expected_ids.len() > budget.max_blocks
             || budget.max_body_bytes == 0

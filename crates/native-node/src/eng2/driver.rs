@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     admission::{Mempool, PeerId},
-    pool::{Padding, Pool},
+    pool::{FillError, Padding, Pool},
     producer::{MiningSettings, PreparedPadding, prepare_padding_witness},
     proofs::NativeVerifier,
     wire::Hash,
@@ -43,6 +43,47 @@ pub struct Head {
     pub height: u64,
     pub id: Hash,
     pub work: siworld_core::pow::Work,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PrepareBlockError {
+    Activities,
+    Store,
+    SlotCount,
+    Pending,
+    Padding(FillError),
+    Candidate(producer::PrepareError),
+}
+impl PrepareBlockError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Activities => "production activities suspended",
+            Self::Store => "production canonical store unavailable",
+            Self::SlotCount => "production position count rejected",
+            Self::Pending => "pending transaction selection rejected",
+            Self::Padding(error) => error.message(),
+            Self::Candidate(error) => error.code(),
+        }
+    }
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Activities => "production_activities_suspended",
+            Self::Store => "production_store_unavailable",
+            Self::SlotCount => "production_slot_count_rejected",
+            Self::Pending => "production_pending_selection_rejected",
+            Self::Padding(FillError::Limit) => "production_padding_shortfall_limit",
+            Self::Padding(FillError::Network) => "production_padding_network_mismatch",
+            Self::Padding(FillError::Insufficient { .. }) => "production_padding_insufficient",
+            Self::Padding(FillError::ReservationsExhausted) => {
+                "production_padding_reservations_exhausted"
+            }
+            Self::Padding(FillError::PrivateTemplateActive) => {
+                "production_private_template_still_owned"
+            }
+            Self::Candidate(error) => error.code(),
+        }
+    }
 }
 
 /// Native verification is synchronous, so this is a commit deadline rather
@@ -169,6 +210,20 @@ impl Driver {
         } else {
             Err("canonical switching pauses owner activities".into())
         }
+    }
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn retain_finalized_checkpoint(
+        &mut self,
+        certified: &super::runtime_export::CertifiedCheckpoint,
+    ) -> Result<(), String> {
+        if self.store.engine().genesis().checkpoint_fork_choice() {
+            self.store.admit_finalized_checkpoint(certified)?;
+        }
+        Ok(())
+    }
+    #[cfg(all(unix, feature = "eng2-runtime"))]
+    pub(crate) fn store_for_checkpoint(&mut self) -> &mut Store {
+        &mut self.store
     }
     pub fn store(&self) -> &Store {
         &self.store
@@ -462,7 +517,9 @@ impl Driver {
         {
             // Canonical commit already succeeded. Preserve that fact and
             // stop production instead of reporting the block uncommitted.
-            state.stop("reorganization_committed_archive_failed");
+            if !self.store.engine().genesis().checkpoint_fork_choice() {
+                state.stop("reorganization_committed_archive_failed");
+            }
             self.last_archive_error = Some(error);
         }
         // The pool is created for this immutable network, so pruning cannot
@@ -643,19 +700,62 @@ impl Driver {
         operations: Option<crate::eng2_operations::PendingOperations>,
         issuances: Vec<crate::issuance::IssuanceRecord>,
     ) -> Result<PreparedBlock, String> {
-        self.ensure_activities_allowed()?;
-        self.store.ensure_exportable()?;
+        self.prepare_block_inner(count, timestamp, settings, operations, issuances, false)
+            .map_err(|error| error.message().into())
+    }
+
+    /// Resident-only: the caller must discard the previous unpublished
+    /// candidate after all of its workers have returned.
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn prepare_private_template(
+        &mut self,
+        count: usize,
+        timestamp: u64,
+        settings: &MiningSettings,
+        operations: Option<crate::eng2_operations::PendingOperations>,
+        issuances: Vec<crate::issuance::IssuanceRecord>,
+    ) -> Result<PreparedBlock, PrepareBlockError> {
+        self.prepare_block_inner(count, timestamp, settings, operations, issuances, true)
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn discard_unpublished_template(&mut self) {
+        self.padding.discard_unpublished_template();
+    }
+
+    #[cfg(feature = "eng2-runtime")]
+    pub(crate) fn mark_template_published(&mut self) {
+        self.padding.mark_template_published();
+    }
+
+    fn prepare_block_inner(
+        &mut self,
+        count: usize,
+        timestamp: u64,
+        settings: &MiningSettings,
+        operations: Option<crate::eng2_operations::PendingOperations>,
+        issuances: Vec<crate::issuance::IssuanceRecord>,
+        private: bool,
+    ) -> Result<PreparedBlock, PrepareBlockError> {
+        self.ensure_activities_allowed()
+            .map_err(|_| PrepareBlockError::Activities)?;
+        self.store
+            .ensure_exportable()
+            .map_err(|_| PrepareBlockError::Store)?;
         if !self.store.engine().genesis().slot_rule().permits(count) {
-            return Err("production position count rejected".into());
+            return Err(PrepareBlockError::SlotCount);
         }
         let state = self.store.engine().state().chain();
-        self.padding.prune(state)?;
         let mut positions = self
             .pending
             .select(state, count)
-            .map_err(|_| "pending transaction selection rejected")?;
-        positions.extend(self.padding.take_for_fill(state, count - positions.len())?);
-        producer::prepare(
+            .map_err(|_| PrepareBlockError::Pending)?;
+        positions.extend(
+            self.padding
+                .take_for_fill_with_visibility(state, count - positions.len(), private)
+                .map_err(PrepareBlockError::Padding)?,
+        );
+        producer::prepare_checked(
             self.store.engine(),
             positions,
             timestamp,
@@ -663,6 +763,7 @@ impl Driver {
             operations,
             issuances,
         )
+        .map_err(PrepareBlockError::Candidate)
     }
     pub fn prepare_work(&self, proved: ProvedBlock) -> Result<Work, String> {
         self.ensure_activities_allowed()?;
@@ -679,7 +780,6 @@ impl super::network::Owner for Driver {
         peer_binding: crate::p2p::Binding,
         expires: std::time::Instant,
     ) -> Result<Option<crate::p2p::BodyAuthorization>, String> {
-        use siworld_core::pow;
         self.store.ensure_exportable()?;
         let binding = self.store.engine().genesis().peer_binding();
         if peer_binding != binding || header.network != binding.network || header.height == 0 {
@@ -701,14 +801,18 @@ impl super::network::Owner for Driver {
             || header.parent != state.tip()
             || header.timestamp <= state.chain().median_time_past()
             || header.target != state.chain().next_target()
-            || !pow::meets_target(
-                &pow::pow_hash(
-                    &header.pow_seed().map_err(|_| "body header seed rejected")?,
-                    header.nonce,
-                    self.store.engine().genesis().config().pow_iterations,
-                ),
-                &header.target,
-            )
+            || !super::proof_of_work::verify(
+                state.chain().config.pow_algorithm(),
+                state.chain().config.pow_iterations,
+                header,
+                || {
+                    super::proof_of_work::epoch_from_state(
+                        binding.genesis,
+                        header.height,
+                        state.chain(),
+                    )
+                },
+            )?
         {
             return Err("body forward header qualification rejected".into());
         }

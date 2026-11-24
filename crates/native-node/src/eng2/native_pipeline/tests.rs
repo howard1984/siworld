@@ -62,6 +62,146 @@ fn unchanged_native_profile_matches_the_observed_existing_genesis() {
     assert_eq!(encoded, expected);
 }
 
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        all(target_os = "windows", target_env = "msvc")
+    )
+))]
+#[test]
+#[ignore = "owner-operated full RandomX dataset and real native proofs; excluded from CI"]
+fn randomx_real_block_is_admitted_by_independent_store_and_reopens() {
+    use crate::eng2::{
+        producer::{self, Search},
+        store::Store,
+    };
+    use std::time::Instant;
+
+    assert!(std::env::var_os("GITHUB_ACTIONS").is_none());
+    let path = std::path::PathBuf::from(
+        std::env::var_os("SIWORLD_RANDOMX_FIXTURE_DIR").expect("disposable local directory"),
+    );
+    assert!(path.is_absolute() && path.join("disposable-fixture").is_file());
+    let origin = path.join("origin");
+    let replica = path.join("replica");
+    for directory in [&origin, &replica] {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(directory).unwrap();
+    }
+    let state = snapshot::tests::bootstrap();
+    let prior = state.chain.config.clone();
+    let config = crate::state::Config::asert_development(prior.network, 1, [255; 32], 1)
+        .unwrap()
+        .with_fund_wallets(prior.fund_allocation.unwrap(), prior.fund_verifying_keys)
+        .unwrap()
+        .with_siworld_randomx()
+        .unwrap();
+    let bytes = Genesis::seal_with_rule(
+        config,
+        state.governance,
+        FeeMode::LegacyMiner,
+        crate::wire::SlotRule::PublicGenesis,
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    let genesis = || Genesis::decode(&bytes).unwrap();
+    let limits = snapshot::tests::limits().chain;
+    let open = |path: &std::path::Path| {
+        let genesis = genesis();
+        let identity =
+            crate::identity::NativeIdentity::initialize(path, genesis.peer_binding()).unwrap();
+        let mut store = Store::create(&path.join("chain.redb"), genesis, limits).unwrap();
+        store.enable_authenticated_restart(identity).unwrap();
+        store
+    };
+    let mut producer_store = open(&origin);
+    let mut replica_store = open(&replica);
+    let prover =
+        crate::proofs::NativeProver::for_genesis(producer_store.engine().genesis()).unwrap();
+    let verifier = NativeVerifier::for_genesis(replica_store.engine().genesis()).unwrap();
+    let settings = crate::producer::MiningSettings {
+        mode: crate::wire::RewardMode::Voyager,
+        recipient: crate::wallet::WalletKeys::from_seed(
+            prior.network,
+            zeroize::Zeroizing::new([55; 32]),
+            0,
+        )
+        .unwrap()
+        .address(),
+    };
+
+    let start = Instant::now();
+    let slots = (0..16)
+        .map(|_| crate::producer::prepare_padding(producer_store.engine().state().chain(), &prover))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let preparation = Instant::now();
+    let engine = producer_store.engine();
+    let mut work = producer::prepare(engine, slots, 301, &settings, None, Vec::new())
+        .unwrap()
+        .prove(&prover)
+        .unwrap()
+        .prepare_work(engine, &verifier)
+        .unwrap();
+    let search_start = Instant::now();
+    let block = loop {
+        assert!(search_start.elapsed() < Duration::from_secs(90));
+        match work.search(1).unwrap() {
+            Search::Found(block) => break block,
+            Search::Pending(next) => {
+                assert_eq!(
+                    next.next_nonce(),
+                    0,
+                    "the minimum-work fixture uses one nonce"
+                );
+                work = next;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    let body_accepted = Instant::now();
+    producer_store
+        .append(&block.header, &block.body, &verifier)
+        .unwrap();
+    let receive = Instant::now();
+    let frame = block
+        .body
+        .encode(producer_store.engine().body_policy())
+        .unwrap();
+    let decoded = crate::eng2::body::Body::decode(
+        &frame,
+        block.header.network,
+        block.header.height,
+        replica_store.engine().body_policy(),
+    )
+    .unwrap();
+    replica_store
+        .append(&block.header, &decoded, &verifier)
+        .unwrap();
+    let acceptance = receive.elapsed();
+    drop(replica_store);
+    let reopened = Store::resume_existing(&replica.join("chain.redb"), genesis(), limits).unwrap();
+    assert_eq!(reopened.engine().state().tip(), block.header.id().unwrap());
+    assert_eq!(reopened.header(1).unwrap(), block.header);
+    assert_eq!(reopened.engine().state().height(), 1);
+    eprintln!(
+        "padding_ms={} template_ms={} cold_dataset_and_search_ms={} replica_validation_ms={} body_bytes={}",
+        (preparation - start).as_millis(),
+        (search_start - preparation).as_millis(),
+        (body_accepted - search_start).as_millis(),
+        acceptance.as_millis(),
+        frame.len(),
+    );
+}
+
 #[test]
 fn exact_receipt_key_rejects_proof_snapshot_fee_root_and_public_mutations() {
     let engine = engine();

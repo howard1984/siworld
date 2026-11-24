@@ -30,6 +30,9 @@ pub struct LightWallet {
 }
 impl LightWallet {
     pub fn new(config: Config, seed: Zeroizing<[u8; 32]>, account: u32) -> Result<Self, String> {
+        if config.pow_algorithm() != pow::Algorithm::SequentialBlake3 {
+            return Err("RandomX requires the engineering-v2 wallet".into());
+        }
         let mut wallet = Wallet::from_seed(config.network, seed, account)?;
         let state = State::new(config)?;
         wallet.scan_light_data(&state, &[], &[], false)?;

@@ -134,14 +134,18 @@ fn admit(shared: &Shared, ready: &Ready) -> Result<bool, String> {
     {
         return Ok(false);
     }
-    owner.retain_fast_headers(&ready.path)?;
     let head = owner.head()?;
     if head.height.checked_add(1) == Some(header.height) && head.id == header.parent {
+        owner.retain_fast_headers(&ready.path)?;
         owner.accept_received(header, &ready.received)?;
         Ok(true)
     } else if head.height >= header.height && owner.header(header.height)?.id() == header.id() {
         Ok(true)
     } else {
+        if !owner.admit_fast_competitor(header, ready.download.peer())? {
+            return Ok(false);
+        }
+        owner.retain_fast_headers(&ready.path)?;
         owner.retain_fast_body(header, &ready.received.body)
     }
 }

@@ -103,6 +103,17 @@ impl<'a> Checked<'a> {
     }
 }
 
+#[cfg(all(unix, feature = "eng2-runtime"))]
+pub(super) fn copy_checked_receipt(
+    transaction: &WriteTransaction,
+    genesis: &Genesis,
+    header: &Header,
+    body_bytes: usize,
+    bytes: &[u8],
+) -> Result<(), String> {
+    Checked::new(genesis, header, body_bytes, bytes)?.write(transaction)
+}
+
 impl Store {
     /// Read only a bounded slice of an already materialized receipt. The stored
     /// digest detects local byte changes; callers still authenticate complete

@@ -3,10 +3,10 @@
 
 use crate::pool::Padding;
 use crate::proofs::NativeProver;
-use crate::state::{State, base_fee};
+use crate::state::{SnapshotError, State, base_fee};
 use crate::wire::{Block, GROUP, MAX_SLOTS, MIN_SLOTS, PublicRecord, RewardRecord, Transaction};
 use native::codec::{ProofContext, PublicTransaction, decode_digest, encode_digest};
-use native::confidential_fees::{FeeOpening, SettlementSlot};
+use native::confidential_fees::{FeeOpening, SettlementError, SettlementSlot};
 use native::encryption::{
     EncryptionContext, PaymentAddress, PaymentCiphertext, PaymentEncryptionOpening,
     RecipientViewKey, SenderChangeSecret, decrypt_change_at, encrypt_change_at,
@@ -80,6 +80,114 @@ struct PreparedRewards {
     records: Vec<RewardRecord>,
     notes: Vec<Note>,
     secret: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CandidateError {
+    SlotCount,
+    Timestamp,
+    Height,
+    Snapshot(SnapshotError),
+    PositionProofSize,
+    PositionPublicFields,
+    NullifierCollision,
+    OutputCollision,
+    IdentityCollision,
+    OpeningMismatch,
+    FeeSumOverflow,
+    SettlementTail,
+    RewardPlan,
+    RewardContext,
+    RewardAmountOverflow,
+    RewardEntropy,
+    RewardEncryption,
+    RewardPaymentCheck,
+    RewardNoteCheck,
+    Settlement(SettlementFailure),
+}
+impl CandidateError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::SlotCount => "production_candidate_slot_count_rejected",
+            Self::Timestamp => "production_candidate_timestamp_not_after_median",
+            Self::Height => "production_candidate_height_overflow",
+            Self::Snapshot(SnapshotError::OutOfRange) => {
+                "production_candidate_snapshot_out_of_range"
+            }
+            Self::Snapshot(SnapshotError::NotCanonical) => {
+                "production_candidate_snapshot_not_canonical"
+            }
+            Self::PositionProofSize => "production_candidate_proof_byte_limit",
+            Self::PositionPublicFields => "production_candidate_public_fields_invalid",
+            Self::NullifierCollision => "production_candidate_nullifier_collision",
+            Self::OutputCollision => "production_candidate_output_collision",
+            Self::IdentityCollision => "production_candidate_identity_collision",
+            Self::OpeningMismatch => "production_candidate_fee_opening_mismatch",
+            Self::FeeSumOverflow => "production_candidate_fee_sum_overflow",
+            Self::SettlementTail => "production_candidate_settlement_tail_rejected",
+            Self::RewardPlan => "production_candidate_reward_plan_invalid",
+            Self::RewardContext => "production_candidate_reward_context_mismatch",
+            Self::RewardAmountOverflow => "production_candidate_reward_amount_overflow",
+            Self::RewardEntropy => "production_candidate_reward_entropy_unavailable",
+            Self::RewardEncryption => "production_candidate_reward_encryption_failed",
+            Self::RewardPaymentCheck => "production_candidate_reward_payment_check_failed",
+            Self::RewardNoteCheck => "production_candidate_reward_note_check_failed",
+            Self::Settlement(failure) => failure.code(),
+        }
+    }
+}
+
+/// Keep the failed settlement invariant, but never retain fee amounts or row indexes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SettlementFailure {
+    Empty,
+    RewardPlan,
+    MinerAsset,
+    DuplicateCommitment,
+    DummyFeeNonZero,
+    RealFeeZero,
+    WrongFeeTier,
+    CommitmentMismatch,
+    FeeSumOverflow,
+    RewardOverflow,
+    MinerUnlockOverflow,
+    MinerAmountMismatch,
+}
+impl From<SettlementError> for SettlementFailure {
+    fn from(error: SettlementError) -> Self {
+        match error {
+            SettlementError::EmptySettlement => Self::Empty,
+            SettlementError::InvalidRewardPlan => Self::RewardPlan,
+            SettlementError::MinerAssetNotSip => Self::MinerAsset,
+            SettlementError::DuplicateCommitment { .. } => Self::DuplicateCommitment,
+            SettlementError::DummyFeeNonZero { .. } => Self::DummyFeeNonZero,
+            SettlementError::RealFeeZero { .. } => Self::RealFeeZero,
+            SettlementError::WrongFeeTier { .. } => Self::WrongFeeTier,
+            SettlementError::CommitmentMismatch { .. } => Self::CommitmentMismatch,
+            SettlementError::FeeSumOverflow => Self::FeeSumOverflow,
+            SettlementError::RewardOverflow => Self::RewardOverflow,
+            SettlementError::MinerUnlockOverflow => Self::MinerUnlockOverflow,
+            SettlementError::MinerAmountMismatch { .. } => Self::MinerAmountMismatch,
+        }
+    }
+}
+impl SettlementFailure {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Empty => "production_settlement_empty",
+            Self::RewardPlan => "production_settlement_reward_plan_invalid",
+            Self::MinerAsset => "production_settlement_miner_asset_mismatch",
+            Self::DuplicateCommitment => "production_settlement_duplicate_commitment",
+            Self::DummyFeeNonZero => "production_settlement_dummy_fee_nonzero",
+            Self::RealFeeZero => "production_settlement_real_fee_zero",
+            Self::WrongFeeTier => "production_settlement_fee_tier_mismatch",
+            Self::CommitmentMismatch => "production_settlement_commitment_mismatch",
+            Self::FeeSumOverflow => "production_settlement_fee_sum_overflow",
+            Self::RewardOverflow => "production_settlement_reward_overflow",
+            Self::MinerUnlockOverflow => "production_settlement_miner_unlock_overflow",
+            Self::MinerAmountMismatch => "production_settlement_miner_amount_mismatch",
+        }
+    }
 }
 
 fn fields_from_entropy<const N: usize>(
@@ -266,6 +374,7 @@ fn prepare_rewards(
 ) -> Result<PreparedRewards, String> {
     let plan = state.reward_plan(settings.mode)?;
     prepare_rewards_with_plan(state, total_fees, settings, &plan)
+        .map_err(|error| error.code().into())
 }
 
 fn prepare_rewards_with_plan(
@@ -273,12 +382,12 @@ fn prepare_rewards_with_plan(
     total_fees: u64,
     settings: &MiningSettings,
     plan: &native::settlement::RewardPlan,
-) -> Result<PreparedRewards, String> {
-    plan.validate()?;
+) -> Result<PreparedRewards, CandidateError> {
+    plan.validate().map_err(|_| CandidateError::RewardPlan)?;
     if state.height.checked_add(1) != Some(plan.block_height)
         || settings.mode.to_byte() != plan.mode as u8
     {
-        return Err("explicit reward plan differs from candidate height or mode".into());
+        return Err(CandidateError::RewardContext);
     }
     let h = Hasher::new();
     let ec = EncryptionContext::new(state.config.network);
@@ -300,19 +409,19 @@ fn prepare_rewards_with_plan(
             value: allocation
                 .amount
                 .checked_add(if index == 0 { total_fees } else { 0 })
-                .ok_or("miner reward amount overflows")?,
+                .ok_or(CandidateError::RewardAmountOverflow)?,
             unlock_height: allocation.unlock_height,
             rho: h.reward_rho(plan.block_height, index),
-            rseed: random_fields()?,
+            rseed: random_fields().map_err(|_| CandidateError::RewardEntropy)?,
         };
         let commitment = h.note_cm(&note);
         let (payment, opening) = encrypt_payment_with_opening(&settings.recipient, &note, &ec)
-            .map_err(|_| "reward encryption failed")?;
+            .map_err(|_| CandidateError::RewardEncryption)?;
         let checked = opening
             .verify_payment(&settings.recipient, &commitment, &payment, &ec)
-            .map_err(|_| "reward payment self-check failed")?;
+            .map_err(|_| CandidateError::RewardPaymentCheck)?;
         if !same_note(&checked, &note) {
-            return Err("reward note self-check failed".into());
+            return Err(CandidateError::RewardNoteCheck);
         }
         secret.extend_from_slice(&encode_digest(&commitment));
         secret.extend_from_slice(&encode_digest(&note.owner));
@@ -515,6 +624,7 @@ fn prepare_candidate(
         plan,
         crate::wire::SlotRule::Legacy,
     )
+    .map_err(|error| error.code().into())
 }
 
 pub(crate) fn prepare_candidate_with_plan(
@@ -524,17 +634,14 @@ pub(crate) fn prepare_candidate_with_plan(
     settings: &MiningSettings,
     plan: native::settlement::RewardPlan,
     slot_rule: crate::wire::SlotRule,
-) -> Result<PreparedCandidate, String> {
+) -> Result<PreparedCandidate, CandidateError> {
     if !slot_rule.permits(positions.len()) {
-        return Err("candidate position count rejected by local rules".into());
+        return Err(CandidateError::SlotCount);
     }
     if timestamp <= state.median_time_past() {
-        return Err("candidate timestamp must exceed median time past".into());
+        return Err(CandidateError::Timestamp);
     }
-    let height = state
-        .height
-        .checked_add(1)
-        .ok_or("engineering block height exhausted")?;
+    let height = state.height.checked_add(1).ok_or(CandidateError::Height)?;
     let count = positions.len();
     let h = Hasher::new();
     positions
@@ -546,51 +653,51 @@ pub(crate) fn prepare_candidate_with_plan(
     let mut transactions = Vec::with_capacity(count);
     let mut total_fees = 0u64;
     for value in positions {
-        state.snapshot(value.transaction.record.snapshot)?;
+        state
+            .snapshot_checked(value.transaction.record.snapshot)
+            .map_err(CandidateError::Snapshot)?;
         if value.transaction.proof.is_empty()
             || value.transaction.proof.len() > crate::wire::MAX_TX_PROOF
         {
-            return Err("prepared transaction proof byte limit".into());
+            return Err(CandidateError::PositionProofSize);
         }
         let public = PublicTransaction::decode(&value.transaction.record.body)
-            .map_err(|_| "invalid prepared transaction public fields")?;
+            .map_err(|_| CandidateError::PositionPublicFields)?;
         for nf in public.nf {
             let nf = encode_digest(&nf);
             if state.spent.contains(&nf) || !spends.insert(nf) {
-                return Err("prepared position nullifier collision".into());
+                return Err(CandidateError::NullifierCollision);
             }
         }
         for cm in public.cm {
             let cm = encode_digest(&cm);
             if state.commitments.contains(&cm) || !commitments.insert(cm) {
-                return Err("prepared position output collision".into());
+                return Err(CandidateError::OutputCollision);
             }
         }
         if !identities.insert(value.transaction.record.statement_id(&state.config.network)) {
-            return Err("prepared position identity collision".into());
+            return Err(CandidateError::IdentityCollision);
         }
         let commitment = h.fee_commit(value.opening.fee, &value.opening.blind);
         if encode_digest(&commitment) != value.transaction.record.fee_commit {
-            return Err("prepared position opening mismatch".into());
+            return Err(CandidateError::OpeningMismatch);
         }
         // The transaction relation already checks its private anchored fee
         // schedule. Settlement consumes only the exact opening; reference-model
         // tier/classification flags must not reinterpret older valid proofs.
         total_fees = total_fees
             .checked_add(value.opening.fee)
-            .ok_or("prepared position fee sum overflows")?;
+            .ok_or(CandidateError::FeeSumOverflow)?;
         slots.push(SettlementSlot {
             commitment,
             opening: value.opening,
         });
         transactions.push(value.transaction);
     }
-    slots.extend(crate::state::tail_slots_for(
-        state.config.network,
-        height,
-        count,
-        slot_rule,
-    )?);
+    slots.extend(
+        crate::state::tail_slots_for(state.config.network, height, count, slot_rule)
+            .map_err(|_| CandidateError::SettlementTail)?,
+    );
     let reward = prepare_rewards_with_plan(state, total_fees, settings, &plan)?;
     let block = Block {
         network: state.config.network,
@@ -624,7 +731,7 @@ pub(crate) fn prepare_candidate_with_plan(
     };
     witness
         .check(&h)
-        .map_err(|_| "invalid prepared fee settlement")?;
+        .map_err(|error| CandidateError::Settlement(error.into()))?;
     Ok(PreparedCandidate {
         block,
         slot_rule,
@@ -892,6 +999,57 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn candidate_reports_snapshot_collision_and_opening_causes_before_proving() {
+        let state = State::new(Config::development([43; 32], 0).unwrap()).unwrap();
+        let origin = state.fingerprint();
+        let settings = settings(RewardMode::Voyager);
+        let prepare = |positions| {
+            prepare_candidate_with_plan(
+                &state,
+                positions,
+                state.timestamp() + 1,
+                &settings,
+                state.reward_plan(settings.mode).unwrap(),
+                crate::wire::SlotRule::PublicGenesis,
+            )
+            .err()
+            .expect("invalid candidate must be rejected before proving")
+        };
+
+        let mut positions = fee_positions(&state, &[0; 16]);
+        positions[0].transaction.record.snapshot.height += 1;
+        assert_eq!(
+            prepare(positions),
+            CandidateError::Snapshot(SnapshotError::OutOfRange)
+        );
+
+        let mut positions = fee_positions(&state, &[0; 16]);
+        positions[0].transaction.record.snapshot.block_id = [21; 32];
+        assert_eq!(
+            prepare(positions),
+            CandidateError::Snapshot(SnapshotError::NotCanonical)
+        );
+
+        let mut positions = fee_positions(&state, &[0; 16]);
+        let duplicate = positions[0].transaction.record.body;
+        positions[1].transaction.record.body[..48].copy_from_slice(&duplicate[..48]);
+        assert_eq!(prepare(positions), CandidateError::NullifierCollision);
+
+        let mut positions = fee_positions(&state, &[0; 16]);
+        positions[0].opening.fee = 1;
+        assert_eq!(prepare(positions), CandidateError::OpeningMismatch);
+
+        let mut positions = fee_positions(&state, &[0; 16]);
+        positions[1].opening.blind = positions[0].opening.blind;
+        positions[1].transaction.record.fee_commit = positions[0].transaction.record.fee_commit;
+        assert_eq!(
+            prepare(positions),
+            CandidateError::Settlement(SettlementFailure::DuplicateCommitment)
+        );
+        assert_eq!(state.fingerprint(), origin);
     }
 
     #[test]

@@ -27,11 +27,11 @@ rule (standard divisor, priority multiplier and miner recipient). The genesis
 identifier derives from that digest with context `siworld eng2 internal genesis v1`.
 
 The canonical genesis file begins with `SWE2GEN2` for the existing engineering
-rules or `SWE2POW3` for the public 16-slot rules. The `pow-16-v1` profile adds
-`slots:min16-step16-max576` to the immutable rules digest. The profile changes
-transaction slot admission and selects authenticated piece streaming. Both
-formats use the same proof-of-work and signed-checkpoint rules. The magic is
-followed by fee-mode byte zero,
+rules, `SWE2POW3` for public 16-slot rules, `SWE2POW4` for 16-slot rules with
+one-hour ASERT and checkpoint-fenced selection, or `SWE2POW5` for the latter
+rules with RandomX. The public slot rule also selects authenticated piece
+streaming. The first three formats retain sequential BLAKE3 work. The magic
+is followed by fee-mode byte zero,
 the 32-byte complete native proof-profile fingerprint, fixed-width native
 configuration, little-endian u32 governance length and canonical governance
 component. Governance bytes are bounded by 131,072. Decoding verifies the exact
@@ -116,7 +116,8 @@ separate public parameter preparation step. This tool never chooses them.
 
 Both commands require non-fixture ASERT rules with production economic timing,
 nonzero timestamp and target, canonical work selector zero, interval 300 and
-work iterations in 1 through 1,000,000. Ordinary transfer fees remain explicitly
+work iterations in 1 through 1,000,000 for BLAKE3, or zero for the fixed
+RandomX profile. Ordinary transfer fees remain explicitly
 `LegacyMiner`. The issuance fee owner must equal the actual governance fee
 owner, and the complete 1,232-byte fee destination must match R. Matching only
 the owner with a substituted encapsulation key is insufficient.
@@ -162,6 +163,18 @@ successful seal is not deployment, block admission, synchronization or proof
 of authority-key ownership. The standalone binary requires neither
 `eng2-runtime`, `native-p2p` nor `eng2-rehearsal`.
 
+## ASERT schedule
+
+| Genesis configuration | Target interval | ASERT half-life |
+| --- | ---: | ---: |
+| Rules revision 5 | 300 seconds | 14,400 seconds |
+| Rules revision 6 | 300 seconds | 3,600 seconds |
+
+The revision is authenticated by the genesis identity and its peer verifier
+binding. Initial target, timestamp and proof-of-work iterations still come
+from the genesis configuration. Existing genesis bytes keep their original
+schedule. The offline inspection report includes `parameters.asert_half_life_seconds`.
+
 ## Encoding public parameters
 
 `encode-public` prepares the two existing canonical inputs to `seal-public`:
@@ -179,7 +192,9 @@ roundtrips finish before directory creation. It contains `config-rules.bin` and
 Files and the directory are synchronized. A filesystem failure may leave a
 partial new directory; preserve and inspect it rather than overwriting it.
 
-The input object contains exactly the following fields. Uppercase names in this
+The one-hour profile adds the numeric field `asert_half_life_seconds: 3600`
+to the object below; omitting it selects the existing four-hour profile.
+The input object otherwise contains exactly the following fields. Uppercase names in this
 illustration stand for actual lowercase hexadecimal public encodings; the
 illustration is not an executable fixture.
 
@@ -224,13 +239,56 @@ check addresses, issuance limits, owner keys and the three nonzero distinct
 checkpoint keys. Public bytes and distinctness do not prove independent key
 custody or possession.
 
-This command deliberately selects the minimum initial nonfixture ASERT work:
-target bytes are all `ff`, iterations are one, the interval is 300 seconds and
-economic timing is production. Later targets follow the existing ASERT rule.
-Zero-iteration fixtures, other targets, intervals, work selectors, fee modes,
-thresholds and profiles are rejected. These input restrictions do not modify
-consensus validation or the runtime. The original sealer's known fixture-key
-check remains in effect.
+The BLAKE3 form uses the minimum initial nonfixture ASERT work: the target is
+32 bytes of `ff` and iterations are one. The RandomX form requires
+`asert_half_life_seconds: 3600`, `pow_iterations: 0`, and this exact
+`proof_of_work` object:
+
+```json
+{
+  "algorithm": "randomx-v1.2.1-siworld-v1",
+  "argon_salt_hex": "5349574f524c442f52616e646f6d582f4172676f6e53616c742f7631",
+  "seed_interval_blocks": 2048,
+  "seed_delay_blocks": 64
+}
+```
+
+It also requires an explicit nonzero 256-bit target, encoded as 32 bytes of
+lowercase hexadecimal in big-endian order. The encoder does not estimate hash
+rate or select a target. For either form the interval is 300 seconds, economic
+timing is production, and the sealer's known fixture-key check still applies.
+
+### RandomX header work
+
+RandomX uses the upstream 1.2.1 implementation with the 28-byte Argon2 salt
+`SIWORLD/RandomX/ArgonSalt/v1`. The salt changes the derived cache and dataset
+for the same input key; it does not prevent owners of general-purpose CPUs
+from switching mining software. Both the salt and the following derivation
+parameters are bound into the genesis rules.
+
+For a candidate at height `h >= 1`, the key-block height is
+`floor(max(h - 64, 0) / 2048) * 2048`. The key is BLAKE3 derive-key under
+`siworld eng2 randomx epoch key v1` over the genesis identifier, little-endian
+u64 key-block height, and the key-block identifier from that candidate's
+verified ancestry. At key-block height zero the identifier is the sealed genesis
+identifier. H2112 is the first height to use H2048. The interval amortizes
+dataset construction; the delay permits building the next dataset while
+mining on the current key. The running miner does not hash with the old key
+after activation. A missing ancestor or dataset delays work for that candidate.
+
+The hash input is the bytes `SIWORLD/RandomX/PoW/v1` followed by a zero byte,
+the existing 32-byte header work seed and the little-endian u64 nonce. The
+256-bit result is compared as big-endian and must be strictly below the
+header target. The block identifier is unchanged. Verification uses light
+mode; miners use per-worker fast-mode VMs. The two-entry miner dataset cache
+can require two fast datasets during rotation, besides verification caches
+and block assembly memory. Capacity must be measured on the deployed host.
+
+The retained proof profile closes over the existing AIR sources and resolved
+proof dependencies. Its v2 lock input retains the original node dependency
+ordering and excludes only the exact RandomX-only package and its node edge.
+This keeps existing proof frames and genesis decoding compatible without
+changing the retained proof relations.
 
 The encoder uses `Config::encode_rules` and
 `GovernanceState::canonical_component_bytes`, their existing decoders, genesis
