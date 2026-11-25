@@ -13,6 +13,7 @@ ROOT_FILES = {
     ".editorconfig", ".gitattributes", ".gitignore", "Cargo.toml", "Cargo.lock",
     "rust-toolchain.toml", "LICENSE", "NOTICE", "README.md", "CONTRIBUTING.md",
     "SECURITY.md", "CODE_OF_CONDUCT.md", "CHANGELOG.md", ".gitleaks.toml",
+    ".gitleaksignore",
 }
 DOCUMENTS = {
     "README.md",
