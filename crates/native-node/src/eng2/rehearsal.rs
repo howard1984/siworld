@@ -462,7 +462,9 @@ fn execute(
                     .prove(&prover)?
             } else {
                 if store.engine().state().governance().issuance_fee_atoms() != 5_000_000_000 {
-                    return Err("cancelled issuance proposal changed the active price".into());
+                    return Err(
+                        "cancelled issuance proposal changed the active issuance fee".into(),
+                    );
                 }
                 let mut issuer = libcrux_ml_dsa::ml_dsa_65::generate_key_pair(*derive(
                     seed.as_ref(),
