@@ -8,4 +8,4 @@
 - [ ] Consensus changes have tests written before the implementation.
 - [ ] No floating point on consensus paths; amounts are in atoms.
 - [ ] No new per-block public statistics and no user-linkable fields in logs or metrics.
-- [ ] Documentation is updated, and `docs/protocol.md` is respected.
+- [ ] Affected specifications and guides in `docs/README.md` are updated.

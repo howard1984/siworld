@@ -25,7 +25,7 @@ lcov.info
 /tmp/
 
 # Material outside the technical publication boundary
-/brand/
+/brand/*
 /website/
 /plans/
 /experiments/
@@ -43,3 +43,8 @@ lcov.info
 # Python test and validation bytecode
 __pycache__/
 *.py[cod]
+
+# Approved README logo assets
+!/brand/LICENSE
+!/brand/siworld-on-dark.png
+!/brand/siworld-on-light.png

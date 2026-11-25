@@ -123,8 +123,8 @@ class ProvenanceTests(unittest.TestCase):
     def test_archive_checksums_bind_provenance_to_exact_contents(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'docs').mkdir()
-            for name in ['LICENSE', 'NOTICE', 'docs/windows-native-miner.md']:
+            (root / 'docs/guides').mkdir(parents=True)
+            for name in ['LICENSE', 'NOTICE', 'docs/guides/mine-on-windows.md']:
                 (root / name).write_text('Technical test fixture\n', encoding='utf-8')
 
             builds = []
@@ -140,7 +140,7 @@ class ProvenanceTests(unittest.TestCase):
                 if command[:2] == ['rustc', '-vV']:
                     return f'rustc test\nhost: {builder.TARGET}\n'
                 if command[:2] == ['git', 'ls-files']:
-                    return b'LICENSE\0NOTICE\0docs/windows-native-miner.md\0'
+                    return b'LICENSE\0NOTICE\0docs/guides/mine-on-windows.md\0'
                 if command[:2] == ['cargo', 'tree']:
                     return 'siworld-miner-cli v0.1.0\n'
                 raise AssertionError(command)

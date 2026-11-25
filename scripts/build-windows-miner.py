@@ -85,7 +85,7 @@ def package(output, expected_commit):
     shutil.copy2(launcher_target / TARGET / 'release/siworld-miner.exe', folder)
     for name in ('LICENSE', 'NOTICE'):
         shutil.copy2(ROOT / name, folder / name)
-    shutil.copy2(ROOT / 'docs/windows-native-miner.md', folder / 'README.md')
+    shutil.copy2(ROOT / 'docs/guides/mine-on-windows.md', folder / 'README.md')
     pe_audit = {path.relative_to(folder).as_posix(): audit(path)
                 for path in sorted(folder.rglob('*.exe'))}
     (folder / 'pe-imports.json').write_text(json.dumps(pe_audit, indent=2) + '\n', encoding='utf-8')

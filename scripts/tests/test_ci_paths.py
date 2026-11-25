@@ -15,7 +15,7 @@ SPEC.loader.exec_module(PATHS)
 
 class PathSelectionTests(unittest.TestCase):
     def test_documentation_does_not_run_rust_workloads(self):
-        self.assertFalse(any(PATHS.select(['docs/architecture.md', 'README.md']).values()))
+        self.assertFalse(any(PATHS.select(['docs/specs/01-notes-and-state.md', 'README.md']).values()))
 
     def test_workflow_and_shared_build_changes_run_all_jobs(self):
         for path in ('Cargo.lock', '.github/workflows/ci.yml', '.cargo/config.toml'):

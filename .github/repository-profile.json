@@ -1,47 +1,44 @@
 {
   "version": 1,
-  "description": "Shielded multi-asset payments in Rust with native STARK proofs and confidential fees. V1 proof engineering freeze; node integration and independent review pending.",
+  "description": "Private by default. Post-quantum by design. Mined on everyday CPUs. Rust implementation of shielded multi-asset payments with native STARK proofs and RandomX proof of work.",
   "topics": [
     "rust",
-    "blockchain-research",
-    "shielded-transactions",
-    "multi-asset",
+    "blockchain",
+    "privacy",
+    "post-quantum-cryptography",
+    "zero-knowledge-proofs",
     "stark",
-    "zero-knowledge",
-    "plonky3",
-    "post-quantum-cryptography"
+    "randomx",
+    "proof-of-work",
+    "multi-asset"
   ],
   "pinned_repositories": [
     "howard1984/siworld"
   ],
   "navigation": [
     {
-      "label": "Protocol",
-      "path": "docs/protocol.md"
+      "label": "Documentation",
+      "path": "docs/README.md"
     },
     {
-      "label": "Proofs",
-      "path": "crates/bench-multi-asset/README.md"
+      "label": "Whitepaper",
+      "path": "docs/whitepaper.md"
     },
     {
-      "label": "Node and network",
-      "path": "docs/v1-node-network-plan.md"
+      "label": "Run a node",
+      "path": "docs/guides/run-a-node.md"
     },
     {
-      "label": "Operations",
-      "path": "docs/v1-deployment.md"
+      "label": "Mine on Linux",
+      "path": "docs/guides/mine-on-linux.md"
     },
     {
-      "label": "Security",
-      "path": "docs/security-model.md"
+      "label": "Exchange integration",
+      "path": "docs/guides/exchange-integration.md"
     },
     {
-      "label": "Legacy",
-      "path": "docs/legacy/README.md"
-    },
-    {
-      "label": "V2 research",
-      "path": "docs/v2/README.md"
+      "label": "Security model",
+      "path": "docs/security/security-model.md"
     }
   ]
 }

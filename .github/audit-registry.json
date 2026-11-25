@@ -6,7 +6,7 @@
       "id": "proof-composition",
       "area": "proofs",
       "status": "planned",
-      "scope": "Native D8 multi-asset transaction, fixed-supply issuance and confidential-fee settlement AIRs; pinned D8/W24 dependency changes; random-codeword PCS; challenger and MMCS geometry; source, suite and public verifier artifacts; enforced query/batch grinding; two-worker hiding and RNG use; ciphertext/fee binding; bounded decoding and canonical snapshot admission. Recursive application aggregation is separate paused V2 research. Revised input unlock-height constraints tied to canonical snapshot heights; mode-dependent one/five SIP reward notes, private-fee addition and complete commitments; fresh actual-AIR screening and public-key reproduction after the economic revision.",
+      "scope": "Native transfer, issuance, and confidential settlement relations; pinned proof dependencies; polynomial commitments, transcript binding, grinding, hiding randomness, ciphertext and fee binding, and bounded proof decoding.",
       "excluded": [
         "unmodified upstream Plonky3",
         "unmodified upstream Plonky3-recursion"
@@ -17,10 +17,10 @@
         "crates/bench-stark/plonky3",
         "crates/bench-d8",
         "crates/bench-stark/patches/recursion-d8-w24.patch",
-        "docs/bht-security-accounting.md",
-        "docs/d8-dependency-patch.md",
         "crates/bench-multi-asset",
-        "crates/bench-multi-asset/artifacts/v1-transaction-profile.json"
+        "crates/bench-multi-asset/artifacts/v1-transaction-profile.json",
+        "docs/specs/03-proof-system.md",
+        "docs/specs/04-blocks-and-fees.md"
       ],
       "report": null,
       "accepted_commit": null,
@@ -30,7 +30,7 @@
       "id": "hash-and-consensus",
       "area": "consensus",
       "status": "planned",
-      "scope": "SIWORLD Poseidon2 instances, BLAKE3 consensus hashes, ASERT, proof-of-work and cumulative-work fork choice. Shared native issuance and rounding, Voyager/Holder allocation, Holder pool deposits/claims, cumulative burn and supply conservation, per-credit 1,461-day fund vesting, authenticated expenditures and atomic economic reorganization rollback. Economic rule version 3 claims the pre-block Holder pool before current-block credits; 24-wallet disposable engineering genesis and immutable per-wallet main-network allocation boundaries.",
+      "scope": "Poseidon2 and BLAKE3 uses, RandomX work and ASERT, accumulated-work selection, checkpoint finality, and execution state commitments. Subsidy rounding, Holder pool ordering, fund vesting, claims, supply conservation, and atomic branch reversal.",
       "excluded": [
         "unmodified upstream BLAKE3",
         "unmodified upstream Poseidon2 reference code"
@@ -41,7 +41,9 @@
         "crates/state",
         "crates/core/src/v1_economics.rs",
         "crates/native-node",
-        "docs/v1-economics.md"
+        "crates/core/src/pow.rs",
+        "docs/specs/05-consensus.md",
+        "docs/specs/06-monetary-policy.md"
       ],
       "report": null,
       "accepted_commit": null,
@@ -51,7 +53,7 @@
       "id": "post-quantum-integration",
       "area": "cryptography",
       "status": "planned",
-      "scope": "SIWORLD integration of ML-KEM-768, ML-DSA-65, sender output self-checks, selective payment receipts, genuine padding encryption, key lifecycle, encoding, authorization and downgrade boundaries. Note lock ciphertext recovery, denomination-only source renaming with preserved address/serialization domains, and off-chain threshold backup/custody boundaries; V1 does not implement consensus multisignature. Offline fund-key seed custody, bounded Argon2id/XChaCha20 vaults, public-only key submissions and verified encrypted backups; native mnemonic entropy semantics, exclusive wallet ownership, encrypted reservations and retained payment openings, restart/reorganization reconciliation and external threshold-backup procedures.",
+      "scope": "ML-KEM-768 and ML-DSA-65 integration, ciphertext binding, selective receipts, address verification, key lifecycle and encrypted wallet storage, offline fund key custody, and wallet reconciliation.",
       "excluded": [
         "unmodified upstream ML-KEM",
         "unmodified upstream ML-DSA"
@@ -59,7 +61,6 @@
       "implementation_paths": [
         "crates/crypto",
         "crates/node",
-        "docs/protocol.md",
         "crates/bench-d8/src/encryption.rs",
         "crates/bench-multi-asset/src/encryption.rs",
         "crates/bench-multi-asset/src/issuance.rs",
@@ -67,8 +68,9 @@
         "crates/native-node/src/wallet_vault.rs",
         "crates/native-node/src/wallet_vault",
         "crates/native-node/src/wallet_cli.rs",
-        "docs/v1-offline-fund-keys.md",
-        "docs/v1-wallet-storage.md"
+        "docs/specs/02-transactions.md",
+        "docs/specs/09-addresses-and-wallets.md",
+        "docs/security/security-model.md"
       ],
       "report": null,
       "accepted_commit": null,
@@ -78,22 +80,20 @@
       "id": "transport-and-worker-boundary",
       "area": "network",
       "status": "planned",
-      "scope": "Legacy miner/worker authentication and retry/resource boundaries, distinct from planned native V1 transcript-bound hybrid peer identities, X25519 plus ML-KEM transport and Dandelion++ source relay. No external review engagement or completed report is represented. Native dual-signed Ed25519/ML-DSA-65 descriptors and immutable trusted pins, no-follow service-credential persistence, explicit connection roles, continuous admission deadlines, proposed maintained TLS hybrid profile, exporter-bound dual authentication and no-fallback/no-keylogging requirements. Production provider activation and independent-host tests remain separate pending gates.",
+      "scope": "Peer identity, pinning, encrypted transport, command roles, admission bounds, and the worker interface's authentication and resource boundaries.",
       "excluded": [
         "unmodified libp2p transport implementation"
       ],
       "implementation_paths": [
         "crates/node/src/miner_protocol.rs",
         "crates/node/src/p2p.rs",
-        "docs/legacy/worker-control.md",
         "crates/node/src/worker_transport.rs",
         "crates/node/tests/worker_listener.rs",
-        "docs/v1-network-design.md",
         "crates/native-node/src/identity.rs",
         "crates/native-node/src/identity",
         "crates/native-node/src/p2p.rs",
-        "docs/v1-native-identity.md",
-        "docs/v1-hybrid-handshake.md"
+        "docs/specs/08-p2p-network.md",
+        "docs/specs/10-rpc.md"
       ],
       "report": null,
       "accepted_commit": null,
@@ -103,15 +103,15 @@
       "id": "operations-and-memory",
       "area": "operations",
       "status": "planned",
-      "scope": "Memory measurement acceptance ceilings, missing-data rejection and process resource measurement.",
+      "scope": "Memory measurement ceilings, missing-data rejection, and process resource measurement.",
       "excluded": [
         "host kernel and Docker VM behavior"
       ],
       "implementation_paths": [
         "tools/control-panel/memory_trend.py",
-        "docs/memory-budgets.md",
         "scripts/measure-native-cgroup.py",
-        "scripts/tests/fixtures/retired-workflows/d8-native-cgroup.yml"
+        "scripts/tests/fixtures/retired-workflows/d8-native-cgroup.yml",
+        "docs/guides/run-a-node.md"
       ],
       "report": null,
       "accepted_commit": null,

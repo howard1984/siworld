@@ -6,7 +6,7 @@ body:
     id: section
     attributes:
       label: Document and section
-      description: For example, docs/protocol.md, block validity rules.
+      description: For example, docs/specs/04-blocks-and-fees.md, Header and body.
     validations:
       required: true
   - type: textarea

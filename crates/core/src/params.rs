@@ -57,7 +57,7 @@ pub const CONTAINER_SIZE_INIT: u32 = 32;
 pub const CONTAINER_SIZE_STEPS: [u32; 4] = [16, 32, 64, 128];
 
 /// The two development-fund accounts' ML-DSA-65 verifying keys, fixed at
-/// genesis (docs/protocol.md, Economics). Each signs that account's payouts.
+/// genesis. Each key authorizes payouts from its corresponding account.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DevFundKeys {
     pub direct: [u8; VERIFYING_KEY_LEN],
@@ -108,16 +108,14 @@ pub struct ChainParams {
     pub proofs: ProofSystemKind,
     /// Names the chain in everything signed off chain for it (development-fund
     /// payouts), so that a signature for one network is not valid on another
-    /// that happens to share a key. A testnet uses its genesis id; the
-    /// mainnet value is fixed at launch (docs/development.md, release criteria).
+    /// that happens to share a key. The chain configuration fixes this identifier.
     pub chain_id: crate::types::Digest,
-    /// Slots per block, N; must be a power of two. The per-epoch demand
-    /// metric for adjusting it is open (docs/security-model.md); fixed for now.
+    /// Fixed slots per block in this container format. Must be a power of two.
     pub container_size: u32,
-    /// Commitment-tree depth D (40 on mainnet, docs/protocol.md).
+    /// Commitment-tree depth; the default chain profile uses depth 40.
     pub commitment_tree_depth: u8,
     /// Recent-roots window W, a power of two: the number of blocks whose
-    /// commitment-tree roots 𝒜 keeps (RECENT_ROOTS_WINDOW in docs/protocol.md).
+    /// commitment-tree roots 𝒜 keeps.
     pub anchor_window: u32,
     /// Sequential BLAKE3 hashes per nonce.
     pub pow_iterations: u64,
@@ -130,11 +128,10 @@ pub struct ChainParams {
     /// [`ChainParams::mainnet`] leaves it at 0, a placeholder: ASERT measures
     /// every block against it, so a chain launched with 0 is decades behind
     /// schedule and its target is the ceiling from block 2 (no work at all).
-    /// Setting it is a mainnet launch item (docs/development.md, release criteria).
+    /// A network configuration must supply its genesis timestamp.
     pub genesis_timestamp: u64,
     /// The development-fund accounts' verifying keys. `None` means the fund
-    /// cannot pay out: every payout is invalid. Setting them is a mainnet
-    /// launch item (docs/development.md, release criteria).
+    /// cannot pay out: every payout is invalid.
     pub dev_fund_keys: Option<DevFundKeys>,
 }
 

@@ -31,6 +31,25 @@ class RepositoryManifestTests(unittest.TestCase):
         ):
             self.assertFalse(repository.allowed(Path("tools/explorer") / name))
 
+    def test_local_links_check_images_fragments_and_index_membership(self):
+        path = ROOT / "README.md"
+        names = {"docs/README.md", "brand/siworld-on-light.png"}
+        body = """
+[Specifications](docs/README.md#protocol-specifications)
+[Missing heading](docs/README.md#missing-heading)
+<img src="brand/siworld-on-light.png">
+<source srcset="brand/missing.png 2x">
+```text
+[Example](example-only.md)
+```
+"""
+        errors = []
+        repository.check_links(path, body, names, errors)
+        self.assertEqual(errors, [
+            "Missing heading anchor in README.md: docs/README.md#missing-heading",
+            "Missing publication target in README.md: brand/missing.png",
+        ])
+
     def test_wallet_text_assets_are_exactly_scoped(self):
         for name in repository.PUBLIC_TEXT_ASSETS:
             self.assertTrue(repository.allowed(Path(name)))
