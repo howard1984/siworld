@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('multi_asset_measurement', ROOT / 'scripts/measure-multi-asset.py')
+SPEC = importlib.util.spec_from_file_location('multi_asset_measurement', ROOT / 'scripts/bench/measure-multi-asset.py')
 M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
 
@@ -273,8 +273,8 @@ class MultiAssetMeasurementTests(unittest.TestCase):
         self.assertIn('--scope', command)
         self.assertIn('MemoryMax=5G', command)
         self.assertIn('MemorySwapMax=0', command)
-        self.assertIn(str(ROOT / 'scripts/measure-multi-asset.py'), command)
-        self.assertNotIn(str(ROOT / 'scripts/measure-native-cgroup.py'), command)
+        self.assertIn(str(ROOT / 'scripts/bench/measure-multi-asset.py'), command)
+        self.assertNotIn(str(ROOT / 'scripts/bench/measure-native-cgroup.py'), command)
         child = M.child_command({**config(), 'executable': '/synthetic/worker', 'private_output': '/synthetic/raw'})
         self.assertEqual(child[1:6], ['transaction', '8', '36', '20', '4'])
 

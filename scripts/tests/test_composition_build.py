@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('composition_build',
-    Path(__file__).parents[1] / 'build-composition-intra.py')
+    Path(__file__).parents[1] / 'bench/build-composition-intra.py')
 BUILD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BUILD)
 CONFIG = {'target': {'cfg(target_arch = "x86_64")': {'rustflags': BUILD.V3_FLAGS}}}

@@ -7,10 +7,10 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location("audit_registry", ROOT / "scripts/check-audit-registry.py")
+spec = importlib.util.spec_from_file_location("audit_registry", ROOT / "scripts/ci/check-audit-registry.py")
 audit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(audit)
-repository_spec = importlib.util.spec_from_file_location("repository_manifest", ROOT / "scripts/check-repository.py")
+repository_spec = importlib.util.spec_from_file_location("repository_manifest", ROOT / "scripts/ci/check-repository.py")
 repository = importlib.util.module_from_spec(repository_spec)
 repository_spec.loader.exec_module(repository)
 
@@ -72,7 +72,7 @@ class RepositoryManifestTests(unittest.TestCase):
             "crates/bench-stark/Cargo.toml",
             "crates/bench-stark/common/src/lib.rs",
             "crates/bench-stark/plonky3/src/lib.rs",
-            "crates/bench-d8/src/common.rs",
+            "crates/native-proof/src/common.rs",
             "crates/bench-multi-asset/src/multi_asset_air.rs",
         ):
             with self.subTest(path=name):

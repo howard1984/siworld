@@ -17,8 +17,8 @@ def module(name, filename):
     return value
 
 
-BUILD = module('release_build', 'build-prover-release.py')
-ISA = module('release_isa', 'check-prover-isa.py')
+BUILD = module('release_build', 'bench/build-prover-release.py')
+ISA = module('release_isa', 'bench/check-prover-isa.py')
 
 
 class ReleaseBuildTests(unittest.TestCase):
@@ -91,7 +91,7 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_native_d8_workers_require_inspected_avx2_packages(self):
-        launcher = (ROOT / "scripts/prover-launcher.rs").read_text()
+        launcher = (ROOT / "scripts/bench/prover-launcher.rs").read_text()
         for name in ("v1-transaction-scan", "fee-settlement-bench"):
             with self.subTest(name=name):
                 self.assertIn(name, BUILD.PROOF_WORKERS)

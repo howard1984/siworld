@@ -27,8 +27,8 @@ new or changed interfaces.
 From the repository root, run the publication and audit checks:
 
 ```sh
-python3 scripts/check-repository.py
-python3 scripts/check-audit-registry.py
+python3 scripts/ci/check-repository.py
+python3 scripts/ci/check-audit-registry.py
 git diff --check
 ```
 

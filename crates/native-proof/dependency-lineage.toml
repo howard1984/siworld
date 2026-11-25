@@ -1,0 +1,19 @@
+schema = 1
+version = "d8-w24-review-v1"
+source_mode = "fixed-fork-revision"
+source_url = "https://github.com/howard1984/siworld"
+source_revision = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+upstream_url = "https://github.com/Plonky3/Plonky3-recursion"
+base_revision = "3a69ba61f713c8400b14eb3d8f0e52caa13512c7"
+upstream_review_revision = "cb50fe9bb2dcd76fc7de1b71d0cd3f099eb235db"
+upstream_review_tree = "e57b72819dbb2a27b5b20cb5b035f3f664e06c3a"
+downstream_revision = "d3d15b2b5d1325fb38ebc8979c1cae04b761e71f"
+downstream_tree = "11f7507a135f825a2ba6c790b9ad6d50a4e40b81"
+patch_file = "crates/bench-stark/patches/recursive-stark-width-24.patch"
+patch_sha256 = "78cc3dc553120147bd3b87371533a3769beed2e62ec034bff5a6378528007c3d"
+suite = "KoalaBear-D8-Poseidon2-W24-digest12"
+
+# Cargo consumes the exact fork revision directly. The patch is a separately
+# checked upstream-base-to-downstream audit archive and is not reapplied.
+# The downstream revision additionally retains the bounded application worker
+# override; the upstream review revision uses the neutral worker policy API.

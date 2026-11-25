@@ -1,4 +1,4 @@
-//! Bounded decoder for the fixed native D8/W24 engineering proof profiles.
+//! Bounded decoder for the fixed native D8/W24 proof profiles.
 //!
 //! Derived from the frozen native admission decoder without changing its
 //! proof schema. This adapter selects a local per-relation body limit.

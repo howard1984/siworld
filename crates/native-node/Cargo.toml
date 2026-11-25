@@ -9,7 +9,7 @@ edition = "2024"
 publish = false
 license = "GPL-3.0-only"
 repository = "https://github.com/howard1984/siworld"
-description = "Native V1 engineering chain and network interfaces"
+description = "Native chain and network interfaces"
 
 [features]
 # Equivalent Rust-only BLAKE3 implementation for cross-target type checks.
@@ -36,17 +36,25 @@ eng2-runtime = ["native-p2p"]
 
 [[bin]]
 name = "siworld-eng2-genesis"
-path = "src/bin/siworld-eng2-genesis.rs"
+path = "src/bin/siworld-native-genesis.rs"
 
 [[bin]]
 name = "siworld-eng2-node"
-path = "src/bin/siworld-eng2-node.rs"
+path = "src/bin/siworld-native-node.rs"
 required-features = ["eng2-runtime"]
 
 [[bin]]
 name = "siworld-eng2-rehearsal"
-path = "src/bin/siworld-eng2-rehearsal.rs"
+path = "src/bin/siworld-native-rehearsal.rs"
 required-features = ["eng2-rehearsal"]
+
+[[bin]]
+name = "siworld-eng2-materials"
+path = "src/bin/siworld-native-materials.rs"
+
+[[bin]]
+name = "siworld-eng2-operations"
+path = "src/bin/siworld-native-operations.rs"
 
 [[bin]]
 name = "siworld-checkpoint-stale-runtime"

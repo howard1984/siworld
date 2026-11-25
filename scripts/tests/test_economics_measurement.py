@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('economics_measurement', ROOT / 'scripts/measure-multi-asset.py')
+SPEC = importlib.util.spec_from_file_location('economics_measurement', ROOT / 'scripts/bench/measure-multi-asset.py')
 M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
 

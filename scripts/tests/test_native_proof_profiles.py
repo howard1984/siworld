@@ -6,7 +6,7 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('native_proof_profiles', ROOT / 'scripts/check-native-proof-profiles.py')
+SPEC = importlib.util.spec_from_file_location('native_proof_profiles', ROOT / 'scripts/ci/check-native-proof-profiles.py')
 PROFILES = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROFILES)
 
@@ -31,7 +31,7 @@ class NativeProofProfileTests(unittest.TestCase):
             lambda p: p.update(cryptographic_approval=True),
             lambda p: p.update(node_integration=True),
             lambda p: p.update(transaction_profile_sha256='0' * 64),
-            lambda p: p['tool_source_sha256'].update({'scripts/native-proof-artifacts.rs': '0' * 64}),
+            lambda p: p['tool_source_sha256'].update({PROFILES.PROVENANCE.canonical_path(PROFILES.TOOLS[1]): '0' * 64}),
             lambda p: p['relations'].pop(),
             lambda p: p['relations'][1].update(capacity=575),
             lambda p: p['relations'][2]['parameters'].update(num_queries=35),

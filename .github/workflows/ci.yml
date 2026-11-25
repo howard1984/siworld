@@ -38,8 +38,8 @@ jobs:
           persist-credentials: false
       - name: Select changed paths
         id: paths
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: python3 scripts/ci-paths.py '${{ github.event.pull_request.base.sha }}' '${{ github.event.pull_request.head.sha }}'
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
+        run: python3 scripts/ci/select-checks.py '${{ github.event.pull_request.base.sha }}' '${{ github.event.pull_request.head.sha }}'
 
   native-economic-accounting:
     needs: changes
@@ -56,9 +56,9 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh native-economic-accounting
+        run: bash scripts/ci/fetch-dependencies.sh native-economic-accounting
       - name: Monetary transition and rejection tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo test --release --locked -p siworld-core v1_economics::tests::
   offline-fund-keys:
@@ -78,14 +78,14 @@ jobs:
           workspaces: crates/fund-keytool
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh offline-fund-keys
+        run: bash scripts/ci/fetch-dependencies.sh offline-fund-keys
       - name: Format and lint isolated custody tool
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo fmt --manifest-path crates/fund-keytool/Cargo.toml --check
           cargo clippy --release --locked --manifest-path crates/fund-keytool/Cargo.toml --all-targets -- -D warnings
       - name: Synthetic custody, backup and malformed-file tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo test --release --locked --manifest-path crates/fund-keytool/Cargo.toml
   secrets:
     name: Sensitive information and history
@@ -110,7 +110,7 @@ jobs:
           mkdir /tmp/siworld-scanner
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp/siworld-scanner gitleaks
       - name: Scan reachable history with redacted findings
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
           /tmp/siworld-scanner/gitleaks git . --log-opts='--all --full-history' \
             --config=.gitleaks.toml --redact=100 --no-banner
@@ -123,14 +123,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Publication manifest and documentation
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
-          python3 scripts/check-ci-policy.py
-          python3 scripts/check-repository.py
-          python3 scripts/check-audit-registry.py
+          python3 scripts/ci/check-ci-policy.py
+          python3 scripts/ci/check-repository.py
+          python3 scripts/ci/check-audit-registry.py
           python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - name: Explorer projection
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: node --test tools/explorer/tests/projection.test.mjs
   workspace:
     needs: changes
@@ -147,24 +147,24 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh workspace
+        run: bash scripts/ci/fetch-dependencies.sh workspace
       - name: Format
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo fmt --all --check
       - name: Default feature isolation
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: python3 scripts/check-node-features.py
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
+        run: python3 scripts/ci/check-node-features.py
       - name: Default binaries
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo check -p siworld-node --bins --locked
       - name: Default proof selection
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo test -p siworld-node --bin siworld-node --locked
       - name: Clippy
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo test --workspace --all-features --locked
 
   bench-plonky3:
@@ -187,12 +187,12 @@ jobs:
           workspaces: crates/bench-stark
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh bench-plonky3
+        run: bash scripts/ci/fetch-dependencies.sh bench-plonky3
       - name: Format
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo fmt --all --check
       - name: Tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo test --release --locked -p siworld-bench-plonky3 -p siworld-bench-common
   native-transaction:
     needs: changes
@@ -209,13 +209,13 @@ jobs:
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh native-transaction
+        run: bash scripts/ci/fetch-dependencies.sh native-transaction
       - name: Native proof and codec tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
-          cargo fmt --manifest-path crates/bench-d8/Cargo.toml --all --check
-          cargo clippy --release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report --lib --tests -- -D warnings
-          native_proof=(--release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report)
+          cargo fmt --manifest-path crates/native-proof/Cargo.toml --all --check
+          cargo clippy --release --locked --manifest-path crates/native-proof/Cargo.toml --features security-report --lib --tests -- -D warnings
+          native_proof=(--release --locked --manifest-path crates/native-proof/Cargo.toml --features security-report)
           for relation in transaction encryption fee_settlement fee_settlement_air proof_codec common envelope padding_pool native_verifier native_security; do
             cargo test "${native_proof[@]}" --lib "$relation::tests"
           done
@@ -223,7 +223,7 @@ jobs:
           cargo test "${native_proof[@]}" --test snapshots
           cargo test "${native_proof[@]}" --lib proof_codec::tests::candidate_profile_roundtrips_the_actual_transaction_air -- --ignored
           cargo test "${native_proof[@]}" --bin v1-transaction-scan --bin native-verifier-bench
-          python3 scripts/check-v1-freeze.py
+          python3 scripts/ci/check-transaction-proof-profile.py
   native-multi-asset:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_multi_asset == 'true') }}
@@ -245,14 +245,14 @@ jobs:
           workspaces: crates/bench-multi-asset -> ../../.local/multi-asset-ci-target
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh native-multi-asset
+        run: bash scripts/ci/fetch-dependencies.sh native-multi-asset
       - name: Native proof and public codec tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo fmt --manifest-path crates/bench-multi-asset/Cargo.toml --check
           cargo clippy --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --lib --tests -- -D warnings
           cargo test --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --lib --test public_codec_rejections
-          python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json
+          python3 scripts/ci/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json
   native-runtime:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_runtime == 'true') }}
@@ -273,14 +273,14 @@ jobs:
           workspaces: crates/native-node
       - name: Acquire locked dependencies
         working-directory: .
-        run: bash scripts/ci-fetch.sh native-runtime
+        run: bash scripts/ci/fetch-dependencies.sh native-runtime
       - name: Native runtime format and lints
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo fmt --manifest-path crates/native-node/Cargo.toml --check
           cargo clippy --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway --all-targets -- -D warnings
       - name: Native protocol, transition, persistence and audit rejection tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway
   wallet:
     needs: changes
@@ -299,9 +299,9 @@ jobs:
           rustup run "$toolchain" cargo install --locked --version 0.2.120 wasm-bindgen-cli --bin wasm-bindgen --root "$HOME/.local/siworld-wasm-bindgen"
           echo "$HOME/.local/siworld-wasm-bindgen/bin" >> "$GITHUB_PATH"
       - name: Acquire locked dependencies
-        run: bash scripts/ci-fetch.sh wallet
+        run: bash scripts/ci/fetch-dependencies.sh wallet
       - name: Wallet unit and browser tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci/run-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo test --locked --manifest-path crates/native-wallet-core/Cargo.toml
           mkdir -p .local/wallet-ci-fixtures

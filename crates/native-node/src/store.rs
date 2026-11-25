@@ -30,6 +30,7 @@ const HEAD_BYTES: usize = 72;
 const FINGERPRINT_BYTES: usize = 32;
 mod checkpoint;
 pub mod checkpoint_bootstrap;
+#[path = "store/compatibility_checkpoint.rs"]
 pub mod engineering_checkpoint;
 mod miner_view;
 pub(super) mod protected_history;

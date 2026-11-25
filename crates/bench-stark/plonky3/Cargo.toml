@@ -52,5 +52,5 @@ required-features = ["experimental-fanin", "phase-profile"]
 
 [[bin]]
 name = "d8-security-screen"
-path = "src/bin/d8_security_screen.rs"
+path = "src/bin/recursive_security_screen.rs"
 required-features = ["security-report"]

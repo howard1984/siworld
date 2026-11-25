@@ -61,7 +61,9 @@ See [Contributing](CONTRIBUTING.md#validation) for test and lint commands.
 | [`crates/bench-multi-asset/`](crates/bench-multi-asset/) | Native transaction, issuance, and settlement proof relations |
 | [`crates/native-wallet-engine/`](crates/native-wallet-engine/) | Wallet state, transaction construction, and light verification |
 | [`docs/`](docs/README.md) | Whitepaper, specifications, operator guides, and parameter reference |
-| [`scripts/`](scripts/) | Validation and reproducible build support |
+| [`crates/native-proof/`](crates/native-proof/) | Native proof building blocks and recursive proof benchmarks |
+| [`scripts/ci/`](scripts/ci/) | Offline validation and check selection |
+| [`scripts/bench/`](scripts/bench/) | Benchmark and proof reproduction tools |
 | [`tools/explorer/`](tools/explorer/) | Read-only chain explorer |
 
 ## Public network

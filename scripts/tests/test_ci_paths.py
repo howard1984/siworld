@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('paths', ROOT / 'scripts/ci-paths.py')
+SPEC = importlib.util.spec_from_file_location('paths', ROOT / 'scripts/ci/select-checks.py')
 PATHS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PATHS)
 

@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('revised_native_profiles', ROOT / 'scripts/check-native-proof-profiles.py')
+SPEC = importlib.util.spec_from_file_location('revised_native_profiles', ROOT / 'scripts/ci/check-native-proof-profiles.py')
 P = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(P)
 SPEC = importlib.util.spec_from_file_location('native_measurement_fixtures', ROOT / 'scripts/tests/test_multi_asset_measurement.py')
@@ -124,7 +124,7 @@ class EconomicNativeProfileTests(unittest.TestCase):
             lambda p: p.update(relation_revision='native-v1-economics-2'),
             lambda p: p.update(transaction_profile_sha256='0' * 64),
             lambda p: p.update(verification_only_process=True),
-            lambda p: p['tool_source_sha256'].update({P.TOOLS[0]: '0' * 64}),
+            lambda p: p['tool_source_sha256'].update({P.PROVENANCE.canonical_path(P.TOOLS[0]): '0' * 64}),
             lambda p: p['relations'][1].update(capacity=575),
             lambda p: p['relations'][0]['parameters'].update(log_blowup=7),
             lambda p: p['relations'][0]['security']['shape'].update(main_width=1420),

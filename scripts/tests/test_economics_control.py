@@ -13,7 +13,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('control_freeze_fixtures',
-    ROOT / 'scripts/tests/test_economics_freeze.py')
+    ROOT / 'scripts/tests/test_monetary_proof_profile.py')
 FIXTURE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(FIXTURE)
 F = FIXTURE.F
@@ -67,7 +67,7 @@ class EconomicsControlTests(unittest.TestCase):
             F.HARDWARE.qualify_hardware_profile(hardware, 'epyc9v45-control')
 
     def workflow(self):
-        return (ROOT / 'scripts/tests/fixtures/retired-workflows/v1-economics.yml').read_text()
+        return (ROOT / 'scripts/tests/fixtures/source-provenance/monetary-proof-workflow.txt').read_text()
 
     def test_workflow_requires_baseline_on_pr_and_gates_selected_key_exports(self):
         workflow = self.workflow()

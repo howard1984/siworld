@@ -15,8 +15,8 @@
         "crates/circuits",
         "crates/prover",
         "crates/bench-stark/plonky3",
-        "crates/bench-d8",
-        "crates/bench-stark/patches/recursion-d8-w24.patch",
+        "crates/native-proof",
+        "crates/bench-stark/patches/recursive-stark-width-24.patch",
         "crates/bench-multi-asset",
         "crates/bench-multi-asset/artifacts/v1-transaction-profile.json",
         "docs/specs/03-proof-system.md",
@@ -61,7 +61,7 @@
       "implementation_paths": [
         "crates/crypto",
         "crates/node",
-        "crates/bench-d8/src/encryption.rs",
+        "crates/native-proof/src/encryption.rs",
         "crates/bench-multi-asset/src/encryption.rs",
         "crates/bench-multi-asset/src/issuance.rs",
         "crates/fund-keytool",
@@ -108,8 +108,8 @@
         "host kernel and Docker VM behavior"
       ],
       "implementation_paths": [
-        "scripts/measure-native-cgroup.py",
-        "scripts/tests/fixtures/retired-workflows/d8-native-cgroup.yml",
+        "scripts/bench/measure-native-cgroup.py",
+        "scripts/tests/fixtures/source-provenance/recursive-proof-workflow.txt",
         "docs/guides/run-a-node.md"
       ],
       "report": null,

@@ -9,6 +9,7 @@
 pub mod agg;
 pub mod air;
 #[cfg(feature = "d8-geometry")]
+#[path = "extension_geometry.rs"]
 pub mod d8_geometry;
 #[cfg(feature = "phase-profile")]
 pub mod profile;

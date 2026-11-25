@@ -1,4 +1,4 @@
-//! Native V1 engineering chain and network interfaces, separate from the retained node.
+//! Native chain and network interfaces.
 #![forbid(unsafe_code)]
 
 pub(crate) mod chain_transition;
@@ -9,17 +9,27 @@ pub mod checkpoint_rejection_acceptance;
 pub(crate) mod checkpoint_service;
 #[cfg(all(feature = "native-p2p", feature = "checkpoint-stale-acceptance", unix))]
 pub mod checkpoint_stale_runtime;
+#[path = "chain_runtime/mod.rs"]
 pub mod eng2;
 pub(crate) use eng2::header as wallet_eng2_header;
+#[path = "chain_economics.rs"]
 pub mod eng2_economics;
+#[path = "chain_fund/mod.rs"]
 pub mod eng2_fund;
+#[path = "chain_governance/mod.rs"]
 pub mod eng2_governance;
 #[cfg(unix)]
+#[path = "chain_materials/mod.rs"]
 pub mod eng2_materials;
+#[path = "chain_operations/mod.rs"]
 pub mod eng2_operations;
+#[path = "chain_settlement.rs"]
 pub mod eng2_settlement;
+#[path = "chain_settlement_air.rs"]
 pub mod eng2_settlement_air;
+#[path = "compatibility_checkpoint/mod.rs"]
 pub mod engineering_checkpoint;
+#[path = "compatibility_genesis.rs"]
 pub mod engineering_genesis;
 pub mod fund_spend;
 pub mod issuance;

@@ -50,7 +50,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-native_base = { package = "siworld-d8-checkpoint-experiment", path = "../bench-d8", default-features = false }
+native_base = { package = "siworld-native-proof", path = "../native-proof", default-features = false }
 libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["mldsa65"] }
 p3-air.workspace = true
 p3-field.workspace = true

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-SPEC = importlib.util.spec_from_file_location('fund_simulation', ROOT / 'scripts/check-fund-simulation.py')
+SPEC = importlib.util.spec_from_file_location('fund_simulation', ROOT / 'scripts/ci/check-fund-simulation.py')
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 

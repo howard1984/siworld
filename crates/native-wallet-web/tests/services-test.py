@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-spec=importlib.util.spec_from_file_location('services',Path(__file__).parents[1]/'tools/engineering-services.py')
+spec=importlib.util.spec_from_file_location('services',Path(__file__).parents[1]/'tools/loopback-services.py')
 m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 
 class VaultTests(unittest.TestCase):

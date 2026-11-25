@@ -2858,7 +2858,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "siworld-d8-checkpoint-experiment"
+name = "siworld-native-proof"
 version = "0.0.0"
 dependencies = [
  "blake3",
@@ -2944,7 +2944,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "siworld-d8-checkpoint-experiment",
+ "siworld-native-proof",
  "zeroize",
 ]
 

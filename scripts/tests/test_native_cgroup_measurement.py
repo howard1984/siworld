@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location('native_cgroup',
-    Path(__file__).parents[1] / 'measure-native-cgroup.py')
+    Path(__file__).parents[1] / 'bench/measure-native-cgroup.py')
 CG = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CG)
 

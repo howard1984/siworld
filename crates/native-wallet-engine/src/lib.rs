@@ -38,12 +38,14 @@ pub mod local {
 }
 pub mod commitment;
 pub mod compact;
+#[path = "chain_history.rs"]
 pub mod eng2_history;
+#[path = "chain_light.rs"]
 pub mod eng2_light;
 pub mod history;
 pub mod light;
 pub mod ranges;
-#[path = "../../native-node/src/eng2/header.rs"]
+#[path = "../../native-node/src/chain_runtime/header.rs"]
 mod wallet_eng2_header;
 
 pub mod paths;

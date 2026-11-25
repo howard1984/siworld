@@ -37,7 +37,7 @@ pub const UNAVAILABLE: u8 = 7;
 pub const END_BATCH: u8 = 8;
 pub const CHECKPOINT: u8 = 9;
 pub const GET_CHECKPOINT_DATA: u8 = 10;
-/// Versioned eng-2 messages remain bounded control frames.
+/// Versioned native protocol messages remain bounded control frames.
 pub(crate) const ENG2_MESSAGE: u8 = 11;
 pub(crate) const CHECKPOINT_ALPN: &[u8] = b"/siworld/native-hybrid/checkpoint/1";
 pub const MAX_HANDSHAKES: usize = 16;
@@ -749,11 +749,11 @@ impl<S: Read + Write> Session<S> {
     pub(crate) fn receive_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
         self.receive_deadline(deadline.clone())
     }
-    /// Eng-2 rejects V1 block frames before their payload is allocated.
+    /// native protocol rejects V1 block frames before their payload is allocated.
     pub(crate) fn receive_eng2_before(&mut self, deadline: &Deadline) -> Result<Packet, Error> {
         self.receive_frame(deadline.clone(), Some(&[ENG2_MESSAGE]))
     }
-    /// An eng-2 application phase bounds both header and body by the same
+    /// An native protocol application phase bounds both header and body by the same
     /// absolute deadline and rejects its smaller frame cap before allocation.
     pub(crate) fn receive_eng2_application_before(
         &mut self,

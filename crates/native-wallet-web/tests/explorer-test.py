@@ -9,7 +9,7 @@ import tempfile
 import threading
 import unittest
 
-spec = importlib.util.spec_from_file_location('services', Path(__file__).parents[1] / 'tools/engineering-services.py')
+spec = importlib.util.spec_from_file_location('services', Path(__file__).parents[1] / 'tools/loopback-services.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 

@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-SPEC = importlib.util.spec_from_file_location('cg', Path(__file__).parents[1] / 'measure-proof-cgroup.py')
+SPEC = importlib.util.spec_from_file_location('cg', Path(__file__).parents[1] / 'bench/measure-proof-cgroup.py')
 CG = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CG)
 
@@ -88,7 +88,7 @@ class MemoryLimitTests(unittest.TestCase):
     def test_cli_preserves_default_and_forwards_explicit_cap(self):
         for options, expected in (([], CG.BUDGET),
                                   (['--memory-max', str(self.EXPERIMENTAL_CAP)], self.EXPERIMENTAL_CAP)):
-            argv = ['measure-proof-cgroup.py', '--output', 'unused', '--uid', '1000',
+            argv = ['bench/measure-proof-cgroup.py', '--output', 'unused', '--uid', '1000',
                     '--gid', '1000', *options, '--', 'synthetic-worker']
             with self.subTest(options=options), mock.patch.object(sys, 'argv', argv), \
                     mock.patch.object(CG, 'measure', return_value={'resource_control_pass': True}) as measure, \
@@ -100,7 +100,7 @@ class MemoryLimitTests(unittest.TestCase):
 
     def test_cli_invalid_caps_do_not_start_measurement(self):
         for cap in ('0', '-1', 'max', '1.5', ''):
-            argv = ['measure-proof-cgroup.py', '--output', 'unused', '--uid', '1000',
+            argv = ['bench/measure-proof-cgroup.py', '--output', 'unused', '--uid', '1000',
                     '--gid', '1000', '--memory-max=' + cap, '--', 'synthetic-worker']
             with self.subTest(cap=cap), mock.patch.object(sys, 'argv', argv), \
                     mock.patch.object(CG, 'measure') as measure, contextlib.redirect_stderr(io.StringIO()):
