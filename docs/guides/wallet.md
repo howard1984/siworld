@@ -22,8 +22,10 @@ uses the chosen network and genesis to verify payment status.
 2. **Create or restore the wallet.** Use its recovery flow. Protect the
    recovery words offline and keep signing material on the wallet device.
    Synchronize until authenticated history covers the account's activity.
-3. **Receive.** Share a full receiving address, or provide a short address
-   and its matching full contact. Inspect incoming notes in the wallet.
+3. **Receive.** Share the full `sivf1…` receiving address first. If you use
+   a secondary `si1p…` address, verify its descriptor against the pinned
+   genesis and the matching full address on the pinned network. Inspect
+   incoming notes in the wallet.
 4. **Send.** Verify the recipient, asset, amount, and fee tier. Review the
    selected inputs and change, then authorize the payment on your device.
 5. **Check payment status.** Treat admission as pending and inclusion in the
@@ -43,6 +45,6 @@ alone cannot verify a recipient's decrypted contents. See
 | Symptom | Check | Action |
 | --- | --- | --- |
 | Restored account has no activity | Network, account, and available authenticated history | Verify the recovery inputs and complete synchronization. |
-| Short address is rejected | Full contact, network, and matching commitment | Request a verified full address. |
+| Short address is rejected | Full contact, network, genesis, and matching descriptor | Request a verified full address. |
 | Payment remains provisional | Checkpoint coverage and selected branch | Wait for authenticated coverage and verify status again. |
 | Note remains locked | Verified height and note unlock height | Wait until the required height is reached. |

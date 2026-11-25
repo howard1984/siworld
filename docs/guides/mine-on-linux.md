@@ -37,10 +37,21 @@ install -Dm755 bin/siworld-miner "$HOME/.local/bin/siworld-miner" &&
 Add `$HOME/.local/bin` to your command path. Keep the release notes,
 checksums, and bundled notices available for later upgrades.
 
+### Recommended memory
+
+| Deployment | RandomX fast mode, installed RAM | RandomX light mode, installed RAM |
+| --- | ---: | ---: |
+| Miner with its embedded node | 16 GiB | 12 GiB |
+| Miner plus a separately running node | 24 GiB | 16 GiB |
+
+These installed-memory recommendations come from measured workloads.
+Checkpoint import and larger workloads can change memory use. The
+fast-mode selection threshold is configured separately.
+
 ### Configure the network and receiving address
 
 Set `GENESIS_ID` to the expected ID from the trusted manifest and
-`FULL_ADDRESS` to your validated full receiving address. Use the release's
+`FULL_ADDRESS` to your validated `sivf1…` full receiving address. Use the release's
 `genesis.bin` and `peers.json` in your working directory.
 
 ```sh
@@ -48,8 +59,10 @@ siworld-miner config init ./genesis.bin "$GENESIS_ID" ./peers.json "$FULL_ADDRES
 siworld-miner config
 ```
 
-For a short address, supply its matching full contact with
-`--contact ./contact.txt`. Keep the instance directory for the chain it
+For a supported `si1p…` short address, verify its version 2 descriptor
+against the selected genesis and supply its matching full contact with
+`--contact ./contact.txt`. Use the full address directly if that
+verification is unavailable. Keep the instance directory for the chain it
 was initialized against. For checkpoint bootstrap on a new instance,
 initialize with `--chain-source checkpoint`, then run
 `siworld-miner config bootstrap ./bootstrap-policy.json` using the trusted
@@ -58,9 +71,23 @@ blocks before producing work.
 
 ### Select Voyager or Holder
 
-Select a mode when prompted, or set it while the miner is stopped. Voyager
-is the default when a background start has no saved mode. Choosing Holder
-confirms that its locked notes cannot be spent early.
+The saved configuration field `reward_mode` accepts `voyager` or `holder`.
+Voyager is the default. When the field is unset, an interactive start
+offers Voyager as the default choice and a background start uses Voyager
+for that run. Holder requires confirmation that its locked notes cannot
+be spent early.
+
+Set a mode while the miner is stopped.
+
+```sh
+siworld-miner config reward-mode voyager
+# To select Holder instead, explicitly acknowledge the lock.
+siworld-miner config reward-mode holder --confirm-holder
+```
+
+The two commands are alternatives. At initialization, the equivalent
+options are `--reward-mode voyager` or
+`--reward-mode holder --confirm-holder`.
 
 | Mode | First miner subsidy note | Other effects |
 | --- | --- | --- |
@@ -105,5 +132,5 @@ are separate from a wallet's unspent balance.
 | --- | --- | --- |
 | Hardware admission fails | Architecture, instruction set, and available memory | Use the supported package and satisfy its hardware requirements. |
 | Synchronization does not advance | Package network, genesis, trusted peers, and disk space | Verify the chosen inputs before changing the instance. |
-| Short address cannot be resolved | Full contact and network binding | Import the verified matching full address. |
+| Short address cannot be resolved | Full contact, network, and genesis binding | Import the verified matching full address. |
 | Shutdown is pending | Status of local proof or database work | Leave the process running until it releases its store. |

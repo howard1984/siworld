@@ -23,6 +23,16 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 interpreted as described in BCP 14 (RFC 2119 and RFC 8174) when, and only when,
 they appear in all capitals.
 
+### Public network and address class
+
+The public network identifier is
+`d38a665e4751c7cb6153ad56df86426303121524edca5158b8d60b4fc53b638f`. It uses the
+`mainnet` address class. Clients SHOULD display the full receiving address
+first. A full address binds the network identifier. A version 2 short
+address descriptor binds the genesis identifier of the selected chain.
+Clients MUST verify the applicable binding. The text prefix alone does
+not authenticate either identifier.
+
 ### Canonical receiving address
 
 A binary receiving address is 1,232 bytes, consisting of a 48-byte
@@ -41,13 +51,14 @@ key, noncanonical field values, or a failed checksum.
 
 ### Short address and contact resolution
 
-A short address starts with `sivs1`. Its payload consists of version 1 and
-a 32-byte commitment to the network and binary receiving address, with the
-same checksum construction. The commitment uses BLAKE3 derive-key context
-`siworld native recipient directory v1` over the network and binary address
-in that order. The wallet MUST obtain a full address independently,
-validate it, and recompute and match the commitment before sending. A short
-address alone MUST NOT be interpreted as a receiving key.
+The `mainnet` short format uses Bech32m with human-readable part `si` and
+starts with `si1p`. A wallet accepting this format MUST validate the
+version 2 descriptor against the independently pinned genesis ID and
+verify that the corresponding full receiving address matches the
+descriptor and the pinned network. It MUST use that verified full address
+as the payment recipient. If a descriptor is unavailable, the wallet
+SHOULD request the full address directly. A short address alone MUST NOT
+be interpreted as a receiving key.
 
 ### Wallet verification
 

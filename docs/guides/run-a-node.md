@@ -21,16 +21,22 @@ materials for the chain it will join.
 
 1. Verify the archive checksum and compare its build and network metadata with
    the trusted release. Extract the complete package. Set `SIWORLD_NODE` to
-   its node executable. Set `NODE_DIR`, `GENESIS_ID`, and `PEER_CONFIG` to
-   the node directory, expected genesis ID, and matching peer manifest.
-2. Place the release's `genesis.bin` in the node directory as described
-   by the package. Check the executable's command list and compare the
-   genesis identity before initializing anything.
+   its node executable. Set `NODE_DIR` and `PEER_CONFIG` to the node
+   directory and matching peer manifest.
+2. Check that the trusted release manifest lists the public network ID
+   `d38a665e4751c7cb6153ad56df86426303121524edca5158b8d60b4fc53b638f`.
+   Take `GENESIS_ID` separately from that manifest. Verify the packaged
+   `genesis.bin` checksum and place the file in `NODE_DIR`. Compare the
+   executable's computed genesis ID with the pinned value before
+   initializing anything.
 
    ```sh
-   "$SIWORLD_NODE" --help
-   "$SIWORLD_NODE" genesis-id "$NODE_DIR"
+   actual_genesis_id="$("$SIWORLD_NODE" genesis-id "$NODE_DIR")" &&
+     test "$actual_genesis_id" = "$GENESIS_ID"
    ```
+
+   Continue only if the check succeeds. See the
+   [protocol parameters](../reference/parameters.md) for both identifiers.
 
 3. For a new node, initialize the service identity explicitly and configure
    only independently trusted peer pins. Existing nodes reuse their service
@@ -70,8 +76,9 @@ materials for the chain it will join.
 "$SIWORLD_NODE" status "$NODE_DIR"
 ```
 
-Compare the network and genesis with the release manifest. Check that the
-validated height and accepted checkpoint advance and that the store reports
+Compare the status field `network_id` with the pinned public network ID
+and recheck the local genesis with `genesis-id`. Check that the validated
+height and accepted checkpoint advance and that the store reports
 availability. A reported peer head is a synchronization hint until the node
 validates the corresponding chain. See [storage and synchronization](../specs/07-storage-and-sync.md).
 
@@ -79,7 +86,7 @@ validates the corresponding chain. See [storage and synchronization](../specs/07
 
 | Symptom | Check | Action |
 | --- | --- | --- |
-| Genesis mismatch | Executable, manifest, and data directory identify a different chain | Select the matching release and preserve the existing store. |
+| Network or genesis mismatch | Executable, manifest, and data directory identify a different chain | Select the matching release and preserve the existing store. |
 | Checkpoint import fails | Availability, peer pins, policy bounds, and target disk space | Correct the input and use the package's verified resume or clean import procedure. |
 | Checkpoint stops advancing | Local validated height and checkpoint authentication status | Preserve the store and inspect local diagnostics before changing configuration. |
 | Store already in use | Ownership and active processes | Stop the owning process cleanly before restarting. |

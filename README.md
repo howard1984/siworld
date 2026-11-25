@@ -30,6 +30,10 @@ Rust implementation of shielded multi-asset payments with native STARK proofs an
 | [Mine](docs/guides/mine-on-linux.md) | Linux installation, reward modes, and operation. |
 | [Exchange integration](docs/guides/exchange-integration.md) | Deposit finality, withdrawal submission, and reconciliation. |
 
+For the public network ID and address formats, see the
+[protocol parameters](docs/reference/parameters.md). For memory sizing, see
+the Linux miner's [recommended configurations](docs/guides/mine-on-linux.md#recommended-memory).
+
 ## Build from source
 
 The Rust toolchain is pinned in [rust-toolchain.toml](rust-toolchain.toml). Install a C and C++ toolchain and CMake for the native dependencies. From the repository root, build the native node library with the peer and wallet gateway interfaces:

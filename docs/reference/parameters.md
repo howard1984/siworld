@@ -9,6 +9,11 @@ specification or guide and do not change block validity.
 
 | Scope | Parameter | Value and unit | Definition |
 | --- | --- | --- | --- |
+| Network | Public network identifier | `d38a665e4751c7cb6153ad56df86426303121524edca5158b8d60b4fc53b638f` (32 bytes) | [09. Addresses and wallets](../specs/09-addresses-and-wallets.md#public-network-and-address-class) |
+| Network | Public genesis identifier | Pin independently from the verified release manifest and check against `genesis.bin` | [Run a node](../guides/run-a-node.md#steps) |
+| Address | Public address class | `mainnet` | [09. Addresses and wallets](../specs/09-addresses-and-wallets.md#public-network-and-address-class) |
+| Address | Primary full format | `sivf1…`, bound to the network ID | [09. Addresses and wallets](../specs/09-addresses-and-wallets.md#canonical-receiving-address) |
+| Address | Secondary short format | `si1p…`, Bech32m, version 2 descriptor bound to the genesis ID | [09. Addresses and wallets](../specs/09-addresses-and-wallets.md#short-address-and-contact-resolution) |
 | Consensus | Work algorithm | SIWORLD RandomX v1.2.1 | [05. Consensus](../specs/05-consensus.md#randomx-proof-of-work) |
 | Consensus | RandomX Argon2d salt | `SIWORLD/RandomX/ArgonSalt/v1` | [05. Consensus](../specs/05-consensus.md#randomx-proof-of-work) |
 | Consensus | RandomX key interval and delay | 2,048 and 64 blocks | [05. Consensus](../specs/05-consensus.md#randomx-proof-of-work) |
