@@ -59,7 +59,8 @@ jobs:
         run: bash scripts/ci-fetch.sh native-economic-accounting
       - name: Monetary transition and rejection tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: cargo test --release --locked -p siworld-core v1_economics::tests::
+        run: |
+          cargo test --release --locked -p siworld-core v1_economics::tests::
   offline-fund-keys:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.offline_fund_keys == 'true') }}
