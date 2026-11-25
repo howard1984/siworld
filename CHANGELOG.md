@@ -3,7 +3,7 @@
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and uses [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [Unreleased]
 
 ### Added
 
@@ -14,8 +14,10 @@ and uses [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Replaced the whitepaper with the current SIWORLD protocol design.
-- Reorganized the README and documentation index around the published interfaces.
+- Reorganized the README around the public protocol and its source layout.
+- Streamlined hosted checks to compilation, linting, and bounded offline tests.
 
 ### Removed
 
 - Superseded specifications, duplicate documentation, and historical deployment notes.
+- Obsolete deployment, resource qualification, and reporting tools.

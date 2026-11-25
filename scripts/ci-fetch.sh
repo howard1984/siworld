@@ -14,12 +14,7 @@ case "$job" in
    cargo fetch --locked --manifest-path "crates/$crate/Cargo.toml"
   done
   exit 0 ;;
- native-transaction)
-  python3 scripts/build-d8-checkpoint.py --prepare-only --output .local/native-transaction
-  manifest=.local/native-transaction/application/Cargo.toml
-  # The isolated generated manifest replaces git sources with reviewed local paths.
-  cargo fetch --manifest-path "$manifest"
-  exit 0 ;;
+ native-transaction) manifest=crates/bench-d8/Cargo.toml ;;
  *) echo 'Unknown dependency graph' >&2; exit 2 ;;
 esac
 cargo fetch --locked --manifest-path "$manifest"

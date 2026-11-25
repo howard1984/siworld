@@ -1,5 +1,9 @@
 # Run a node
 
+**Public releases**
+
+Genesis ID and installation packages: Published at network launch.
+
 ## Overview
 
 A SIWORLD full node checks work, proofs, and state transitions. This guide

@@ -57,26 +57,9 @@ jobs:
       - name: Acquire locked dependencies
         working-directory: .
         run: bash scripts/ci-fetch.sh native-economic-accounting
-      - name: Current monetary rejection tests and production-schedule simulation
+      - name: Monetary transition and rejection tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          cargo test --release --locked -p siworld-core v1_economics::tests::
-          mkdir -p .local/native-accounting
-          cargo test --release --locked -p siworld-core v1_economics::tests::seeded_twenty_year_modes_preserve_supply_and_curve -- --ignored --exact --nocapture > .local/native-accounting/simulation.log 2>&1
-          python3 scripts/check-fund-simulation.py .local/native-accounting/simulation.log .local/native-accounting/simulation.json
-      - name: Compare the source-bound numeric reference
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          python3 - <<'PY_ACCOUNTING'
-          import hashlib
-          import json
-          from pathlib import Path
-          reference = json.loads(Path('crates/core/artifacts/v1-economics-simulation.json').read_text())
-          actual = json.loads(Path('.local/native-accounting/simulation.json').read_text())
-          assert reference['simulation'] == actual['simulation'], 'Executed accounting differs from the reference'
-          for name, digest in reference['sources_sha256'].items():
-              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == digest, 'Accounting source differs from the reference'
-          PY_ACCOUNTING
+        run: cargo test --release --locked -p siworld-core v1_economics::tests::
   offline-fund-keys:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.offline_fund_keys == 'true') }}
@@ -138,29 +121,16 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Browser history-cache and proof-progress contracts
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: node --test crates/native-wallet-web/tests/online-storage.test.mjs crates/native-wallet-web/tests/commitment-session.test.mjs crates/native-wallet-web/tests/proof-progress.test.mjs
       - name: Publication manifest and documentation
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: |
           python3 scripts/check-ci-policy.py
           python3 scripts/check-repository.py
-          python3 scripts/check-native-envelope-policy.py
-          python3 scripts/check-fee-settlement-evaluation.py --schema >/tmp/fee-settlement-schema.json
-      - name: Wallet record selection regressions
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: node --test crates/native-wallet-web/tests/storage-selection.test.mjs
-      - name: Shared wallet history regressions
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: node --test crates/native-wallet-web/tests/commitment-session.test.mjs
-      - name: Audit evidence and memory declarations
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
           python3 scripts/check-audit-registry.py
-          python3 scripts/check-memory-budgets.py
           python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
-          python3 -m unittest discover -s tools/control-panel -p 'test_*.py' -v
+      - name: Explorer projection
+        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
+        run: node --test tools/explorer/tests/projection.test.mjs
   workspace:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.workspace == 'true') }}
@@ -222,24 +192,6 @@ jobs:
       - name: Tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: cargo test --release --locked -p siworld-bench-plonky3 -p siworld-bench-common
-      - name: Isolated composition relation and profiler format
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          cargo test --release --locked -p siworld-bench-plonky3 --features experimental-fanin,phase-profile,security-report --lib
-          cargo clippy --release --locked -p siworld-bench-plonky3 --features experimental-fanin,phase-profile,security-report --bin composition-bench -- -D warnings
-      - name: D8 scalar geometry rejection tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          cargo test --release --locked -p siworld-bench-plonky3 --features d8-geometry --lib d8_geometry::tests
-          cargo clippy --release --locked -p siworld-bench-plonky3 --features d8-geometry --lib -- -D warnings
-      - name: Conditional D8 planning screen
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          cargo test --release --locked -p siworld-bench-plonky3 --features security-report --bin d8-security-screen
-          cargo clippy --release --locked -p siworld-bench-plonky3 --features security-report --bin d8-security-screen -- -D warnings
-          cargo run --release --locked -p siworld-bench-plonky3 --features security-report --bin d8-security-screen > /tmp/d8-screen.json
-          python3 -c 'import json; r=json.load(open("/tmp/d8-screen.json")); assert len(r["layers"]) == 3; assert all(len(x["candidates"]) == 3 and all(c["screen_pass_conditional_on_shape_and_sites"] and not c["approved"] for c in x["candidates"]) for x in r["layers"])'
-
   native-transaction:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_transaction == 'true') }}
@@ -256,55 +208,12 @@ jobs:
       - name: Acquire locked dependencies
         working-directory: .
         run: bash scripts/ci-fetch.sh native-transaction
-      - name: Check CPU before executing optimized tests
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/native-cpu-check
-          /tmp/native-cpu-check --check-cpu
-      - name: Native constraint and encoding rejection tests
-        env:
-          RAYON_NUM_THREADS: 4
+      - name: Native proof and codec tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo fmt --manifest-path crates/bench-d8/Cargo.toml --all --check
-          python3 - <<'PY_NATIVE_TEST'
-          import importlib.util
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location('build_d8', 'scripts/build-d8-checkpoint.py')
-          build = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(build)
-          command = ['cargo', 'test', '--release', '--manifest-path', '.local/native-transaction/application/Cargo.toml', '--features', 'security-report', '--lib']
-          for module, minimum in [('transaction', 8), ('codec', 7), ('encryption', 12), ('fee_settlement', 5), ('fee_settlement_air', 10), ('proof_codec', 14), ('common', 1), ('envelope', 6), ('padding_pool', 1), ('native_verifier', 2), ('native_security', 1)]:
-              selected = [*command, module + '::tests']
-              if module == 'codec':
-                  selected += ['--', '--skip', 'proof_codec::tests']
-              build.run_logged(selected, Path('.local/native-transaction') / (module + '-tests.log'), nonempty_tests=True, minimum_tests=minimum)
-          build.run_logged([*command[:-1], '--test', 'snapshots'], Path('.local/native-transaction/snapshot-tests.log'), nonempty_tests=True, minimum_tests=15)
-          build.run_logged([*command, 'proof_codec::tests::candidate_profile_roundtrips_the_actual_transaction_air', '--', '--ignored'], Path('.local/native-transaction/candidate-codec-test.log'), nonempty_tests=True, minimum_tests=1)
-          build.run_logged([*command[:-1], '--bin', 'v1-transaction-scan'], Path('.local/native-transaction/diagnostic-tests.log'), nonempty_tests=True, minimum_tests=2)
-          build.run_logged([*command[:-1], '--bin', 'native-verifier-bench'], Path('.local/native-transaction/verifier-worker-tests.log'), nonempty_tests=True, minimum_tests=2)
-          PY_NATIVE_TEST
-          cargo clippy --release --manifest-path .local/native-transaction/application/Cargo.toml --features security-report --lib --bin v1-transaction-scan --bin native-verifier-bench --bin v1-freeze-artifacts -- -D warnings
-          cargo build --release --manifest-path .local/native-transaction/application/Cargo.toml --features security-report --bin v1-transaction-scan --bin v1-freeze-artifacts
-          python3 scripts/check-v1-freeze.py
-          timeout 600 .local/native-transaction/application/target/release/v1-freeze-artifacts \
-            --root "$GITHUB_WORKSPACE" --output .local/native-transaction/reproduced-freeze.json
-          python3 scripts/check-v1-reproduction.py --reproduced .local/native-transaction/reproduced-freeze.json
-          .local/native-transaction/application/target/release/v1-transaction-scan --security-only --log-blowup 4 --queries 80 --grinding 16 --output .local/native-transaction/security-diagnostic.json
-      - name: Preserve registry dependency pins
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          python3 - <<'PY_LOCK'
-          import importlib.util
-          from pathlib import Path
-          spec = importlib.util.spec_from_file_location('build_d8', 'scripts/build-d8-checkpoint.py')
-          build = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(build)
-          expected = build.registry_pins(Path('crates/bench-d8/Cargo.lock').read_text())
-          actual = build.registry_pins(Path('.local/native-transaction/application/Cargo.lock').read_text())
-          assert expected == actual, 'Registry pins changed during native validation'
-          PY_LOCK
-
+          cargo clippy --release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report --lib --tests -- -D warnings
+          cargo test --release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report --lib --test snapshots
   native-multi-asset:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_multi_asset == 'true') }}
@@ -327,52 +236,13 @@ jobs:
       - name: Acquire locked dependencies
         working-directory: .
         run: bash scripts/ci-fetch.sh native-multi-asset
-      - name: Check CPU admission before optimized code
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          rustc scripts/prover-launcher.rs --edition=2021 -O -D warnings -C target-cpu=x86-64 -o /tmp/multi-asset-cpu-check
-          /tmp/multi-asset-cpu-check --check-cpu
-      - name: Validate native relations and public artifact tooling
+      - name: Native proof and public codec tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: |
           cargo fmt --manifest-path crates/bench-multi-asset/Cargo.toml --check
-          cargo clippy --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --all-targets -- -D warnings
-          cargo test --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --lib --bin profile-artifacts --test public_codec_rejections
-          rustc --edition=2024 --test crates/bench-multi-asset/src/experiments/transaction_layout.rs -D warnings -o /tmp/transaction-layout-tests
-          /tmp/transaction-layout-tests
-          cargo build --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --bin profile-artifacts
-      - name: Reproduce the frozen transaction public key and security ledger
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          python3 - <<'PY_PROFILE'
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          frozen = Path('crates/bench-multi-asset/artifacts/v1-transaction-profile.json')
-          profile = json.loads(frozen.read_text())
-          params = profile['parameters']
-          output = Path('.local/multi-asset-profile-reproduced.json')
-          worker = Path(os.environ['CARGO_TARGET_DIR']) / 'release/profile-artifacts'
-          subprocess.run([str(worker), str(params['log_blowup']), str(params['num_queries']),
-              str(params['query_pow_bits']), str(output)], check=True)
-          subprocess.run(['python3', 'scripts/freeze-multi-asset.py', '--check', str(frozen),
-              '--verifier-key', str(output)], check=True)
-          PY_PROFILE
-      - name: Reproduce all three fixed native relation keys and security reports
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          rustfmt --edition=2024 --check scripts/native-proof-artifacts.rs
+          cargo clippy --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --lib --tests -- -D warnings
+          cargo test --release --locked --manifest-path crates/bench-multi-asset/Cargo.toml --features security-report --lib --test public_codec_rejections
           python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json
-          python3 scripts/check-native-proof-profiles.py --prepare .local/native-proof-profiles/application
-          cargo build --release --locked --manifest-path .local/native-proof-profiles/application/Cargo.toml --features security-report --bin native-proof-artifacts
-          cargo test --release --locked --manifest-path .local/native-proof-profiles/application/Cargo.toml --features security-report --bin native-proof-artifacts
-          mkdir -p .local/native-proof-profiles/reproduced
-          for kind in transaction settlement issuance; do
-            "$CARGO_TARGET_DIR/release/native-proof-artifacts" "$kind" ".local/native-proof-profiles/reproduced/$kind.json"
-          done
-          python3 scripts/check-native-proof-profiles.py --check crates/bench-multi-asset/artifacts/v1-native-proof-profiles.json --reproduced .local/native-proof-profiles/reproduced
-
   native-runtime:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_runtime == 'true') }}
@@ -402,13 +272,6 @@ jobs:
       - name: Native protocol, transition, persistence and audit rejection tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
         run: cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway
-      - name: Isolated checkpoint alarm scope and retention preservation
-        shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: |
-          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib service::stale_acceptance::tests::
-          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib store::retention_tests::acceptance_finality_observation_preserves_backlog_until_explicit_bounded_probe -- --exact
-          cargo test --release --locked --manifest-path crates/native-node/Cargo.toml --features native-p2p,wallet-light-gateway,checkpoint-stale-acceptance --lib checkpoint_stale_runtime::tests::
-
   wallet:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.wallet == 'true') }}

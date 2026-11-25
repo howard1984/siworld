@@ -1,5 +1,9 @@
 # Use a wallet
 
+**Public releases**
+
+Genesis ID and installation packages: Published at network launch.
+
 ## Overview
 
 Use a SIWORLD wallet to receive and send private transfers. The wallet

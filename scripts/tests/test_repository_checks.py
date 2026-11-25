@@ -33,12 +33,12 @@ class RepositoryManifestTests(unittest.TestCase):
 
     def test_local_links_check_images_fragments_and_index_membership(self):
         path = ROOT / "README.md"
-        names = {"docs/README.md", "brand/siworld-on-light.png"}
+        names = {"docs/README.md", "README.md"}
         body = """
 [Specifications](docs/README.md#protocol-specifications)
 [Missing heading](docs/README.md#missing-heading)
-<img src="brand/siworld-on-light.png">
-<source srcset="brand/missing.png 2x">
+<img src="README.md">
+<source srcset="missing.png 2x">
 ```text
 [Example](example-only.md)
 ```
@@ -47,7 +47,7 @@ class RepositoryManifestTests(unittest.TestCase):
         repository.check_links(path, body, names, errors)
         self.assertEqual(errors, [
             "Missing heading anchor in README.md: docs/README.md#missing-heading",
-            "Missing publication target in README.md: brand/missing.png",
+            "Missing publication target in README.md: missing.png",
         ])
 
     def test_wallet_text_assets_are_exactly_scoped(self):

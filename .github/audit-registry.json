@@ -108,7 +108,6 @@
         "host kernel and Docker VM behavior"
       ],
       "implementation_paths": [
-        "tools/control-panel/memory_trend.py",
         "scripts/measure-native-cgroup.py",
         "scripts/tests/fixtures/retired-workflows/d8-native-cgroup.yml",
         "docs/guides/run-a-node.md"

@@ -72,7 +72,7 @@ try {
   async function unlock(password) { await page.click('#open-unlock'); await page.fill('#password', password); await page.click('#next'); }
   await page.goto(origin); await ready();
   const first = 'synthetic first device passphrase';
-  const second = '  synthetic second device passphrase \u5bc6\u7801 \u{1f511}  ';
+  const second = '  synthetic second device passphrase cafe\u0301 \u{1f511}  ';
   const firstId = '11111111-1111-4111-8111-111111111111', secondId = 'eeeeeeee-1111-4111-8111-111111111111';
   await create(first); await lock(); await create(second); await lock();
   assert.equal(await page.inputValue('#saved-wallet'), secondId, 'New wallets must remain selected.');

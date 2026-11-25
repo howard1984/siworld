@@ -1,5 +1,9 @@
 # Mine on Linux
 
+**Public releases**
+
+Genesis ID and installation packages: Published at network launch.
+
 ## Overview
 
 The `siworld-miner` command runs outbound RandomX mining and its validating

@@ -37,10 +37,6 @@ DOCUMENTS = {
     "specs/10-rpc.md",
     "whitepaper.md",
 }
-BRAND_IMAGES = {
-    "brand/siworld-on-dark.png",
-    "brand/siworld-on-light.png",
-}
 PUBLIC_ARTIFACTS = {
     "crates/core/artifacts/v1-economics-simulation.json",
     "crates/bench-d8/artifacts/v1-native-freeze.json",
@@ -138,11 +134,8 @@ def allowed(path):
         return name in ROOT_FILES
     if path.parts[0] == "docs":
         return path.relative_to("docs").as_posix() in DOCUMENTS
-    if path.parts[0] == "brand":
-        return name in BRAND_IMAGES or name == "brand/LICENSE"
     if name in {".cargo/config.toml", "scripts/prover-launcher.rs",
-                "scripts/native-proof-artifacts.rs", "scripts/native-runtime-launcher.rs",
-                "scripts/settlement-full-load.rs",
+                "scripts/native-proof-artifacts.rs",
                 "crates/bench-stark/patches/recursion-d8-w24.patch"}:
         return True
     if name in {"scripts/ci-offline.sh", "scripts/ci-fetch.sh", "scripts/ci-bin/cargo"}:
@@ -152,9 +145,7 @@ def allowed(path):
     if path.parts[0] == "scripts":
         return path.suffix == ".py" and (len(path.parts) == 2 or (len(path.parts) == 3 and path.parts[1] == "tests"))
     if path.parts[0] == "tools":
-        return name in EXPLORER_FILES or name in {
-            "tools/control-panel/memory_trend.py", "tools/control-panel/test_memory_trend.py"
-        }
+        return name in EXPLORER_FILES
     if name in {".github/audit-registry.json", ".github/repository-profile.json"}:
         return True
     if path.parts[0] == ".github":
@@ -248,10 +239,6 @@ def main():
             continue
         if path.is_symlink() or not path.is_file():
             errors.append(f"Expected a regular file: {name}")
-            continue
-        if name in BRAND_IMAGES:
-            if not path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"):
-                errors.append(f"Expected a PNG image: {name}")
             continue
         if name in PUBLIC_ARTIFACTS and path.suffix != ".json":
             continue

@@ -6,7 +6,8 @@ The [whitepaper](whitepaper.md) explains the protocol design. The specifications
 define the rules used to validate transactions, blocks, state, and network
 data. Each specification identifies its applicable ruleset. Select the
 ruleset using the pinned genesis for the network. The guides cover
-installation, verification, and integration.
+installation, verification, and integration. The public genesis ID and
+installation packages are published at network launch.
 
 ## Protocol specifications
 
@@ -29,6 +30,7 @@ installation, verification, and integration.
 | --- | --- |
 | [Run a node](guides/run-a-node.md) | Verify a release, initialize a node, and synchronize the selected chain |
 | [Mine on Linux](guides/mine-on-linux.md) | Install, configure, and operate the RandomX miner |
+| [Mine on Windows](guides/mine-on-windows.md) | Verify the Windows package and its network configuration |
 | [Exchange integration](guides/exchange-integration.md) | Verify deposits, submit withdrawals, and reconcile state |
 | [Wallet](guides/wallet.md) | Create or restore a wallet and verify payment status |
 

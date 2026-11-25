@@ -1,69 +1,81 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="brand/siworld-on-dark.png">
-  <img alt="SIWORLD" src="brand/siworld-on-light.png" width="300">
-</picture>
-
 # SIWORLD
 
 **Private by default. Post-quantum by design. Mined on everyday CPUs.**
 
-Rust implementation of shielded multi-asset payments with native STARK proofs and RandomX proof of work.
+SIWORLD is a Rust implementation of shielded multi-asset payments. The public
+protocol uses native STARK proofs and RandomX proof of work.
 
 [![CI](https://github.com/howard1984/siworld/actions/workflows/ci.yml/badge.svg)](https://github.com/howard1984/siworld/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
 
+[Whitepaper](docs/whitepaper.md) · [Protocol specifications](docs/README.md#protocol-specifications) · [Run a node](docs/guides/run-a-node.md) · [Mine on Linux](docs/guides/mine-on-linux.md) · [Exchange integration](docs/guides/exchange-integration.md)
+
 ## Protocol features
 
-- **Every ordinary transfer is shielded.** The ledger conceals the payment graph, transfer amounts and assets, and the receipt height of spent notes.
-- **Post-quantum cryptography protects payments and authenticates protocol actions.** Recipient data uses ML-KEM-768 and signed protocol messages use ML-DSA-65.
-- **Native STARKs prove private state transitions without a trusted setup.** Nodes verify each transfer against the public statement.
-- **RandomX runs on general-purpose CPUs.** Miners use the same proof-of-work algorithm to extend the chain.
-- **Voyager and Holder spread new issuance over time.** The two mining modes use distinct subsidy allocation and locking rules and share the Holder pool.
+- **Shielded transfers conceal who paid whom, how much, and when the spent notes were received.**
+- **ML-KEM-768 protects recipient data. ML-DSA-65 authenticates signed protocol messages.**
+- **Native STARKs prove private state transitions without a trusted setup.**
+- **RandomX proof of work runs on general-purpose CPUs.** ASERT adjusts difficulty.
+- **Voyager and Holder spread new issuance over time** through distinct subsidy and locking rules.
 
-## Documentation
+See the [security model](docs/security/security-model.md) for the protocol's
+cryptographic assumptions and observer model.
 
-| Resource | Purpose |
-| --- | --- |
-| [Whitepaper](docs/whitepaper.md) | Protocol design, privacy, and security assumptions. |
-| [Specs](docs/README.md#protocol-specifications) | Consensus, proof formats, wire protocols, and validation rules. |
-| [Run a node](docs/guides/run-a-node.md) | Installation, verification, and synchronization. |
-| [Mine](docs/guides/mine-on-linux.md) | Linux installation, reward modes, and operation. |
-| [Exchange integration](docs/guides/exchange-integration.md) | Deposit finality, withdrawal submission, and reconciliation. |
+## Architecture
 
-For the public network ID and address formats, see the
-[protocol parameters](docs/reference/parameters.md). For memory sizing, see
-the Linux miner's [recommended configurations](docs/guides/mine-on-linux.md#recommended-memory).
+The diagram shows how participants interact under the public protocol. The
+[specifications](docs/README.md#protocol-specifications) define the public
+network rules.
+
+```mermaid
+flowchart LR
+    Wallet["Wallet"] -->|"Shielded transaction and proof"| Node["Validating node"]
+    Miner["CPU miner"] -->|"Block and proof of work"| Node
+    Node <-->|"Blocks and signed checkpoints"| Peers["Peer network"]
+    Node -->|"Verified notes and checkpoints"| Wallet
+    Node -->|"Accepted chain updates"| State["Ledger state"]
+```
 
 ## Build from source
 
-The Rust toolchain is pinned in [rust-toolchain.toml](rust-toolchain.toml). Install a C and C++ toolchain and CMake for the native dependencies. From the repository root, build the native node library with the peer and wallet gateway interfaces:
+Install Rust through rustup and use the pinned
+[toolchain](rust-toolchain.toml). Install a C and C++ toolchain and CMake for
+native dependencies. These commands build the checked-out source revision.
+From the repository root, build the workspace and the native node library
+with its peer and wallet gateway interfaces.
 
 ```sh
+cargo build --workspace --locked
 cargo build --release --locked --manifest-path crates/native-node/Cargo.toml \
   --features native-p2p,wallet-light-gateway --lib
 ```
 
-Use the [node guide](docs/guides/run-a-node.md) for release-specific binaries and verification steps. The [contribution guide](CONTRIBUTING.md) lists local checks.
+See [Contributing](CONTRIBUTING.md#validation) for test and lint commands.
 
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| [`crates/native-node/`](crates/native-node/) | Node validation, chain selection, storage, and peer services. |
-| [`crates/bench-multi-asset/`](crates/bench-multi-asset/) | Native transaction, issuance, and settlement proof relations. |
-| [`crates/native-wallet-engine/`](crates/native-wallet-engine/) | Wallet state, payment construction, and light verification. |
-| [`crates/core/src/pow.rs`](crates/core/src/pow.rs) | Work-target arithmetic shared by the node runtimes. |
-| [`crates/miner-cli/`](crates/miner-cli/) | Miner commands and local operation. |
-| [`docs/`](docs/README.md) | Whitepaper, specifications, guides, and reference. |
-| [`scripts/`](scripts/) | Build, packaging, and validation tooling. |
-| [`tools/`](tools/) | Explorer and supporting tools. |
+| [`crates/`](crates/) | Rust protocol, proof, node, wallet, and miner components |
+| [`crates/native-node/`](crates/native-node/) | Native transaction and block validation, peer services, and state storage |
+| [`crates/bench-multi-asset/`](crates/bench-multi-asset/) | Native transaction, issuance, and settlement proof relations |
+| [`crates/native-wallet-engine/`](crates/native-wallet-engine/) | Wallet state, transaction construction, and light verification |
+| [`docs/`](docs/README.md) | Whitepaper, specifications, operator guides, and parameter reference |
+| [`scripts/`](scripts/) | Validation and reproducible build support |
+| [`tools/explorer/`](tools/explorer/) | Read-only chain explorer |
 
-## Security
+## Public network
 
-Use the [private disclosure process](SECURITY.md) to report a vulnerability. See the [security model](docs/security/security-model.md) for the protocol's trust and privacy assumptions.
+| Item | Availability |
+| --- | --- |
+| Network ID and address formats | [Protocol parameters](docs/reference/parameters.md) |
+| Genesis ID | Published at network launch |
+| Downloads and installation packages | Published at network launch |
 
-## License
+Release information is available at [siworld.io](https://siworld.io/).
 
-Software is licensed under [GPL-3.0-only](LICENSE). See [NOTICE](NOTICE) for third-party notices and [the brand license](brand/LICENSE) for logo assets.
+## Security and license
 
-[siworld.io](https://siworld.io/)
+Report vulnerabilities through the [private disclosure process](SECURITY.md).
+SIWORLD software is licensed under [GPL-3.0-only](LICENSE). See [NOTICE](NOTICE)
+for third-party attribution.
