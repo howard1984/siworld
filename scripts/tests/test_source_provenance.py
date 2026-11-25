@@ -31,6 +31,7 @@ class SourceRelocationTests(unittest.TestCase):
     def test_runtime_code_has_no_hash_exception(self):
         self.assertFalse(R.matches(ROOT, 'crates/native-proof/src/lib.rs', b'changed', '0' * 64))
         tooling = {
+            'scripts/native-proof-artifacts.rs',
             'scripts/prover-launcher.rs',
             'crates/bench-d8/src/bin/checkpoint.rs',
             'crates/bench-d8/src/bin/fee-settlement-bench.rs',
