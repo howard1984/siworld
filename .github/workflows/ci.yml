@@ -220,6 +220,8 @@ jobs:
           done
           cargo test "${native_proof[@]}" --lib codec::tests -- --skip proof_codec::tests
           cargo test "${native_proof[@]}" --test snapshots
+          cargo test "${native_proof[@]}" --lib proof_codec::tests::candidate_profile_roundtrips_the_actual_transaction_air -- --ignored
+          cargo test "${native_proof[@]}" --bin v1-transaction-scan --bin native-verifier-bench
           python3 scripts/check-v1-freeze.py
   native-multi-asset:
     needs: changes
