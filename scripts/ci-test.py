@@ -95,6 +95,8 @@ def main():
             output = run([binary, name, '--exact', *[a for a in runtime_args if a != '--exact']], deadline)
             print(output, end='')
             count += 1
+    if filters and not count:
+        raise SystemExit('No tests match the requested selection')
     print(f'Bounded offline test selections: {count}')
 
 

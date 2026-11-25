@@ -214,7 +214,13 @@ jobs:
         run: |
           cargo fmt --manifest-path crates/bench-d8/Cargo.toml --all --check
           cargo clippy --release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report --lib --tests -- -D warnings
-          cargo test --release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report --lib --test snapshots
+          native_proof=(--release --locked --manifest-path crates/bench-d8/Cargo.toml --features security-report)
+          for relation in transaction encryption fee_settlement fee_settlement_air proof_codec common envelope padding_pool native_verifier native_security; do
+            cargo test "${native_proof[@]}" --lib "$relation::tests"
+          done
+          cargo test "${native_proof[@]}" --lib codec::tests -- --skip proof_codec::tests
+          cargo test "${native_proof[@]}" --test snapshots
+          python3 scripts/check-v1-freeze.py
   native-multi-asset:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.native_multi_asset == 'true') }}
