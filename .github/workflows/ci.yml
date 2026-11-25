@@ -164,7 +164,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         shell: bash --noprofile --norc -c "exec bash \"$GITHUB_WORKSPACE/scripts/ci-offline.sh\" \"$1\"" -- {0}
-        run: cargo test --workspace --all-features --locked
+        run: |
+          # Run the background mining service fixtures on owner-controlled machines.
+          cargo test --workspace --all-features --locked -- \
+            --skip a_follower_syncs_and_receives_a_payment \
+            --skip a_miner_with_peers_mines_only_once_synced
+
   bench-plonky3:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.bench_plonky3 == 'true') }}

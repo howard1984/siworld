@@ -23,6 +23,18 @@ def main():
             'eng2-runtime', 'eng2-rehearsal',
             'run-network', 'run-native', 'ssh ', 'gh release')):
         raise SystemExit('Hosted CI contains a local-only operation')
+    local_mining_tests = (
+        'a_follower_syncs_and_receives_a_payment',
+        'a_miner_with_peers_mines_only_once_synced',
+    )
+    workspace_tests = [
+        line for line in text.splitlines() if 'cargo test --workspace' in line
+    ]
+    if len(workspace_tests) != 1:
+        raise SystemExit('Expected one bounded workspace test invocation')
+    command = text[text.index(workspace_tests[0]):].split('\n\n', 1)[0]
+    if any(f'--skip {test}' not in command for test in local_mining_tests):
+        raise SystemExit('Background service tests require owner-controlled execution')
     safe_setup = {'Install pinned toolchain', 'Install pinned toolchain and WASM target',
                   'Acquire locked dependencies', 'Install checksum-pinned secret scanner'}
     for block in re.split(r'^      - ', text, flags=re.M)[1:]:
