@@ -9,6 +9,18 @@ import subprocess
 import sys
 
 
+# These integration targets start a mining service or use a test driver
+# with an unbounded nonce search. Compile them in hosted checks.
+LOCAL_TARGETS = {
+    'crates/node/tests/devnet.rs',
+    'crates/node/tests/network.rs',
+    'crates/node/tests/node.rs',
+    'crates/node/tests/plonky3.rs',
+    'crates/node/tests/proving.rs',
+}
+LOCAL_TESTS = {'devnet_releases_inputs_of_evicted_payments'}
+
+
 def run(command, timeout):
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, start_new_session=True)
@@ -26,7 +38,8 @@ def run(command, timeout):
 
 
 def main():
-    arguments = [a for a in sys.argv[1:] if a != '--offline']
+    hosted = '--hosted' in sys.argv[1:]
+    arguments = [a for a in sys.argv[1:] if a not in ('--offline', '--hosted')]
     split = arguments.index('--') if '--' in arguments else len(arguments)
     cargo_args, runtime_args = arguments[:split], arguments[split + 1:]
     if '--doc' in cargo_args:
@@ -64,9 +77,16 @@ def main():
         raise SystemExit('No compiled test executable found')
     count = 0
     for binary, metadata in binaries.items():
+        target = metadata['target']
+        source = '/'.join(Path(target['src_path']).parts[-4:])
+        if hosted and source in LOCAL_TARGETS:
+            print(f'Local validation only: {source}', flush=True)
+            continue
         listed = run([binary, *filters, *runtime_args, '--list', '--format=terse'], 30)
         names = [line[:-6] for line in listed.splitlines() if line.endswith(': test')]
         for name in names:
+            if hosted and name in LOCAL_TESTS:
+                continue
             # Consensus fixtures and PoW-related tests must finish in seconds.
             pow_test = (metadata.get('target', {}).get('name') == 'pow' or
                         re.search(r'(^|::|_)(pow|mining|nonce|mine|mined)(::|_|$)', name))
